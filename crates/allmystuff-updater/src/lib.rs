@@ -43,6 +43,13 @@ pub fn default_release_api_beta() -> &'static str {
 
 const USER_AGENT: &str = concat!("allmystuff-self-update/", env!("CARGO_PKG_VERSION"));
 
+/// The minisign public key releases are signed with, baked in at build time.
+/// `None` until release signing is configured (set `ALLMYSTUFF_RELEASE_PUBKEY`
+/// to the base64 key when building the shipped binary). When set, a valid
+/// detached signature over each artifact is **required** before it is staged —
+/// SHA-256 proves integrity, the signature proves provenance.
+const RELEASE_PUBKEY: Option<&str> = option_env!("ALLMYSTUFF_RELEASE_PUBKEY");
+
 // ---------------------------------------------------------------------------
 // Errors.
 // ---------------------------------------------------------------------------
@@ -720,7 +727,16 @@ async fn stage_release(
             .ok_or_else(|| Error::msg("asset missing download url"))?;
         let dest = dir.join(&asset_name);
         let expected = find_sha256(assets, &asset_name, &client).await;
-        download_and_verify(&client, url, &dest, expected.as_deref(), &asset_name).await?;
+        let signature = find_signature(assets, &asset_name, &client).await;
+        download_and_verify(
+            &client,
+            url,
+            &dest,
+            expected.as_deref(),
+            signature.as_deref(),
+            &asset_name,
+        )
+        .await?;
         manifest.push(serde_json::json!({
             "kind": kind.as_str(),
             "path": dest.to_string_lossy(),
@@ -742,8 +758,8 @@ async fn stage_release(
 }
 
 /// Find the expected SHA-256 for `asset_name`: a `<asset>.sha256` sidecar
-/// asset, else a `SHA256SUMS` line. `None` if neither is published (we then
-/// stage without verification, logging a warning).
+/// asset, else a `SHA256SUMS` line. `None` if neither is published — staging
+/// then fails closed (a published checksum is mandatory).
 async fn find_sha256(
     assets: &[serde_json::Value],
     asset_name: &str,
@@ -786,11 +802,42 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
         .await?)
 }
 
+/// Fetch the detached minisign signature (`<asset>.minisig`) for `asset_name`,
+/// if the release publishes one. Returns the `.minisig` file's text.
+async fn find_signature(
+    assets: &[serde_json::Value],
+    asset_name: &str,
+    client: &reqwest::Client,
+) -> Option<String> {
+    let sidecar = format!("{asset_name}.minisig");
+    let a = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(&sidecar))?;
+    let url = a["browser_download_url"].as_str()?;
+    fetch_text(client, url).await.ok()
+}
+
+/// Verify a detached minisign signature over `data` against the baked-in
+/// release public key. Pure verification (no signing); fails closed on any
+/// malformed input.
+fn verify_signature(
+    pubkey_b64: &str,
+    data: &[u8],
+    minisig_text: &str,
+) -> std::result::Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
+        .map_err(|e| format!("bad release public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(minisig_text)
+        .map_err(|e| format!("bad signature file: {e}"))?;
+    pk.verify(data, &sig, false).map_err(|e| e.to_string())
+}
+
 async fn download_and_verify(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
+    expected_sig: Option<&str>,
     asset_name: &str,
 ) -> Result<()> {
     let bytes = client
@@ -800,17 +847,39 @@ async fn download_and_verify(
         .error_for_status()?
         .bytes()
         .await?;
-    if let Some(expected) = expected_sha256 {
-        let actual = hex::encode(Sha256::digest(&bytes));
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(Error::ChecksumMismatch {
-                asset: asset_name.to_string(),
-                expected: expected.to_string(),
-                actual,
-            });
+    // Integrity: a published SHA-256 is mandatory. We never stage an
+    // unverified binary — a missing checksum used to fall through to a bare
+    // warning, which let anyone who could omit the sidecar serve any payload.
+    let Some(expected) = expected_sha256 else {
+        return Err(Error::msg(format!(
+            "no SHA-256 published for {asset_name}; refusing to stage unverified"
+        )));
+    };
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(Error::ChecksumMismatch {
+            asset: asset_name.to_string(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    // Authenticity: when a release signing key is baked in, a valid detached
+    // signature over the artifact is required. SHA-256 comes from the same
+    // release and proves only integrity; the signature is what makes a swapped
+    // release asset detectable.
+    match RELEASE_PUBKEY {
+        Some(pubkey) => {
+            let sig_text = expected_sig.ok_or_else(|| {
+                Error::msg(format!(
+                    "no signature published for {asset_name}; refusing to stage"
+                ))
+            })?;
+            verify_signature(pubkey, &bytes, sig_text)
+                .map_err(|e| Error::msg(format!("signature check failed for {asset_name}: {e}")))?;
         }
-    } else {
-        tracing::warn!("no SHA-256 published for {asset_name}; staging unverified");
+        None => tracing::warn!(
+            "release signing not configured in this build; {asset_name} verified by SHA-256 only"
+        ),
     }
     std::fs::write(dest, &bytes)?;
     Ok(())
@@ -912,6 +981,14 @@ fn extract_binary(archive: &Path, out_dir: &Path, bin_name: &str) -> Result<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_verification_fails_closed_on_garbage() {
+        // Malformed key or signature must error, never silently pass — the
+        // download path treats any Err here as "do not stage".
+        assert!(verify_signature("not-a-valid-key", b"payload", "not-a-sig").is_err());
+        assert!(verify_signature("", b"payload", "").is_err());
+    }
 
     #[test]
     fn install_kind_detection() {

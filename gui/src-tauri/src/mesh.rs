@@ -968,7 +968,7 @@ impl Mesh {
                     let Some(me) = self.local_node_id() else {
                         return;
                     };
-                    let structural = self.ownership.merge_fleet(&me, &roster);
+                    let structural = self.ownership.merge_fleet(&me, &from, &roster);
                     // Gossip echoes after every presence answer and
                     // re-broadcast; only a roster that *changed* something
                     // is worth a line at the default level.
@@ -1640,41 +1640,21 @@ impl Mesh {
         self.broadcast_roster(&roster).await;
     }
 
-    /// Broadcast one explicit roster on every network — used for the final
-    /// minus-self roster of a leave (our own store is already cleared) and
-    /// the bumped roster of a kick. Logs how many peers each network's
-    /// broadcast actually reached, so "the roster never arrived" is
-    /// diagnosable from this side's log.
+    /// Hand one explicit roster to each of its members individually — never a
+    /// blanket `ChannelSendAll`. Used for the final minus-self roster of a
+    /// leave (our own store is already cleared) and the bumped roster of a
+    /// kick. The roster carries the fleet's grouping key and a receiver only
+    /// honours membership from its owner or an existing member, so it goes to
+    /// the membership only, never to every peer on the network — that keeps
+    /// the key off bystanders and matches what the receiver will accept.
     async fn broadcast_roster(&self, roster: &OwnedRoster) {
-        let networks = { self.state.lock().networks.clone() };
-        let Ok(payload) = serde_json::to_value(roster) else {
-            return;
-        };
-        for network in networks {
-            let resp = self
-                .client
-                .request(&Request::ChannelSendAll {
-                    network: network.clone(),
-                    channel: CHANNEL_OWNED.to_string(),
-                    payload: payload.clone(),
-                })
-                .await;
-            match resp {
-                Ok(r) if r.ok => {
-                    let n = r
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("dispatched_to"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    tracing::debug!("owned roster broadcast on {network} reached {n} peer(s)");
-                }
-                Ok(r) => tracing::warn!(
-                    "owned roster broadcast on {network} refused: {}",
-                    r.error.unwrap_or_else(|| "(no error)".into())
-                ),
-                Err(e) => tracing::warn!("owned roster broadcast on {network} failed: {e}"),
+        let me = self.local_node_id();
+        let me_canon = me.as_deref().map(pubkey_part);
+        for member in &roster.members {
+            if Some(pubkey_part(member.device.as_str())) == me_canon {
+                continue;
             }
+            self.send_roster_to(member.device.as_str(), roster).await;
         }
     }
 

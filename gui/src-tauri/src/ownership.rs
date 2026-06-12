@@ -246,11 +246,18 @@ impl Ownership {
         changed
     }
 
-    /// Merge an inbound fleet roster a peer gossiped. We adopt its key if we
-    /// hold none **and the roster actually lists us** — gossip is broadcast,
-    /// and a bystander on the network must not join itself to someone else's
-    /// fleet just by hearing it. Once we have a key we only merge rosters
-    /// that share it (a foreign fleet's gossip is ignored).
+    /// Merge an inbound fleet roster a peer gossiped — but only from a sender
+    /// we already trust. `from` is the daemon-attested peer id of the sender.
+    /// Membership grants owner/fleet-only control on the mesh (terminal, files,
+    /// input), so a roster is honoured **only** when `from` is our recorded
+    /// owner or an already-known fleet member. A keyless device adopting its
+    /// first fleet accepts it solely from its **owner** (the peer it just
+    /// completed the authenticated claim with) and only when the roster lists
+    /// us; a device that already holds a key still requires the key to match
+    /// *and* the sender to be owner/member — knowing the (broadcast-observable)
+    /// key is not enough. This is the gate that stops a stranger writing
+    /// themselves into the fleet to earn a remote shell. Once we have a key, a
+    /// foreign fleet's gossip (different key) is ignored.
     ///
     /// Convergence is by version, with *replacement* semantics on a newer
     /// roster: a strictly newer copy replaces our member set wholesale —
@@ -267,25 +274,48 @@ impl Ownership {
     /// fleet remains) and refresh the UI. A label-only refresh is saved but
     /// does *not* re-broadcast, so two peers that disagree on a label can't
     /// ping-pong gossip forever.
-    pub fn merge_fleet(&self, me: &str, incoming: &OwnedRoster) -> bool {
+    pub fn merge_fleet(&self, me: &str, from: &str, incoming: &OwnedRoster) -> bool {
         if incoming.key.is_empty() {
             return false;
         }
         let me_canon = pubkey_part(me).to_string();
+        let from_canon = pubkey_part(from);
+        if from_canon.is_empty() {
+            return false;
+        }
         let mut i = self.inner.lock();
-        // A foreign fleet's gossip (a key we don't share) is ignored once we
-        // hold one. Done before any mutation so the borrow doesn't conflict.
-        if let Some(k) = &i.fleet_key {
-            if k != &incoming.key {
-                return false;
+        // Authorization gate — the fix for unauthenticated fleet-roster
+        // injection. A roster is only honoured from a sender we already trust,
+        // never from an arbitrary peer that merely lists us or merely knows the
+        // (broadcast-observable) key. Computed before any mutation so the
+        // immutable borrow doesn't conflict.
+        let from_is_owner = i.owner.as_deref().map(pubkey_part) == Some(from_canon);
+        let from_is_member = i
+            .fleet_members
+            .iter()
+            .any(|m| pubkey_part(m.device.as_str()) == from_canon);
+        match &i.fleet_key {
+            // Already in a fleet: only our owner or an existing member may move
+            // membership, and only within our own fleet (matching key).
+            Some(k) => {
+                if k != &incoming.key || !(from_is_owner || from_is_member) {
+                    return false;
+                }
             }
-        } else {
-            let listed = incoming
-                .members
-                .iter()
-                .any(|m| pubkey_part(m.device.as_str()) == me_canon);
-            if !listed {
-                return false;
+            // Keyless — a freshly-claimed device adopting its first fleet:
+            // accept only from our recorded owner, and only when the roster
+            // actually lists us. A device with no owner never adopts.
+            None => {
+                if !from_is_owner {
+                    return false;
+                }
+                let listed = incoming
+                    .members
+                    .iter()
+                    .any(|m| pubkey_part(m.device.as_str()) == me_canon);
+                if !listed {
+                    return false;
+                }
             }
         }
         let adopting = i.fleet_key.is_none();
@@ -629,10 +659,12 @@ mod tests {
         let roster = owner.fleet().expect("owner has a fleet");
         assert_eq!(roster.members.len(), 2);
 
-        // The claimed device starts blank, then merges the owner's gossip:
-        // it adopts the key and the membership (it is listed).
+        // The claimed device records its owner (the claim handshake set it),
+        // then merges the owner's gossip: it adopts the key and the membership
+        // (it is listed).
         let target = memory();
-        assert!(target.merge_fleet("nuc-BBBBB", &roster));
+        target.inner.lock().owner = Some("owner-AAAAA".into());
+        assert!(target.merge_fleet("nuc-BBBBB", "owner-AAAAA", &roster));
         let t = target.fleet().unwrap();
         assert_eq!(t.key, key);
         assert_eq!(t.members.len(), 2);
@@ -647,7 +679,7 @@ mod tests {
                 label: "Intruder".into(),
             }],
         };
-        assert!(!target.merge_fleet("nuc-BBBBB", &foreign));
+        assert!(!target.merge_fleet("nuc-BBBBB", "intruder", &foreign));
         assert_eq!(target.fleet().unwrap().members.len(), 2);
     }
 
@@ -665,7 +697,9 @@ mod tests {
             }],
         };
         let bystander = memory();
-        assert!(!bystander.merge_fleet("someone-else", &roster));
+        bystander.inner.lock().owner = Some("owner".into());
+        // Even from our own owner, a roster that doesn't list us isn't adopted.
+        assert!(!bystander.merge_fleet("someone-else", "owner", &roster));
         assert!(bystander.fleet().is_none());
     }
 
@@ -703,7 +737,7 @@ mod tests {
                 },
             ],
         };
-        assert!(dev.merge_fleet("this-dev", &roster));
+        assert!(dev.merge_fleet("this-dev", "new-owner", &roster));
         assert_eq!(dev.fleet().unwrap().key, "fresh-key");
     }
 
@@ -722,26 +756,28 @@ mod tests {
         // A member merging the newer roster adopts the name — and the
         // rename alone is structural (it re-broadcasts and refreshes UI).
         let member = memory();
-        assert!(member.merge_fleet("nuc-BBBBB", &named));
+        member.inner.lock().owner = Some("owner-AAAAA".into());
+        assert!(member.merge_fleet("nuc-BBBBB", "owner-AAAAA", &named));
         assert_eq!(member.fleet().unwrap().name, "Casey");
         let renamed = OwnedRoster {
             name: "Casey's house".into(),
             version: named.version + 1,
             ..named.clone()
         };
-        assert!(member.merge_fleet("nuc-BBBBB", &renamed));
+        assert!(member.merge_fleet("nuc-BBBBB", "owner-AAAAA", &renamed));
         assert_eq!(member.fleet().unwrap().name, "Casey's house");
 
         // Equal-version gossip fills an *empty* name (label-style refresh,
         // not structural) but never overwrites a non-empty one.
         let other = memory();
+        other.inner.lock().owner = Some("owner-AAAAA".into());
         let unnamed = OwnedRoster {
             name: String::new(),
             ..renamed.clone()
         };
-        assert!(other.merge_fleet("nuc-BBBBB", &unnamed));
+        assert!(other.merge_fleet("nuc-BBBBB", "owner-AAAAA", &unnamed));
         assert!(
-            !other.merge_fleet("nuc-BBBBB", &renamed),
+            !other.merge_fleet("nuc-BBBBB", "owner-AAAAA", &renamed),
             "name fill isn't structural"
         );
         assert_eq!(other.fleet().unwrap().name, "Casey's house");
@@ -749,7 +785,7 @@ mod tests {
             name: "Impostor".into(),
             ..renamed.clone()
         };
-        assert!(!other.merge_fleet("nuc-BBBBB", &conflicting));
+        assert!(!other.merge_fleet("nuc-BBBBB", "owner-AAAAA", &conflicting));
         assert_eq!(
             other.fleet().unwrap().name,
             "Casey's house",
@@ -784,34 +820,37 @@ mod tests {
         // A member holds [owner, a, b] at v3; the owner kicks `b` and
         // gossips v4 without it. Union semantics could never drop `b`.
         let dev = memory();
-        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("a", "owner", &roster("k", 3, &["owner", "a", "b"])));
         assert_eq!(dev.fleet().unwrap().members.len(), 3);
 
-        assert!(dev.merge_fleet("a", &roster("k", 4, &["owner", "a"])));
+        assert!(dev.merge_fleet("a", "owner", &roster("k", 4, &["owner", "a"])));
         let f = dev.fleet().unwrap();
         assert_eq!(f.version, 4);
         assert_eq!(f.members.len(), 2);
         assert!(!f.members.iter().any(|m| m.device.as_str() == "b"));
 
         // Stale gossip (the kicked copy echoing back at v3) is ignored.
-        assert!(!dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+        assert!(!dev.merge_fleet("a", "owner", &roster("k", 3, &["owner", "a", "b"])));
         assert_eq!(dev.fleet().unwrap().members.len(), 2);
     }
 
     #[test]
     fn a_newer_roster_without_us_means_we_were_kicked() {
         let dev = memory();
-        assert!(dev.merge_fleet("b", &roster("k", 3, &["owner", "a", "b"])));
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("b", "owner", &roster("k", 3, &["owner", "a", "b"])));
         // v4 arrives without us → drop the fleet entirely (and report it as
         // structural so the UI refreshes).
-        assert!(dev.merge_fleet("b", &roster("k", 4, &["owner", "a"])));
+        assert!(dev.merge_fleet("b", "owner", &roster("k", 4, &["owner", "a"])));
         assert!(dev.fleet().is_none());
     }
 
     #[test]
     fn leaving_returns_the_minus_self_roster_and_clears_local_state() {
         let dev = memory();
-        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a"])));
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("a", "owner", &roster("k", 3, &["owner", "a"])));
 
         let out = dev.leave_fleet("a-AB12C").expect("was a member");
         assert_eq!(out.version, 4, "bumped so the leave out-ranks v3 copies");
@@ -824,7 +863,8 @@ mod tests {
     #[test]
     fn kicking_needs_membership_and_skips_self() {
         let dev = memory();
-        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("a", "owner", &roster("k", 3, &["owner", "a", "b"])));
 
         let out = dev.kick_member("a", "b").expect("member may kick");
         assert_eq!(out.version, 4);
@@ -906,5 +946,73 @@ mod tests {
             dev.fleet().is_none(),
             "membership follows ownership — a released device leaves the fleet"
         );
+    }
+
+    #[test]
+    fn merge_rejects_unsolicited_roster_from_a_stranger() {
+        // Attack: a keyless device must not adopt a fleet just because a
+        // stranger gossips a roster that lists it — that is how a peer would
+        // write itself in to earn owner/fleet-only control (shell, files,
+        // input). Only the recorded owner can hand down the first roster.
+        let dev = memory();
+        dev.inner.lock().owner = Some("my-owner".into());
+        let injected = roster("attacker-key", 1, &["my-device", "attacker"]);
+        assert!(
+            !dev.merge_fleet("my-device", "attacker", &injected),
+            "a non-owner can't seed our fleet"
+        );
+        assert!(dev.fleet().is_none(), "nothing adopted");
+
+        // The same shape from the real owner (who hands it down right after
+        // the authenticated claim) is accepted.
+        let legit = roster("owner-key", 1, &["my-owner", "my-device"]);
+        assert!(dev.merge_fleet("my-device", "my-owner", &legit));
+        assert!(dev.fleet().is_some());
+    }
+
+    #[test]
+    fn merge_rejects_a_key_holder_who_is_not_a_member() {
+        // Even with the correct (broadcast-observable) key, a peer that is not
+        // already our owner or a member cannot rewrite membership.
+        let dev = memory();
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("me", "owner", &roster("k", 2, &["owner", "me"])));
+        assert_eq!(dev.fleet().unwrap().members.len(), 2);
+
+        let poisoned = roster("k", 3, &["owner", "me", "attacker"]);
+        assert!(
+            !dev.merge_fleet("me", "attacker", &poisoned),
+            "knowing the key is not membership"
+        );
+        assert!(
+            !dev
+                .fleet()
+                .unwrap()
+                .members
+                .iter()
+                .any(|m| m.device.as_str() == "attacker"),
+            "attacker never entered the roster"
+        );
+
+        // The owner making the same change is honoured.
+        assert!(dev.merge_fleet("me", "owner", &poisoned));
+        assert!(dev
+            .fleet()
+            .unwrap()
+            .members
+            .iter()
+            .any(|m| m.device.as_str() == "attacker"));
+    }
+
+    #[test]
+    fn an_existing_member_may_propagate_roster_changes() {
+        // Convergence still works once the owner has introduced a member: that
+        // member's later gossip is accepted (owner-or-member authority), so
+        // peers heal without routing every change through the owner.
+        let dev = memory();
+        dev.inner.lock().owner = Some("owner".into());
+        assert!(dev.merge_fleet("me", "owner", &roster("k", 2, &["owner", "me", "peer"])));
+        assert!(dev.merge_fleet("me", "peer", &roster("k", 3, &["owner", "me", "peer", "peer2"])));
+        assert_eq!(dev.fleet().unwrap().members.len(), 4);
     }
 }

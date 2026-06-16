@@ -38,7 +38,10 @@ crates/
 ├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
 ├── allmystuff-session     # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
 ├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
-└── allmystuff-cli         # `allmystuff` (opens the GUI) + scan / capabilities / update
+├── allmystuff-cli         # `allmystuff` (opens the GUI) + scan / capabilities / update
+├── allmystuff-cec         # the CEC service client: the typed HTTP contract, a transport-generic client, and an in-memory mock backend
+├── allmystuff-cec-mock    # `allmystuff-cec-mock` — a runnable reference CEC backend over the mock, for end-to-end testing
+└── allmystuff-agent       # `allmystuff-agent` — the headless CEC technician tool (sign in, go online, accept help sessions)
 ```
 
 ### allmystuff-inventory
@@ -573,6 +576,76 @@ link stayed up) answers with its own presence + roster directly — the mesh
 carries traffic when something happens, never on a timer. The fleet roster
 (it holds the grouping key) is only ever *handed* to fleet members; presence
 goes to everyone.
+
+## The CEC service
+
+**CEC** — Critical Error Computing — is the company behind AllMyStuff, and the
+hosted backend behind the two services advertised on allmystuff.works. The free
+app needs none of it; an **optional account** unlocks:
+
+- **Ask-for-Help** (Concierge) — a real CEC technician, one tap away.
+- **Private Line** — "a venue of your own": CEC-hosted signaling/STUN/TURN
+  serving only your devices.
+
+The app is a *client* of this backend exactly the way it's a client of the
+daemon: `allmystuff-cec` mirrors the HTTP contract (the typed Rust DTOs in
+`model.rs` **are** the contract — see `crates/allmystuff-cec/CONTRACT.md`)
+without owning the server, and the Tauri backend (`gui/src-tauri/src/cec.rs`)
+holds the `reqwest`-backed client plus the persisted account state
+(`~/.myownmesh/allmystuff-cec.json`). A runnable reference backend
+(`allmystuff-cec-mock`) and a headless agent tool (`allmystuff-agent`) round
+out the picture, both built on the same client crate.
+
+### Accounts
+
+Optional, and passwordless: enter an email, get a one-time code. Identity proof
+is the code; the same `verify` call **binds this device's mesh pubkey** to the
+account, so the backend knows which nodes to provision a mesh for and pre-trust.
+The token lives app-side (never the webview); the entitlements blob
+(`{ hardware, private_line, concierge }`) drives the two product decisions —
+whether to stand up the CEC mesh (`hardware || private_line || concierge`) and
+whether Ask-for-Help is live (`concierge.is_some()`).
+
+### The CEC mesh — one service node, agents behind it
+
+When a customer has CEC hardware *or* a service, the app provisions a dedicated,
+isolated network — `cec-customer-<hash>`, where `<hash>` is a stable, opaque
+digest of the account id (no PII reaches the mesh). It rides the **existing
+networks-as-venues machinery**: the backend's `MeshProvision` carries a venue
+(its own signaling/STUN/TURN, plus a live venue-file URL the app adds as an
+ordinary **remote venue**) and the bare pubkey of a single **CEC Service**
+node. The app joins the network with `auto_approve`, assigns the CEC venue, and
+pre-approves that one node in the roster.
+
+The isolation is the point: because the network id is unique, its signaling
+room (`SHA-256(app-id : network-id)`) is too, so the only peers a customer ever
+sees there are their own devices and the one CEC Service node. **Individual
+agents are never mesh peers** — the backend operates that single node identity
+and bridges whichever technician is handling the customer to it. "Agents log in
+through the app, but their connections are managed by the backend provider, not
+the mesh engine" falls straight out of this: no MyOwnMesh changes were needed.
+
+### Ask-for-Help — a help room exposed to agents
+
+Pressing Ask-for-Help (the front-end's `cecAskHelp`) mints a host-side help
+room on the CEC network — an ordinary virtual room (`CHANNEL_ROOMS`) with a
+`room:{host}:cec-{nonce}` id, holding just this device and the CEC Service node
+— then `POST`s it to the backend, which exposes the queued session to online
+agents. An agent (via `allmystuff-agent` → the backend) accepts, the backend
+joins the room as the CEC Service node, and the customer's existing room call
+UI carries the session — screen share, control, voice, chat — over normal
+routes. The customer polls `GET /v1/help/{id}` and watches it go
+`queued → assigned → connected`. Nothing about the mesh's room plane changed;
+the CEC help room is just a recognisably-named one.
+
+### Testing
+
+`allmystuff-cec` is fully testable without a network: the `MockBackend` is a
+faithful in-memory implementation of the contract, driven through a socket-free
+`MockTransport` in unit/integration tests (the customer and agent flows both),
+and through a tiny HTTP shim in `allmystuff-cec-mock` for running the real app
+and agent against it (`allmystuff-cec-mock --demo`). The mesh side is the app's
+usual control-socket client; only the HTTP layer is new.
 
 ## Next milestones
 

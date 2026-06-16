@@ -194,7 +194,11 @@ impl MockBackend {
                 ok(json!({ "ok": true, "service": "allmystuff-cec-mock" }))
             }
 
-            _ => err(404, "not_found", &format!("no route for {} {}", req.method.as_str(), req.path)),
+            _ => err(
+                404,
+                "not_found",
+                &format!("no route for {} {}", req.method.as_str(), req.path),
+            ),
         }
     }
 
@@ -458,10 +462,7 @@ impl MockBackend {
         };
         // The venue is whatever serves the customer's CEC network. Re-derive
         // from the venue token convention so we don't have to store a back-ref.
-        let venue = cec_venue_spec(
-            &cec_mesh_venue_token(&session.network_id),
-            "service",
-        );
+        let venue = cec_venue_spec(&cec_mesh_venue_token(&session.network_id), "service");
         ok(serde_json::to_value(AgentAssignment { session, venue }).unwrap())
     }
 
@@ -654,7 +655,10 @@ fn gen_code(next: &mut u64) -> String {
     static SALT: AtomicU64 = AtomicU64::new(0);
     let n = next_id(next);
     let salt = SALT.fetch_add(1, Ordering::Relaxed);
-    let v = (now_secs().wrapping_add(n).wrapping_add(salt.wrapping_mul(7))) % 1_000_000;
+    let v = (now_secs()
+        .wrapping_add(n)
+        .wrapping_add(salt.wrapping_mul(7)))
+        % 1_000_000;
     format!("{v:06}")
 }
 

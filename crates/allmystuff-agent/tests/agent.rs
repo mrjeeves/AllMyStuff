@@ -17,10 +17,11 @@ fn config_round_trips_and_defaults() {
     assert_eq!(fresh.backend_url, allmystuff_agent::DEFAULT_BACKEND);
 
     // Save then reload.
-    let mut c = Config::default();
-    c.backend_url = "http://127.0.0.1:8787".into();
-    c.token = Some("tok_abc".into());
-    c.email = Some("sam@cec.example".into());
+    let c = Config {
+        backend_url: "http://127.0.0.1:8787".into(),
+        token: Some("tok_abc".into()),
+        email: Some("sam@cec.example".into()),
+    };
     c.save(&path).unwrap();
 
     let back = Config::load(&path);

@@ -109,7 +109,10 @@ async fn run(
         }
         "online" => {
             let p = client.set_presence(true).await?;
-            println!("You're online. {}", if p.online { "Available." } else { "" });
+            println!(
+                "You're online. {}",
+                if p.online { "Available." } else { "" }
+            );
             Ok(())
         }
         "offline" => {
@@ -252,7 +255,11 @@ fn io(e: std::io::Error) -> Error {
 
 fn describe(e: &Error) -> String {
     match e {
-        Error::Api { code: Some(c), message, .. } => format!("{message} ({c})"),
+        Error::Api {
+            code: Some(c),
+            message,
+            ..
+        } => format!("{message} ({c})"),
         _ => e.to_string(),
     }
 }

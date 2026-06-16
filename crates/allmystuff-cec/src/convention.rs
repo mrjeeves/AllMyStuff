@@ -95,9 +95,9 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with(CEC_NETWORK_PREFIX));
         assert!(is_cec_network(&a));
-        assert!(a.chars().all(|c| c.is_ascii_lowercase()
-            || c.is_ascii_digit()
-            || c == '-'));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         assert_ne!(a, customer_network_id("acct_456"));
     }
 

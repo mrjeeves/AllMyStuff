@@ -953,7 +953,8 @@ async fn cec_verify_sign_in(
     device_id: Option<String>,
     device_label: Option<String>,
 ) -> Result<Value, String> {
-    cec.verify_sign_in(email, code, device_id, device_label).await
+    cec.verify_sign_in(email, code, device_id, device_label)
+        .await
 }
 
 #[tauri::command]
@@ -997,7 +998,8 @@ async fn cec_ask_for_help(
     device_id: String,
     topic: Option<String>,
 ) -> Result<Value, String> {
-    cec.ask_for_help(network_id, room_id, device_id, topic).await
+    cec.ask_for_help(network_id, room_id, device_id, topic)
+        .await
 }
 
 #[tauri::command]

@@ -106,7 +106,8 @@ impl<T: Transport> CecClient<T> {
             email: email.to_string(),
         })
         .map_err(enc)?;
-        self.call(ApiRequest::post("/v1/auth/start").body(body)).await
+        self.call(ApiRequest::post("/v1/auth/start").body(body))
+            .await
     }
 
     /// `POST /v1/auth/verify` — exchange the code for a session and (if given)
@@ -126,7 +127,9 @@ impl<T: Transport> CecClient<T> {
             device_label: device_label.map(str::to_string),
         })
         .map_err(enc)?;
-        let session: Session = self.call(ApiRequest::post("/v1/auth/verify").body(body)).await?;
+        let session: Session = self
+            .call(ApiRequest::post("/v1/auth/verify").body(body))
+            .await?;
         self.token = Some(session.token.clone());
         Ok(session)
     }
@@ -149,14 +152,19 @@ impl<T: Transport> CecClient<T> {
     }
 
     /// `POST /v1/me/device` — bind (or re-label) a mesh device on the account.
-    pub async fn bind_device(&self, device_id: &str, label: Option<&str>) -> Result<Account, Error> {
+    pub async fn bind_device(
+        &self,
+        device_id: &str,
+        label: Option<&str>,
+    ) -> Result<Account, Error> {
         self.require_token()?;
         let body = serde_json::to_value(BindDevice {
             device_id: device_id.to_string(),
             label: label.map(str::to_string),
         })
         .map_err(enc)?;
-        self.call(ApiRequest::post("/v1/me/device").body(body)).await
+        self.call(ApiRequest::post("/v1/me/device").body(body))
+            .await
     }
 
     // --- the CEC mesh ------------------------------------------------------
@@ -166,7 +174,8 @@ impl<T: Transport> CecClient<T> {
     pub async fn provision_mesh(&self, device_id: &str) -> Result<MeshProvision, Error> {
         self.require_token()?;
         let body = serde_json::json!({ "device_id": device_id });
-        self.call(ApiRequest::post("/v1/mesh/provision").body(body)).await
+        self.call(ApiRequest::post("/v1/mesh/provision").body(body))
+            .await
     }
 
     // --- Private Line ------------------------------------------------------
@@ -178,7 +187,8 @@ impl<T: Transport> CecClient<T> {
             label: label.map(str::to_string),
         })
         .map_err(enc)?;
-        self.call(ApiRequest::post("/v1/private-line").body(body)).await
+        self.call(ApiRequest::post("/v1/private-line").body(body))
+            .await
     }
 
     /// `GET /v1/private-line` — the customer's Private Lines.
@@ -190,7 +200,8 @@ impl<T: Transport> CecClient<T> {
     /// `DELETE /v1/private-line/{id}` — cancel a Private Line.
     pub async fn cancel_private_line(&self, id: &str) -> Result<(), Error> {
         self.require_token()?;
-        self.call_unit(ApiRequest::delete(format!("/v1/private-line/{id}"))).await
+        self.call_unit(ApiRequest::delete(format!("/v1/private-line/{id}")))
+            .await
     }
 
     // --- Ask-for-Help (customer) ------------------------------------------
@@ -211,7 +222,8 @@ impl<T: Transport> CecClient<T> {
     /// `POST /v1/help/{id}/cancel` — cancel a queued help session.
     pub async fn cancel_help(&self, id: &str) -> Result<(), Error> {
         self.require_token()?;
-        self.call_unit(ApiRequest::post(format!("/v1/help/{id}/cancel"))).await
+        self.call_unit(ApiRequest::post(format!("/v1/help/{id}/cancel")))
+            .await
     }
 
     // --- agent side --------------------------------------------------------
@@ -220,7 +232,8 @@ impl<T: Transport> CecClient<T> {
     pub async fn set_presence(&self, online: bool) -> Result<AgentPresence, Error> {
         self.require_token()?;
         let body = serde_json::to_value(SetPresence { online }).map_err(enc)?;
-        self.call(ApiRequest::post("/v1/agent/presence").body(body)).await
+        self.call(ApiRequest::post("/v1/agent/presence").body(body))
+            .await
     }
 
     /// `GET /v1/agent/queue` — help sessions waiting for an online agent.
@@ -233,19 +246,22 @@ impl<T: Transport> CecClient<T> {
     /// and room to join as the CEC Service node.
     pub async fn accept_help(&self, id: &str) -> Result<AgentAssignment, Error> {
         self.require_token()?;
-        self.call(ApiRequest::post(format!("/v1/agent/help/{id}/accept"))).await
+        self.call(ApiRequest::post(format!("/v1/agent/help/{id}/accept")))
+            .await
     }
 
     /// `POST /v1/agent/help/{id}/decline` — pass on a session.
     pub async fn decline_help(&self, id: &str) -> Result<(), Error> {
         self.require_token()?;
-        self.call_unit(ApiRequest::post(format!("/v1/agent/help/{id}/decline"))).await
+        self.call_unit(ApiRequest::post(format!("/v1/agent/help/{id}/decline")))
+            .await
     }
 
     /// `POST /v1/agent/help/{id}/end` — end a session you're handling.
     pub async fn end_help(&self, id: &str) -> Result<(), Error> {
         self.require_token()?;
-        self.call_unit(ApiRequest::post(format!("/v1/agent/help/{id}/end"))).await
+        self.call_unit(ApiRequest::post(format!("/v1/agent/help/{id}/end")))
+            .await
     }
 
     // --- dev / mock-only ---------------------------------------------------
@@ -253,12 +269,18 @@ impl<T: Transport> CecClient<T> {
     /// `POST /v1/dev/grant` — MOCK ONLY. Set up entitlements / agent role.
     pub async fn dev_grant(&self, grant: &DevGrant) -> Result<(), Error> {
         let body = serde_json::to_value(grant).map_err(enc)?;
-        self.call_unit(ApiRequest::post("/v1/dev/grant").body(body)).await
+        self.call_unit(ApiRequest::post("/v1/dev/grant").body(body))
+            .await
     }
 
     /// Issue an arbitrary request — an escape hatch for tooling. Prefer the
     /// typed methods above.
-    pub async fn raw(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, Error> {
+    pub async fn raw(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, Error> {
         let mut req = ApiRequest::new(method, path);
         req.body = body;
         let resp = {

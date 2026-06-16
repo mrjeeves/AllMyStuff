@@ -114,7 +114,10 @@ async fn serve_one(mut stream: TcpStream, backend: Arc<MockBackend>) -> std::io:
     let mut bearer = None;
     for line in lines {
         if let Some(v) = header_value(line, "authorization") {
-            if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+            if let Some(tok) = v
+                .strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+            {
                 bearer = Some(tok.trim().to_string());
             }
         }

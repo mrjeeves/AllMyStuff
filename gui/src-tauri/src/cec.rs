@@ -307,10 +307,12 @@ fn snapshot_of(st: &Persisted) -> Value {
 /// Turn a relative venue URL (`/v1/venues/…`) into an absolute one against the
 /// backend, so the front-end (and the daemon, indirectly) can fetch it.
 fn absolutize_venue(base: &str, venue: &mut VenueSpec) {
-    if let Some(url) = &venue.url {
-        if url.starts_with('/') {
-            venue.url = Some(format!("{}{}", base.trim_end_matches('/'), url));
-        }
+    // Take the url out before reassigning so no borrow of `venue.url` is alive
+    // across the mutation (and it reads cleanly for clippy).
+    let needs_abs = venue.url.as_deref().is_some_and(|u| u.starts_with('/'));
+    if needs_abs {
+        let url = venue.url.take().unwrap_or_default();
+        venue.url = Some(format!("{}{}", base.trim_end_matches('/'), url));
     }
 }
 

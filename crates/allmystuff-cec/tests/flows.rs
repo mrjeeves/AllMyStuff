@@ -62,12 +62,9 @@ async fn customer_signs_in_provisions_mesh_and_asks_for_help() {
 
     // The venue file is fetchable (this is the remote-venue the app loads).
     let venue_path = prov.venue.url.unwrap();
-    let file = client
-        .raw(Method::Get, &venue_path, None)
-        .await
-        .unwrap();
+    let file = client.raw(Method::Get, &venue_path, None).await.unwrap();
     assert_eq!(file["kind"], VenueFile::KIND);
-    assert!(file["signaling_servers"].as_array().unwrap().len() >= 1);
+    assert!(!file["signaling_servers"].as_array().unwrap().is_empty());
 
     // Ask for help: mint a help room hosted by this device, then open a session.
     let room_id = convention::help_room_id("dev-casey-1");

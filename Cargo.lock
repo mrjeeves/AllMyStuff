@@ -9,12 +9,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "allmystuff-agent"
+version = "0.1.12"
+dependencies = [
+ "allmystuff-cec",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "allmystuff-bridge"
 version = "0.1.12"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-protocol",
+]
+
+[[package]]
+name = "allmystuff-cec"
+version = "0.1.12"
+dependencies = [
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "allmystuff-cec-mock"
+version = "0.1.12"
+dependencies = [
+ "allmystuff-cec",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

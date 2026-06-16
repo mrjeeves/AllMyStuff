@@ -1,0 +1,30 @@
+[package]
+name = "allmystuff-cec"
+description = "The CEC (Critical Error Computing) service client: the typed HTTP contract AllMyStuff speaks to the hosted backend for optional accounts, Ask-for-Help (Concierge), Private Line venues, the per-customer CEC mesh, and agent presence — plus an in-memory mock backend for tests and a local reference server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[features]
+# `reqwest` (default) compiles the real HTTP transport. Turn it off for a
+# pure-logic build (e.g. a wasm or strictly-mock consumer) that only wants
+# the contract types, the client over a custom transport, and the mock.
+default = ["reqwest"]
+reqwest = ["dep:reqwest"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "allmystuff-cec-mock"
+description = "A local reference/mock CEC backend — runs the in-memory allmystuff-cec MockBackend behind a tiny HTTP server so the real app and agent can be exercised end to end without the hosted service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "allmystuff-cec-mock"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Pure-logic build: we only need the contract + mock, never the HTTP client.
+allmystuff-cec = { workspace = true }
+serde_json = { workspace = true }
+# `net` for the listener; the rest come from the workspace tokio features.
+tokio = { workspace = true, features = ["net"] }

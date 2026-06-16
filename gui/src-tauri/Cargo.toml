@@ -64,6 +64,9 @@ allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../../crates/allmystuff-bridge" }
 allmystuff-session = { path = "../../crates/allmystuff-session" }
 allmystuff-updater = { path = "../../crates/allmystuff-updater" }
+# The CEC service client — optional accounts, Ask-for-Help, Private Line, and
+# the per-customer CEC mesh. Brings the real reqwest transport (its default).
+allmystuff-cec = { path = "../../crates/allmystuff-cec" }
 
 # Cross-platform audio capture + playback for the media plane — CoreAudio
 # on macOS, WASAPI on Windows, ALSA on Linux. Same crate (and version)

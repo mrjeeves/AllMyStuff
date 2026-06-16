@@ -18,6 +18,7 @@
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
+  import AskForHelpButton from "./AskForHelpButton.svelte";
   import ApprovalsPopup from "./ApprovalsPopup.svelte";
   import ClaimSheet from "./ClaimSheet.svelte";
   import ShareSheet from "./ShareSheet.svelte";
@@ -173,6 +174,9 @@
            re-join from the parked config, a clean transport restart for when
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
+      <!-- Ask for Help — a CEC technician, one tap away (routes to the Account
+           pane until there's an account + a Concierge plan). -->
+      <AskForHelpButton compact />
       <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
       <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">

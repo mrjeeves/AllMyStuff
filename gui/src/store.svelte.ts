@@ -32,6 +32,8 @@ import {
   type Venue,
 } from "./venues";
 import { fetchVenueServers } from "./venue-settings";
+import * as cecApi from "./cec";
+import type { CecSnapshot, CecHelpSession, CecPrivateLine } from "./cec";
 import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
@@ -155,7 +157,7 @@ import {
 } from "./types";
 
 /** Which pane the settings panel is showing. */
-export type SettingsTab = "networks" | "venues" | "updates" | "fleet" | "sharing";
+export type SettingsTab = "networks" | "venues" | "account" | "updates" | "fleet" | "sharing";
 
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
@@ -759,6 +761,7 @@ class AppStore {
     await onNodeSites((e) => this.applyNodeSites(e));
     await this.loadUpdateStatus();
     await this.loadDisabledNetworks();
+    await this.loadCec();
     this.startMeshPolling();
     await onSubscription((s) => {
       const live = s.status === "live";
@@ -772,6 +775,7 @@ class AppStore {
         void this.loadOwnedFleet();
         void this.loadSites();
         void this.loadDisabledNetworks();
+        void this.loadCec();
       }
       this.backendConnected = live;
     });
@@ -4698,6 +4702,352 @@ class AppStore {
     setTimeout(() => {
       this.toasts = this.toasts.filter((t) => t.id !== id);
     }, 3200);
+  }
+
+  // ===================================================================
+  // CEC service — the optional Critical Error Computing account and the
+  // two services it unlocks: Ask-for-Help (Concierge) and the Private
+  // Line. The HTTP side lives in the Tauri backend (`cec.rs` →
+  // `allmystuff-cec`); this orchestrates the mesh side on top of the
+  // existing room / network / venue verbs. Everything degrades to a
+  // believable demo off the desktop backend (web preview).
+  // ===================================================================
+
+  cec = $state<CecSnapshot>({
+    backend_url: "https://api.allmystuff.works",
+    signed_in: false,
+    account: null,
+    entitlements: { hardware: false, private_line: false, concierge: null },
+    provision: null,
+  });
+  /** A sign-in code has been requested and we're waiting for it. */
+  cecCodeSent = $state(false);
+  cecBusy = $state(false);
+  cecPrivateLines = $state<CecPrivateLine[]>([]);
+  /** The help session the user is currently in (or just opened), if any. */
+  activeHelp = $state<CecHelpSession | null>(null);
+  private helpPoll: ReturnType<typeof setInterval> | null = null;
+
+  get cecSignedIn(): boolean {
+    return this.cec.signed_in;
+  }
+  /** Ask-for-Help is live only with an account *and* an active Concierge plan. */
+  get cecCanAskForHelp(): boolean {
+    return this.cec.signed_in && cecApi.canAskForHelp(this.cec.entitlements);
+  }
+  get cecConciergeTier(): string | null {
+    return cecApi.conciergeLabel(this.cec.entitlements.concierge);
+  }
+  /** The canonical id of the single CEC Service node, once a mesh exists. */
+  get cecServiceNodeId(): string | null {
+    const id = this.cec.provision?.cec_service_node_id;
+    return id ? canonicalNodeId(id) : null;
+  }
+  isCecNetworkId(networkId: string | null | undefined): boolean {
+    return cecApi.isCecNetwork(networkId ?? undefined);
+  }
+  /** "CEC Service" for the one service node, else null — so the graph shows a
+   *  single CEC node rather than our plumbing. */
+  cecNodeLabel(nodeId: string): string | null {
+    const svc = this.cecServiceNodeId;
+    return svc && sameMachine(nodeId, svc) ? cecApi.CEC_SERVICE_LABEL : null;
+  }
+
+  async loadCec() {
+    try {
+      const s = await cecApi.cecState();
+      if (s) this.cec = s;
+    } catch {
+      /* a missing/old backend leaves the signed-out default in place */
+    }
+    if (this.cec.signed_in) void this.cecLoadLines();
+  }
+
+  async cecSetBackend(url: string) {
+    const s = await cecApi.cecSetBackendUrl(url);
+    this.cec = s ?? {
+      ...this.cec,
+      backend_url: url.trim().replace(/\/+$/, ""),
+      signed_in: false,
+      account: null,
+      provision: null,
+    };
+    this.toast("ok", "Saved the CEC service address");
+  }
+
+  async cecBeginSignIn(email: string) {
+    const e = email.trim();
+    if (!e.includes("@")) {
+      this.toast("warn", "Enter a valid email address");
+      return;
+    }
+    this.cecBusy = true;
+    try {
+      const r = await cecApi.cecStartSignIn(e);
+      this.cecCodeSent = true;
+      this.toast("ok", r ? `Code sent to ${r.masked_email}` : "Demo mode — enter any 6-digit code");
+    } catch (err) {
+      this.toast("warn", `Couldn't send a code: ${errMsg(err)}`);
+    } finally {
+      this.cecBusy = false;
+    }
+  }
+
+  async cecVerifyCode(email: string, code: string) {
+    this.cecBusy = true;
+    try {
+      const me = isTauri() ? canonicalNodeId(this.localId) : "demo-device";
+      const s = await cecApi.cecVerifySignIn(email.trim(), code.trim(), me, undefined);
+      this.cec = s ?? {
+        ...this.cec,
+        signed_in: true,
+        account: {
+          id: "acct_demo",
+          email: email.trim(),
+          display_name: email.trim().split("@")[0],
+          roles: ["customer"],
+          device_ids: [me],
+        },
+        entitlements: { hardware: false, private_line: false, concierge: "pay_as_you_go" },
+      };
+      this.cecCodeSent = false;
+      this.toast("ok", `Signed in to CEC as ${this.cec.account?.email ?? email}`);
+      if (cecApi.wantsCecMesh(this.cec.entitlements)) await this.cecProvision();
+      void this.cecLoadLines();
+    } catch (err) {
+      this.toast("warn", `Sign-in failed: ${errMsg(err)}`);
+    } finally {
+      this.cecBusy = false;
+    }
+  }
+
+  async cecRefreshAccount() {
+    try {
+      const s = await cecApi.cecRefresh();
+      if (s) {
+        this.cec = s;
+        void this.cecLoadLines();
+      }
+    } catch (err) {
+      this.toast("warn", `Couldn't refresh your account: ${errMsg(err)}`);
+    }
+  }
+
+  async cecLogOut() {
+    const s = await cecApi.cecSignOut();
+    this.cec = s ?? {
+      backend_url: this.cec.backend_url,
+      signed_in: false,
+      account: null,
+      entitlements: { hardware: false, private_line: false, concierge: null },
+      provision: null,
+    };
+    this.cecPrivateLines = [];
+    this.cecStopHelpPoll();
+    this.activeHelp = null;
+    this.toast("ok", "Signed out of CEC");
+  }
+
+  /** Stand up (or refresh) the isolated `cec-customer-<hash>` mesh: join the
+   *  network with auto-approve, add its venue, and pre-trust the single CEC
+   *  Service node — the only non-customer peer that ever appears on it. */
+  async cecProvision() {
+    const me = canonicalNodeId(this.localId);
+    try {
+      const prov = await cecApi.cecProvisionMesh(me);
+      if (!prov) {
+        // Demo: a stand-in descriptor so the UI can show the CEC node.
+        this.cec.provision = {
+          network_id: "cec-customer-demo",
+          label: cecApi.CEC_NETWORK_LABEL,
+          venue: { url: null, signaling: [], stun: [], turn: [] },
+          cec_service_node_id: "cecservice-demo",
+          auto_approve: true,
+        };
+        return;
+      }
+      this.cec.provision = prov;
+      const venueId = this.cecEnsureVenue(prov.label || cecApi.CEC_NETWORK_LABEL, prov.venue);
+      // Join the network (ignore "already joined" on a re-provision).
+      try {
+        await meshNetworkAdd(
+          buildNetworkConfig({
+            networkId: prov.network_id,
+            label: cecApi.CEC_NETWORK_LABEL,
+            autoApprove: true,
+            signaling: prov.venue.signaling,
+            stun: prov.venue.stun,
+            turn: prov.venue.turn,
+          }),
+        );
+      } catch {
+        /* already on this network — fine, keep going */
+      }
+      this.networkVenues[prov.network_id] = [venueId];
+      this.persistNetworkVenues();
+      try {
+        await meshRosterApprove(
+          prov.network_id,
+          canonicalNodeId(prov.cec_service_node_id),
+          cecApi.CEC_SERVICE_LABEL,
+        );
+      } catch {
+        /* the auto-approve network will admit it regardless */
+      }
+      await this.refreshNetworks();
+    } catch (err) {
+      this.toast("warn", `Couldn't set up your CEC connection: ${errMsg(err)}`);
+    }
+  }
+
+  /** Find or create the local venue record for a CEC venue (so it shows in the
+   *  Venues pane and can be re-fetched), returning its id. */
+  private cecEnsureVenue(
+    label: string,
+    v: { url?: string | null; signaling: string[]; stun: string[]; turn: { url: string; username: string; credential: string }[] },
+  ): string {
+    const url = v.url ?? undefined;
+    const existing = this.venues.find((x) => (url && x.url === url) || (!url && x.label === label));
+    if (existing) return existing.id;
+    const venue: Venue = {
+      id: newVenueId(),
+      label,
+      ...(url ? { url } : {}),
+      signaling: [...v.signaling],
+      stun: [...v.stun],
+      turn: v.turn.map((t) => ({ url: t.url, username: t.username, credential: t.credential })),
+    };
+    this.venues.push(venue);
+    saveVenues(this.venues);
+    return venue.id;
+  }
+
+  async cecRentLine(label?: string) {
+    this.cecBusy = true;
+    try {
+      const pl = await cecApi.cecRentPrivateLine(label);
+      if (pl) {
+        this.cecEnsureVenue(pl.label, pl.venue);
+        this.cec.entitlements.private_line = true;
+        await this.cecLoadLines();
+        this.toast(
+          "ok",
+          `Your Private Line “${pl.label}” is ready — assign it to a network in Venues`,
+        );
+      } else {
+        this.toast("info", "Renting a Private Line needs the desktop app and a CEC account");
+      }
+    } catch (err) {
+      this.toast("warn", `Couldn't rent a Private Line: ${errMsg(err)}`);
+    } finally {
+      this.cecBusy = false;
+    }
+  }
+
+  async cecLoadLines() {
+    try {
+      const lines = await cecApi.cecListPrivateLines();
+      if (lines) this.cecPrivateLines = lines;
+    } catch {
+      /* signed out / offline — keep whatever we have */
+    }
+  }
+
+  async cecCancelLine(id: string) {
+    const s = await cecApi.cecCancelPrivateLine(id);
+    if (s) this.cec = s;
+    await this.cecLoadLines();
+    this.toast("ok", "Private Line cancelled");
+  }
+
+  /** The Ask-for-Help button. Opens a host-side help room holding just this
+   *  device and the single CEC Service node, tells the backend (which exposes
+   *  it to online agents), and pops the call window. */
+  async cecAskHelp(topic?: string) {
+    if (!this.cecSignedIn) {
+      this.toast("info", "Create a free CEC account to ask for help");
+      this.openSettings("account");
+      return;
+    }
+    if (!cecApi.canAskForHelp(this.cec.entitlements)) {
+      this.toast("info", "Ask-for-Help needs an active Concierge plan");
+      this.openSettings("account");
+      return;
+    }
+    this.cecBusy = true;
+    try {
+      if (!this.cec.provision) await this.cecProvision();
+      const prov = this.cec.provision;
+      if (!prov) {
+        this.toast("warn", "Couldn't reach your CEC connection");
+        return;
+      }
+      const me = canonicalNodeId(this.localId);
+      const cecNode = canonicalNodeId(prov.cec_service_node_id);
+      const roomId = cecApi.helpRoomId(me);
+      // Host-side help room: just you and the one CEC Service node.
+      const room: VirtualRoom = {
+        id: roomId,
+        name: cecApi.CEC_SERVICE_LABEL,
+        members: [me, cecNode],
+        owner: me,
+        access: "invite",
+      };
+      this.rooms.push(room);
+      this.saveRooms();
+      this.broadcastRoom(room, this.inviteMessage(room));
+      const session = await cecApi.cecAskForHelp(prov.network_id, roomId, me, topic);
+      this.activeHelp = session ?? {
+        id: "help_demo",
+        status: "assigned",
+        network_id: prov.network_id,
+        room_id: roomId,
+        cec_service_node_id: prov.cec_service_node_id,
+        customer_device_id: me,
+        customer_label: this.cec.account?.display_name ?? "you",
+        topic: topic ?? null,
+        agent_label: "Sam @ CEC",
+        created_at: Date.now() / 1000,
+      };
+      this.toast("ok", "Connecting you to CEC…");
+      void openRoomWindow(roomId);
+      if (session) this.cecStartHelpPoll(session.id);
+    } catch (err) {
+      this.toast("warn", `Couldn't ask for help: ${errMsg(err)}`);
+    } finally {
+      this.cecBusy = false;
+    }
+  }
+
+  private cecStartHelpPoll(id: string) {
+    this.cecStopHelpPoll();
+    if (!isTauri()) return;
+    this.helpPoll = setInterval(() => {
+      void cecApi
+        .cecHelpStatus(id)
+        .then((s) => {
+          if (!s) return;
+          this.activeHelp = s;
+          if (s.status === "ended" || s.status === "cancelled") this.cecStopHelpPoll();
+        })
+        .catch(() => {
+          /* transient — try again next tick */
+        });
+    }, 3000);
+  }
+
+  private cecStopHelpPoll() {
+    if (this.helpPoll) {
+      clearInterval(this.helpPoll);
+      this.helpPoll = null;
+    }
+  }
+
+  async cecEndHelp() {
+    const h = this.activeHelp;
+    this.cecStopHelpPoll();
+    this.activeHelp = null;
+    if (h && !h.id.startsWith("help_demo")) await cecApi.cecCancelHelp(h.id);
   }
 }
 

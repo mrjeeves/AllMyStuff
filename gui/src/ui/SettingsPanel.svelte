@@ -9,10 +9,12 @@
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
+  import AccountSection from "./settings/AccountSection.svelte";
 
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "venues", label: "Venues", icon: "📡" },
+    { id: "account", label: "Account", icon: "🆘" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "updates", label: "Updates", icon: "⬆️" },
@@ -25,6 +27,7 @@
     app.settingsTab = tab;
     if (tab === "updates") void app.loadUpdateStatus();
     if (tab === "fleet") void app.loadOwnedFleet();
+    if (tab === "account") void app.loadCec();
   }
 </script>
 
@@ -53,6 +56,8 @@
         <NetworksSection />
       {:else if app.settingsTab === "venues"}
         <VenuesSection />
+      {:else if app.settingsTab === "account"}
+        <AccountSection />
       {:else if app.settingsTab === "fleet"}
         <FleetSection />
       {:else if app.settingsTab === "sharing"}

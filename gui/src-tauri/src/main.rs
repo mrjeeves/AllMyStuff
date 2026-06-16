@@ -20,6 +20,7 @@
 mod audio;
 mod byte_queues;
 mod camera_capture;
+mod cec;
 mod clipboard;
 mod control_client;
 mod daemon_spawn;
@@ -922,6 +923,93 @@ async fn mesh_identity_set_label(
 
 // ---- self-update (AllMyStuff's own updater, not the daemon's) ----------
 
+// ---- CEC service ------------------------------------------------------
+//
+// The optional Critical Error Computing account and the two services it
+// unlocks: Ask-for-Help (Concierge) and the Private Line. State lives in
+// `cec::Cec`; the front-end orchestrates the mesh side (join the CEC network,
+// approve the service node, mint the help room) on top of these.
+
+#[tauri::command]
+fn cec_state(cec: State<'_, cec::Cec>) -> Value {
+    cec.snapshot()
+}
+
+#[tauri::command]
+fn cec_set_backend_url(cec: State<'_, cec::Cec>, url: String) -> Result<Value, String> {
+    cec.set_backend_url(url)
+}
+
+#[tauri::command]
+async fn cec_start_sign_in(cec: State<'_, cec::Cec>, email: String) -> Result<Value, String> {
+    cec.start_sign_in(email).await
+}
+
+#[tauri::command]
+async fn cec_verify_sign_in(
+    cec: State<'_, cec::Cec>,
+    email: String,
+    code: String,
+    device_id: Option<String>,
+    device_label: Option<String>,
+) -> Result<Value, String> {
+    cec.verify_sign_in(email, code, device_id, device_label).await
+}
+
+#[tauri::command]
+async fn cec_refresh(cec: State<'_, cec::Cec>) -> Result<Value, String> {
+    cec.refresh().await
+}
+
+#[tauri::command]
+async fn cec_sign_out(cec: State<'_, cec::Cec>) -> Result<Value, String> {
+    cec.sign_out().await
+}
+
+#[tauri::command]
+async fn cec_provision_mesh(cec: State<'_, cec::Cec>, device_id: String) -> Result<Value, String> {
+    cec.provision_mesh(device_id).await
+}
+
+#[tauri::command]
+async fn cec_rent_private_line(
+    cec: State<'_, cec::Cec>,
+    label: Option<String>,
+) -> Result<Value, String> {
+    cec.rent_private_line(label).await
+}
+
+#[tauri::command]
+async fn cec_list_private_lines(cec: State<'_, cec::Cec>) -> Result<Value, String> {
+    cec.list_private_lines().await
+}
+
+#[tauri::command]
+async fn cec_cancel_private_line(cec: State<'_, cec::Cec>, id: String) -> Result<Value, String> {
+    cec.cancel_private_line(id).await
+}
+
+#[tauri::command]
+async fn cec_ask_for_help(
+    cec: State<'_, cec::Cec>,
+    network_id: String,
+    room_id: String,
+    device_id: String,
+    topic: Option<String>,
+) -> Result<Value, String> {
+    cec.ask_for_help(network_id, room_id, device_id, topic).await
+}
+
+#[tauri::command]
+async fn cec_help_status(cec: State<'_, cec::Cec>, id: String) -> Result<Value, String> {
+    cec.help_status(id).await
+}
+
+#[tauri::command]
+async fn cec_cancel_help(cec: State<'_, cec::Cec>, id: String) -> Result<Value, String> {
+    cec.cancel_help(id).await
+}
+
 #[tauri::command]
 async fn update_status() -> Result<Value, String> {
     serde_json::to_value(allmystuff_updater::status().map_err(|e| e.to_string())?)
@@ -1002,6 +1090,7 @@ fn main() {
             daemon_child: Mutex::new(None),
             disabled_networks: networks_store::DisabledNetworks::load(),
         })
+        .manage(cec::Cec::load())
         .invoke_handler(tauri::generate_handler![
             scan_self,
             scan_full,
@@ -1065,6 +1154,19 @@ fn main() {
             mesh_roster_remove,
             mesh_roster_list,
             mesh_identity_set_label,
+            cec_state,
+            cec_set_backend_url,
+            cec_start_sign_in,
+            cec_verify_sign_in,
+            cec_refresh,
+            cec_sign_out,
+            cec_provision_mesh,
+            cec_rent_private_line,
+            cec_list_private_lines,
+            cec_cancel_private_line,
+            cec_ask_for_help,
+            cec_help_status,
+            cec_cancel_help,
             update_status,
             update_check,
             update_apply,

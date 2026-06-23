@@ -610,6 +610,10 @@ class AppStore {
   /** The venues pill's dropdown — the master on/off for each venue, the sibling
    *  of the meshes pill. */
   venueMenuOpen = $state(false);
+  /** The fleet pill's dropdown — the fleets you're in (and their meshes), the
+   *  sibling of the meshes and venues pills. A fleet is a closed mesh with a
+   *  custom label, so it earns the same menu shape: you can be in several. */
+  fleetMenuOpen = $state(false);
   /** Venues the user has switched **off** (by id). An off-list, so venues are
    *  on by default; only the user adds to it, while driving a mesh can only
    *  remove from it. */
@@ -653,8 +657,20 @@ class AppStore {
   isFleetOwner = $derived.by(() => this.ownedFleet?.is_owner ?? false);
 
   /** The fleet's closed-network id (the word-salad mesh name), if any. The
-   *  meshes list uses it to lock the fleet mesh. */
+   *  fleet menu and the meshes list use it to spot the fleet mesh. */
   fleetNetworkId = $derived.by(() => this.ownedFleet?.network_id?.trim() || null);
+
+  /** **This** device's own role in its fleet — the clarified roles: a "member"
+   *  can *be* controlled, a "manager" *can* control (and admit members), an
+   *  "owner" controls and sets managers/owners. Read from the signed roster
+   *  (the backend stamps self's true role), so a promoted manager reads as one.
+   *  Null when not in a fleet. */
+  selfFleetRole = $derived.by(() => this.fleetRoleOf(this.localId));
+
+  /** Whether this device may *control* others in the fleet — a manager or an
+   *  owner. (Members can be controlled but, in the granular model to come,
+   *  won't initiate control.) Owners are always managers-and-more. */
+  iAmFleetManager = $derived.by(() => this.isFleetOwner || this.selfFleetRole === "manager");
 
   /** Whether a mesh in the list is *the fleet mesh* — the closed network that
    *  backs your fleet. It's joined and left via the fleet, not as a mesh. */
@@ -662,6 +678,30 @@ class AppStore {
     const id = this.fleetNetworkId;
     return !!id && !!net?.network_id && net.network_id === id;
   }
+
+  /** The fleets this device is in. A fleet is a closed mesh with a custom
+   *  label, so — like meshes and venues — you can be in several. The backend
+   *  tracks a single owned fleet today, so this is `[ownedFleet]` (or empty);
+   *  shaping it as a list keeps the fleet menu (and everything that reads it)
+   *  ready for the multi-fleet expansion without another UI rewrite. */
+  fleets = $derived.by<OwnedRoster[]>(() =>
+    this.ownedFleet && this.inFleet ? [this.ownedFleet] : [],
+  );
+
+  /** The live meshes that are **not** a fleet mesh — what the meshes pill and
+   *  its menu list. A fleet mesh is the closed network a fleet rides on; it
+   *  belongs in the fleet menu (you join/leave it by joining/leaving the
+   *  fleet), so it's lifted out of the plain meshes list. */
+  meshNetworks = $derived.by(() =>
+    (Array.isArray(this.networks) ? this.networks : []).filter((n) => !this.isFleetMesh(n)),
+  );
+
+  /** The live meshes that *are* a fleet mesh — shown in the fleet menu beside
+   *  the fleet they back. Today there's at most one; a list keeps the menu
+   *  ready for several. */
+  fleetMeshes = $derived.by(() =>
+    (Array.isArray(this.networks) ? this.networks : []).filter((n) => this.isFleetMesh(n)),
+  );
 
   /** The fleet owner's display name, read from the signed roster (the member
    *  whose role is "owner"). Lets every device — member, manager, owner — label
@@ -808,11 +848,15 @@ class AppStore {
     }
   }
 
-  /** Grant a fleet member a role (owner-only; backend enforces + may need MFA). */
-  async grantFleetRole(device: string, role: "manager" | "owner") {
-    await this.runFleetGov(role === "owner" ? "Make owner" : "Make manager", (code) =>
-      fleetGrantRole(device, role, code),
-    );
+  /** Grant a fleet member a role. AllMyStuff's policy is narrower than the
+   *  MyOwnMesh substrate: a manager may grant **member** only; managers and
+   *  owners are the owner's to set (and an owner grant needs the custody code
+   *  when MFA is enrolled — a human at an owner device). The backend re-enforces
+   *  it and surfaces a plain refusal otherwise. */
+  async grantFleetRole(device: string, role: "member" | "manager" | "owner") {
+    const title =
+      role === "owner" ? "Make owner" : role === "manager" ? "Make manager" : "Make member";
+    await this.runFleetGov(title, (code) => fleetGrantRole(device, role, code));
   }
 
   /** Withdraw a fleet member's role, back to a plain member (owner-only). */

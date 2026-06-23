@@ -2538,6 +2538,16 @@ impl Mesh {
         // the user sees includes this device: it holds the key. Add self so the
         // GUI's "am I in my fleet" check (and the relationship reconcile that
         // depends on it) is true for members, not just the owner.
+        // This device's own role (it's never in the signed roster it holds).
+        // Read from the governance state so a promoted manager shows as such,
+        // not as a plain member, then mapped back to MyOwnMesh's wire term
+        // ("manager" → "controller") for the roster the GUI reads.
+        let self_role_wire = match self.self_fleet_role().await.as_deref() {
+            Some("owner") => "owner",
+            Some("manager") => "controller",
+            _ if self.ownership.is_fleet_owner() => "owner",
+            _ => "member",
+        };
         if let Some(me) = self.local_node_id() {
             let canon = pubkey_part(&me).to_string();
             if !members
@@ -2550,16 +2560,9 @@ impl Mesh {
                     label,
                 });
             }
-            // Best-effort role for this device (it isn't in its own roster):
-            // the founder is the owner, everyone else defaults to member.
-            member_roles.entry(canon).or_insert_with(|| {
-                if self.ownership.is_fleet_owner() {
-                    "owner"
-                } else {
-                    "member"
-                }
-                .to_string()
-            });
+            member_roles
+                .entry(canon)
+                .or_insert_with(|| self_role_wire.to_string());
         }
         let roster = OwnedRoster {
             key,
@@ -2840,6 +2843,51 @@ impl Mesh {
         closed && i_am_owner
     }
 
+    /// This device's own governance role on its fleet's closed network, in the
+    /// AllMyStuff UI terms — "owner" | "manager" | "member". A node's own entry
+    /// is never in the signed roster it holds, so the role is read from the
+    /// signed governance state's `roles` map (MyOwnMesh's "controller" surfaces
+    /// as the friendlier "manager"). The founder always reads as owner, even
+    /// before the kind-change self-election ratifies. `None` when not in a fleet
+    /// (or no closed network yet — a claimed-but-keyless member), where there's
+    /// nothing to grant anyway. The daemon is the security boundary; this is the
+    /// local view that gates the friendlier, narrower checks on top of it.
+    async fn self_fleet_role(&self) -> Option<String> {
+        let network = self.ownership.fleet_network_id()?;
+        if self.ownership.is_fleet_owner() {
+            return Some("owner".to_string());
+        }
+        let me = self.local_node_id()?;
+        let me = pubkey_part(&me).to_string();
+        let data = match self
+            .client
+            .request(&Request::GovernanceState { network })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            // Daemon unreachable / no state yet: assume the lowest authority
+            // rather than guess upward — a member can't grant, which fails safe.
+            _ => return Some("member".to_string()),
+        };
+        let role = data
+            .get("state")
+            .and_then(|s| s.get("roles"))
+            .and_then(|v| v.as_object())
+            .and_then(|roles| {
+                roles
+                    .iter()
+                    .find(|(k, _)| pubkey_part(k) == me)
+                    .and_then(|(_, v)| v.as_str())
+                    .map(|r| match r {
+                        "owner" => "owner",
+                        "controller" => "manager",
+                        _ => "member",
+                    })
+            })
+            .unwrap_or("member");
+        Some(role.to_string())
+    }
+
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
     /// from the fleet's closed-network **signed roster** (`RosterList`). No
     /// fleet → clear it (only the owner, via the direct check in
@@ -3064,12 +3112,17 @@ impl Mesh {
         Ok(())
     }
 
-    /// Front-end command: grant `device` a fleet role. `role` is the UI term
-    /// — "manager" (a controller: can admit members) or "owner" (full
-    /// authority, co-signs governance). Authoring a role grant is an owner
-    /// authority act on the closed network; the daemon enforces the quorum and
-    /// rejects the proposal if this device lacks the authority, so we just
-    /// float it and surface any refusal. The roster's role projection updates
+    /// Front-end command: grant `device` a fleet role. `role` is the AllMyStuff
+    /// UI term — "member" (a node that can be controlled), "manager" (a
+    /// MyOwnMesh "controller": can control, and can admit members) or "owner"
+    /// (controls, and sets managers and owners). AllMyStuff's policy is
+    /// deliberately narrower than the MyOwnMesh substrate (see
+    /// [`ams_may_grant`]): a manager may grant the **member** role only —
+    /// managers and owners are the owner's to set, and an owner grant also needs
+    /// a human at an owner device (the custody second factor). We enforce the
+    /// product rule here first, for a clear refusal rather than a silent quorum
+    /// drop, then float the proposal; the daemon re-enforces the quorum on the
+    /// wire as the real security boundary. The roster's role projection updates
     /// once it ratifies, and the GUI refreshes from `allmystuff://owned`.
     pub async fn fleet_grant_role(
         self: &Arc<Self>,
@@ -3081,11 +3134,34 @@ impl Mesh {
             .ownership
             .fleet_network_id()
             .ok_or("this device isn't in a fleet")?;
-        // Map the UI's "manager" onto MyOwnMesh's "controller".
-        let role = match role.as_str() {
-            "manager" | "controller" => "controller",
+        // Normalise the requested UI term ("controller" is accepted as an alias
+        // for "manager" so older callers keep working).
+        let requested = match role.as_str() {
+            "member" => "member",
+            "manager" | "controller" => "manager",
             "owner" => "owner",
             other => return Err(format!("unknown fleet role: {other}")),
+        };
+        // AllMyStuff's narrower-than-MyOwnMesh policy: a manager may grant the
+        // member role only. Refuse the rest here, before the daemon even sees
+        // the proposal, so the user gets a plain reason.
+        let self_role = self
+            .self_fleet_role()
+            .await
+            .unwrap_or_else(|| "member".to_string());
+        if !ams_may_grant(&self_role, requested) {
+            return Err(match requested {
+                "owner" => "only the fleet owner can set owners".to_string(),
+                "manager" => "only the fleet owner can set managers".to_string(),
+                _ => "you don't have authority to grant that role".to_string(),
+            });
+        }
+        // Map the UI term onto MyOwnMesh's role names ("manager" → "controller").
+        let role = match requested {
+            "member" => "member",
+            "manager" => "controller",
+            "owner" => "owner",
+            _ => unreachable!("requested normalised above"),
         };
         let target = pubkey_part(&device).to_string();
         tracing::info!("granting {role} to {} on {network}", short_id(&device));
@@ -5414,6 +5490,14 @@ impl Mesh {
     /// this closes (AMS-01); membership is now the signed roster a peer can
     /// only enter via the owner's governance. Fails closed — an empty or stale
     /// cache denies control rather than guessing.
+    ///
+    /// Role model: a **member** is a node that can *be* controlled, a
+    /// **manager** *can* control (and admit members), an **owner** controls and
+    /// sets managers/owners. Today any signed-roster member may control any
+    /// other (so managers reach managers, members, and even owners — as
+    /// intended), and the per-role granularity that would let a *member* be
+    /// controlled without itself initiating control is the deferred "more
+    /// granular control" work — not mapped here yet.
     fn sender_may_control(&self, sender: &str) -> bool {
         let canon = pubkey_part(sender);
         if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
@@ -5988,6 +6072,21 @@ fn empty_owned() -> Value {
     json!({ "key": "", "version": 0, "members": [], "is_owner": false, "network_id": "" })
 }
 
+/// AllMyStuff's fleet role-grant policy — deliberately **narrower** than the
+/// MyOwnMesh closed-network substrate it rides on. MyOwnMesh's `Role::can_grant`
+/// lets a controller grant a controller (rank ≥ rank); AllMyStuff does not.
+///
+/// The clarified roles: a **member** is a node that can *be* controlled, a
+/// **manager** (a MyOwnMesh "controller") is a node that *can* control, and an
+/// **owner** controls *and* sets managers and owners. So a manager may grant the
+/// **member** role only; setting managers or owners is the owner's alone (and an
+/// owner grant additionally needs a human at an owner device — the custody
+/// second factor, enforced by the daemon). `granter` / `target` are the
+/// AllMyStuff UI terms ("member" | "manager" | "owner").
+fn ams_may_grant(granter: &str, target: &str) -> bool {
+    matches!((granter, target), ("owner", _) | ("manager", "member"))
+}
+
 /// The fleet network's display label. A fleet is a closed network owned by the
 /// originating node, so when it carries an owner name it reads "<name>'s
 /// Fleet"; unnamed, the label is empty and MyOwnMesh falls back to the
@@ -6354,6 +6453,26 @@ mod tests {
         fn restart(&self) -> ! {
             unreachable!("test sink never restarts")
         }
+    }
+
+    /// AllMyStuff's fleet role-grant policy is narrower than MyOwnMesh's: an
+    /// owner sets anything, a manager may grant the **member** role only, and a
+    /// plain member grants nothing. This is the "controllers grant members only,
+    /// even though the underlying myownmesh allows more" rule.
+    #[test]
+    fn ams_grant_policy_limits_managers_to_members() {
+        // Owners set every role.
+        assert!(ams_may_grant("owner", "owner"));
+        assert!(ams_may_grant("owner", "manager"));
+        assert!(ams_may_grant("owner", "member"));
+        // Managers may grant members — and only members.
+        assert!(ams_may_grant("manager", "member"));
+        assert!(!ams_may_grant("manager", "manager"));
+        assert!(!ams_may_grant("manager", "owner"));
+        // Members grant nothing.
+        assert!(!ams_may_grant("member", "member"));
+        assert!(!ams_may_grant("member", "manager"));
+        assert!(!ams_may_grant("member", "owner"));
     }
 
     /// Regression guard for the GUI crash where `Mesh::new` spawned its media

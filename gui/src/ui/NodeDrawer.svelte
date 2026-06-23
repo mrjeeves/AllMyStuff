@@ -408,10 +408,10 @@
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
           <div class="fleet-actions">
             {#if st.role === "member"}
-              <button class="btn small" title="A manager can admit devices to the fleet" onclick={() => app.grantFleetRole(node.id, "manager")}>Make manager</button>
+              <button class="btn small" title="A manager can control other devices and admit members" onclick={() => app.grantFleetRole(node.id, "manager")}>Make manager</button>
             {/if}
             {#if st.role !== "owner"}
-              <button class="btn small" title="An owner has full fleet authority and co-signs governance" onclick={() => app.grantFleetRole(node.id, "owner")}>Make owner</button>
+              <button class="btn small" title="An owner controls and sets managers and owners. Setting an owner needs an owner device and your authenticator." onclick={() => app.grantFleetRole(node.id, "owner")}>Make owner</button>
             {/if}
             {#if st.role === "manager"}
               <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw manager</button>
@@ -422,12 +422,19 @@
             <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
           </div>
           <p class="hint tiny">
-            A <b>manager</b> can admit devices; an <b>owner</b> has full
-            authority. Withdrawing returns them to a plain member.
+            A <b>member</b> can be controlled; a <b>manager</b> can control and
+            admit members; an <b>owner</b> controls and sets managers and owners.
+            Withdrawing returns them to a plain member.
           </p>
         {:else}
           <p class="hint">
-            In your fleet{#if st.role && st.role !== "member"} as <b>{st.role}</b>{/if}. Only the fleet owner can change roles.
+            In your fleet{#if st.role && st.role !== "member"} as <b>{st.role}</b>{/if}.
+            {#if app.selfFleetRole === "manager"}
+              As a manager you can control devices and admit members; only an
+              owner sets managers and owners.
+            {:else}
+              Only managers and the owner can change who's in the fleet.
+            {/if}
           </p>
         {/if}
 

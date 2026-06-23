@@ -14,6 +14,7 @@
   import NodeDrawer from "./NodeDrawer.svelte";
   import NetworkMenu from "./NetworkMenu.svelte";
   import VenueMenu from "./VenueMenu.svelte";
+  import FleetMenu from "./FleetMenu.svelte";
   import Sidebar from "./Sidebar.svelte";
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
@@ -102,13 +103,38 @@
     </div>
 
     <div class="summary">
-      <button
-        class="chip yours"
-        onclick={() => app.openSettings("fleet")}
-        title="Your fleet — name it, see its key and members"
-      >
-        <b>{app.mineCount}</b> yours{#if app.fleetName}&nbsp;· {app.fleetName}{/if}
-      </button>
+      <!-- The fleet pill: a sibling of the meshes and venues pills. A fleet is
+           a closed mesh with a custom label, so it gets the same dropdown
+           shape — the fleets you're in, each with its mesh, an inline rename
+           for the ones you own, and a unified Leave. -->
+      <span class="net-anchor">
+        <button
+          class="chip fleet"
+          class:live={app.inFleet}
+          onclick={(e) => {
+            e.stopPropagation();
+            app.fleetMenuOpen = !app.fleetMenuOpen;
+          }}
+          title="Your fleets — name them, see members, or leave"
+          aria-haspopup="menu"
+          aria-expanded={app.fleetMenuOpen}
+        >
+          <span class="net-dot"></span>
+          {#if !app.inFleet}
+            no fleet
+          {:else if app.fleets.length > 1}
+            {app.fleets.length} fleets
+          {:else}
+            {app.fleetName ||
+              (app.fleetOwnerName() ? `${app.fleetOwnerName()}'s fleet` : "your fleet")}
+          {/if}
+          {#if app.mineCount > 0}<b class="yours-count" title="{app.mineCount} of your devices">{app.mineCount}</b>{/if}
+          <span class="net-chevron" class:open={app.fleetMenuOpen} aria-hidden="true">▾</span>
+        </button>
+        {#if app.fleetMenuOpen}
+          <FleetMenu />
+        {/if}
+      </span>
       <button
         class="chip shared"
         onclick={() => app.openSettings("sharing")}
@@ -122,7 +148,7 @@
              switches and the network-settings button (no separate button). -->
         <button
           class="chip net"
-          class:live={app.backendConnected && app.networks.length > 0}
+          class:live={app.backendConnected && app.meshNetworks.length > 0}
           onclick={(e) => {
             e.stopPropagation();
             app.netMenuOpen = !app.netMenuOpen;
@@ -134,10 +160,10 @@
           <span class="net-dot"></span>
           {!app.backendConnected
             ? "demo mode"
-            : app.networks.length > 1
-              ? `${app.networks.length} meshes`
-              : app.activeNetwork
-                ? app.meshLabel(app.activeNetwork)
+            : app.meshNetworks.length > 1
+              ? `${app.meshNetworks.length} meshes`
+              : app.meshNetworks.length === 1
+                ? app.meshLabel(app.meshNetworks[0])
                 : app.disabledNets.length > 0
                   ? "meshes off"
                   : "no mesh"}
@@ -304,15 +330,38 @@
     gap: 0.4rem;
     margin-left: auto;
   }
-  .chip.yours,
   .chip.shared {
     cursor: pointer;
     transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .chip.yours:hover,
   .chip.shared:hover {
     background: var(--surface);
     border-color: var(--accent);
+  }
+  /* The fleet pill: the owned-side sibling of the meshes/venues pills. Neutral
+     when you're in no fleet, accent-lit once you are — a fleet is a closed mesh
+     with a custom label, so it shares the menu-pill shape. */
+  .chip.fleet {
+    background: var(--surface);
+    color: var(--ink-soft);
+    border-color: var(--line-strong);
+  }
+  .chip.fleet.live {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border-color: var(--accent-soft);
+  }
+  .chip.fleet.live .net-dot {
+    box-shadow: 0 0 0 3px oklch(0.64 0.255 350 / 0.18);
+  }
+  .yours-count {
+    font-size: 0.66rem;
+    font-weight: 700;
+    color: var(--ink);
+    background: var(--surface);
+    border-radius: var(--r-pill);
+    padding: 0 0.3rem;
+    margin-left: 0.1rem;
   }
   .net-anchor {
     position: relative;

@@ -839,13 +839,16 @@ export async function fleetSetName(name: string): Promise<void> {
   await invoke("fleet_set_name", { name });
 }
 
-/** Grant a fleet member a role: "manager" (a controller — can admit members)
- *  or "owner" (full authority). Owner-only; the daemon enforces the quorum and
- *  throws with the reason when refused. `code` is the custody second factor
+/** Grant a fleet member a role: "member" (a node that can be controlled),
+ *  "manager" (a controller — can control, and can admit members) or "owner"
+ *  (controls, and sets managers and owners). AllMyStuff's policy is narrower
+ *  than the MyOwnMesh substrate: a manager may grant "member" only; managers
+ *  and owners are the owner's to set. The daemon enforces it (and the quorum)
+ *  and throws with the reason when refused. `code` is the custody second factor
  *  when fleet MFA is enrolled. */
 export async function fleetGrantRole(
   device: string,
-  role: "manager" | "owner",
+  role: "member" | "manager" | "owner",
   code?: string,
 ): Promise<void> {
   if (!isTauri()) return;

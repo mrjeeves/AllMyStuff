@@ -385,13 +385,34 @@ Tauri 2 + Svelte 5, a client of the daemon.
   itself has two layouts switched from the zoom controls: the radial
   default and a **grouped grid** — one labelled section per fleet (yours,
   each owner's, "unknown fleet" for devices advertising no owner). The
-  top bar's **network pill** opens a menu listing every network with an
-  on/off switch — disable parks the network's full config in
+  top bar's **network pill** opens a menu listing every *non-fleet* network
+  with an on/off switch — disable parks the network's full config in
   `allmystuff-networks.json` (under `~/.myownmesh`) and leaves it
   daemon-side; enable re-joins from the parked config; roster files
   survive on disk in between, so approvals aren't lost (the daemon has no
   dormant-network notion — `network_set_enabled` in the Tauri backend is
   what holds the ticket).
+
+  **Fleets are closed meshes with a custom label**, so — like meshes and
+  venues — you can be in several, and they earn their own dropdown: the top
+  bar's **fleet pill** (`FleetMenu.svelte`) lists the fleets you're in, each
+  with its **fleet mesh** (lifted out of the network pill — you join and
+  leave it by joining and leaving the fleet, so leaving the fleet *is*
+  leaving the mesh), an **inline rename** for the ones you own, a roster
+  with role badges, and a unified **Leave**. Fleet roles are deliberately
+  restrictive: a **member** is a node that can *be* controlled, a
+  **manager** (a MyOwnMesh "controller") *can* control — managers open
+  controlling connections to other managers, members, and even owners (the
+  finer-grained "who may control whom" is later work) — and an **owner**
+  controls *and* sets managers and owners. AllMyStuff is narrower than the
+  MyOwnMesh substrate on purpose (`ams_may_grant` in `node/src/mesh.rs`): a
+  manager may grant the **member** role only, even though MyOwnMesh's
+  `Role::can_grant` would let a controller grant a controller; setting an
+  owner additionally takes a human at an owner device (the custody second
+  factor). The daemon re-enforces every grant's quorum on the wire — the UI
+  gate is the friendly, narrower check on top. Because leave/reform is meant
+  to be easy, a total lockout is recoverable out-of-band (physical access /
+  backdoors), so the easy exit never paints anyone into a corner.
 
   New/joined networks default their signaling relay + STUN + TURN to
   MyOwnMesh's semi-public reference servers (`wss://myownmesh.com`,

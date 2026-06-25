@@ -1,0 +1,26 @@
+[package]
+name = "allmystuff-mobile-core"
+description = "The transport-agnostic core of the AllMyStuff mobile (iOS/Android) client: the phone's viewer/controller capability model, the client-side media decode/encode planes, route negotiation helpers, and the MeshClient seam the embedded myownmesh-core fills in. Pure Rust — builds and tests with nothing but serde, so the wire contract is verified the same way the desktop crates are."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+allmystuff-graph = { workspace = true }
+allmystuff-protocol = { workspace = true }
+allmystuff-session = { workspace = true }
+
+[dev-dependencies]
+# Tests build media-channel frames (whose byte fields travel base64 in JSON)
+# straight from JSON values, since the frame tag types are private to
+# allmystuff-session. Same engine the wire uses, so the fixtures are honest.
+base64 = { workspace = true }

@@ -133,6 +133,7 @@ AllMyStuff is under active development. What works today:
 | Audio and camera | ✅ | Opus audio and H.264 camera over the same transport |
 | Discovery and routing | ✅ | Peers appear via presence; sessions negotiate and tear down cleanly |
 | File/disk streaming | 🚧 | Sessions set up; bulk transport is in progress |
+| Mobile (iOS/Android) | 🚧 | In design; the pure client core has landed (`allmystuff-mobile-core`). See [docs/MOBILE.md](docs/MOBILE.md) |
 
 ## Building from source
 

@@ -10,6 +10,7 @@ members = [
     "crates/allmystuff-service",
     "crates/allmystuff-cli",
     "crates/allmystuff-term",
+    "crates/allmystuff-mobile-core",
 ]
 # The Tauri desktop app (`gui/src-tauri`) and the headless mesh node
 # (`node/` — the `allmystuff-node` engine + the `allmystuff-serve` binary)
@@ -38,6 +39,7 @@ allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.2.4" }
 allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.4" }
 allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.4" }
 allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.4" }
+allmystuff-mobile-core = { path = "crates/allmystuff-mobile-core", version = "0.2.4" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

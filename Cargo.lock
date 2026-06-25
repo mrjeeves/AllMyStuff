@@ -49,6 +49,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-mobile-core"
+version = "0.2.4"
+dependencies = [
+ "allmystuff-graph",
+ "allmystuff-protocol",
+ "allmystuff-session",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "allmystuff-protocol"
 version = "0.2.4"
 dependencies = [

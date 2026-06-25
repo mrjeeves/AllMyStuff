@@ -7,11 +7,21 @@ reuse, the wire contract the phone must speak byte-for-byte, the phased plan to
 ship it, the risks, and the handful of decisions that are the product owner's
 to make.
 
-The first slice of it — the pure, transport-agnostic core of the mobile
-client — already lives in the repo as
-[`crates/allmystuff-mobile-core`](../crates/allmystuff-mobile-core) and is
-tested the same way every other AllMyStuff crate is (`cargo test -p
-allmystuff-mobile-core`). Everything in §3 marked "✅ in repo" is real today.
+Two slices of it already live in the repo:
+
+- the pure, transport-agnostic **core** of the mobile client,
+  [`crates/allmystuff-mobile-core`](../crates/allmystuff-mobile-core), tested
+  the same way every other AllMyStuff crate is (`cargo test -p
+  allmystuff-mobile-core`); and
+- a runnable **Tauri mobile shell**, [`gui/mobile`](../gui/mobile), that wraps
+  the *exact* desktop Svelte UI (the graph/map, Console, Files, Terminal) and
+  answers what it can honestly from the core today — chiefly `scan_self`, which
+  puts a real phone node with the real viewer/controller capability set on the
+  graph. It type-checks for `aarch64-linux-android` in CI (`gui-mobile` job),
+  with no Android NDK, because it links no C-building crate yet. See §11 for
+  the one-command build.
+
+Everything in §3 marked "✅ in repo" is real today.
 
 ---
 
@@ -159,11 +169,12 @@ the network (Risk R6) and never depend on the webview's own codec.
 | `allmystuff-session` | ✅ reuse whole | The media frame types (`VideoFrame`, `VideoAssembler`, `InputAction`, `TermEvent`, `FileEvent`, `AudioFrame`, `MediaPayload`) and the route state machine. The consumer-half spec. |
 | `myownmesh-core` | ✅ embed (cross-compiled) | The mesh, in-process. The reason the plan works. |
 | `allmystuff-mobile-core` | ✅ **in repo** (new) | The phone's capability model, the media decode/encode planes, route-offer helpers, and the `MeshClient` seam. Pure; tested. (§4) |
+| `gui/mobile` (Tauri shell) | ✅ **in repo** (new) | The mobile Tauri 2 app: reuses the desktop `gui/src/**` Svelte UI verbatim (`frontendDist: "../dist"`), backed by `allmystuff-mobile-core`. Its own crate, so the desktop build is untouched; `tauri android/ios init` runs against it. (§11) |
 | `allmystuff-bridge` | ↪ partial | Reuse the synthetic-endpoint *scheme*, not the hardware scan. The phone's capability builder is `allmystuff-mobile-core::caps` instead. |
 | Svelte components | ↪ rework for touch | `Terminal.svelte` (xterm.js) ~free; `Graph.svelte`/`Files.svelte` need responsive + touch; `Console.svelte` renders fine but `input-keys.ts` is mouse/keyboard-only and must be rebuilt for touch. `App.svelte`'s multi-window routing becomes in-app navigation. |
 | `node/` engine | ✖ excluded | `xcap`/`cpal`/`nokhwa`/`enigo`/`portable-pty` etc. are desktop *capture/injection*. A phone is a viewer, not a host. |
 | `allmystuff-updater` | ✖ excluded (`cfg`) | Binary self-swap is forbidden on iOS / restricted on Android; the stores own updates. |
-| Desktop Tauri shell | ✖ `cfg` out | tray, autostart, single-instance, OS-service install, `externalBin` sidecars, `open_secondary_window`. |
+| Desktop Tauri shell | ✖ separate crate | The mobile shell is `gui/mobile`, *not* a `cfg`-gated `gui/src-tauri` — that keeps the desktop's tray / autostart / single-instance / OS-service / `externalBin` sidecars / `open_secondary_window` out of the mobile binary with zero risk to the green desktop build. The two share only the frontend. |
 
 ---
 
@@ -319,9 +330,11 @@ hardest capture last.
 - ⬜ `myownmesh-ffi` (§5); prove `open → join → exchange one message` with a desktop peer.
 
 **Phase 1 — v1: Graph + Terminal (smallest shippable).**
-- `tauri ios/android init`; mobile entry point; `cfg`-gate the desktop shell + updater.
-- Embed `myownmesh-core` via the FFI; identity in Keychain/Keystore; fleet pairing.
-- Render `Graph.svelte` (responsive) for discovery; reuse the graph/protocol/session crates whole.
+- ✅ Mobile entry point + Tauri shell as its own crate (`gui/mobile`), reusing
+  the desktop Svelte UI; `scan_self` backed by `allmystuff-mobile-core`;
+  android-target CI check. `tauri android/ios init` runs against it (§11).
+- ⬜ Embed `myownmesh-core` via the FFI; identity in Keychain/Keystore; fleet pairing.
+- ⬜ Render `Graph.svelte` (responsive) for discovery; reuse the graph/protocol/session crates whole.
 - **Terminal**: `offer_terminal` → `TermPlane` ↔ xterm.js, plus an on-screen
   modifier bar (Ctrl/Esc/arrows/Tab). Pure JSON, no codec, no decoder — that's
   why it's first.
@@ -382,6 +395,37 @@ code and this plan already assume; flag any you'd change.
 
 ## 11. Build & release deltas
 
+### Build the shell now
+
+The shell is in `gui/mobile`. It reuses the desktop frontend, so the only
+extra inputs are the platform toolchains. From `gui/mobile`:
+
+```sh
+# one-time: the mobile Rust targets + the Tauri CLI for this package
+rustup target add aarch64-linux-android armv7-linux-androideabi \
+                  aarch64-apple-ios aarch64-apple-ios-sim
+pnpm install            # just the Tauri CLI; the UI installs in ../ on build
+
+# Android — needs the Android SDK + NDK on PATH (ANDROID_HOME, NDK_HOME) and
+# cargo-ndk (`cargo install cargo-ndk`):
+pnpm tauri android init          # generates gen/android (git-ignored)
+pnpm tauri android dev           # run on a device/emulator
+pnpm tauri android build         # -> .apk / .aab
+
+# iOS — needs macOS + Xcode + an Apple Developer signing identity:
+pnpm tauri ios init              # generates gen/apple (git-ignored)
+pnpm tauri ios dev               # run in the simulator / on device
+pnpm tauri ios build             # -> .ipa
+```
+
+`tauri android/ios init` regenerates the native Gradle/Xcode projects under
+`gen/` from the shell + config, so they're intentionally **not** committed.
+CI's `gui-mobile` job proves the Rust backend keeps type-checking for Android
+on every push (no NDK needed until the embedded engine lands). Desktop smoke
+test of the same shell on a GTK box: `pnpm tauri dev`.
+
+### Release deltas
+
 Adding mobile means, beyond the desktop's existing Linux CI + minisign-signed
 releases:
 
@@ -401,5 +445,7 @@ releases:
 as a true mesh peer via a small UniFFI layer, reuses the pure
 graph/protocol/session crates and the Svelte UI, decodes media natively, and
 ships terminal-first → desktop-view → audio/camera. The crux is settled; the
-foundation is in `allmystuff-mobile-core`; the next gate is the NDK/iOS
-cross-compile (R1's tail) and the FFI crate.*
+core (`allmystuff-mobile-core`) and a runnable Tauri shell (`gui/mobile`,
+android-checked in CI) are in the repo; the next gate is the embedded-engine
+FFI crate (wiring the `MeshClient` seam to `myownmesh-core`) plus the
+NDK/iOS cross-compile (R1's tail).*

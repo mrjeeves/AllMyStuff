@@ -165,3 +165,40 @@ jobs:
       - name: cargo test backend
         working-directory: gui/src-tauri
         run: cargo test
+
+  # The mobile (iOS/Android) Tauri shell. It reuses the same Svelte frontend
+  # as the desktop and embeds the phone's viewer/controller core
+  # (allmystuff-mobile-core) instead of spawning a desktop node, so it never
+  # pulls the GTK/WebKitGTK desktop webview — on device Tauri uses the system
+  # webview. We verify it type-checks for a real mobile target. No Android NDK
+  # is needed yet: this shell links no C-building crate (the embedded
+  # myownmesh-core engine, which brings `ring`, lands in a later slice).
+  gui-mobile:
+    name: GUI mobile · android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/mobile
+      # tauri's build script / generate_context! want the frontend dist to
+      # exist — it's the same build the desktop shell consumes.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
+      - name: build frontend (for tauri build script)
+        working-directory: gui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: cargo check mobile shell (android target)
+        working-directory: gui/mobile
+        run: cargo check --target aarch64-linux-android

@@ -1,0 +1,51 @@
+# The AllMyStuff **mobile** Tauri shell (iOS / Android).
+#
+# Like `../src-tauri`, this crate lives outside the main Cargo workspace —
+# an empty `[workspace]` table makes it its own single-member root — so a
+# `cargo build --workspace` at the repo root stays webview-free. It reuses
+# the *exact* Svelte frontend the desktop ships (see `tauri.conf.json`'s
+# `frontendDist = "../dist"`); the only thing that differs is this Rust
+# backend, which embeds the phone's viewer/controller brain
+# (`allmystuff-mobile-core`) instead of spawning a desktop node over a
+# control socket — iOS forbids the child process the desktop model needs.
+[workspace]
+
+[package]
+name = "allmystuff-mobile"
+version = "0.2.4"
+description = "AllMyStuff mobile (iOS/Android) — a Tauri 2 shell around the shared Svelte UI, backed by the phone's embedded viewer/controller core."
+authors = ["Chris Paul"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.88.0"
+
+# Tauri's mobile targets link the app as a library (the platform shell — an
+# Android `NativeActivity` / an iOS view controller — calls `run()` through
+# the C ABI), while the desktop smoke-test build is an ordinary binary. Both
+# entry points funnel into `run()` in `lib.rs`.
+[lib]
+name = "allmystuff_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "allmystuff-mobile"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# No `tray-icon` / `autostart` / `single-instance` here — those are desktop
+# concerns with no mobile story. `shell` stays for opening external links.
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The phone's transport-agnostic brain: its capability model and the
+# client-side media planes. Pure Rust, no native deps — it gives us a real
+# phone `NodeProfile` (identity + viewer/controller capabilities) to put on
+# the graph today, and the `MeshClient` seam the embedded engine fills in
+# next. Pulled by path; it inherits its versions from the main workspace.
+allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }

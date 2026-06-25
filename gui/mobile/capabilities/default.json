@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "Core webview permissions plus opening external links in the system browser.",
+  "windows": ["main"],
+  "permissions": ["core:default", "shell:allow-open"]
+}

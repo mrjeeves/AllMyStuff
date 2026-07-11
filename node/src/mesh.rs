@@ -3126,6 +3126,7 @@ impl Mesh {
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
         self.cec.set_session(&session_id, "requested");
+        self.cec.link_session_peer(&session_id, &customer);
         let request = allmystuff_cec_protocol::ControlMessage::Connect(
             allmystuff_cec_protocol::ConnectControl::Request {
                 session_id: session_id.clone(),
@@ -3311,6 +3312,291 @@ impl Mesh {
             out.push(v);
         }
         Ok(Value::Array(out))
+    }
+
+    /// `cec_purchase_request` (technician): ask the customer to complete a
+    /// purchase — the $50 diagnostic session. **Optional and
+    /// technician-triggered only**; the customer's app never initiates one.
+    /// Works in every shape a help call takes:
+    ///
+    /// - **before answering** (from the help queue): pin-connects to the
+    ///   customer on the shared support area, exactly like a dial — no screen
+    ///   session, no approval needed to *ask* (the same trust bar as the
+    ///   connect prompt: the prompt names the asker, the customer declines
+    ///   freely);
+    /// - **mid-session**: the ask rides the live connection and carries its
+    ///   session id;
+    /// - **after disconnecting** (the Diag button on a stored machine): the
+    ///   ask goes out sessionless over the still-standing peer connection, or
+    ///   re-reaches the machine through the support area.
+    ///
+    /// The wire carries display strings and ids only — the customer's app
+    /// opens its own built-in checkout URL, and no payment data ever rides the
+    /// mesh. Empty `item`/`price` fall back to the canonical
+    /// diagnostic-session copy so every prompt is fully labelled. The Request
+    /// goes out under the daemon's acknowledged-delivery contract (the same
+    /// discipline as the connect request), so the returned flow is
+    /// immediately "requested" and progress arrives on `cec://purchase`; an
+    /// undelivered ask settles itself cancelled so the strip tells the truth.
+    pub async fn cec_purchase_request(
+        self: &Arc<Self>,
+        node: String,
+        number: String,
+        session_id: String,
+        item: String,
+        price: String,
+        note: String,
+    ) -> Result<Value, String> {
+        let canonical = crate::cec::pubkey_part(&node).to_string();
+        // The number is key-derived from the device id; caller-supplied digits
+        // are only a cosmetic fallback for the directory row.
+        let digits = crate::cec::number_digits(&number);
+        let number = if digits.is_empty() {
+            allmystuff_cec_protocol::support_id_from_device(&node)
+        } else {
+            digits
+        };
+        // Attach the live session when there is one; an ask made outside a
+        // session (help queue / post-disconnect) is simply sessionless.
+        let session_id = if session_id.is_empty() {
+            self.cec.active_session_for(&node).unwrap_or_default()
+        } else {
+            session_id
+        };
+        // Where to reach them: the network their frames already arrive on,
+        // else the shared support area — joined idempotently and
+        // pin-connected exactly like a dial, so a machine billed straight
+        // from the help queue earns its directory row AND the standing
+        // relationship the technician's later Control click rides.
+        let network_id = match self.network_for_peer(&node) {
+            Some(n) => n,
+            None => {
+                let (area, config) = crate::cec::help_network_config();
+                self.cec_join_silent(&area, config).await?;
+                self.client
+                    .request(&Request::NetworkConnectPeer {
+                        network: area.clone(),
+                        peer: canonical.clone(),
+                        // A support relationship is a standing dial, whether
+                        // it began with a screen or a bill.
+                        pin: true,
+                        wait_ms: 0,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|resp| {
+                        if resp.ok {
+                            Ok(())
+                        } else {
+                            Err(resp
+                                .error
+                                .unwrap_or_else(|| "connect_peer refused by the daemon".into()))
+                        }
+                    })?;
+                let (label, hostname) = self.cec_peer_ident(&canonical).unwrap_or_default();
+                let record =
+                    self.cec
+                        .record_dialed(node.clone(), number.clone(), label, hostname, true);
+                self.sink.emit("cec://peer", record.to_value());
+                area
+            }
+        };
+        let item = if item.trim().is_empty() {
+            allmystuff_cec_protocol::DIAGNOSTIC_ITEM.to_string()
+        } else {
+            item
+        };
+        let price = if price.trim().is_empty() {
+            allmystuff_cec_protocol::DIAGNOSTIC_PRICE.to_string()
+        } else {
+            price
+        };
+        let purchase_id = format!("buy-{}-{}", short_id(&canonical), fresh_boot_id());
+        let request = allmystuff_cec_protocol::ControlMessage::Purchase(
+            allmystuff_cec_protocol::PurchaseControl::Request {
+                purchase_id: purchase_id.clone(),
+                session_id: session_id.clone(),
+                agent_name: self.cec.agent_name(),
+                item: item.clone(),
+                price: price.clone(),
+                note: note.clone(),
+            },
+        );
+        let flow = crate::cec::PurchaseFlow {
+            purchase_id: purchase_id.clone(),
+            session_id,
+            peer: node.clone(),
+            agent_name: self.cec.agent_name(),
+            item,
+            price,
+            note,
+            state: "requested".into(),
+            updated_at: crate::cec::now_secs(),
+        };
+        self.cec.record_purchase(flow.clone());
+        self.sink.emit("cec://purchase", flow.to_value());
+
+        // Deliver under the acked contract: queued until the customer's link
+        // is up, retransmitted across session rebuilds, resolved when their
+        // node has actually taken the frame. The customer dedupes by
+        // purchase_id and re-asserts current state on a redelivery. A
+        // delivery that genuinely lapses settles the ask cancelled, so the
+        // technician's strip clears instead of waiting on a ghost.
+        {
+            let mesh = self.clone();
+            let net = network_id.clone();
+            let peer = canonical.clone();
+            let pid = purchase_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mesh
+                    .cec_send_control_acked(&net, &peer, &request, CEC_CONNECT_TTL)
+                    .await
+                {
+                    tracing::warn!("cec purchase request undelivered: {e}");
+                    if let Some(updated) = mesh.cec.set_purchase_state(&pid, "cancelled") {
+                        mesh.sink.emit("cec://purchase", updated.to_value());
+                    }
+                }
+            });
+        }
+        Ok(flow.to_value())
+    }
+
+    /// The network a purchase word travels on: wherever the peer's frames
+    /// already arrive, else the shared support area — joined idempotently so
+    /// the acked send has a channel to queue on. Reaching the peer itself is
+    /// the standing dial's job (pinned when the relationship started); this
+    /// only guarantees the channel exists.
+    async fn cec_purchase_network(self: &Arc<Self>, peer: &str) -> Result<String, String> {
+        if let Some(network_id) = self.network_for_peer(peer) {
+            return Ok(network_id);
+        }
+        let (area, config) = crate::cec::help_network_config();
+        self.cec_join_silent(&area, config).await?;
+        Ok(area)
+    }
+
+    /// `cec_purchase_status` (customer): report where the customer is in the
+    /// purchase flow — `seen` / `opened` / `claimed` / `declined`. The local
+    /// record and the customer's own UI move immediately; the wire word
+    /// follows under the acked contract in a spawned task and stays
+    /// best-effort (the phone call is the backstop; the technician verifies
+    /// the order in the store regardless).
+    pub async fn cec_purchase_status(
+        self: &Arc<Self>,
+        purchase_id: String,
+        state: String,
+    ) -> Result<Value, String> {
+        let wire_state = crate::cec::parse_purchase_state(&state)?;
+        let flow = self
+            .cec
+            .purchase(&purchase_id)
+            .ok_or_else(|| "unknown purchase".to_string())?;
+        if flow.is_terminal() {
+            // Settled asks don't reopen — echo the final state back.
+            return Ok(flow.to_value());
+        }
+        let updated = self
+            .cec
+            .set_purchase_state(&purchase_id, crate::cec::purchase_state_str(wire_state));
+        if let Some(f) = &updated {
+            self.sink.emit("cec://purchase", f.to_value());
+        }
+        match self.cec_purchase_network(&flow.peer).await {
+            Ok(network_id) => {
+                let mesh = self.clone();
+                let canonical = crate::cec::pubkey_part(&flow.peer).to_string();
+                let message = allmystuff_cec_protocol::ControlMessage::Purchase(
+                    allmystuff_cec_protocol::PurchaseControl::Status {
+                        purchase_id,
+                        state: wire_state,
+                    },
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = mesh
+                        .cec_send_control_acked(&network_id, &canonical, &message, CEC_CONNECT_TTL)
+                        .await
+                    {
+                        tracing::warn!("cec purchase status undelivered: {e}");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("cec purchase status has no channel: {e}"),
+        }
+        Ok(updated.map(|f| f.to_value()).unwrap_or(flow.to_value()))
+    }
+
+    /// `cec_purchase_confirm` (technician): the order landed in the store and
+    /// checks out against this customer — settle the ask and tell the
+    /// customer's app, whose prompt turns into "confirmed, continuing".
+    pub async fn cec_purchase_confirm(
+        self: &Arc<Self>,
+        purchase_id: String,
+    ) -> Result<Value, String> {
+        self.cec_purchase_close(purchase_id, true).await
+    }
+
+    /// `cec_purchase_cancel` (technician): withdraw the ask (never mind /
+    /// taking payment another way). Dismisses the customer's prompt.
+    pub async fn cec_purchase_cancel(
+        self: &Arc<Self>,
+        purchase_id: String,
+    ) -> Result<Value, String> {
+        self.cec_purchase_close(purchase_id, false).await
+    }
+
+    /// The shared close: settle the local ask, then tell the customer under
+    /// the acked contract in a spawned task — a Confirm/Withdraw click never
+    /// blocks on delivery (the word is queued until the customer's link is
+    /// up and retransmitted across rebuilds). The money truth lives in the
+    /// store, not on the wire: a close the customer's app never hears leaves
+    /// their prompt behind, and the phone call — or a re-click, since
+    /// re-closing a settled ask re-sends the wire word without moving or
+    /// re-announcing anything — covers that gap.
+    async fn cec_purchase_close(
+        self: &Arc<Self>,
+        purchase_id: String,
+        confirm: bool,
+    ) -> Result<Value, String> {
+        let flow = self
+            .cec
+            .purchase(&purchase_id)
+            .ok_or_else(|| "unknown purchase".to_string())?;
+        let canonical = crate::cec::pubkey_part(&flow.peer).to_string();
+        let network_id = self.cec_purchase_network(&flow.peer).await?;
+        let message = if confirm {
+            allmystuff_cec_protocol::PurchaseControl::Confirm {
+                purchase_id: purchase_id.clone(),
+            }
+        } else {
+            allmystuff_cec_protocol::PurchaseControl::Cancel {
+                purchase_id: purchase_id.clone(),
+            }
+        };
+        let state = if confirm { "confirmed" } else { "cancelled" };
+        let updated = self.cec.set_purchase_state(&purchase_id, state);
+        if let Some(f) = &updated {
+            self.sink.emit("cec://purchase", f.to_value());
+        }
+        {
+            let mesh = self.clone();
+            let message = allmystuff_cec_protocol::ControlMessage::Purchase(message);
+            tokio::spawn(async move {
+                if let Err(e) = mesh
+                    .cec_send_control_acked(&network_id, &canonical, &message, CEC_CONNECT_TTL)
+                    .await
+                {
+                    tracing::warn!("cec purchase close undelivered: {e}");
+                }
+            });
+        }
+        Ok(updated.map(|f| f.to_value()).unwrap_or(flow.to_value()))
+    }
+
+    /// `cec_purchases`: every tracked purchase ask — the GUI re-sync pull, so
+    /// a restarted GUI mid-session recovers the prompt instead of losing it.
+    pub async fn cec_purchases(&self) -> Result<Value, String> {
+        Ok(Value::Array(self.cec.purchases()))
     }
 
     /// `forget_node` — an **app-wide** feature on every node's gear, not a CEC
@@ -3620,7 +3906,9 @@ impl Mesh {
 
     /// Handle one inbound CEC control message (the `cec.control` channel).
     /// Customer side: a `Request` raises the 3-choice prompt (`cec://request`);
-    /// technician side: an `Approve`/`Deny`/`End` moves the session.
+    /// technician side: an `Approve`/`Deny`/`End` moves the session. The
+    /// purchase handshake rides the same channel — see
+    /// [`Self::handle_cec_purchase`].
     async fn handle_cec_control(self: &Arc<Self>, from: String, network: String, payload: Value) {
         let msg: allmystuff_cec_protocol::ControlMessage = match serde_json::from_value(payload) {
             Ok(m) => m,
@@ -3629,7 +3917,17 @@ impl Mesh {
                 return;
             }
         };
-        if let allmystuff_cec_protocol::ControlMessage::Connect(connect) = msg {
+        let connect = match msg {
+            allmystuff_cec_protocol::ControlMessage::Purchase(purchase) => {
+                self.handle_cec_purchase(from, network, purchase).await;
+                return;
+            }
+            allmystuff_cec_protocol::ControlMessage::Connect(connect) => connect,
+            // App control and unknown kinds: nothing wired (yet) — dropped, by
+            // the same forward-compat discipline the wire contract promises.
+            _ => return,
+        };
+        {
             tracing::info!(
                 "cec connect message from {}: {}",
                 short_id(&from),
@@ -3651,6 +3949,10 @@ impl Mesh {
                     agent_name,
                     want_control,
                 } => {
+                    // Whatever this Request becomes, the session is *with* its
+                    // sender — link it so per-session features (the purchase
+                    // ask) can resolve the peer later.
+                    self.cec.link_session_peer(&session_id, &from);
                     // The technician retransmits its Request every 2s until it
                     // sees an answer — because a single send can be dropped
                     // before the data channel is up (the very race the Request
@@ -3800,6 +4102,7 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
                     self.cec.set_session(&session_id, "active");
+                    self.cec.link_session_peer(&session_id, &from);
                     // The customer just approved — this connection is now in
                     // active use. Stamp its `last_used` (and re-emit the peer so
                     // the CEC tab's time-since refreshes) so the technician's
@@ -3829,6 +4132,18 @@ impl Mesh {
                     if self.cec.retire_once(&from) {
                         self.cec_emit_grants();
                     }
+                    // A purchase ask was "before we continue" — with the
+                    // session over there's nothing to continue, so a live ask
+                    // settles as cancelled and the prompt comes down.
+                    if !session_id.is_empty() {
+                        if let Some(flow) = self.cec.purchase_for_session(&session_id) {
+                            if let Some(updated) =
+                                self.cec.set_purchase_state(&flow.purchase_id, "cancelled")
+                            {
+                                self.sink.emit("cec://purchase", updated.to_value());
+                            }
+                        }
+                    }
                     self.sink.emit(
                         "cec://session",
                         json!({ "session_id": session_id, "state": "ended" }),
@@ -3836,6 +4151,136 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::Unknown => {}
             }
+        }
+    }
+
+    /// Handle one inbound purchase message. Customer side: a `Request` from a
+    /// technician holding a **live grant** raises the purchase prompt
+    /// (`cec://purchase`), and a `Confirm`/`Cancel` settles it; technician
+    /// side: a `Status` from the asked customer moves the ask along. Anything
+    /// else — strangers, unknown ids, settled asks — drops without an event.
+    async fn handle_cec_purchase(
+        self: &Arc<Self>,
+        from: String,
+        network: String,
+        purchase: allmystuff_cec_protocol::PurchaseControl,
+    ) {
+        match purchase {
+            allmystuff_cec_protocol::PurchaseControl::Request {
+                purchase_id,
+                session_id,
+                agent_name,
+                item,
+                price,
+                note,
+            } => {
+                // The trust bar is the connect prompt's: reaching this room
+                // took the number (told out-of-band, on the phone), the prompt
+                // names the asker, and the customer can always decline. No
+                // grant is required to *ask* — a purchase request is how a
+                // technician quotes the work before the customer lets them in
+                // (from the help queue), or after they've disconnected. When a
+                // grant does exist, its name — the one the customer actually
+                // approved — outranks the wire's claim.
+                //
+                // The technician re-sends the Request until answered (the
+                // channel can land a beat after connect), so a beat for the
+                // ask already on screen just re-asserts where it stands —
+                // that re-Status is what stops the re-sends. Same manners as
+                // the connect handshake.
+                if let Some(existing) = self.cec.purchase(&purchase_id) {
+                    if !existing.is_terminal() {
+                        if let Ok(state) = crate::cec::parse_purchase_state(&existing.state) {
+                            let _ = self
+                                .cec_send_control(
+                                    &network,
+                                    &from,
+                                    &allmystuff_cec_protocol::ControlMessage::Purchase(
+                                        allmystuff_cec_protocol::PurchaseControl::Status {
+                                            purchase_id,
+                                            state,
+                                        },
+                                    ),
+                                )
+                                .await;
+                        }
+                        return;
+                    }
+                }
+                let item = if item.trim().is_empty() {
+                    allmystuff_cec_protocol::DIAGNOSTIC_ITEM.to_string()
+                } else {
+                    item
+                };
+                let price = if price.trim().is_empty() {
+                    allmystuff_cec_protocol::DIAGNOSTIC_PRICE.to_string()
+                } else {
+                    price
+                };
+                tracing::info!(
+                    "cec purchase request from {}: {item} {price}",
+                    short_id(&from)
+                );
+                let granted_name = self.cec.agent_name_for(&from);
+                let flow = crate::cec::PurchaseFlow {
+                    purchase_id,
+                    session_id,
+                    peer: from.clone(),
+                    // The grant's name (the one the customer approved) when
+                    // there is one; the wire's claim otherwise — exactly the
+                    // trust the connect prompt's name carries.
+                    agent_name: if granted_name.is_empty() {
+                        agent_name
+                    } else {
+                        granted_name
+                    },
+                    item,
+                    price,
+                    note,
+                    state: "requested".into(),
+                    updated_at: crate::cec::now_secs(),
+                };
+                self.cec.record_purchase(flow.clone());
+                self.sink.emit("cec://purchase", flow.to_value());
+            }
+            allmystuff_cec_protocol::PurchaseControl::Status { purchase_id, state } => {
+                // A state minted by a newer peer than us: leave the ask where
+                // it is rather than record a word we can't render.
+                if matches!(state, allmystuff_cec_protocol::PurchaseState::Unknown) {
+                    return;
+                }
+                self.cec_purchase_settle(
+                    &from,
+                    &purchase_id,
+                    crate::cec::purchase_state_str(state),
+                );
+            }
+            allmystuff_cec_protocol::PurchaseControl::Confirm { purchase_id } => {
+                self.cec_purchase_settle(&from, &purchase_id, "confirmed");
+            }
+            allmystuff_cec_protocol::PurchaseControl::Cancel { purchase_id } => {
+                self.cec_purchase_settle(&from, &purchase_id, "cancelled");
+            }
+            allmystuff_cec_protocol::PurchaseControl::Unknown => {}
+        }
+    }
+
+    /// Move a purchase ask on word from the wire — but only on the word of
+    /// the peer the ask belongs to (the customer can't confirm their own
+    /// purchase; a third party can't decline someone else's).
+    fn cec_purchase_settle(&self, from: &str, purchase_id: &str, state: &str) {
+        let Some(flow) = self.cec.purchase(purchase_id) else {
+            return;
+        };
+        if crate::cec::pubkey_part(&flow.peer) != crate::cec::pubkey_part(from) {
+            tracing::warn!(
+                "dropping CEC purchase update from {} — not the ask's peer",
+                short_id(from)
+            );
+            return;
+        }
+        if let Some(updated) = self.cec.set_purchase_state(purchase_id, state) {
+            self.sink.emit("cec://purchase", updated.to_value());
         }
     }
 

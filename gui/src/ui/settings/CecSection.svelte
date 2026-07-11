@@ -110,6 +110,33 @@
     void app.dialCec();
   }
 
+  /** The purchase strip's status line, by flow state. The two waiting states
+   *  read the same to the technician ("sent, not answered"); `seen` just
+   *  additionally proves the customer's app is new enough to show it. */
+  function purchaseLabel(state: string): string {
+    switch (state) {
+      case "requested":
+        return "waiting on the customer";
+      case "seen":
+        return "on the customer's screen";
+      case "opened":
+        return "they're at the checkout";
+      case "claimed":
+        return "they say it's paid — check the store's orders";
+      case "declined":
+        return "the customer declined";
+      case "confirmed":
+        return "paid — all set";
+      default:
+        return state;
+    }
+  }
+
+  /** Whether a purchase ask is still in flight (withdrawable). */
+  function purchaseLive(state: string): boolean {
+    return ["requested", "seen", "opened", "claimed", "declined"].includes(state);
+  }
+
   onMount(() => {
     void app.loadCec();
   });
@@ -207,6 +234,7 @@
       <ul class="rows">
         {#each app.cecHelpWaiting as w (w.node)}
           {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
+          {@const queuePurchase = app.cecPurchaseFor(w.node)}
           <li class="row col asking">
             <div class="row-top">
               <span class="dot busy"></span>
@@ -227,7 +255,49 @@
               >
                 Control
               </button>
+              {#if !queuePurchase || !purchaseLive(queuePurchase.state)}
+                <!-- Bill the diagnostic before answering: the ask reaches
+                     their app without connecting to their screen, and their
+                     progress shows right here. -->
+                <button
+                  class="btn small"
+                  title="Ask them to purchase the $50 diagnostic session before you take the call — their app opens our secure checkout"
+                  onclick={() =>
+                    void app.requestCecPurchase({
+                      node: w.node,
+                      number: w.number,
+                      name: shownName,
+                    })}
+                >
+                  Request $50 diagnostic
+                </button>
+              {/if}
             </div>
+            {#if queuePurchase && purchaseLive(queuePurchase.state)}
+              <div class="purchase-strip" class:paid={queuePurchase.state === "claimed"}>
+                <span class="p-price">{queuePurchase.price || "$50"}</span>
+                <span class="p-status">
+                  <b>{queuePurchase.item || "Diagnostic session"}</b>
+                  <span class="p-sub">{purchaseLabel(queuePurchase.state)}</span>
+                </span>
+                {#if queuePurchase.state === "claimed"}
+                  <button
+                    class="btn small primary"
+                    title="Confirm you can see their paid order in the store — this tells them they're all set"
+                    onclick={() => void app.confirmCecPurchase(queuePurchase)}
+                  >
+                    Confirm received
+                  </button>
+                {/if}
+                <button
+                  class="btn small danger"
+                  title="Withdraw the request — their prompt comes down"
+                  onclick={() => void app.cancelCecPurchase(queuePurchase)}
+                >
+                  Withdraw
+                </button>
+              </div>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -276,6 +346,7 @@
       </p>
       <ul class="rows">
         {#each customers as c (c.number)}
+          {@const purchase = app.cecPurchaseFor(c.node)}
           <li class="row col" class:stale={isStale(c.last_used)}>
             <div class="row-top">
               <span class="dot" class:on={c.online}></span>
@@ -341,6 +412,76 @@
                 </button>
               {/if}
             </div>
+            <!-- The diagnostic-session ask. Optional and technician-triggered
+                 only: the button sends the prompt to the customer's app (their
+                 checkout opens in their own browser — no card details near
+                 either app), their progress streams back here, and Confirm is
+                 the human close: check the order actually landed in the store
+                 (it carries their support number) before clicking it. -->
+            {#if editingKey !== c.number && c.node}
+              {#if purchase && purchaseLive(purchase.state)}
+                <div class="purchase-strip" class:paid={purchase.state === "claimed"}>
+                  <span class="p-price">{purchase.price || "$50"}</span>
+                  <span class="p-status">
+                    <b>{purchase.item || "Diagnostic session"}</b>
+                    <span class="p-sub">{purchaseLabel(purchase.state)}</span>
+                  </span>
+                  {#if purchase.state === "claimed"}
+                    <button
+                      class="btn small primary"
+                      title="Confirm you can see their paid order in the store — this tells them they're all set"
+                      onclick={() => void app.confirmCecPurchase(purchase)}
+                    >
+                      Confirm received
+                    </button>
+                  {/if}
+                  {#if purchase.state === "declined"}
+                    <button
+                      class="btn small"
+                      title="Send the purchase request again"
+                      onclick={() =>
+                        void app.requestCecPurchase({
+                          node: c.node,
+                          number: c.number,
+                          name: app.cecCustomerName(c),
+                        })}
+                    >
+                      Ask again
+                    </button>
+                  {/if}
+                  <button
+                    class="btn small danger"
+                    title="Withdraw the request — their prompt comes down"
+                    onclick={() => void app.cancelCecPurchase(purchase)}
+                  >
+                    Withdraw
+                  </button>
+                </div>
+              {:else if purchase && purchase.state === "confirmed"}
+                <div class="purchase-strip settled">
+                  <span class="p-price">{purchase.price || "$50"}</span>
+                  <span class="p-status">
+                    <b>{purchase.item || "Diagnostic session"}</b>
+                    <span class="p-sub ok">{purchaseLabel(purchase.state)}</span>
+                  </span>
+                </div>
+              {:else if c.online}
+                <div class="purchase-strip idle">
+                  <button
+                    class="btn small"
+                    title="Ask them to purchase the $50 diagnostic session — works connected or not; their app opens our secure checkout"
+                    onclick={() =>
+                      void app.requestCecPurchase({
+                        node: c.node,
+                        number: c.number,
+                        name: app.cecCustomerName(c),
+                      })}
+                  >
+                    Request $50 diagnostic
+                  </button>
+                </div>
+              {/if}
+            {/if}
           </li>
         {/each}
       </ul>
@@ -651,6 +792,54 @@
     border-radius: var(--r-pill, 999px);
     padding: 0.02rem 0.4rem;
     vertical-align: middle;
+  }
+
+  /* The diagnostic-purchase strip — a quiet sub-row under the connection
+     actions. Idle it's just the ask button; live it carries the price, the
+     status, and the close controls. The claimed state gets the accent border:
+     it's the one beat that's waiting on the technician. */
+  .purchase-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    border-top: 1px solid var(--line);
+    padding-top: 0.5rem;
+  }
+  .purchase-strip.idle {
+    border-top-style: dashed;
+  }
+  .purchase-strip.paid {
+    border-top-color: var(--accent);
+  }
+  .p-price {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--ink);
+    border: 1px solid var(--line-strong, var(--line));
+    border-radius: var(--r-pill, 999px);
+    padding: 0.08rem 0.5rem;
+    flex-shrink: 0;
+  }
+  .p-status {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+    font-size: 0.8rem;
+    line-height: 1.35;
+  }
+  .p-status b {
+    font-weight: 600;
+  }
+  .p-sub {
+    font-size: 0.72rem;
+    color: var(--ink-soft);
+  }
+  .p-sub.ok {
+    color: var(--ok, #35c26a);
+    font-weight: 600;
   }
 
   /* The stale marker — a connection unused past the threshold, the cleanup

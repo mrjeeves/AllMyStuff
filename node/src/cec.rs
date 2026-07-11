@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
-use allmystuff_cec_protocol::{format_support_id, support_id_from_device, ApprovalScope, Role};
+use allmystuff_cec_protocol::{
+    format_support_id, support_id_from_device, ApprovalScope, PurchaseState, Role,
+};
 
 /// Where the customer's consent store lives:
 /// `~/.myownmesh/cec-consent.json`, honouring `MYOWNMESH_HOME` — the same home
@@ -90,6 +92,66 @@ impl PendingRequest {
             "session_id": self.session_id,
             "verification_code": self.verification_code,
         })
+    }
+}
+
+/// One purchase ask (the $50 diagnostic session), tracked by both roles: the
+/// technician records it when they send the [`PurchaseControl::Request`], the
+/// customer when it arrives. In-memory only — a purchase ask is a live
+/// interaction on a help call (the technician simply re-asks after a
+/// restart), and the *authoritative* record of payment is the store order,
+/// never this bookkeeping.
+///
+/// [`PurchaseControl::Request`]: allmystuff_cec_protocol::PurchaseControl::Request
+#[derive(Clone, Debug)]
+pub struct PurchaseFlow {
+    /// Unique id for this ask, minted by the technician's node.
+    pub purchase_id: String,
+    /// The CEC session the ask belongs to — empty for an ask made outside one
+    /// (before answering a help call, or after disconnecting). One live ask
+    /// per **peer** either way.
+    pub session_id: String,
+    /// The other side, as first seen: the customer (technician side) or the
+    /// technician (customer side). Compared canonically via [`pubkey_part`].
+    pub peer: String,
+    /// The technician's Agent Name. Customer side prefers the *grant's* name
+    /// (the one the customer approved) when a live grant exists, falling back
+    /// to the wire's claim — the same trust the connect prompt's name carries
+    /// (verified against the person on the phone).
+    pub agent_name: String,
+    /// What's being purchased, e.g. "CEC Diagnostic Session" (display only).
+    pub item: String,
+    /// Display price, e.g. "$50" — the checkout page stays authoritative.
+    pub price: String,
+    /// Optional free-text from the technician.
+    pub note: String,
+    /// Where the ask stands: `requested` → `seen`/`opened`/`claimed`/`declined`
+    /// → `confirmed` | `cancelled`. The two closing states are terminal.
+    pub state: String,
+    /// Unix seconds of the last state change.
+    pub updated_at: u64,
+}
+
+impl PurchaseFlow {
+    /// The `cec://purchase` event / `cec_purchases` result shape.
+    pub fn to_value(&self) -> Value {
+        json!({
+            "purchase_id": self.purchase_id,
+            "session_id": self.session_id,
+            "peer": self.peer,
+            "agent_name": self.agent_name,
+            "item": self.item,
+            "price": self.price,
+            "note": self.note,
+            "state": self.state,
+            "updated_at": self.updated_at,
+        })
+    }
+
+    /// Whether this flow can still move (`confirmed` / `cancelled` are the
+    /// closing states; everything else is live).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.state.as_str(), "confirmed" | "cancelled")
     }
 }
 
@@ -207,6 +269,11 @@ struct CecInner {
     dialed: HashMap<String, DialedCustomer>,
     /// Live session states by session id, for `cec://session`.
     sessions: HashMap<String, String>,
+    /// Which peer each session is with (session id → device id as-seen) —
+    /// linked by whichever side learns it (the dial, or the inbound Request /
+    /// Approve), so "the active session with this customer" is answerable
+    /// without parsing ids.
+    session_peers: HashMap<String, String>,
     /// Cancellation flag for the in-flight dial (one at a time — the GUI
     /// serializes dials). `begin_dial` mints a fresh flag; `cancel_dial` trips
     /// it; the discovery poll and the connect-request re-send loop both honor
@@ -228,6 +295,9 @@ struct CecInner {
     /// last beacon; an `available: false` beacon (cancel / help arrived)
     /// removes one immediately.
     help_wanted: HashMap<String, HelpSeeker>,
+    /// Live purchase asks by purchase id (both roles, one live ask per
+    /// session). In-memory only — see [`PurchaseFlow`].
+    purchases: HashMap<String, PurchaseFlow>,
 }
 
 /// One customer waiting on the global help mesh, as heard from their beacon.
@@ -283,11 +353,13 @@ impl Cec {
                 pending: Vec::new(),
                 dialed,
                 sessions: HashMap::new(),
+                session_peers: HashMap::new(),
                 dial_cancel: None,
                 asking_help: false,
                 watching_help: false,
                 help_epoch: 0,
                 help_wanted: HashMap::new(),
+                purchases: HashMap::new(),
             }),
         }
     }
@@ -801,6 +873,32 @@ impl Cec {
         self.inner.lock().sessions.get(session_id).cloned()
     }
 
+    /// Remember which peer `session_id` is with — linked by whichever side
+    /// learns it (the dial mints it against a customer; an inbound Request /
+    /// Approve names its sender), so per-session features (the purchase ask)
+    /// can resolve "the active session with this peer" without parsing ids.
+    pub fn link_session_peer(&self, session_id: &str, peer: &str) {
+        self.inner
+            .lock()
+            .session_peers
+            .insert(session_id.to_string(), peer.to_string());
+    }
+
+    /// The **active** session with `peer`, if any (canonical compare).
+    pub fn active_session_for(&self, peer: &str) -> Option<String> {
+        let inner = self.inner.lock();
+        let key = pubkey_part(peer);
+        inner.session_peers.iter().find_map(|(sid, p)| {
+            let active = pubkey_part(p) == key
+                && inner
+                    .sessions
+                    .get(sid)
+                    .map(|s| s == "active")
+                    .unwrap_or(false);
+            active.then(|| sid.clone())
+        })
+    }
+
     /// Whether a pending connect-request is already recorded for `session_id`.
     /// The technician retransmits its Request every 2s until answered, so this
     /// lets the customer refresh the pending record on each beat *without*
@@ -850,6 +948,83 @@ impl Cec {
     pub fn retire_once(&self, tech: &str) -> bool {
         self.inner.lock().consent.revoke_once(tech)
     }
+
+    /// The Agent Name the customer approved for `tech` — read from the live
+    /// grant, so a purchase prompt names the person the customer actually let
+    /// in (never a wire-supplied claim). Empty when no live grant.
+    pub fn agent_name_for(&self, tech: &str) -> String {
+        let inner = self.inner.lock();
+        let key = pubkey_part(tech);
+        inner
+            .consent
+            .active_grants(now_secs())
+            .into_iter()
+            .find(|g| pubkey_part(&g.technician) == key)
+            .map(|g| g.agent_name)
+            .unwrap_or_default()
+    }
+
+    // ---- purchase asks (the $50 diagnostic session) ----------------------
+
+    /// Record a purchase ask, superseding any earlier ask with the same peer
+    /// (a technician's re-ask replaces, it never stacks prompts) — mirroring
+    /// how [`record_pending`](Cec::record_pending) dedupes connect-requests
+    /// by technician. Keyed by peer, not session, because an ask can be made
+    /// *outside* a session (before answering a help call, or after
+    /// disconnecting) where `session_id` is empty.
+    pub fn record_purchase(&self, flow: PurchaseFlow) {
+        let mut inner = self.inner.lock();
+        let key = pubkey_part(&flow.peer).to_string();
+        inner.purchases.retain(|_, p| pubkey_part(&p.peer) != key);
+        inner.purchases.insert(flow.purchase_id.clone(), flow);
+    }
+
+    /// Look up a purchase ask by id.
+    pub fn purchase(&self, purchase_id: &str) -> Option<PurchaseFlow> {
+        self.inner.lock().purchases.get(purchase_id).cloned()
+    }
+
+    /// Move a purchase ask to `state`, returning the updated flow for the
+    /// `cec://purchase` emit. `None` for an unknown id, an already-closed flow
+    /// (`confirmed` / `cancelled` never reopen — a late or replayed message
+    /// can't resurrect a settled ask), or a no-op same-state write (so callers
+    /// don't re-emit an event for a retransmitted status).
+    pub fn set_purchase_state(&self, purchase_id: &str, state: &str) -> Option<PurchaseFlow> {
+        let mut inner = self.inner.lock();
+        let flow = inner.purchases.get_mut(purchase_id)?;
+        if flow.is_terminal() || flow.state == state {
+            return None;
+        }
+        flow.state = state.to_string();
+        flow.updated_at = now_secs();
+        Some(flow.clone())
+    }
+
+    /// The live (non-terminal) purchase ask on `session_id`, if any. Empty
+    /// never matches — a sessionless ask isn't tied to any session's end.
+    pub fn purchase_for_session(&self, session_id: &str) -> Option<PurchaseFlow> {
+        if session_id.is_empty() {
+            return None;
+        }
+        self.inner
+            .lock()
+            .purchases
+            .values()
+            .find(|p| p.session_id == session_id && !p.is_terminal())
+            .cloned()
+    }
+
+    /// Every tracked purchase ask, for the `cec_purchases` re-sync query (a
+    /// GUI that restarts mid-session pulls these rather than losing the
+    /// prompt).
+    pub fn purchases(&self) -> Vec<Value> {
+        self.inner
+            .lock()
+            .purchases
+            .values()
+            .map(PurchaseFlow::to_value)
+            .collect()
+    }
 }
 
 /// The customer-facing scope word for a grant (the `cec_grants` shape) —
@@ -880,6 +1055,33 @@ pub fn parse_scope(s: &str) -> Result<ApprovalScope, String> {
         other => Err(format!(
             "unknown approval scope '{other}' (want once | three_hours | forever)"
         )),
+    }
+}
+
+/// Map the node-control purchase `state` argument — the states a *customer*
+/// reports ([`PurchaseState`] minus the technician-only closes) — to the wire
+/// enum. Unknown values are an error the dispatch surfaces.
+pub fn parse_purchase_state(s: &str) -> Result<PurchaseState, String> {
+    match s {
+        "seen" => Ok(PurchaseState::Seen),
+        "opened" => Ok(PurchaseState::Opened),
+        "claimed" => Ok(PurchaseState::Claimed),
+        "declined" => Ok(PurchaseState::Declined),
+        other => Err(format!(
+            "unknown purchase state '{other}' (want seen | opened | claimed | declined)"
+        )),
+    }
+}
+
+/// The bookkeeping word for a wire [`PurchaseState`] — the same strings
+/// [`PurchaseFlow::state`] holds and the `cec://purchase` event carries.
+pub fn purchase_state_str(state: PurchaseState) -> &'static str {
+    match state {
+        PurchaseState::Seen => "seen",
+        PurchaseState::Opened => "opened",
+        PurchaseState::Claimed => "claimed",
+        PurchaseState::Declined => "declined",
+        PurchaseState::Unknown => "unknown",
     }
 }
 
@@ -1212,6 +1414,131 @@ mod tests {
         assert!(cec.remove_help_beacon(&display));
         assert!(cec.help_list().is_empty());
         assert!(!cec.remove_help_beacon(ME), "second withdrawal is a no-op");
+    }
+
+    fn purchase(id: &str, session: &str) -> PurchaseFlow {
+        PurchaseFlow {
+            purchase_id: id.into(),
+            session_id: session.into(),
+            peer: TECH.into(),
+            agent_name: "Alex at CEC".into(),
+            item: "CEC Diagnostic Session".into(),
+            price: "$50".into(),
+            note: String::new(),
+            state: "requested".into(),
+            updated_at: now_secs(),
+        }
+    }
+
+    #[test]
+    fn purchase_flow_moves_and_closes() {
+        let cec = Cec::new(None);
+        cec.record_purchase(purchase("p1", "s1"));
+        assert_eq!(cec.purchase("p1").unwrap().state, "requested");
+        assert_eq!(cec.purchase_for_session("s1").unwrap().purchase_id, "p1");
+
+        // Ordinary progress, one emit per real change…
+        assert!(cec.set_purchase_state("p1", "seen").is_some());
+        assert!(
+            cec.set_purchase_state("p1", "seen").is_none(),
+            "a retransmitted status is not a change"
+        );
+        assert!(cec.set_purchase_state("p1", "opened").is_some());
+        assert!(cec.set_purchase_state("p1", "claimed").is_some());
+
+        // …until a close, which is final: nothing reopens a settled ask.
+        assert!(cec.set_purchase_state("p1", "confirmed").is_some());
+        assert!(cec.set_purchase_state("p1", "opened").is_none());
+        assert!(cec.set_purchase_state("p1", "cancelled").is_none());
+        assert_eq!(cec.purchase("p1").unwrap().state, "confirmed");
+        // A closed ask no longer counts as the session's live one.
+        assert!(cec.purchase_for_session("s1").is_none());
+        assert!(cec.set_purchase_state("nope", "seen").is_none());
+    }
+
+    #[test]
+    fn purchase_reask_supersedes_per_peer() {
+        let cec = Cec::new(None);
+        cec.record_purchase(purchase("p1", "s1"));
+        cec.record_purchase(purchase("p2", "s1"));
+        // The re-ask replaced the original — one live ask per peer.
+        assert!(cec.purchase("p1").is_none());
+        assert_eq!(cec.purchase_for_session("s1").unwrap().purchase_id, "p2");
+        assert_eq!(cec.purchases().len(), 1);
+        // Same peer, later sessionless re-ask (post-disconnect): still one.
+        let mut sessionless = purchase("p3", "");
+        sessionless.peer = format!("{TECH}-AB12C"); // display form, same key
+        cec.record_purchase(sessionless);
+        assert_eq!(cec.purchases().len(), 1);
+        assert!(cec.purchase_for_session("s1").is_none());
+        assert!(cec.purchase("p3").is_some());
+        // A different peer keeps its own ask.
+        let mut other = purchase("p4", "");
+        other.peer = ME.into();
+        cec.record_purchase(other);
+        assert_eq!(cec.purchases().len(), 2);
+        // An empty session id never reads as "the session's ask".
+        assert!(cec.purchase_for_session("").is_none());
+    }
+
+    #[test]
+    fn parse_purchase_state_accepts_customer_states_only() {
+        assert_eq!(parse_purchase_state("seen").unwrap(), PurchaseState::Seen);
+        assert_eq!(
+            parse_purchase_state("opened").unwrap(),
+            PurchaseState::Opened
+        );
+        assert_eq!(
+            parse_purchase_state("claimed").unwrap(),
+            PurchaseState::Claimed
+        );
+        assert_eq!(
+            parse_purchase_state("declined").unwrap(),
+            PurchaseState::Declined
+        );
+        // The closing states are technician verbs (`cec_purchase_confirm` /
+        // `cec_purchase_cancel`), never a reportable customer status.
+        assert!(parse_purchase_state("confirmed").is_err());
+        assert!(parse_purchase_state("cancelled").is_err());
+        for s in [
+            PurchaseState::Seen,
+            PurchaseState::Opened,
+            PurchaseState::Claimed,
+            PurchaseState::Declined,
+        ] {
+            assert_eq!(parse_purchase_state(purchase_state_str(s)).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn active_session_resolves_by_peer() {
+        let cec = Cec::new(None);
+        assert!(cec.active_session_for(TECH).is_none());
+        cec.set_session("s1", "requested");
+        cec.link_session_peer("s1", TECH);
+        // Requested isn't active yet.
+        assert!(cec.active_session_for(TECH).is_none());
+        cec.set_session("s1", "active");
+        assert_eq!(cec.active_session_for(TECH).as_deref(), Some("s1"));
+        // Display-suffix and bare forms are the same peer.
+        let display = format!("{TECH}-AB12C");
+        assert_eq!(cec.active_session_for(&display).as_deref(), Some("s1"));
+        cec.set_session("s1", "ended");
+        assert!(cec.active_session_for(TECH).is_none());
+    }
+
+    #[test]
+    fn agent_name_comes_from_the_grant() {
+        let cec = Cec::new(None);
+        assert_eq!(cec.agent_name_for(TECH), "");
+        cec.approve(TECH, "Alex at CEC", ApprovalScope::Once, true)
+            .unwrap();
+        assert_eq!(cec.agent_name_for(TECH), "Alex at CEC");
+        // Display-suffix and bare forms resolve to the same grant.
+        let display = format!("{TECH}-AB12C");
+        assert_eq!(cec.agent_name_for(&display), "Alex at CEC");
+        cec.revoke(TECH).unwrap();
+        assert_eq!(cec.agent_name_for(TECH), "");
     }
 
     #[test]

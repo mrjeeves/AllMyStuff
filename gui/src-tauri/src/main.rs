@@ -1386,6 +1386,76 @@ async fn cec_pending(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Technician: ask a customer to complete the $50 diagnostic-session
+/// purchase — from the help queue before answering, mid-session, or after
+/// disconnecting. Optional, technician-triggered only. `number` lets the node
+/// reach a machine with no standing connection (it joins the number room like
+/// a dial); the session, when one is live, is resolved node-side. Returns the
+/// purchase flow; progress arrives on `cec://purchase`.
+#[tauri::command]
+async fn cec_purchase_request(
+    state: State<'_, AppState>,
+    node: String,
+    number: String,
+    session_id: String,
+    item: String,
+    price: String,
+    note: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "cec_purchase_request",
+            json!({
+                "node": node,
+                "number": number,
+                "session_id": session_id,
+                "item": item,
+                "price": price,
+                "note": note,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Technician: the order landed in the store and checks out — settle the ask
+/// and turn the customer's prompt into "confirmed, continuing".
+#[tauri::command]
+async fn cec_purchase_confirm(
+    state: State<'_, AppState>,
+    purchase_id: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_purchase_confirm", json!({ "purchase_id": purchase_id }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Technician: withdraw a purchase ask — dismisses the customer's prompt.
+#[tauri::command]
+async fn cec_purchase_cancel(
+    state: State<'_, AppState>,
+    purchase_id: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_purchase_cancel", json!({ "purchase_id": purchase_id }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Every tracked purchase ask — the GUI re-sync pull.
+#[tauri::command]
+async fn cec_purchases(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_purchases", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Customer: approve a technician at a scope (once / three_hours / forever).
 #[tauri::command]
 async fn cec_approve(
@@ -2400,6 +2470,10 @@ fn main() {
             cec_help_watch,
             cec_forget_number,
             cec_cancel_dial,
+            cec_purchase_request,
+            cec_purchase_confirm,
+            cec_purchase_cancel,
+            cec_purchases,
             forget_node,
             mesh_status,
             mesh_identity,

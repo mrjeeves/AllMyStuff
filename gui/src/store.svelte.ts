@@ -177,11 +177,17 @@ import {
   onCecPeer,
   onCecSession,
   onCecGrants,
+  cecPurchaseRequest,
+  cecPurchaseConfirm,
+  cecPurchaseCancel,
+  cecPurchases,
+  onCecPurchase,
   type CecStatus,
   type CecPending,
   type CecGrant,
   type CecPeer,
   type CecScope,
+  type CecPurchase,
   type ServiceActionResult,
   type ServiceStatus,
   type SessionSnapshot,
@@ -581,6 +587,11 @@ class AppStore {
    *  goes active, the technician's remote-control console opens for them (the
    *  AnyDesk-style "connect and you're in"). Cleared once opened. */
   cecAutoOpenNode = $state<string | null>(null);
+  /** The latest purchase ask per customer (keyed by the flow's `peer` id) —
+   *  the $50 diagnostic-session flow. Fed by the `cec://purchase` event +
+   *  the `cec_purchases` re-sync pull; a closed ask stays visible as its
+   *  final state until the next one replaces it. */
+  cecPurchases = $state<Record<string, CecPurchase>>({});
   /** The customers currently asking for help on the global help room —
    *  longest-waiting first (the node keeps queue order). Drives the CEC tab's
    *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
@@ -1477,6 +1488,15 @@ class AppStore {
     });
     await onCecGrants((grants) => {
       this.cecGrantList = grants;
+    });
+    await onCecPurchase((p) => {
+      this.cecPurchases = { ...this.cecPurchases, [p.peer]: p };
+      // The two beats a technician on the phone is actually waiting on.
+      if (p.state === "claimed") {
+        this.toast("info", "Customer says the purchase is complete — check the store, then confirm");
+      } else if (p.state === "declined") {
+        this.toast("warn", "The customer declined the purchase");
+      }
     });
     await onCecHelp((e) => {
       // Technician side of `cec://help`: the node pushes the whole fresh
@@ -6906,6 +6926,16 @@ class AppStore {
     // the CEC tab is enough to start hearing the beacons.
     const waiting = await cecHelpList();
     if (waiting) this.cecHelpWaiting = waiting;
+    // Live purchase asks — so a reopened window recovers the flow's state.
+    const purchases = await cecPurchases();
+    if (purchases) {
+      const byPeer: Record<string, CecPurchase> = {};
+      for (const p of purchases) {
+        const prior = byPeer[p.peer];
+        if (!prior || (p.updated_at ?? 0) >= (prior.updated_at ?? 0)) byPeer[p.peer] = p;
+      }
+      this.cecPurchases = byPeer;
+    }
   }
 
   /** Technician: answer a raised hand — dial the customer's device directly
@@ -7124,6 +7154,53 @@ class AppStore {
       this.toast("warn", `Couldn't revoke: ${errMsg(e)}`);
     }
     void this.loadCec();
+  }
+
+  /** The latest purchase ask with a customer, by their node id. */
+  cecPurchaseFor(node: string): CecPurchase | null {
+    return (node && this.cecPurchases[node]) || null;
+  }
+
+  /** Technician: ask a customer to complete the $50 diagnostic-session
+   *  purchase — works from the help queue (before answering them), during a
+   *  session, or after disconnecting; the node re-reaches the machine by its
+   *  number room when nothing is connected. The customer's app opens the
+   *  store's secure checkout; their progress comes back on `cec://purchase`. */
+  async requestCecPurchase(who: { node: string; number: string; name?: string }) {
+    if (!who.node) return;
+    try {
+      const flow = await cecPurchaseRequest(who.node, who.number);
+      if (flow) {
+        this.cecPurchases = { ...this.cecPurchases, [flow.peer]: flow };
+        this.toast(
+          "ok",
+          `Asked ${who.name?.trim() || "the customer"} to purchase the diagnostic session`,
+        );
+      }
+    } catch (e) {
+      this.toast("warn", `Couldn't send the purchase request: ${errMsg(e)}`);
+    }
+  }
+
+  /** Technician: the order is in the store and checks out — settle the ask.
+   *  Verify it in the store admin first; this tells the customer they're set. */
+  async confirmCecPurchase(p: CecPurchase) {
+    try {
+      const flow = await cecPurchaseConfirm(p.purchase_id);
+      if (flow) this.cecPurchases = { ...this.cecPurchases, [flow.peer]: flow };
+    } catch (e) {
+      this.toast("warn", `Couldn't confirm — the customer may be offline: ${errMsg(e)}`);
+    }
+  }
+
+  /** Technician: withdraw a purchase ask — the customer's prompt comes down. */
+  async cancelCecPurchase(p: CecPurchase) {
+    try {
+      const flow = await cecPurchaseCancel(p.purchase_id);
+      if (flow) this.cecPurchases = { ...this.cecPurchases, [flow.peer]: flow };
+    } catch (e) {
+      this.toast("warn", `Couldn't withdraw it: ${errMsg(e)}`);
+    }
   }
 
   /** The per-node gear "Forget this node": drop it from the graph + roster,

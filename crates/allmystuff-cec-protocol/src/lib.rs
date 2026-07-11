@@ -55,7 +55,10 @@ pub use ids::{
 pub use media::{
     decode_media_frame, encode_media_frame, MediaFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
 };
-pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, SupportPresence};
+pub use wire::{
+    AppControl, ApprovalScope, ConnectControl, ControlMessage, PurchaseControl, PurchaseState,
+    Role, SupportPresence,
+};
 
 /// Prefix the retired per-number rooms carried (`cec-<9 digits>`). Kept
 /// solely so upgrading nodes can recognise and purge the legacy rooms older
@@ -106,6 +109,22 @@ pub const ROLE_TECH_TAG: &str = "cec-tech";
 
 /// Seconds in the "Auto-Approve for 3 hours" window.
 pub const THREE_HOURS_SECS: u64 = 3 * 60 * 60;
+
+/// The one place a customer is ever sent to pay: the CEC-owned purchase page,
+/// which hands off to the store's hosted checkout. The customer's app builds
+/// this URL **itself** (appending its own support number / reference — see
+/// [`PurchaseControl`](wire::PurchaseControl)); it is deliberately never taken
+/// from the wire, so no peer can steer a customer's browser anywhere else.
+/// Store domain / product config live behind this page, so they can change
+/// without shipping a new app.
+pub const DIAGNOSTIC_BUY_URL: &str = "https://support.cec.direct/buy/diagnostic/";
+
+/// Display fallbacks for the diagnostic-session ask, used when a
+/// [`PurchaseControl::Request`](wire::PurchaseControl::Request) arrives with
+/// empty display fields. The checkout page stays authoritative for the charge.
+pub const DIAGNOSTIC_ITEM: &str = "CEC Diagnostic Session";
+/// See [`DIAGNOSTIC_ITEM`].
+pub const DIAGNOSTIC_PRICE: &str = "$50";
 
 /// This build's version string (`CARGO_PKG_VERSION`).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

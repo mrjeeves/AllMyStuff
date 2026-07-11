@@ -2,7 +2,8 @@
 //!
 //! Two things ride the mesh: a [`SupportPresence`] beacon (broadcast, so a
 //! technician can find a customer), and point-to-point [`ControlMessage`]s
-//! (the connect-request → approve/deny → end handshake, plus app control).
+//! (the connect-request → approve/deny → end handshake, app control, and the
+//! mid-session purchase-request handshake).
 //!
 //! Every enum is internally-tagged serde with an `Unknown` catch-all and every
 //! additive field is `#[serde(default)]`, so a newer peer's extra variant or
@@ -197,6 +198,101 @@ pub enum AppControl {
     Unknown,
 }
 
+/// Where a requested purchase stands, as reported by the customer's app in
+/// [`PurchaseControl::Status`]. Display-state only — the *authoritative* record
+/// of payment is the store order the technician verifies out-of-band before
+/// sending [`PurchaseControl::Confirm`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PurchaseState {
+    /// The customer's app displayed the request (also tells the technician the
+    /// customer's app is new enough to know about purchases at all).
+    Seen,
+    /// The customer opened the secure checkout in their browser.
+    Opened,
+    /// The customer says they completed the purchase. A *claim*, not proof —
+    /// the technician verifies the order in the store before confirming.
+    Claimed,
+    /// The customer declined to purchase.
+    Declined,
+    /// Forward-compat catch-all.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The purchase handshake, carried inside [`ControlMessage::Purchase`] on
+/// [`CHANNEL_CONTROL`](crate::CHANNEL_CONTROL).
+///
+/// This is how a technician asks the customer to complete a purchase (the $50
+/// diagnostic session) — before answering their help call, mid-session, or
+/// after disconnecting to quote the work. Deliberate properties:
+///
+/// - **Technician-triggered only.** The customer's app never initiates one; it
+///   only ever answers a [`Request`](PurchaseControl::Request).
+/// - **Same trust bar as the connect prompt.** A Request needs no prior grant
+///   — reaching the customer's number-derived room is the discovery gate, the
+///   prompt names the asker (`agent_name`, exactly like
+///   [`ConnectControl::Request`]), and the customer verifies the name against
+///   the technician on the phone and can always decline. When a live grant
+///   exists, the customer's node prefers the *grant's* name over the wire's.
+/// - **No money moves on the mesh.** The wire carries only *display strings*
+///   and state. Payment happens in the customer's own browser on the store's
+///   hosted checkout; the checkout URL is a constant built into the customer's
+///   app ([`DIAGNOSTIC_BUY_URL`](crate::DIAGNOSTIC_BUY_URL)) — never taken from
+///   the wire, so a peer can't steer the customer's browser anywhere else.
+/// - **Human confirmation closes the loop.** The technician sees the order
+///   arrive in the store (tagged with the customer's support number), then
+///   sends [`Confirm`](PurchaseControl::Confirm). No webhooks, no server —
+///   the same person-checks-person shape as the agent-name verification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PurchaseControl {
+    /// Technician → customer: "please complete this purchase before we
+    /// continue." `item`/`price`/`note` are display strings for the customer's
+    /// prompt (the checkout page stays authoritative for the real charge); a
+    /// customer app with no defaults of its own may show them verbatim.
+    ///
+    /// Re-sent on a short loop until a [`Status`](PurchaseControl::Status)
+    /// answers (the same delivery discipline as the connect handshake); the
+    /// customer's node dedupes by `purchase_id`.
+    Request {
+        /// Unique id for this ask, minted by the technician's node — lets a
+        /// withdrawn or re-issued request be told apart from the original.
+        purchase_id: String,
+        /// The CEC session this ask belongs to — empty for an ask made outside
+        /// one (before answering a help call, or after disconnecting).
+        session_id: String,
+        /// The asker's Agent Name, for the prompt — same trust as the connect
+        /// prompt's name: the customer checks it against the person on the
+        /// phone. Ignored in favour of the grant's name when one is live.
+        #[serde(default)]
+        agent_name: String,
+        /// What's being purchased, e.g. "CEC Diagnostic Session".
+        #[serde(default)]
+        item: String,
+        /// Display price, e.g. "$50". The checkout page is authoritative.
+        #[serde(default)]
+        price: String,
+        /// Optional free-text from the technician, shown under the prompt.
+        #[serde(default)]
+        note: String,
+    },
+    /// Customer → technician: where the customer is in the flow.
+    Status {
+        purchase_id: String,
+        state: PurchaseState,
+    },
+    /// Technician → customer: order verified in the store — all set. The
+    /// customer's prompt turns into a "confirmed, continuing" note.
+    Confirm { purchase_id: String },
+    /// Technician → customer: withdraw the ask (never mind / wrong click /
+    /// taking payment another way). Dismisses the customer's prompt.
+    Cancel { purchase_id: String },
+    /// Forward-compat: an unrecognised kind decodes here and is ignored.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The single point-to-point control envelope, dispatched on the outer `t`
 /// tag. Mirrors AllMyStuff's `ControlMessage` shape, trimmed to what CEC
 /// Support uses.
@@ -207,6 +303,11 @@ pub enum ControlMessage {
     Connect(ConnectControl),
     /// App/service control.
     App(AppControl),
+    /// The mid-session purchase handshake. An older peer decodes this whole
+    /// envelope to [`Unknown`](ControlMessage::Unknown) and ignores it — which
+    /// is why [`PurchaseState::Seen`] exists: no `Seen` back means the other
+    /// side may be too old to know about purchases.
+    Purchase(PurchaseControl),
     /// Forward-compat catch-all.
     #[serde(other)]
     Unknown,
@@ -284,6 +385,98 @@ mod tests {
         assert_eq!(cc, ConnectControl::Unknown);
         let ac: AppControl = serde_json::from_str(r#"{"kind":"reboot_bios"}"#).unwrap();
         assert_eq!(ac, AppControl::Unknown);
+        let pc: PurchaseControl =
+            serde_json::from_str(r#"{"kind":"refund","purchase_id":"p"}"#).unwrap();
+        assert_eq!(pc, PurchaseControl::Unknown);
+        let ps: PurchaseState = serde_json::from_str(r#"{"kind":"escrowed"}"#).unwrap();
+        assert_eq!(ps, PurchaseState::Unknown);
+    }
+
+    #[test]
+    fn purchase_round_trips_each_variant() {
+        let msgs = vec![
+            ControlMessage::Purchase(PurchaseControl::Request {
+                purchase_id: "p1".into(),
+                session_id: "s1".into(),
+                agent_name: "Alex at CEC".into(),
+                item: "CEC Diagnostic Session".into(),
+                price: "$50".into(),
+                note: "So we can dig into the blue screens.".into(),
+            }),
+            // A sessionless ask — made before answering a help call, or after
+            // disconnecting.
+            ControlMessage::Purchase(PurchaseControl::Request {
+                purchase_id: "p2".into(),
+                session_id: String::new(),
+                agent_name: "Alex at CEC".into(),
+                item: "CEC Diagnostic Session".into(),
+                price: "$50".into(),
+                note: String::new(),
+            }),
+            ControlMessage::Purchase(PurchaseControl::Status {
+                purchase_id: "p1".into(),
+                state: PurchaseState::Seen,
+            }),
+            ControlMessage::Purchase(PurchaseControl::Status {
+                purchase_id: "p1".into(),
+                state: PurchaseState::Opened,
+            }),
+            ControlMessage::Purchase(PurchaseControl::Status {
+                purchase_id: "p1".into(),
+                state: PurchaseState::Claimed,
+            }),
+            ControlMessage::Purchase(PurchaseControl::Status {
+                purchase_id: "p1".into(),
+                state: PurchaseState::Declined,
+            }),
+            ControlMessage::Purchase(PurchaseControl::Confirm {
+                purchase_id: "p1".into(),
+            }),
+            ControlMessage::Purchase(PurchaseControl::Cancel {
+                purchase_id: "p1".into(),
+            }),
+        ];
+        for m in msgs {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: ControlMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(m, back, "round-trip {json}");
+        }
+    }
+
+    #[test]
+    fn purchase_request_tolerates_missing_display_fields() {
+        // An older (or minimal) technician sends only the ids; the display
+        // strings must default to empty so the customer's app falls back to
+        // its own built-in "CEC Diagnostic Session — $50" copy.
+        let pc: PurchaseControl =
+            serde_json::from_str(r#"{"kind":"request","purchase_id":"p1","session_id":"s1"}"#)
+                .unwrap();
+        assert_eq!(
+            pc,
+            PurchaseControl::Request {
+                purchase_id: "p1".into(),
+                session_id: "s1".into(),
+                agent_name: String::new(),
+                item: String::new(),
+                price: String::new(),
+                note: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn purchase_wire_form_is_tagged() {
+        // Pin the exact wire shape: outer `t`, inner `kind`, tagged state —
+        // the JSON contract the node relays and the GUIs consume.
+        let m = ControlMessage::Purchase(PurchaseControl::Status {
+            purchase_id: "p1".into(),
+            state: PurchaseState::Claimed,
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            json,
+            r#"{"t":"purchase","kind":"status","purchase_id":"p1","state":{"kind":"claimed"}}"#
+        );
     }
 
     #[test]

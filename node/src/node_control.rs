@@ -1469,6 +1469,40 @@ pub async fn dispatch(
             let on: bool = try_arg!(opt(a, "on")).unwrap_or(true);
             json_result(mesh.cec_help_watch(on).await)
         }
+        // The diagnostic-purchase handshake (the $50 diagnostic session).
+        // Technician verbs: request / confirm / cancel; customer verb: status.
+        // Optional, technician-triggered only; no payment data rides the node —
+        // the customer's app opens its own built-in checkout URL. `number`
+        // lets a request reach a machine with no standing connection (the
+        // help queue, or a stored machine after disconnecting), same as a
+        // dial; `session_id` is normally left empty and resolved (or omitted)
+        // node-side.
+        "cec_purchase_request" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let number: String = try_arg!(opt(a, "number")).unwrap_or_default();
+            let session_id: String = try_arg!(opt(a, "session_id")).unwrap_or_default();
+            let item: String = try_arg!(opt(a, "item")).unwrap_or_default();
+            let price: String = try_arg!(opt(a, "price")).unwrap_or_default();
+            let note: String = try_arg!(opt(a, "note")).unwrap_or_default();
+            json_result(
+                mesh.cec_purchase_request(node, number, session_id, item, price, note)
+                    .await,
+            )
+        }
+        "cec_purchase_status" => {
+            let purchase_id: String = try_arg!(arg(a, "purchase_id"));
+            let state: String = try_arg!(arg(a, "state"));
+            json_result(mesh.cec_purchase_status(purchase_id, state).await)
+        }
+        "cec_purchase_confirm" => {
+            let purchase_id: String = try_arg!(arg(a, "purchase_id"));
+            json_result(mesh.cec_purchase_confirm(purchase_id).await)
+        }
+        "cec_purchase_cancel" => {
+            let purchase_id: String = try_arg!(arg(a, "purchase_id"));
+            json_result(mesh.cec_purchase_cancel(purchase_id).await)
+        }
+        "cec_purchases" => json_result(mesh.cec_purchases().await),
         // "Forget this node" is an app-wide feature on every node's gear (drops
         // any node from the graph/roster + tears its session down). It lives on
         // the general `forget_node` op; `cec_forget_node` is kept as an alias so

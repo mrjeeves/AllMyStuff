@@ -1456,6 +1456,94 @@ export async function onCecGrants(
   );
 }
 
+/** Where a mid-session purchase ask stands. `requested` → the customer-reported
+ *  beats (`seen` / `opened` / `claimed` / `declined`) → the technician's close
+ *  (`confirmed` / `cancelled`). */
+export type CecPurchaseState =
+  | "requested"
+  | "seen"
+  | "opened"
+  | "claimed"
+  | "declined"
+  | "confirmed"
+  | "cancelled";
+
+/** One mid-session purchase ask — the $50 diagnostic session (the
+ *  `cec://purchase` event + `cec_purchases` rows). Display strings only: the
+ *  customer pays in their own browser on the store's checkout, and the
+ *  technician confirms against the store order — no payment data rides the
+ *  mesh or this app. */
+export interface CecPurchase {
+  purchase_id: string;
+  session_id: string;
+  /** The other side: the customer (technician side) / the technician
+   *  (customer side). */
+  peer: string;
+  agent_name: string;
+  item: string;
+  price: string;
+  note: string;
+  state: CecPurchaseState;
+  updated_at: number;
+}
+
+/** Technician: ask a customer to complete the $50 diagnostic-session
+ *  purchase — from the help queue before answering them, mid-session, or
+ *  after disconnecting. Strictly optional and technician-triggered. Pass the
+ *  machine's support `number` so the node can reach it even with no standing
+ *  connection (it joins the number room exactly like a dial); a live session,
+ *  when one exists, is attached node-side. Throws with the backend's reason
+ *  (e.g. unjoinable room). Null in web mode. */
+export async function cecPurchaseRequest(
+  node: string,
+  number = "",
+  note = "",
+): Promise<CecPurchase | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("cec_purchase_request", {
+    node,
+    number,
+    sessionId: "",
+    item: "",
+    price: "",
+    note,
+  })) as CecPurchase;
+}
+
+/** Technician: the order landed in the store and checks out — settle the ask
+ *  and turn the customer's prompt into "confirmed, continuing". Throws when
+ *  the customer is unreachable (the confirm never sent). */
+export async function cecPurchaseConfirm(purchaseId: string): Promise<CecPurchase | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("cec_purchase_confirm", { purchaseId })) as CecPurchase;
+}
+
+/** Technician: withdraw the ask (never mind / taking payment another way) —
+ *  dismisses the customer's prompt. */
+export async function cecPurchaseCancel(purchaseId: string): Promise<CecPurchase | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("cec_purchase_cancel", { purchaseId })) as CecPurchase;
+}
+
+/** Every tracked purchase ask — the re-sync pull so a reopened window shows
+ *  the live ask instead of losing it. Null = couldn't fetch (keep the last
+ *  snapshot); empty in web mode. */
+export async function cecPurchases(): Promise<CecPurchase[] | null> {
+  const r = await tryInvoke<CecPurchase[]>("cec_purchases");
+  return Array.isArray(r) ? r : null;
+}
+
+/** A purchase ask moved (`cec://purchase`) — requested, a customer beat, or a
+ *  close. No-op in web mode. */
+export async function onCecPurchase(cb: (p: CecPurchase) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CecPurchase>("cec://purchase", (e) => cb(e.payload));
+}
+
 // ---- virtual rooms (the rooms plane) ------------------------------------
 
 /** Fan one room-plane message out to `members` (canonical or display node

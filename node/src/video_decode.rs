@@ -192,8 +192,35 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 /// normal one-frame parser delay from a wedged/unsupported decoder.
 const ZERO_OUTPUT_AU_LIMIT: u32 = 30;
 
+/// Viewer-local choice for the native H.264 decoder. This is carried only over
+/// the GUI-to-node control socket; it is not part of route negotiation or any
+/// peer-visible control message.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DecoderPreference {
+    #[default]
+    Automatic,
+    Software,
+}
+
+impl DecoderPreference {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("automatic") {
+            "automatic" => Ok(Self::Automatic),
+            "software" => Ok(Self::Software),
+            other => Err(format!(
+                "unsupported local decoder preference {other:?} (automatic | software)"
+            )),
+        }
+    }
+
+    fn requires_software(self) -> bool {
+        matches!(self, Self::Software)
+    }
+}
+
 struct RouteDecode {
     tx: mpsc::SyncSender<Au>,
+    preference: DecoderPreference,
     /// Set on queue overflow; the thread dumps to the next key unit.
     need_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -225,8 +252,14 @@ impl DecodeBridge {
     /// its place (corrupt unit, dumped backlog) so the caller can ask the
     /// sender to re-key. Both are only captured when this call starts the
     /// thread. A full queue dumps wholesale and re-keys — see module docs.
-    pub fn feed<F, G>(&self, route_id: &str, au: Au, on_frame: F, on_glitch: G)
-    where
+    pub fn feed<F, G>(
+        &self,
+        route_id: &str,
+        preference: DecoderPreference,
+        au: Au,
+        on_frame: F,
+        on_glitch: G,
+    ) where
         F: Fn(Vec<u8>) + Send + 'static,
         G: Fn(Option<u64>) + Send + 'static,
     {
@@ -234,27 +267,37 @@ impl DecodeBridge {
         let mut au = au;
         let mut restarting = false;
         if let Some(entry) = routes.get_mut(route_id) {
-            match entry.tx.try_send(au) {
-                Ok(()) => return,
-                Err(mpsc::TrySendError::Full(_)) => {
-                    // Deltas past a full queue are useless without their
-                    // predecessors. The decoder thread drops its whole stale
-                    // backlog and requests a fresh key unit.
-                    entry.need_key.store(true, Ordering::SeqCst);
-                    return;
-                }
-                Err(mpsc::TrySendError::Disconnected(returned)) => {
-                    // A panicked/returned decoder used to leave a permanent
-                    // tombstone in `routes`: every later feed failed against
-                    // the dead receiver and the display could never restart.
-                    au = returned;
-                    restarting = true;
+            if entry.preference != preference {
+                // Decoder selection belongs to this local viewer. Replacing a
+                // watch with a different preference must replace its worker
+                // too, otherwise a visible "software" selection can keep
+                // feeding the already-running hardware decoder indefinitely.
+                restarting = true;
+            } else {
+                match entry.tx.try_send(au) {
+                    Ok(()) => return,
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // Deltas past a full queue are useless without their
+                        // predecessors. The decoder thread drops its whole stale
+                        // backlog and requests a fresh key unit.
+                        entry.need_key.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(returned)) => {
+                        // A panicked/returned decoder used to leave a permanent
+                        // tombstone in `routes`: every later feed failed against
+                        // the dead receiver and the display could never restart.
+                        au = returned;
+                        restarting = true;
+                    }
                 }
             }
         }
         if restarting {
             drop(routes.remove(route_id));
-            tracing::warn!("native video decoder for {route_id} exited; restarting");
+            tracing::warn!(
+                "native video decoder for {route_id} exited or changed preference; restarting"
+            );
         }
 
         // Every fresh decoder starts in `waiting_key`, including the ordinary
@@ -277,13 +320,14 @@ impl DecodeBridge {
             if request_key {
                 on_glitch(None);
             }
-            run_decode(&st, &nk, &id, rx, on_frame, on_glitch);
+            run_decode(&st, &nk, &id, preference, rx, on_frame, on_glitch);
         });
-        tracing::info!("native video decoder started for {route_id}");
+        tracing::info!("native video decoder started for {route_id} ({preference:?})");
         routes.insert(
             route_id.to_string(),
             RouteDecode {
                 tx,
+                preference,
                 need_key,
                 stop,
                 thread: Some(thread),
@@ -348,6 +392,11 @@ impl H264RuntimePolicy {
     #[cfg(all(windows, feature = "host"))]
     fn demote(&mut self) {
         self.delta_failures = Self::DEMOTE_AFTER;
+    }
+
+    #[cfg(all(windows, feature = "host"))]
+    fn note_zero_output_failure(&mut self) {
+        self.demote();
     }
 
     fn requires_software(&self) -> bool {
@@ -602,6 +651,7 @@ fn run_decode<F, G>(
     stop: &AtomicBool,
     need_key: &AtomicBool,
     route_id: &str,
+    preference: DecoderPreference,
     rx: mpsc::Receiver<Au>,
     on_frame: F,
     on_glitch: G,
@@ -724,7 +774,12 @@ fn run_decode<F, G>(
         if decoder.is_none() {
             let built = match stream_codec {
                 AuCodec::H264 => {
-                    let opened = if h264_runtime.requires_software() {
+                    let opened = if preference.requires_software() {
+                        tracing::info!(
+                            "H.264 decoder for {route_id}: viewer selected OpenH264 software"
+                        );
+                        H264Rung::software()
+                    } else if h264_runtime.requires_software() {
                         tracing::warn!(
                             "H.264 decoder for {route_id}: repeated NVDEC delta failures; keeping this route on OpenH264 software"
                         );
@@ -1056,6 +1111,19 @@ fn run_decode<F, G>(
             }
         }
         if let Some(e) = broke {
+            #[cfg(all(windows, feature = "host"))]
+            if zero_output_aus >= ZERO_OUTPUT_AU_LIMIT
+                && matches!(decoder.as_ref(), Some(Active::H264(H264Rung::Nvdec(_))))
+            {
+                // An NVDEC session can accept every access unit while never
+                // surfacing a picture. Reopening the same rung only recreates
+                // the black-screen loop, so automatic mode takes the portable
+                // software rung on the next clean entry.
+                h264_runtime.note_zero_output_failure();
+                tracing::warn!(
+                    "H.264 NVDEC for {route_id} produced no pictures across {ZERO_OUTPUT_AU_LIMIT} accepted access units; demoting this route to OpenH264"
+                );
+            }
             // Corrupt bitstream (a lost unit upstream): drop the decoder,
             // re-enter at the next IDR. Rate-limited — at frame rate this
             // would otherwise be a log flood.
@@ -1159,6 +1227,7 @@ mod tests {
             "dead-route".into(),
             RouteDecode {
                 tx: dead_tx,
+                preference: DecoderPreference::Automatic,
                 need_key: Arc::new(AtomicBool::new(false)),
                 stop: Arc::new(AtomicBool::new(false)),
                 thread: None,
@@ -1168,6 +1237,7 @@ mod tests {
         let (glitch_tx, glitch_rx) = mpsc::channel();
         bridge.feed(
             "dead-route",
+            DecoderPreference::Automatic,
             Au {
                 ts_us: 1,
                 key: false,
@@ -1200,6 +1270,7 @@ mod tests {
         let (glitch_tx, glitch_rx) = mpsc::channel();
         bridge.feed(
             "fresh-delta-route",
+            DecoderPreference::Automatic,
             Au {
                 ts_us: 1,
                 key: false,
@@ -1218,6 +1289,84 @@ mod tests {
         );
         assert!(bridge.is_running("fresh-delta-route"));
         bridge.stop("fresh-delta-route");
+    }
+
+    #[test]
+    fn local_decoder_preference_is_strict_and_defaults_to_automatic() {
+        assert_eq!(
+            DecoderPreference::parse(None).unwrap(),
+            DecoderPreference::Automatic
+        );
+        assert_eq!(
+            DecoderPreference::parse(Some("automatic")).unwrap(),
+            DecoderPreference::Automatic
+        );
+        assert_eq!(
+            DecoderPreference::parse(Some("software")).unwrap(),
+            DecoderPreference::Software
+        );
+        assert!(DecoderPreference::Software.requires_software());
+        assert!(DecoderPreference::parse(Some("nvdec")).is_err());
+    }
+
+    #[test]
+    fn changing_local_decoder_preference_replaces_the_route_worker() {
+        let bridge = DecodeBridge::new();
+        let delta = || Au {
+            ts_us: 1,
+            key: false,
+            data: vec![0, 0, 0, 1, 0x41, 0x9a],
+        };
+
+        bridge.feed(
+            "preference-route",
+            DecoderPreference::Automatic,
+            delta(),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(
+            bridge
+                .routes
+                .lock()
+                .get("preference-route")
+                .map(|route| route.preference),
+            Some(DecoderPreference::Automatic)
+        );
+
+        bridge.feed(
+            "preference-route",
+            DecoderPreference::Software,
+            delta(),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(
+            bridge
+                .routes
+                .lock()
+                .get("preference-route")
+                .map(|route| route.preference),
+            Some(DecoderPreference::Software)
+        );
+        bridge.stop("preference-route");
+    }
+
+    #[cfg(all(windows, feature = "host"))]
+    #[test]
+    fn zero_output_failure_demotes_h264_route_until_restart() {
+        let mut policy = H264RuntimePolicy::default();
+        assert!(!policy.requires_software());
+        policy.note_zero_output_failure();
+        assert!(
+            policy.requires_software(),
+            "a decoder that accepts the zero-output limit must not reopen NVDEC"
+        );
+        policy.reset();
+        assert!(
+            !policy.requires_software(),
+            "a new route generation gets the automatic hardware ladder again"
+        );
     }
 
     #[cfg(all(windows, feature = "host"))]
@@ -1289,6 +1438,7 @@ mod tests {
             let tx = tx.clone();
             bridge.feed(
                 "r1",
+                DecoderPreference::Automatic,
                 Au {
                     ts_us: 0,
                     key: shade == 40, // first unit out of a fresh encoder is the IDR
@@ -1342,6 +1492,7 @@ mod tests {
             let sink = tx.clone();
             bridge.feed(
                 "resize-route",
+                DecoderPreference::Automatic,
                 Au {
                     ts_us: seq * 20_000,
                     key: true,
@@ -1436,6 +1587,7 @@ mod tests {
                 let sink = frame_tx.clone();
                 bridge.feed(
                     "paced-h264-route",
+                    DecoderPreference::Automatic,
                     Au {
                         ts_us,
                         key: is_decode_entry(&data),
@@ -1540,6 +1692,7 @@ mod tests {
                     let sink = got.clone();
                     bridge.feed(
                         "route-hevc",
+                        DecoderPreference::Automatic,
                         Au {
                             ts_us: i * 16_667,
                             key: false,

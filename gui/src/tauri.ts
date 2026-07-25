@@ -578,10 +578,12 @@ function parseVideoPacket(
  *  packets — for webviews without WebCodecs, and the bottom rung of the
  *  console's decode ladder. Returns an unwatch fn (a no-op in web mode,
  *  where no frames can arrive anyway). */
+export type NativeDecoderPreference = "automatic" | "software";
+
 export async function watchVideo(
   routeId: string,
   cb: (f: VideoFrameMsg) => void,
-  opts?: { decode?: boolean },
+  opts?: { decode?: boolean; decoder?: NativeDecoderPreference },
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { invoke } = await import("@tauri-apps/api/core");
@@ -589,6 +591,7 @@ export async function watchVideo(
   const token = (await invoke("video_watch", {
     routeId,
     decode: opts?.decode ?? false,
+    decoder: opts?.decoder ?? "automatic",
   })) as number;
   let stopped = false;
   let inFlight = false;
@@ -1697,9 +1700,10 @@ export async function isWindowFullscreen(): Promise<boolean> {
 export async function openVideoWindow(
   key: string,
   title: string,
+  decoder: NativeDecoderPreference = "automatic",
 ): Promise<void> {
   if (!isTauri()) return;
-  await tryInvoke("open_video_window", { key, title });
+  await tryInvoke("open_video_window", { key, title, decoder });
 }
 
 /** Which stream this window is a popout for, when it was opened by
@@ -1707,6 +1711,15 @@ export async function openVideoWindow(
 export function videoWindowTarget(): string | null {
   if (typeof window === "undefined") return null;
   return new URLSearchParams(window.location.search).get("video");
+}
+
+/** Native decoder choice carried into a dedicated video popout. This query
+ *  belongs to the local window only and never enters route negotiation. */
+export function videoWindowDecoderPreference(): NativeDecoderPreference {
+  if (typeof window === "undefined") return "automatic";
+  return new URLSearchParams(window.location.search).get("decoder") === "software"
+    ? "software"
+    : "automatic";
 }
 
 /** Pop the CEC Support console out into its own window. One fixed window —

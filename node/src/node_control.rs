@@ -51,6 +51,7 @@ use allmystuff_session::{FileEvent, InputAction, TermEvent};
 use crate::control_client::{ControlClient, Request};
 use crate::mesh::Mesh;
 use crate::networks_store::DisabledNetworks;
+use crate::video_decode::DecoderPreference;
 use crate::UiSink;
 
 // ---------------------------------------------------------------------------
@@ -956,7 +957,13 @@ pub async fn dispatch(
         "video_watch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             let decode: Option<bool> = try_arg!(opt(a, "decode"));
-            DispatchOut::Json(json!(mesh.video_watch(route_id, decode.unwrap_or(false))))
+            let decoder: Option<String> = try_arg!(opt(a, "decoder"));
+            let decoder = try_arg!(DecoderPreference::parse(decoder.as_deref()));
+            DispatchOut::Json(json!(mesh.video_watch(
+                route_id,
+                decode.unwrap_or(false),
+                decoder,
+            )))
         }
         "video_poll" => {
             let route_id: String = try_arg!(arg(a, "route_id"));

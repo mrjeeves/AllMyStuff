@@ -50,7 +50,7 @@ use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
-use crate::video_decode::{Au, DecodeBridge};
+use crate::video_decode::{Au, DecodeBridge, DecoderPreference};
 use std::time::{Duration, Instant};
 
 pub struct Mesh {
@@ -376,6 +376,9 @@ struct VideoWatcher {
     /// Whether this window asked the backend to decode H.264 for it
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
+    /// Which native H.264 rung this local window selected. This never leaves
+    /// the GUI-to-node process boundary.
+    decoder: DecoderPreference,
     queue: std::collections::VecDeque<Vec<u8>>,
     /// Updated by the window's 16 ms safety poll even when no frame arrived.
     /// A post-disconnect-request poll is stronger liveness evidence than mere
@@ -3836,11 +3839,12 @@ impl Mesh {
         // Time the pacer's chunk trains as they land — the bandwidth
         // estimate + delay trend the feedback loop reports back (M3/T1.1).
         self.note_video_arrival(&route_id, rtp_timestamp, data.len());
-        let wants_decode = self
+        let (wants_decode, decoder_preference) = self
             .video_watchers
             .lock()
             .get(&route_id)
-            .is_some_and(|w| w.decode);
+            .map(|w| (w.decode, w.decoder))
+            .unwrap_or((false, DecoderPreference::Automatic));
         if first {
             tracing::info!(
                 "first H.264 sample for {route_id} from {} ({} bytes, key={key}, native decode={wants_decode})",
@@ -3857,6 +3861,7 @@ impl Mesh {
             let glitch_rid = route_id.clone();
             self.video_decode.feed(
                 &route_id,
+                decoder_preference,
                 Au { ts_us, key, data },
                 move |packet| {
                     if let Some(mesh) = mesh.upgrade() {
@@ -4139,7 +4144,7 @@ impl Mesh {
     /// units — for webviews without WebCodecs, and the last rung of the
     /// console's decode ladder. Returns the claim token to pass back to
     /// [`Self::video_unwatch`].
-    pub fn video_watch(&self, route_id: String, decode: bool) -> u64 {
+    pub fn video_watch(&self, route_id: String, decode: bool, decoder: DecoderPreference) -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
         if !decode {
@@ -4150,7 +4155,9 @@ impl Mesh {
         // One line per watch claim, so a viewer-side log shows which
         // window holds each stream and on which decode path — the missing
         // half of "frames flowing but no window watching".
-        tracing::info!("window watching {route_id} (native decode: {decode})");
+        tracing::info!(
+            "window watching {route_id} (native decode: {decode}, decoder: {decoder:?})"
+        );
         // A fresh watch (a re-open, an input switch) must start its peer's
         // video dead-lane grace over. When the previous session closed, its
         // orphaned frames drained with no route here and left a stale
@@ -4184,6 +4191,7 @@ impl Mesh {
             VideoWatcher {
                 token,
                 decode,
+                decoder,
                 queue: std::collections::VecDeque::new(),
                 last_poll: Instant::now(),
             },

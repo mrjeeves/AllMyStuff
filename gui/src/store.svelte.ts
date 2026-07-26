@@ -52,6 +52,7 @@ import {
   connectRoute,
   labsSet,
   tuneRoute,
+  type NativeDecoderPreference,
   type StreamTune,
   type VideoLocalEvent,
   consoleWindowTarget,
@@ -3573,7 +3574,10 @@ class AppStore {
    *  *first* (awaited, so the teardown precedes the popout's fresh offer
    *  on the wire — the same ordering the console's tab switches keep, so
    *  the popout takes the H.264 lane over instead of racing it). */
-  async popOutConsoleInput(capId: string) {
+  async popOutConsoleInput(
+    capId: string,
+    decoder: NativeDecoderPreference = "automatic",
+  ) {
     if (!isTauri() || isMobile()) return;
     const cap = this.capability(capId);
     if (!cap) return;
@@ -3586,7 +3590,11 @@ class AppStore {
       if (owned) await this.disconnect(owned);
     }
     const machine = this.machineByAnyId(cap.node);
-    void openVideoWindow(key, `${cap.label} · ${machine?.label ?? "AllMyStuff"}`);
+    void openVideoWindow(
+      key,
+      `${cap.label} · ${machine?.label ?? "AllMyStuff"}`,
+      decoder,
+    );
   }
 
   /** Lift a room share's tile out into its own OS window. The popout only

@@ -51,6 +51,7 @@ use allmystuff_session::{FileEvent, InputAction, TermEvent};
 use crate::control_client::{ControlClient, Request};
 use crate::mesh::Mesh;
 use crate::networks_store::DisabledNetworks;
+use crate::video_decode::DecoderPreference;
 use crate::UiSink;
 
 // ---------------------------------------------------------------------------
@@ -956,7 +957,13 @@ pub async fn dispatch(
         "video_watch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             let decode: Option<bool> = try_arg!(opt(a, "decode"));
-            DispatchOut::Json(json!(mesh.video_watch(route_id, decode.unwrap_or(false))))
+            let decoder: Option<String> = try_arg!(opt(a, "decoder"));
+            let decoder = try_arg!(DecoderPreference::parse(decoder.as_deref()));
+            DispatchOut::Json(json!(mesh.video_watch(
+                route_id,
+                decode.unwrap_or(false),
+                decoder,
+            )))
         }
         "video_poll" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
@@ -1962,7 +1969,7 @@ async fn ensure_node_current(bin: &Path, pin: &str) {
 /// [`crate::daemon_spawn::ensure_daemon_running`]'s shape; the GUI will call
 /// this in Phase B.
 pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
-    ensure_node_running_pinned(None).await
+    ensure_node_running_impl(None, false).await
 }
 
 /// Like [`ensure_node_running`], but the caller supplies the AllMyStuff version
@@ -1971,10 +1978,105 @@ pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
 /// itself first — the same "keep a sidecar you don't own current" move
 /// AllMyStuff makes for a reused `myownmesh` (see [`crate::daemon_spawn`]). The
 /// CEC Support app uses this so a separately-installed AllMyStuff node it reuses
-/// is brought up to the version CEC needs to work properly. `pin = None` is
-/// exactly [`ensure_node_running`]'s behaviour — no version check at all.
+/// is brought up to the version CEC needs to work properly. On Windows this
+/// CEC-specific entry point also rejects a Session 0 media/input node. A
+/// `pin = None` skips only the version check.
 pub async fn ensure_node_running_pinned(pin: Option<&str>) -> Result<Option<NodeChild>> {
+    ensure_node_running_impl(pin, true).await
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinnedNodeAction {
+    Reuse,
+    Spawn,
+}
+
+/// Decide whether CEC Support may reuse or create the shared node.
+///
+/// CEC's Windows service runs as LocalSystem in Session 0. It may use an
+/// already-running interactive node, but it must never create or reuse a media
+/// and input host in Session 0.
+#[cfg(any(windows, test))]
+fn pinned_node_action(caller_session: u32, node_session: Option<u32>) -> Result<PinnedNodeAction> {
+    match node_session {
+        Some(0) => bail!(
+            "the shared AllMyStuff node is running in Windows Session 0; \
+             refusing to attach desktop capture or input"
+        ),
+        Some(_) => Ok(PinnedNodeAction::Reuse),
+        None if caller_session == 0 => bail!(
+            "no interactive AllMyStuff node is running; refusing to launch \
+             desktop capture or input from Windows Session 0"
+        ),
+        None => Ok(PinnedNodeAction::Spawn),
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_session(pid: u32) -> Result<u32> {
+    let mut session_id = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session_id)
+    };
+    if ok == 0 {
+        bail!(
+            "resolve Windows SessionId for PID {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(session_id)
+}
+
+#[cfg(windows)]
+async fn windows_node_process_session() -> Result<(u32, u32)> {
+    let client = NodeClient::new()?;
+    let stream = client
+        .connect()
+        .await
+        .context("connect to inspect the shared node owner")?;
+    let pid = stream
+        .peer_creds()
+        .context("read shared node pipe credentials")?
+        .pid()
+        .ok_or_else(|| anyhow!("the shared node pipe did not report an owner PID"))?;
+    let session_id = windows_process_session(pid)?;
+    Ok((pid, session_id))
+}
+
+async fn ensure_node_running_impl(
+    pin: Option<&str>,
+    require_interactive_windows_node: bool,
+) -> Result<Option<NodeChild>> {
+    #[cfg(windows)]
+    let caller = if require_interactive_windows_node {
+        let pid = std::process::id();
+        let session_id = windows_process_session(pid)?;
+        tracing::info!(
+            caller_pid = pid,
+            caller_session_id = session_id,
+            "validating CEC Support node session ownership"
+        );
+        Some((pid, session_id))
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let _ = require_interactive_windows_node;
+
     if NodeClient::probe().await {
+        #[cfg(windows)]
+        if let Some((caller_pid, caller_session_id)) = caller {
+            let (node_pid, node_session_id) = windows_node_process_session().await?;
+            pinned_node_action(caller_session_id, Some(node_session_id))?;
+            tracing::info!(
+                caller_pid,
+                caller_session_id,
+                node_pid,
+                node_session_id,
+                "CEC Support is reusing an interactive AllMyStuff node"
+            );
+        }
         tracing::info!("existing allmystuff node found on the control socket");
         // A node we didn't spawn is already serving. If the caller pins a
         // version and the on-disk Installed binary is behind it, refresh it so
@@ -2002,6 +2104,16 @@ pub async fn ensure_node_running_pinned(pin: Option<&str>) -> Result<Option<Node
             }
         }
         return Ok(None);
+    }
+
+    #[cfg(windows)]
+    if let Some((caller_pid, caller_session_id)) = caller {
+        pinned_node_action(caller_session_id, None)?;
+        tracing::info!(
+            caller_pid,
+            caller_session_id,
+            "CEC Support may launch the node in this interactive session"
+        );
     }
 
     let (bin, source) = find_node_binary().ok_or_else(|| {
@@ -2098,6 +2210,25 @@ pub async fn ensure_node_running_pinned(pin: Option<&str>) -> Result<Option<Node
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pinned_node_session_policy_allows_only_interactive_media_hosts() {
+        assert_eq!(
+            pinned_node_action(0, Some(1)).unwrap(),
+            PinnedNodeAction::Reuse
+        );
+        assert_eq!(
+            pinned_node_action(1, Some(1)).unwrap(),
+            PinnedNodeAction::Reuse
+        );
+        assert_eq!(
+            pinned_node_action(1, None).unwrap(),
+            PinnedNodeAction::Spawn
+        );
+        assert!(pinned_node_action(0, None).is_err());
+        assert!(pinned_node_action(1, Some(0)).is_err());
+        assert!(pinned_node_action(0, Some(0)).is_err());
+    }
 
     /// AMS-04: the Unix control socket must be bound owner-only (0600) so no
     /// other local user/process can reach the privileged control API. Binds a

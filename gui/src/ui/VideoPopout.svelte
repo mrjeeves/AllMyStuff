@@ -31,6 +31,7 @@
     sendInput,
     toggleWindowFullscreen,
     tuneRoute,
+    videoWindowDecoderPreference,
     watchVideo,
     watchVideoStatus,
     type StreamTune,
@@ -47,6 +48,11 @@
     const route = app.catalog.routes.find((r) => r.id === app.videoPopoutLive);
     return (route && app.capabilityForDisplay(route.from)) ?? null;
   });
+  const sourceMachine = $derived(
+    sourceCap ? app.machineByAnyId(sourceCap.node) : undefined,
+  );
+  const kvmSource = $derived(app.isKvm(sourceMachine));
+  const decoderPreference = videoWindowDecoderPreference();
   /** Whether this window owns its route (a console input it wired) —
    *  what gates the quality pills. A watched room share is the sender's
    *  stream to shape. */
@@ -373,7 +379,7 @@
         // h264 never arrives here — decode: true means the backend hands
         // this window ready-to-paint frames.
       },
-      { decode: true },
+      { decode: true, decoder: decoderPreference },
     ).then((u) => {
       if (cancelled) u();
       else unwatch = u;
@@ -438,7 +444,7 @@
     pointerLocked = document.pointerLockElement === stageEl;
   }
   function maybePointerLock() {
-    if (fullscreen && controlActive && !pointerLocked) {
+    if (fullscreen && controlActive && !kvmSource && !pointerLocked) {
       void stageEl?.requestPointerLock();
     }
   }
@@ -448,7 +454,7 @@
   });
   $effect(() => {
     // Falling out of fullscreen or control releases the capture.
-    if (pointerLocked && (!fullscreen || !controlActive)) {
+    if (pointerLocked && (!fullscreen || !controlActive || kvmSource)) {
       document.exitPointerLock();
     }
   });
@@ -456,7 +462,7 @@
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
-    if (pointerLocked) {
+    if (pointerLocked && !kvmSource) {
       // Raw deltas, uncoalesced beyond the browser's own batching — this
       // is the aim path; the 16 ms absolute-move throttle doesn't apply.
       if (e.movementX !== 0 || e.movementY !== 0) {
@@ -478,7 +484,7 @@
     // forward even if the cursor was last over a hover-bar button.
     if (down) stageEl?.focus({ preventScroll: true });
     if (down) maybePointerLock();
-    if (pointerLocked) {
+    if (pointerLocked && !kvmSource) {
       e.preventDefault();
       send({ kind: "mouse_button", button: e.button, down });
       return;

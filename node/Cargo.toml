@@ -245,6 +245,9 @@ windows-sys = { version = "0.60", features = [
     # QueryPerformanceCounter/Frequency — mapping DXGI's QPC LastPresentTime
     # onto the monotonic clock for the M1 capture-age span (win_capture.rs).
     "Win32_System_Performance",
+    # ProcessIdToSessionId validates that CEC Support only reuses an
+    # interactive-session media/input node and never starts one in Session 0.
+    "Win32_System_RemoteDesktop",
     # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (daemon_spawn's kill-on-close job)
     # embeds IO_COUNTERS, which windows-sys gates behind Threading. The GUI
     # workspace got this feature via unification from another dep; the node

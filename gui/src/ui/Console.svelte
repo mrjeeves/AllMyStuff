@@ -40,6 +40,7 @@
     toggleWindowFullscreen,
     watchVideo,
     watchVideoStatus,
+    type NativeDecoderPreference,
     type VideoHostStatus,
   } from "../tauri";
   import {
@@ -58,6 +59,7 @@
   let { windowed = false }: { windowed?: boolean } = $props();
 
   const node = $derived(app.consoleNode);
+  const kvmSource = $derived(app.isKvm(node ?? undefined));
   // What this machine actually shared with us — the console activates with
   // whatever subset is available and hides the toggles for the rest (a
   // screen-only share shows the screen, no inert Audio/Control buttons).
@@ -206,6 +208,10 @@
   // repeatedly. Sticky for the session — a webview whose decoder wedged
   // once isn't owed a third chance.
   let nativeDecode = $state(typeof VideoDecoder === "undefined");
+  // The decode location and the selected native rung are separate. Automatic
+  // native fallback may still use a GPU decoder; the visible software choice
+  // must force OpenH264 on this viewer only.
+  let nativeDecoderPreference = $state<NativeDecoderPreference>("automatic");
 
   // ---- the quality choices --------------------------------------------
   //
@@ -332,6 +338,7 @@
     openSub = null;
     // Where to decode is this window's choice; which transport to offer
     // is the store's (it re-offers the route when that part changes).
+    nativeDecoderPreference = v === "native" ? "software" : "automatic";
     nativeDecode = v === "native" || (v === "auto" && typeof VideoDecoder === "undefined");
     app.setConsoleCodec(v === "mjpeg" ? "mjpeg" : v === "auto" ? "auto" : "h264");
   }
@@ -603,10 +610,17 @@
       try {
         void VideoDecoder.isConfigSupported({ codec: "avc1.42E01F" })
           .then((s) => {
-            if (!s.supported) nativeDecode = true;
+            if (!s.supported) {
+              nativeDecoderPreference = "automatic";
+              nativeDecode = true;
+            }
           })
-          .catch(() => (nativeDecode = true));
+          .catch(() => {
+            nativeDecoderPreference = "automatic";
+            nativeDecode = true;
+          });
       } catch {
+        nativeDecoderPreference = "automatic";
         nativeDecode = true;
       }
     }
@@ -701,6 +715,7 @@
     // Reading this here makes the ladder's last rung re-run the effect:
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
+    const nativeDecoder = nativeDecoderPreference;
     // A route CHANGE (screen tab, camera tab, or the teardown between
     // them) with a picture on the glass = a switch: hold the old frame
     // dimmed instead of flashing the placeholder. A decode-mode re-wire
@@ -788,10 +803,14 @@
     let pendingFrame: VideoFrame | null = null;
     let paintScheduled = false;
     queuePeek = () => decoder?.decodeQueueSize ?? 0;
-    decodeModeNote = native ? "native" : "";
+    decodeModeNote = native ? `native ${nativeDecoder === "software" ? "sw" : "auto"}` : "";
     // "webview (hw)" only asserts we *asked* for hardware (prefer-hardware);
     // whether WKWebView honours it shows in whether decFps reaches 60.
-    decodePath = native ? "native (sw)" : "webview (hw)";
+    decodePath = native
+      ? nativeDecoder === "software"
+        ? "native (sw)"
+        : "native (auto)"
+      : "webview (hw)";
 
     const rebuildDecoder = () => {
       if (decodeMode !== "prefer-software") {
@@ -803,6 +822,7 @@
         // openh264 decoder. Setting the flag re-runs this effect, which
         // re-watches the route in native mode (and tears this rung down).
         console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
+        nativeDecoderPreference = "software";
         nativeDecode = true;
         decodePath = "native (sw)";
         askRefresh();
@@ -1033,7 +1053,7 @@
       // rebuild as mid-stream stalls — without waiting for the 1s sweep.
       if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
       },
-      { decode: native },
+      { decode: native, decoder: nativeDecoder },
     ).then((u) => {
       // The route may have changed while the subscribe was in flight.
       if (cancelled) u();
@@ -1509,7 +1529,7 @@
     pointerLocked = document.pointerLockElement === stageEl;
   }
   function maybePointerLock() {
-    if (theater && stagePointerActive && !pointerLocked) {
+    if (theater && stagePointerActive && !kvmSource && !pointerLocked) {
       void stageEl?.requestPointerLock();
     }
   }
@@ -1519,7 +1539,7 @@
   });
   $effect(() => {
     // Falling out of theater or control releases the capture.
-    if (pointerLocked && (!theater || !stagePointerActive)) {
+    if (pointerLocked && (!theater || !stagePointerActive || kvmSource)) {
       document.exitPointerLock();
     }
   });
@@ -1535,7 +1555,7 @@
       touchMouse.move(e);
       return;
     }
-    if (pointerLocked && stagePointerActive) {
+    if (pointerLocked && stagePointerActive && !kvmSource) {
       // Raw deltas, no throttle — the aiming path.
       if (e.movementX !== 0 || e.movementY !== 0) {
         app.sendConsoleInput({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
@@ -1628,7 +1648,7 @@
     // mouse; while captured, buttons forward raw (no position re-seat —
     // the relative stream owns the cursor).
     if (down) maybePointerLock();
-    if (pointerLocked) {
+    if (pointerLocked && !kvmSource) {
       e.preventDefault();
       app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
       if (down) heldButtons.add(e.button);
@@ -2063,7 +2083,9 @@
                 class="kbtn"
                 title="Pop {selected.label} out into its own window"
                 aria-label="Pop {selected.label} out into its own window"
-                onclick={() => selectedId && void app.popOutConsoleInput(selectedId)}>⧉</button
+                onclick={() =>
+                  selectedId &&
+                  void app.popOutConsoleInput(selectedId, nativeDecoderPreference)}>⧉</button
               >
             {/if}
           {/if}
@@ -2260,7 +2282,7 @@
                       aria-label="Pop {inp.label} out into its own window"
                       onclick={(e) => {
                         e.stopPropagation();
-                        void app.popOutConsoleInput(inp.id);
+                        void app.popOutConsoleInput(inp.id, nativeDecoderPreference);
                       }}>⧉</button
                     >
                   {/if}

@@ -41,14 +41,53 @@ use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_autostart::ManagerExt;
 
+mod backend_recovery;
 mod window_behavior;
+
+use backend_recovery::{
+    BackendRecovery, Decision as RecoveryDecision, Observation as RecoveryObservation,
+    Ownership as RecoveryOwnership, SocketState as RecoverySocketState, WEDGED_RESTART_ROUNDS,
+};
+
+#[derive(Default)]
+struct OwnedNode {
+    child: Option<NodeChild>,
+    /// Monotonic identity for GUI-owned node processes. Reusing an external
+    /// service node leaves this unchanged because the GUI does not own it.
+    generation: u64,
+}
+
+impl OwnedNode {
+    fn install(&mut self, child: NodeChild) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.child = Some(child);
+        self.generation
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.child.as_mut().is_some_and(NodeChild::is_alive)
+    }
+
+    fn observation(&mut self) -> (RecoveryOwnership, u64) {
+        let ownership = if self.is_alive() {
+            RecoveryOwnership::GuiOwnedAlive
+        } else {
+            RecoveryOwnership::NoLiveGuiChild
+        };
+        (ownership, self.generation)
+    }
+
+    fn take(&mut self) {
+        self.child.take();
+    }
+}
 
 struct AppState {
     node: Arc<NodeClient>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
     /// the app); a reused service node has no child here and keeps running.
-    node_child: Mutex<Option<NodeChild>>,
+    node_child: Mutex<OwnedNode>,
 }
 
 // ---- this machine -----------------------------------------------------
@@ -413,13 +452,18 @@ async fn clipboard_pull(state: State<'_, AppState>, route_id: String) -> Result<
 /// frames — for webviews without WebCodecs, and the bottom rung of the
 /// console's decode ladder.
 #[tauri::command]
-async fn video_watch(app: tauri::AppHandle, route_id: String, decode: Option<bool>) -> u64 {
+async fn video_watch(
+    app: tauri::AppHandle,
+    route_id: String,
+    decode: Option<bool>,
+    decoder: Option<String>,
+) -> u64 {
     let state = app.state::<AppState>();
     match state
         .node
         .request(
             "video_watch",
-            json!({ "route_id": route_id, "decode": decode }),
+            json!({ "route_id": route_id, "decode": decode, "decoder": decoder }),
         )
         .await
     {
@@ -976,13 +1020,23 @@ async fn open_video_window(
     app: tauri::AppHandle,
     key: String,
     title: String,
+    decoder: Option<String>,
 ) -> Result<(), String> {
+    let decoder = match decoder.as_deref() {
+        None | Some("automatic") => "automatic",
+        Some("software") => "software",
+        Some(other) => {
+            return Err(format!(
+                "unsupported local decoder preference {other:?} (automatic | software)"
+            ))
+        }
+    };
     open_secondary_window(
         &app,
         &format!("video-{}", window_slug(&key)),
         // The key carries capability/route ids (colons, the route arrow) —
         // percent-encode so the query survives; URLSearchParams decodes.
-        format!("index.html?video={}", query_encode(&key)),
+        format!("index.html?video={}&decoder={decoder}", query_encode(&key)),
         &title,
         (880.0, 560.0),
         (380.0, 260.0),
@@ -2217,19 +2271,13 @@ fn heal_node(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Never heal over our own live serve — replacing its handle would
         // kill it (see the pump's wedge handling).
-        if handle
-            .state::<AppState>()
-            .node_child
-            .lock()
-            .as_mut()
-            .map(|c| c.is_alive())
-            .unwrap_or(false)
-        {
+        if handle.state::<AppState>().node_child.lock().is_alive() {
             return;
         }
         match ensure_node_running().await {
             Ok(Some(child)) => {
-                handle.state::<AppState>().node_child.lock().replace(child);
+                let generation = handle.state::<AppState>().node_child.lock().install(child);
+                tracing::info!(generation, "installed GUI-owned node during heal");
             }
             Ok(None) => {}
             Err(e) => tracing::error!("couldn't bring the allmystuff node back up: {e:#}"),
@@ -2271,10 +2319,7 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
 /// in-process. Reconnects if the node restarts.
 async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
     use tokio::sync::mpsc;
-    // Consecutive grace windows the socket stayed dead while OUR child kept
-    // running — the wedged-not-gone state. Only a repeat offender earns a
-    // deliberate, owner-controlled restart.
-    let mut wedged_rounds: u32 = 0;
+    let mut recovery = BackendRecovery::default();
     loop {
         // The node may be *gone*, not just restarting — e.g. another client app
         // (CEC Support) spawned it and exited, taking the kill-on-close serve
@@ -2284,64 +2329,111 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
         // bound yet) must not read as "gone": respawning over it would
         // kill-on-drop the very child being waited on, and the stack would
         // flap spawn/kill forever.
-        let mut gone = !NodeClient::probe().await;
-        if gone {
+        let first_probe_ready = NodeClient::probe().await;
+        let mut socket = if first_probe_ready {
+            RecoverySocketState::Ready
+        } else {
+            RecoverySocketState::Unresponsive
+        };
+        if !first_probe_ready {
             for _ in 0..50 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 if NodeClient::probe().await {
-                    gone = false;
+                    socket = RecoverySocketState::ReadyAfterGrace;
                     break;
                 }
             }
         }
-        if gone {
-            // Socket dead through the grace window — but if OUR child is still
-            // running, the serve is alive behind a busy/wedged socket, not
-            // gone. Respawning then spawns a bind-loser and kills the live
-            // serve when the old handle is replaced: the spawn/kill metronome
-            // that made every peer connect/reconnect in a loop. Only respawn
-            // over a child we've confirmed dead; a serve that stays wedged for
-            // three straight windows gets a deliberate owner restart instead.
-            let own_alive = app
-                .state::<AppState>()
-                .node_child
-                .lock()
-                .as_mut()
-                .map(|c| c.is_alive())
-                .unwrap_or(false);
-            if own_alive {
-                wedged_rounds += 1;
-                if wedged_rounds >= 3 {
-                    tracing::warn!(
-                        "node socket dead across {wedged_rounds} grace windows with our serve alive — restarting it deliberately"
-                    );
-                    app.state::<AppState>().node_child.lock().take();
-                    wedged_rounds = 0;
-                    match ensure_node_running().await {
-                        Ok(Some(child)) => {
-                            app.state::<AppState>().node_child.lock().replace(child);
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
-                    }
-                } else {
-                    tracing::warn!(
-                        "node socket unresponsive but our serve is still running — not respawning over it ({wedged_rounds}/3)"
-                    );
-                }
-            } else {
-                wedged_rounds = 0;
-                tracing::info!("node is gone — bringing it back up");
+
+        let (ownership, generation) = app.state::<AppState>().node_child.lock().observation();
+        let evidence = recovery.observe(RecoveryObservation {
+            socket,
+            ownership,
+            generation,
+        });
+        match evidence.decision {
+            RecoveryDecision::Healthy => {
+                tracing::debug!(
+                    target: "allmystuff::backend_recovery",
+                    socket = evidence.observation.socket.label(),
+                    ownership = evidence.observation.ownership.label(),
+                    generation = evidence.observation.generation,
+                    prior_wedged_rounds = evidence.prior_wedged_rounds,
+                    wedged_rounds = evidence.wedged_rounds,
+                    decision = evidence.decision.label(),
+                    "local node recovery decision"
+                );
+            }
+            RecoveryDecision::StartupCompleted => {
+                tracing::info!(
+                    target: "allmystuff::backend_recovery",
+                    socket = evidence.observation.socket.label(),
+                    ownership = evidence.observation.ownership.label(),
+                    generation = evidence.observation.generation,
+                    decision = evidence.decision.label(),
+                    "local node became ready during the existing startup grace window"
+                );
+            }
+            RecoveryDecision::WaitForOwnedNode => {
+                tracing::warn!(
+                    target: "allmystuff::backend_recovery",
+                    socket = evidence.observation.socket.label(),
+                    ownership = evidence.observation.ownership.label(),
+                    generation = evidence.observation.generation,
+                    wedged_rounds = evidence.wedged_rounds,
+                    restart_after = WEDGED_RESTART_ROUNDS,
+                    decision = evidence.decision.label(),
+                    "local node socket is unresponsive while the GUI-owned process remains alive"
+                );
+            }
+            RecoveryDecision::RestartOwnedNode => {
+                tracing::warn!(
+                    target: "allmystuff::backend_recovery",
+                    socket = evidence.observation.socket.label(),
+                    ownership = evidence.observation.ownership.label(),
+                    generation = evidence.observation.generation,
+                    restart_after = WEDGED_RESTART_ROUNDS,
+                    decision = evidence.decision.label(),
+                    "restarting the unresponsive GUI-owned node"
+                );
+                app.state::<AppState>().node_child.lock().take();
                 match ensure_node_running().await {
                     Ok(Some(child)) => {
-                        app.state::<AppState>().node_child.lock().replace(child);
+                        let next_generation =
+                            app.state::<AppState>().node_child.lock().install(child);
+                        tracing::info!(
+                            target: "allmystuff::backend_recovery",
+                            generation = next_generation,
+                            "installed replacement GUI-owned node"
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
                 }
             }
-        } else {
-            wedged_rounds = 0;
+            RecoveryDecision::EnsureNode => {
+                tracing::info!(
+                    target: "allmystuff::backend_recovery",
+                    socket = evidence.observation.socket.label(),
+                    ownership = evidence.observation.ownership.label(),
+                    generation = evidence.observation.generation,
+                    decision = evidence.decision.label(),
+                    "local node is unavailable; ensuring one is running"
+                );
+                match ensure_node_running().await {
+                    Ok(Some(child)) => {
+                        let next_generation =
+                            app.state::<AppState>().node_child.lock().install(child);
+                        tracing::info!(
+                            target: "allmystuff::backend_recovery",
+                            generation = next_generation,
+                            "installed GUI-owned node"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
+                }
+            }
         }
         let (tx, mut rx) = mpsc::channel::<NodeEvent>(256);
         if let Err(e) = node.subscribe_events(tx).await {
@@ -2613,7 +2705,7 @@ fn main() {
             };
             app.manage(AppState {
                 node: node.clone(),
-                node_child: Mutex::new(None),
+                node_child: Mutex::new(OwnedNode::default()),
             });
             tauri::async_runtime::spawn(async move {
                 // One node per machine: reuse the Always-On service's node if
@@ -2623,7 +2715,13 @@ fn main() {
                 match ensure_node_running().await {
                     Ok(child) => {
                         if let Some(c) = child {
-                            handle.state::<AppState>().node_child.lock().replace(c);
+                            let generation =
+                                handle.state::<AppState>().node_child.lock().install(c);
+                            tracing::info!(
+                                target: "allmystuff::backend_recovery",
+                                generation,
+                                "installed initial GUI-owned node"
+                            );
                         }
                     }
                     Err(e) => tracing::error!("couldn't bring up the allmystuff node: {e:#}"),

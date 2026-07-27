@@ -74,10 +74,7 @@ pub fn with_exposed(
 /// error: `unexpose` runs on the way out of a run that may never have
 /// published, and a shutdown path that can fail for that is worse than one
 /// that cannot.
-pub fn without_exposed(
-    current: &BTreeMap<String, String>,
-    port: u16,
-) -> BTreeMap<String, String> {
+pub fn without_exposed(current: &BTreeMap<String, String>, port: u16) -> BTreeMap<String, String> {
     let mut next = current.clone();
     next.remove(&service_id(port));
     next
@@ -207,8 +204,8 @@ pub fn frame(cmd: &str, args: Value) -> Vec<u8> {
 /// words on failure: the message an Ashlar call site raises should be the one
 /// the node wrote, not a paraphrase of it.
 pub fn unwrap_answer(payload: &[u8]) -> Result<Value, String> {
-    let value: Value =
-        serde_json::from_slice(payload).map_err(|e| format!("the node's answer was not JSON: {e}"))?;
+    let value: Value = serde_json::from_slice(payload)
+        .map_err(|e| format!("the node's answer was not JSON: {e}"))?;
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
@@ -239,8 +236,14 @@ mod tests {
         let mut current = BTreeMap::new();
         current.insert("tcp:3000".to_string(), "dev server".to_string());
         let after = with_exposed(&current, 8080, "enclave.app");
-        assert_eq!(after.get("tcp:3000").map(String::as_str), Some("dev server"));
-        assert_eq!(after.get("tcp:8080").map(String::as_str), Some("enclave.app"));
+        assert_eq!(
+            after.get("tcp:3000").map(String::as_str),
+            Some("dev server")
+        );
+        assert_eq!(
+            after.get("tcp:8080").map(String::as_str),
+            Some("enclave.app")
+        );
 
         let back = without_exposed(&after, 8080);
         assert_eq!(back, current, "withdrawing restores exactly what was there");
@@ -264,7 +267,11 @@ mod tests {
             ]
         });
         let sites = peer_sites(&snapshot);
-        assert_eq!(sites.len(), 2, "a peer with no node id is skipped: {sites:?}");
+        assert_eq!(
+            sites.len(),
+            2,
+            "a peer with no node id is skipped: {sites:?}"
+        );
         assert_eq!(sites[0], ("n1".to_string(), 8080, "ada's pad".to_string()));
         assert_eq!(
             sites[1],
@@ -347,8 +354,11 @@ mod tests {
     #[test]
     fn a_url_is_built_out_here_never_in_ashlar_source() {
         assert_eq!(local_url(47001), "http://127.0.0.1:47001");
-        assert_eq!(site("ada", "pad", &local_url(1)), json!({
-            "peer": "ada", "label": "pad", "url": "http://127.0.0.1:1"
-        }));
+        assert_eq!(
+            site("ada", "pad", &local_url(1)),
+            json!({
+                "peer": "ada", "label": "pad", "url": "http://127.0.0.1:1"
+            })
+        );
     }
 }

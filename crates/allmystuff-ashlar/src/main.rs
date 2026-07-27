@@ -43,7 +43,10 @@ fn main() {
             },
             Err(e) => json!({ "error": format!("not a call envelope: {e}") }),
         };
-        if writeln!(stdout, "{answer}").and_then(|_| stdout.flush()).is_err() {
+        if writeln!(stdout, "{answer}")
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
             // Ashlar hung up. Nothing to report to, and nothing left to do.
             return;
         }
@@ -128,12 +131,20 @@ fn published() -> Result<Value, String> {
     let exposed = exposed_map(&node("site_exposed", json!({}))?);
     let me = node("mesh_identity", json!({}))
         .ok()
-        .and_then(|v| v.get("device_id").and_then(Value::as_str).map(str::to_string))
+        .and_then(|v| {
+            v.get("device_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "this node".to_string());
     let mut out = Vec::new();
     for (id, label) in &exposed {
         let Some(port) = port_of(id) else { continue };
-        let shown = if label.is_empty() { id.clone() } else { label.clone() };
+        let shown = if label.is_empty() {
+            id.clone()
+        } else {
+            label.clone()
+        };
         out.push(site(&me, &shown, &local_url(port)));
     }
     Ok(Value::Array(out))
@@ -233,8 +244,14 @@ fn connect() -> Result<Stream, String> {
 fn text_arg(args: &[Value], index: usize) -> Result<String, String> {
     match args.get(index) {
         Some(Value::String(s)) => Ok(s.clone()),
-        Some(other) => Err(format!("argument {} must be a text, not {other}", index + 1)),
-        None => Err(format!("this call wants at least {} argument(s)", index + 1)),
+        Some(other) => Err(format!(
+            "argument {} must be a text, not {other}",
+            index + 1
+        )),
+        None => Err(format!(
+            "this call wants at least {} argument(s)",
+            index + 1
+        )),
     }
 }
 
@@ -245,8 +262,14 @@ fn port_arg(args: &[Value], index: usize) -> Result<u16, String> {
             .filter(|p| *p > 0 && *p <= u16::MAX as u64)
             .map(|p| p as u16)
             .ok_or_else(|| format!("argument {} must be a port number", index + 1)),
-        Some(other) => Err(format!("argument {} must be a port number, not {other}", index + 1)),
-        None => Err(format!("this call wants at least {} argument(s)", index + 1)),
+        Some(other) => Err(format!(
+            "argument {} must be a port number, not {other}",
+            index + 1
+        )),
+        None => Err(format!(
+            "this call wants at least {} argument(s)",
+            index + 1
+        )),
     }
 }
 
@@ -287,7 +310,10 @@ mod tests {
     #[test]
     fn a_port_and_a_label_are_read_in_that_order() {
         assert_eq!(port_arg(&[json!(8080)], 0), Ok(8080));
-        assert_eq!(text_arg(&[json!(8080), json!("app")], 1), Ok("app".to_string()));
+        assert_eq!(
+            text_arg(&[json!(8080), json!("app")], 1),
+            Ok("app".to_string())
+        );
         assert_eq!(
             text_arg(&[json!(8080)], 2),
             Err("this call wants at least 3 argument(s)".to_string())

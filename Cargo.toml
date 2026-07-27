@@ -18,6 +18,10 @@ members = [
     # mesh) and by the standalone CEC Support client app.
     "crates/allmystuff-cec-protocol",
     "crates/allmystuff-cec-consent",
+    # The Ashlar seam: a co-process answering an Ashlar program's `mesh.sites`
+    # space. It speaks the node's control wire rather than linking the node, so
+    # it belongs in this fast workspace and not beside the media stack.
+    "crates/allmystuff-ashlar",
 ]
 # The Tauri desktop app (`gui/src-tauri`) and the headless mesh node
 # (`node/` — the `allmystuff-node` engine + the `allmystuff-serve` binary)
@@ -49,6 +53,7 @@ allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.49" }
 allmystuff-mobile-core = { path = "crates/allmystuff-mobile-core", version = "0.2.49" }
 allmystuff-cec-protocol = { path = "crates/allmystuff-cec-protocol", version = "0.2.49" }
 allmystuff-cec-consent = { path = "crates/allmystuff-cec-consent", version = "0.2.49" }
+allmystuff-ashlar = { path = "crates/allmystuff-ashlar", version = "0.2.49" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

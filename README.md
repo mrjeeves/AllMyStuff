@@ -58,6 +58,12 @@ It's free, open source, and runs on macOS, Linux, and Windows.
 - **Sites.** Open a machine's local web service in your browser — even one
   bound to loopback — through a port mapped on the machine you're sitting at.
   Only ports the host advertises are ever proxied.
+- **Ashlar sites.** An [Ashlar](https://github.com/mrjeeves/ashlar) program
+  reaches this node across its own foreign boundary: `ashlar run --mesh`
+  publishes the port it is serving to a private mesh, and the peers on that
+  mesh open it in a browser through a locally mapped port. No forwarded port,
+  no public address, nothing vendored — the site names a capability and this
+  node answers it (`allmystuff-ashlar`).
 - **KVM appliances.** Point a NanoKVM-class device at a machine and you can
   reach its screen and keyboard even when its OS is down — BIOS included —
   with power and reset a click away; the KVM's own web UI opens through the mesh.

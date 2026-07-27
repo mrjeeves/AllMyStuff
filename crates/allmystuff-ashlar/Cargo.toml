@@ -1,0 +1,31 @@
+# The Ashlar seam: a co-process that answers an Ashlar program's `mesh.sites`
+# space over JSON Lines, driving this machine's AllMyStuff node.
+#
+# It lives in the LIGHT workspace on purpose. The node engine carries the media
+# stack (xcap / cpal / openh264 / …) and takes minutes to build; this speaks the
+# node's control wire instead of linking it, so the seam compiles and tests in
+# seconds and a `cargo test --workspace` covers it. The wire it re-implements is
+# small and fixed — `[u32 BE len][tag][JSON]`, defined in
+# `node/src/node_control.rs` — and `frame_roundtrips_the_node_wire` pins it.
+[package]
+name = "allmystuff-ashlar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Answer an Ashlar program's `mesh.sites` space — publish this machine's site to the mesh, and reach the peers'."
+
+[lib]
+name = "allmystuff_ashlar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "allmystuff-ashlar"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+interprocess = { workspace = true }
+dirs = { workspace = true }

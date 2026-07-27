@@ -78,6 +78,7 @@ crates/
 ├── allmystuff-term          # `amst` — the command-line terminal (a mesh PTY in your own terminal)
 ├── allmystuff-cec-protocol  # CEC Support's wire types: support ids, consent control, the help beacon
 ├── allmystuff-cec-consent   # a customer's standing technician approvals (once / 3 hours / forever)
+├── allmystuff-ashlar        # `allmystuff-ashlar` — answer an Ashlar program's `mesh.sites` space over JSON Lines
 ├── allmystuff-mobile-core   # the phone's model: viewer/controller capability set + NodeProfile (docs/MOBILE.md)
 ├── allmystuff-updater       # self-update: release feed, SHA-256 verify, stage-then-apply
 ├── allmystuff-service       # install/manage the OS background service (systemd / launchd / Windows SCM)
@@ -217,6 +218,31 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   device briefly think a co-member was "in another fleet." Keys are
   per-device identities (no shared secrets); see MyOwnMesh
   `docs/NETWORK-TYPES.md` for the governance contract.
+
+### allmystuff-ashlar
+
+The seam an [Ashlar](https://github.com/mrjeeves/ashlar) site reaches this
+machine through. Ashlar has one boundary for everything outside its builtin
+set, and two space names derive to a co-process rather than to a library the
+project supplies: `mesh` — the roster, answered by `myownmesh ashlar` — and
+`mesh.sites`, answered by the `allmystuff-ashlar` binary here. Sites are the
+half that needs a proxy able to carry a TCP connection to a peer, which is
+exactly what this node has and MyOwnMesh alone does not.
+
+Four calls over JSON Lines on stdin/stdout — `expose`, `unexpose`,
+`published`, `nearby` — driving ops the node already had (`site_exposed`,
+`site_set_exposed`, `site_mappings`, `site_map`, `session_snapshot`,
+`mesh_networks`). Publishing stays **opt-in at the node**: `expose` adds one
+port to the owner's exposed selection, the proxy still refuses every port
+outside it, and `nearby` reads what peers *advertise* rather than scanning
+anyone.
+
+It lives in the light workspace and speaks the node's control wire
+(`[u32 BE len][tag][JSON]`) instead of linking `allmystuff-node`, so it builds
+in seconds and `cargo test --workspace` covers it. That is a real coupling:
+the frame format is defined in `node/src/node_control.rs` and re-implemented
+here, pinned by `frame_roundtrips_the_node_wire`. Change that wire and change
+both.
 
 ### allmystuff-bridge
 

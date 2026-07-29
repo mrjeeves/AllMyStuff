@@ -36,6 +36,7 @@
 //! [`allmystuff_updater::tick_forever_unattended`].
 
 use std::future::Future;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -525,7 +526,15 @@ fn init_logging(as_service: bool) {
             .with_ansi(false)
             .with_writer(make)
     });
-    let stdout_layer = tracing_subscriber::fmt::layer().with_target(false);
+    // Colour only when a human is actually looking. Every *file* layer here
+    // already sets `with_ansi(false)`; stdout was left on the default, which is
+    // unconditionally ON. Under systemd that stdout is captured by
+    // journald/rsyslog, so each line lands in /var/log/syslog wrapped in
+    // escape sequences (`#033[2m…#033[0m`) — tens of wasted bytes per line on
+    // a box that logs continuously, and grep stops matching what you can see.
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal());
 
     // The field-test log: a second file, in the directory the node was
     // launched from, at full debug verbosity for our crates regardless of

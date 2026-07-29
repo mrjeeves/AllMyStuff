@@ -1890,6 +1890,19 @@ export function updateStatus(): Promise<UpdateStatus | null> {
   return tryInvoke<UpdateStatus>("update_status");
 }
 
+/** The background auto-update ticker reporting what a check decided — the
+ *  launch check (~30s after start) and then every `check_interval_hours`.
+ *  Without this the ticker was mute: it staged updates that nobody was told
+ *  about, so auto-update looked like it wasn't running at all. No-op listener
+ *  in web mode. */
+export async function onUpdateChecked(
+  cb: (o: CheckOutcome) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CheckOutcome>("update://checked", (e) => cb(e.payload));
+}
+
 export function updateCheck(): Promise<CheckOutcome | null> {
   return tryInvoke<CheckOutcome>("update_check");
 }

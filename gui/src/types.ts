@@ -538,7 +538,9 @@ export interface CheckOutcome {
     | "not_due"
     | "up_to_date"
     | "policy_blocked"
-    | "staged";
+    | "staged"
+    /** Newer release exists, but this install can't swap its own binaries. */
+    | "manual_update_available";
   current?: string;
   latest?: string;
   policy?: string;

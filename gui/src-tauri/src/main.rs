@@ -2730,10 +2730,25 @@ fn main() {
             });
             // Self-update ticker — the first check fires shortly after launch,
             // then at the configured interval. Spawned unconditionally:
-            // `check_now` no-ops when auto-update is off or this is a
-            // package-managed install. Without this the in-app updater only
-            // ever checks when the user clicks "Check now".
-            tauri::async_runtime::spawn(allmystuff_updater::tick_forever());
+            // `check_now` no-ops when auto-update is off. Without this the
+            // in-app updater only ever checks when the user clicks "Check now".
+            //
+            // Every outcome is forwarded to the webview as `update://checked`,
+            // so a release found in the background actually reaches the user.
+            // The ticker used to run mute — a staged update sat on disk until
+            // someone happened to open Settings → Updates, which is what made
+            // an app that *was* checking look like one that never did.
+            let update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(allmystuff_updater::tick_forever_notify(
+                move |outcome| match serde_json::to_value(outcome) {
+                    Ok(payload) => {
+                        if let Err(e) = update_handle.emit("update://checked", payload) {
+                            tracing::warn!("couldn't emit the self-update outcome: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("couldn't serialise the self-update outcome: {e}"),
+                },
+            ));
             Ok(())
         })
         .build(tauri::generate_context!())

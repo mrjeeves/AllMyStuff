@@ -83,7 +83,9 @@
           {pkg ? "Installed via a package manager" : "Installed as a standalone binary"}
         </div>
       </div>
-      <button class="btn small" disabled={app.updateBusy || pkg} onclick={() => app.checkUpdates()}>
+      <!-- Checking works everywhere, including a package-managed install: it
+           can't install the update, but it can still tell you one is out. -->
+      <button class="btn small" disabled={app.updateBusy} onclick={() => app.checkUpdates()}>
         {app.updateBusy ? "Checking…" : "Check now"}
       </button>
     </section>
@@ -95,8 +97,11 @@
     {#if pkg}
       <section class="block">
         <p class="notice">
-          AllMyStuff was installed through a package manager (Homebrew, apt, MSI…),
-          so self-update is off — update it the same way you installed it.
+          This copy of AllMyStuff can't replace its own files — it was installed
+          through a package manager (Homebrew, apt, Chocolatey, Scoop), or into a
+          location that needs an administrator to write to. It still checks for
+          new releases and will tell you when one lands; installing it is done
+          the same way you installed AllMyStuff.
         </p>
       </section>
     {:else}

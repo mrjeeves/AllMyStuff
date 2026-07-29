@@ -103,6 +103,7 @@ import {
   meshRosterRemove,
   onOwned,
   onOwnership,
+  onUpdateChecked,
   onRoom,
   onRoomLocal,
   onSession,
@@ -1492,6 +1493,11 @@ class AppStore {
     await this.loadSites();
     await onNodeSites((e) => this.applyNodeSites(e));
     await this.loadUpdateStatus();
+    // The background ticker's verdict. Registered here (not in the Updates
+    // pane) so a release found while the user is anywhere in the app still
+    // surfaces — the pane only mounts when you go looking for it, which is
+    // exactly the trap that made auto-update feel like it never ran.
+    await onUpdateChecked((o) => this.applyUpdateChecked(o));
     await this.loadDisabledNetworks();
     this.startMeshPolling();
     await onSubscription((s) => {
@@ -7798,6 +7804,37 @@ class AppStore {
     }
   }
 
+  /** A background check reported in. Only the outcomes that mean "there is
+   *  something newer than what you're running" are worth interrupting for —
+   *  the routine up-to-date / not-due / disabled ticks refresh the Updates
+   *  pane quietly and say nothing. */
+  private applyUpdateChecked(o: CheckOutcome) {
+    this.updateOutcome = o;
+    void this.loadUpdateStatus();
+    switch (o.outcome) {
+      case "staged":
+        this.toast(
+          "info",
+          `Update ${o.version} is ready — relaunch to run it (Settings → Updates)`,
+        );
+        break;
+      case "manual_update_available":
+        this.toast(
+          "info",
+          `${o.latest} is available — update the way you installed AllMyStuff`,
+        );
+        break;
+      case "policy_blocked":
+        this.toast(
+          "info",
+          `${o.latest} is available — approve it in Settings → Updates`,
+        );
+        break;
+      default:
+        break;
+    }
+  }
+
   /** Check the release feed now and stage anything permitted. */
   async checkUpdates() {
     if (!isTauri()) {
@@ -8251,6 +8288,8 @@ class AppStore {
         return "You're on the latest version";
       case "policy_blocked":
         return `${o.latest} is available but held by your auto-apply setting`;
+      case "manual_update_available":
+        return `${o.latest} is available, but this install can't update itself — update it the way you installed it`;
       case "package_manager":
         return "Installed via a package manager — update through it";
       case "disabled":

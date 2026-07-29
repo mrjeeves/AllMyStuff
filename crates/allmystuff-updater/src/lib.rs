@@ -314,6 +314,14 @@ pub enum CheckOutcome {
     Staged {
         version: String,
     },
+    /// A newer release exists, but this install can't swap its own binaries —
+    /// a package-managed copy, or a per-machine install this process can't
+    /// write to. Reported rather than swallowed so the app can still *tell*
+    /// you an update is out and how to take it.
+    ManualUpdateAvailable {
+        current: String,
+        latest: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -773,17 +781,33 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     if !au.enabled || env_disabled() {
         return Ok(CheckOutcome::Disabled);
     }
-    if detect_install_kind() == InstallKind::PackageManager {
-        return Ok(CheckOutcome::PackageManager);
-    }
     if !force && !is_due(au.check_interval_hours) {
         return Ok(CheckOutcome::NotDue);
     }
-    stamp_check_now();
+
+    // A package-managed / unwritable install can't stage or apply anything,
+    // but it can still *look*. Checking anyway is what turns "self-update is
+    // off here" into "0.2.50 is out, update it the way you installed it" —
+    // previously this returned before the fetch, so such an install never
+    // contacted the release feed at all and silently reported nothing forever.
+    let managed = detect_install_kind() == InstallKind::PackageManager;
 
     let release = fetch_release(&au).await?;
     let latest = release_tag(&release)?;
     let current = current_version().to_string();
+    // Stamped only now: a failed fetch must not burn the interval, or one
+    // offline moment costs a full `check_interval_hours` before the next try.
+    stamp_check_now();
+
+    if managed {
+        return Ok(
+            if compare_semver(&current, &latest) == std::cmp::Ordering::Less {
+                CheckOutcome::ManualUpdateAvailable { current, latest }
+            } else {
+                CheckOutcome::UpToDate { current, latest }
+            },
+        );
+    }
 
     // Which halves are behind `latest` — the CLI gauged by the running binary's
     // version, each installed sibling (GUI, node) by its recorded stamp. Gating
@@ -834,18 +858,59 @@ fn wanted_artifacts(current: &str, latest: &str) -> Vec<ArtifactKind> {
         .collect()
 }
 
-/// One attended check, logging the outcome. Shared by the launch check and
-/// every interval tick of [`tick_forever`]. `force` skips only the interval
-/// cooldown ([`is_due`]); the enabled flag and package-manager guard inside
-/// [`check_now`] still apply, so a forced launch check no-ops cleanly when
-/// auto-update is off or the install is package-managed.
-async fn run_attended_check(force: bool) {
+/// One attended check: log the outcome, then hand it to `notify` so the app
+/// can surface it. Shared by the launch check and every interval tick of
+/// [`tick_forever`]. `force` skips only the interval cooldown ([`is_due`]);
+/// the enabled flag inside [`check_now`] still applies, so a forced launch
+/// check no-ops cleanly when auto-update is off. A package-managed or
+/// unwritable install still checks — it reports
+/// [`CheckOutcome::ManualUpdateAvailable`] rather than staging.
+async fn run_attended_check(force: bool, notify: &(dyn Fn(&CheckOutcome) + Send + Sync)) {
     match check_now(force).await {
-        Ok(CheckOutcome::Staged { version }) => {
+        Ok(outcome) => {
+            log_check_outcome(&outcome);
+            notify(&outcome);
+        }
+        Err(e) => tracing::warn!("self-update check failed: {e}"),
+    }
+}
+
+/// Log what a check decided — *every* outcome, not just the interesting one.
+/// These used to be swallowed by a bare `Ok(_) => {}`, which meant a ticker
+/// that was silently disabled (package-managed install, auto-update off) and a
+/// ticker that was running fine and finding nothing looked exactly alike: no
+/// output at all, at any log level. That is the single hardest part of "it
+/// never checks" to diagnose, so each branch now says so.
+fn log_check_outcome(outcome: &CheckOutcome) {
+    match outcome {
+        CheckOutcome::Staged { version } => {
             tracing::info!("self-update staged {version}; applies on next launch");
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("self-update check failed: {e}"),
+        CheckOutcome::ManualUpdateAvailable { current, latest } => {
+            tracing::info!(
+                "self-update: {latest} is available (running {current}), but this install is \
+                 package-managed or not writable by this process — update it the way you \
+                 installed it"
+            );
+        }
+        CheckOutcome::UpToDate { current, latest } => {
+            tracing::debug!("self-update: up to date (running {current}, latest {latest})");
+        }
+        CheckOutcome::PolicyBlocked {
+            current,
+            latest,
+            policy,
+        } => {
+            tracing::info!(
+                "self-update: {latest} is available (running {current}) but the '{policy}' \
+                 apply policy holds it back — apply it from Settings → Updates"
+            );
+        }
+        CheckOutcome::NotDue => tracing::debug!("self-update: not due yet, skipping this tick"),
+        CheckOutcome::Disabled => tracing::debug!("self-update: disabled, skipping this tick"),
+        CheckOutcome::PackageManager => {
+            tracing::debug!("self-update: package-managed install, skipping this tick")
+        }
     }
 }
 
@@ -857,9 +922,11 @@ async fn run_attended_check(force: bool) {
 /// used to no-op on the cooldown and wait the full interval). It then starts
 /// the 24h timer: another check every `check_interval_hours` (re-read each loop
 /// so a settings change takes effect without a restart). Each tick is gated on
-/// the enabled flag, the package-manager guard, and the apply policy — so
-/// spawning it in a disabled or package-managed install simply no-ops, launch
-/// check included. Whatever it stages applies on the next launch (see
+/// the enabled flag and the apply policy, so spawning it in a disabled install
+/// no-ops. A package-managed or unwritable install still *checks* — it just
+/// reports [`CheckOutcome::ManualUpdateAvailable`] instead of staging, so the
+/// app can say a release is out even where it can't install it itself.
+/// Whatever it does stage applies on the next launch (see
 /// [`apply_pending_if_any`]).
 ///
 /// Every long-lived process that links the updater spawns this: the desktop
@@ -869,17 +936,32 @@ async fn run_attended_check(force: bool) {
 /// on its own. The short-lived CLI subcommands don't spawn it: they act once
 /// and exit.
 pub async fn tick_forever() {
+    tick_forever_notify(|_| {}).await
+}
+
+/// [`tick_forever`], plus a callback fired with the outcome of every check.
+///
+/// The ticker is otherwise mute: it logs, and a staged update sits on disk
+/// until someone thinks to open Settings → Updates, because the background
+/// task holds no handle to the UI and so cannot tell it anything. The desktop
+/// app passes a closure here that emits a Tauri event, which is what makes an
+/// "update ready" actually reach the user — the notify half of an update
+/// notification system.
+pub async fn tick_forever_notify<F>(notify: F)
+where
+    F: Fn(&CheckOutcome) + Send + Sync + 'static,
+{
     // Let a freshly launched app/node settle (bind sockets, bring the session
     // online) before the first network hit.
     tokio::time::sleep(Duration::from_secs(30)).await;
     // The launch check: force past the interval cooldown so opening the app is
-    // its own check (still gated on enabled + package manager). Then the 24h
-    // timer takes over for the rest of the run.
-    run_attended_check(true).await;
+    // its own check (still gated on the enabled flag). Then the 24h timer takes
+    // over for the rest of the run.
+    run_attended_check(true, &notify).await;
     loop {
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
-        run_attended_check(false).await;
+        run_attended_check(false, &notify).await;
     }
 }
 
@@ -941,7 +1023,7 @@ async fn run_unattended_check(force: bool, relaunch: fn() -> !) {
                 Err(e) => tracing::warn!("self-update apply failed: {e}; retrying next tick"),
             }
         }
-        Ok(_) => {}
+        Ok(other) => log_check_outcome(&other),
         Err(e) => tracing::warn!("self-update check failed: {e}"),
     }
 }
@@ -1086,12 +1168,49 @@ fn staged_version() -> Option<String> {
 // ---- install-kind detection ------------------------------------------
 
 pub fn detect_install_kind() -> InstallKind {
-    let path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    detect_install_kind_from_path(&path)
+    let Ok(exe) = std::env::current_exe() else {
+        return InstallKind::Raw;
+    };
+    // A foreign package manager owns the binary outright — never self-update.
+    if detect_install_kind_from_path(&exe.to_string_lossy()) == InstallKind::PackageManager {
+        return InstallKind::PackageManager;
+    }
+    // Otherwise the only question left is whether we can actually perform the
+    // swap. A per-machine install (`C:\Program Files\…` from the MSI, `/opt/…`)
+    // is owned by Administrators/root, so an unelevated process can stage a
+    // download it will never be able to apply — retrying, and failing, forever.
+    // Treating that as package-managed keeps the *check* running (so a new
+    // release is still reported) while routing the install itself back through
+    // the installer that owns it.
+    match exe.parent() {
+        Some(dir) if !dir_is_writable(dir) => InstallKind::PackageManager,
+        _ => InstallKind::Raw,
+    }
 }
 
+/// Whether `dir` accepts writes from this process. Probing by *doing* it is
+/// the only reliable test on Windows, where ACLs (and virtualisation) make a
+/// permissions read meaningless — and it's what the swap itself will attempt.
+fn dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".allmystuff-write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Path-only classification: is this binary owned by a *foreign* package
+/// manager (Homebrew, apt, Chocolatey, Scoop) that must do the updating?
+///
+/// Deliberately **not** a test for "somewhere under Program Files". Our own
+/// Windows MSI installs to `C:\Program Files\AllMyStuff\`, and treating that
+/// as package-managed silently disabled self-update — check included — for
+/// every machine that took the MSI rather than the NSIS setup. Whether such an
+/// install can be *written* is a separate question, answered by
+/// [`dir_is_writable`] in [`detect_install_kind`].
 fn detect_install_kind_from_path(path_str: &str) -> InstallKind {
     // Homebrew (macOS/Linux).
     if path_str.contains("/Cellar/")
@@ -1105,14 +1224,9 @@ fn detect_install_kind_from_path(path_str: &str) -> InstallKind {
     if path_str.starts_with("/usr/bin/") || path_str.starts_with("/usr/sbin/") {
         return InstallKind::PackageManager;
     }
-    #[cfg(target_os = "windows")]
     {
         let lower = path_str.to_lowercase();
-        if lower.contains("\\program files\\")
-            || lower.contains("\\program files (x86)\\")
-            || lower.contains("\\chocolatey\\lib\\")
-            || lower.contains("\\scoop\\apps\\")
-        {
+        if lower.contains("\\chocolatey\\lib\\") || lower.contains("\\scoop\\apps\\") {
             return InstallKind::PackageManager;
         }
     }
@@ -1479,6 +1593,54 @@ mod tests {
             detect_install_kind_from_path("/home/me/.local/bin/allmystuff"),
             InstallKind::Raw
         );
+    }
+
+    #[test]
+    fn windows_package_managers_are_detected_but_program_files_is_not() {
+        // Chocolatey and Scoop genuinely own their copy — they must update it.
+        assert_eq!(
+            detect_install_kind_from_path(
+                r"C:\ProgramData\chocolatey\lib\allmystuff\allmystuff.exe"
+            ),
+            InstallKind::PackageManager
+        );
+        assert_eq!(
+            detect_install_kind_from_path(
+                r"C:\Users\me\scoop\apps\allmystuff\current\allmystuff.exe"
+            ),
+            InstallKind::PackageManager
+        );
+        // `C:\Program Files\AllMyStuff` is where our OWN MSI lands. Classifying
+        // it as package-managed is what silently switched self-update off — the
+        // check included — for every MSI install, so the path alone must not
+        // decide it. Whether that install is writable is a separate question
+        // (`dir_is_writable`), asked at runtime rather than guessed from text.
+        assert_eq!(
+            detect_install_kind_from_path(r"C:\Program Files\AllMyStuff\allmystuff-gui.exe"),
+            InstallKind::Raw
+        );
+        assert_eq!(
+            detect_install_kind_from_path(r"C:\Program Files (x86)\AllMyStuff\allmystuff.exe"),
+            InstallKind::Raw
+        );
+        // The per-user NSIS location was always fine and stays fine.
+        assert_eq!(
+            detect_install_kind_from_path(
+                r"C:\Users\me\AppData\Local\AllMyStuff\allmystuff-gui.exe"
+            ),
+            InstallKind::Raw
+        );
+    }
+
+    #[test]
+    fn write_probe_tells_a_writable_dir_from_a_missing_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(dir_is_writable(tmp.path()));
+        // The probe must clean up after itself — a stray file next to the
+        // installed binary on every status() call would be its own bug report.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // A directory that doesn't exist can't be written to.
+        assert!(!dir_is_writable(&tmp.path().join("nope")));
     }
 
     #[test]

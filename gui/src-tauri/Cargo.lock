@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "serde",
  "serde_json",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "serde",
  "serde_json",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "serde",
  "serde_json",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
@@ -151,7 +151,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "allmystuff-graph",
  "serde",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.48"
+version = "0.2.49"
 dependencies = [
  "dirs 5.0.1",
  "flate2",

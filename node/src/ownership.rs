@@ -529,6 +529,15 @@ fn upsert_member_into(members: &mut Vec<OwnedMember>, device: &str, label: &str)
             members.push(OwnedMember {
                 device: NodeId::from(canon),
                 label: label.to_string(),
+                // Stamped on first add only. A later upsert is a label refresh,
+                // not a fresh claim, so it must not move this — the stamp is
+                // what tells `ensure_fleet_network` whether a signed eviction
+                // predates the claim, and a gossip-driven label touch would
+                // otherwise keep pushing it past every tombstone.
+                // An unset clock stamps this low, which reads as older than any
+                // eviction — the conservative direction (prune), not the one
+                // that resurrects a device.
+                claimed_at: Some(crate::cec::now_secs()),
             });
             true
         }
@@ -874,6 +883,36 @@ mod tests {
     }
 
     #[test]
+    fn upsert_stamps_the_first_add_and_a_label_refresh_never_moves_it() {
+        // The stamp dates this owner's CLAIM of the device, and the eviction
+        // prune in `ensure_fleet_network` compares it against the tombstone. A
+        // later upsert is a label refresh driven by roster gossip, not a fresh
+        // claim — if it moved the stamp, a device would drift past every
+        // eviction just by being talked about.
+        let mut members = Vec::new();
+        assert!(upsert_member_into(&mut members, "k1", "Laptop"));
+        let stamped = members[0].claimed_at.expect("first add must be stamped");
+
+        assert!(upsert_member_into(&mut members, "k1", "My laptop"));
+        assert_eq!(
+            members[0].claimed_at,
+            Some(stamped),
+            "a label refresh moved the claim stamp"
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_claim_stamp_still_loads() {
+        // Records written before the field existed must keep loading: this is
+        // the owner's fleet list, and a parse failure would drop real members.
+        // `None` reads as older than any eviction, so such a device keeps the
+        // previous always-prune behaviour rather than being resurrected by an
+        // upgrade.
+        let m: OwnedMember = serde_json::from_str(r#"{"device":"k1","label":"Laptop"}"#).unwrap();
+        assert_eq!(m.claimed_at, None);
+    }
+
+    #[test]
     fn upsert_dedups_by_canonical_pubkey_and_refreshes_labels() {
         let mut members = Vec::new();
         assert!(upsert_member_into(&mut members, "k1-AB12C", "Laptop"));
@@ -922,6 +961,7 @@ mod tests {
         dev.inner.lock().fleet_members.push(OwnedMember {
             device: "old-owner".into(),
             label: "Old".into(),
+            claimed_at: None,
         });
 
         assert!(dev.try_accept_claim("new-owner"));

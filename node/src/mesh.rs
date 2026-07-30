@@ -6408,6 +6408,11 @@ impl Mesh {
                                 members.push(OwnedMember {
                                     device: NodeId::from(pubkey_part(id)),
                                     label,
+                                    // A projection of the signed roster for the
+                                    // GUI, not this owner's local record — the
+                                    // claim stamp lives on the latter and is
+                                    // read only by the eviction prune.
+                                    claimed_at: None,
                                 });
                             }
                         }
@@ -6451,6 +6456,7 @@ impl Mesh {
                 members.push(OwnedMember {
                     device: NodeId::from(canon.as_str()),
                     label: m.label.clone(),
+                    claimed_at: m.claimed_at,
                 });
             }
             member_roles
@@ -6473,6 +6479,7 @@ impl Mesh {
                 members.push(OwnedMember {
                     device: NodeId::from(canon.as_str()),
                     label,
+                    claimed_at: None,
                 });
             }
             // Best-effort role for this device (it isn't in its own roster):
@@ -6506,6 +6513,7 @@ impl Mesh {
                     members.push(OwnedMember {
                         device: NodeId::from(canon.as_str()),
                         label: String::new(),
+                        claimed_at: None,
                     });
                 }
                 member_roles
@@ -7306,15 +7314,36 @@ impl Mesh {
         let signed_evicted = self.signed_evicted(&network).await;
         if !signed_evicted.is_empty() {
             let mut pruned = false;
-            for member in self.ownership.fleet_member_ids() {
-                if signed_evicted.contains(pubkey_part(&member)) {
+            for m in self.ownership.fleet_members() {
+                let member = m.device.to_string();
+                let Some(&evicted_at) = signed_evicted.get(pubkey_part(&member)) else {
+                    continue;
+                };
+                // Compare stamps rather than mere set membership. Membership
+                // converges last-writer-wins, so an eviction only outranks a
+                // claim that came before it. A device this owner deliberately
+                // re-claimed AFTER the eviction is the later intent, and the
+                // admit loop below authors the superseding grant the governance
+                // layer already honours (`re_admitting_an_evicted_member_
+                // supersedes_the_tombstone`). Pruning on set membership alone
+                // dropped it here first, every time, so that grant was never
+                // written and unclaim → re-claim was a one-way door.
+                //
+                // An unstamped (pre-upgrade) record sorts as older, so it keeps
+                // the previous always-prune behaviour; re-claiming stamps it.
+                if m.claimed_at.is_some_and(|at| at > evicted_at) {
                     tracing::info!(
-                        "pruning {} from the local fleet list — the signed governance evicted it",
+                        "keeping {} — re-claimed after the signed eviction; re-admitting it",
                         short_id(&member)
                     );
-                    let _ = self.ownership.kick_member(&member);
-                    pruned = true;
+                    continue;
                 }
+                tracing::info!(
+                    "pruning {} from the local fleet list — the signed governance evicted it",
+                    short_id(&member)
+                );
+                let _ = self.ownership.kick_member(&member);
+                pruned = true;
             }
             if pruned {
                 // Reflect the removal now: the authorised-controller cache and the
@@ -7654,7 +7683,10 @@ impl Mesh {
     /// daemon that doesn't report the field), so a transient read failure or a
     /// version skew never prunes a live member — it just falls back to the old
     /// (re-asserting) behaviour.
-    async fn signed_evicted(self: &Arc<Self>, network: &str) -> std::collections::HashSet<String> {
+    async fn signed_evicted(
+        self: &Arc<Self>,
+        network: &str,
+    ) -> std::collections::HashMap<String, u64> {
         let data = match self
             .client
             .request(&Request::GovernanceState {
@@ -7663,17 +7695,9 @@ impl Mesh {
             .await
         {
             Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
-            _ => return std::collections::HashSet::new(),
+            _ => return std::collections::HashMap::new(),
         };
-        data.get("evicted")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|k| pubkey_part(k).to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        eviction_stamps(&data)
     }
 
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
@@ -12529,6 +12553,71 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// so a device id in display form (`pubkey-SUFFIX`, what `IdentityShow` and
 /// presence use) and bare form (`pubkey`, what the daemon delivers as a
 /// channel `from`) compare equal.
+/// Date each device the fleet's signed governance has removed: canonical pubkey
+/// → the unix second its removal was authored.
+///
+/// Takes the raw `GovernanceState` reply. `evicted` is the authoritative,
+/// already-verified answer to *whether* a device is removed; `state.member_log`
+/// is read only for **when**, so nothing here re-decides membership or trusts an
+/// unverified entry. The latest entry targeting a removed device IS its removal
+/// — that is what made the verdict come out removed under the member log's
+/// last-writer-wins fold — so the max stamp over that device's entries is the
+/// tombstone's stamp without having to match variant kinds.
+///
+/// A removed device the log can't date is recorded at `u64::MAX`, which outranks
+/// every claim: an undatable eviction keeps the old always-prune behaviour
+/// rather than being quietly waived.
+fn eviction_stamps(data: &Value) -> std::collections::HashMap<String, u64> {
+    let removed: std::collections::HashSet<String> = data
+        .get("evicted")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|k| pubkey_part(k).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if removed.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    if let Some(log) = data
+        .get("state")
+        .and_then(|s| s.get("member_log"))
+        .and_then(|v| v.as_array())
+    {
+        for entry in log {
+            let Some(stamp) = entry.get("at").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let Some(target) = entry
+                .get("variant")
+                .and_then(|v| v.get("target"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let target = pubkey_part(target).to_string();
+            if !removed.contains(&target) {
+                continue;
+            }
+            at.entry(target)
+                .and_modify(|s| *s = (*s).max(stamp))
+                .or_insert(stamp);
+        }
+    }
+
+    removed
+        .into_iter()
+        .map(|k| {
+            let stamp = at.get(&k).copied().unwrap_or(u64::MAX);
+            (k, stamp)
+        })
+        .collect()
+}
+
 fn pubkey_part(id: &str) -> &str {
     if let Some((body, suffix)) = id.rsplit_once('-') {
         if suffix.len() == 5 && suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -12830,6 +12919,72 @@ fn parse_media(s: &str) -> MediaKind {
 
 #[cfg(test)]
 mod tests {
+    // ---- eviction stamps -------------------------------------------------
+    //
+    // The JSON below matches what `GovernanceState` actually emits — verified
+    // against myownmesh-core's `Transition`, which serialises the variant as a
+    // NESTED object ({"at":..,"variant":{"kind":"evict","target":".."},..}), not
+    // flattened. If that ever changes, `eviction_stamps` silently dates nothing,
+    // every eviction sorts as u64::MAX and the prune goes back to being
+    // unconditional — so these pin the shape as much as the logic.
+
+    #[test]
+    fn eviction_stamps_dates_each_removal_from_the_member_log() {
+        let data = serde_json::json!({
+            "evicted": ["kvmkey"],
+            "state": {"member_log": [
+                {"at": 100, "variant": {"kind": "role_grant", "target": "kvmkey", "role": "member"},
+                 "signers": ["owner"], "signatures": ["s"]},
+                {"at": 200, "variant": {"kind": "evict", "target": "kvmkey"},
+                 "signers": ["owner"], "signatures": ["s"]},
+                // A different device's entries must not leak into the stamp.
+                {"at": 900, "variant": {"kind": "evict", "target": "otherkey"},
+                 "signers": ["owner"], "signatures": ["s"]},
+            ]}
+        });
+
+        let stamps = super::eviction_stamps(&data);
+
+        assert_eq!(stamps.len(), 1, "only devices in `evicted` are dated");
+        assert_eq!(stamps.get("kvmkey"), Some(&200));
+    }
+
+    #[test]
+    fn an_undatable_eviction_outranks_every_claim() {
+        // No member log to read (an older daemon, a read that lost the field).
+        // The device is still removed, so it must stay pruned rather than being
+        // waived by a stamp we couldn't find.
+        let data = serde_json::json!({"evicted": ["kvmkey"]});
+
+        let stamps = super::eviction_stamps(&data);
+
+        assert_eq!(stamps.get("kvmkey"), Some(&u64::MAX));
+    }
+
+    #[test]
+    fn no_evictions_dates_nothing() {
+        let data = serde_json::json!({"evicted": [], "state": {"member_log": []}});
+        assert!(super::eviction_stamps(&data).is_empty());
+    }
+
+    #[test]
+    fn eviction_stamps_canonicalises_the_display_suffix() {
+        // The log and the `evicted` list may carry either the bare pubkey or a
+        // display id; the local member list is canonical, so both sides must
+        // collapse or the lookup misses and the prune runs anyway.
+        let data = serde_json::json!({
+            "evicted": ["kvmkey-AB12C"],
+            "state": {"member_log": [
+                {"at": 500, "variant": {"kind": "evict", "target": "kvmkey"},
+                 "signers": ["owner"], "signatures": ["s"]},
+            ]}
+        });
+
+        let stamps = super::eviction_stamps(&data);
+
+        assert_eq!(stamps.get("kvmkey"), Some(&500));
+    }
+
     use super::*;
 
     #[test]

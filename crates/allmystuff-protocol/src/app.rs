@@ -391,6 +391,24 @@ pub struct OwnedMember {
     /// label a gossip carries wins).
     #[serde(default)]
     pub label: String,
+    /// Unix seconds at which this owner first added the member, or `None` for a
+    /// record written before this field existed.
+    ///
+    /// Load-bearing for exactly one decision: whether a signed eviction still
+    /// applies. `ensure_fleet_network` prunes a locally listed device the signed
+    /// governance has removed, so one owner's admit loop can't resurrect a
+    /// device another owner evicted. Membership converges last-writer-wins on
+    /// the entry stamp, so an eviction only outranks a claim that came *before*
+    /// it — and without this the prune could not tell the two apart, which made
+    /// a deliberate re-claim of a previously evicted device impossible: the
+    /// prune ran before the admit loop every time, so the superseding grant the
+    /// governance layer would have honoured was never authored.
+    ///
+    /// `None` is treated as older than any eviction, so a legacy record keeps
+    /// the previous (always-prune) behaviour rather than being resurrected by
+    /// an upgrade. Re-claiming such a device stamps it and recovers it.
+    #[serde(default)]
+    pub claimed_at: Option<u64>,
 }
 
 /// A snapshot of an owner's fleet for the front-end: the shared key, the
@@ -1670,10 +1688,13 @@ mod tests {
                 OwnedMember {
                     device: "my-laptop".into(),
                     label: "My laptop".into(),
+                    claimed_at: Some(1_700_000_000),
                 },
                 OwnedMember {
                     device: "spare-nuc".into(),
                     label: "Spare NUC".into(),
+                    // Unstamped: a member whose record predates the field.
+                    claimed_at: None,
                 },
             ],
         };

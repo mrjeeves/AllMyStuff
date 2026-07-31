@@ -916,12 +916,15 @@ fn log_check_outcome(outcome: &CheckOutcome) {
 
 /// Background auto-update ticker — the half of self-update that makes it
 /// "set and forget". Runs forever: a **launch check** fires shortly after the
-/// process starts and *always* checks when auto-update is enabled — it ignores
-/// the interval cooldown, so opening the app catches a release even when the
-/// last check was under `check_interval_hours` ago (a relaunch within the day
-/// used to no-op on the cooldown and wait the full interval). It then starts
-/// the 24h timer: another check every `check_interval_hours` (re-read each loop
-/// so a settings change takes effect without a restart). Each tick is gated on
+/// process starts and ignores the interval cooldown, so opening the app
+/// catches a release even when the last check was under `check_interval_hours`
+/// ago (a relaunch within the day used to no-op on the cooldown and wait the
+/// full interval). It is *claimed* rather than unconditional — one launch
+/// check per machine coming up, not one per process that links this crate, so
+/// the GUI and the node it spawns don't fetch the same feed twice on every
+/// launch (see [`claim_launch_check`]). It then starts the 24h timer: another
+/// check every `check_interval_hours` (re-read each loop so a settings change
+/// takes effect without a restart). Each tick is gated on
 /// the enabled flag and the apply policy, so spawning it in a disabled install
 /// no-ops. A package-managed or unwritable install still *checks* — it just
 /// reports [`CheckOutcome::ManualUpdateAvailable`] instead of staging, so the
@@ -955,9 +958,13 @@ where
     // online) before the first network hit.
     tokio::time::sleep(Duration::from_secs(30)).await;
     // The launch check: force past the interval cooldown so opening the app is
-    // its own check (still gated on the enabled flag). Then the 24h timer takes
-    // over for the rest of the run.
-    run_attended_check(true, &notify).await;
+    // its own check (still gated on the enabled flag). Claimed, so the GUI and
+    // the node it spawned don't both fetch the same feed on the way up — see
+    // [`claim_launch_check`]. Then the interval timer takes over for the rest
+    // of the run.
+    if claim_launch_check() {
+        run_attended_check(true, &notify).await;
+    }
     loop {
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
@@ -985,16 +992,56 @@ where
 /// manager, apply policy, interval), so this no-ops cleanly when auto-update
 /// is off or the install is package-managed — `relaunch` never fires then.
 /// Like the attended ticker, the launch check ignores the interval cooldown
-/// (a node that bounces inside the interval still checks once on the way up),
-/// then the 24h timer takes over.
+/// (a node that bounces inside the interval still checks once on the way up)
+/// and is claimed against the other halves starting alongside it, then the 24h
+/// timer takes over. Standing down on a lost claim doesn't cost this node its
+/// currency: it adopts whatever the winner staged instead (see
+/// [`adopt_launch_stage`]).
 pub async fn tick_forever_unattended(relaunch: fn() -> !) {
     tokio::time::sleep(Duration::from_secs(30)).await;
-    // Launch check first (cooldown ignored), then the recurring interval.
-    run_unattended_check(true, relaunch).await;
+    // Launch check first (cooldown ignored, but claimed so a GUI starting
+    // alongside this node doesn't fetch the same feed twice), then the
+    // recurring interval.
+    if claim_launch_check() {
+        run_unattended_check(true, relaunch).await;
+    } else {
+        adopt_launch_stage(relaunch).await;
+    }
     loop {
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
         run_unattended_check(false, relaunch).await;
+    }
+}
+
+/// The unattended node lost the launch claim: another half of this install
+/// (the desktop GUI, almost always) is running the launch check right now.
+/// Fetching the same feed a second time is exactly what the claim exists to
+/// prevent — but standing down mustn't cost this node the "always current"
+/// half of its job, or a service box would sit on a staged update until its
+/// next interval tick, which is the one thing running unattended is for.
+///
+/// The winner stages into the same `pending.json` this node applies from, so
+/// there's nothing to fetch: wait for its check to land, then apply whatever
+/// is there. Silent when nothing was staged (the common case — the machine
+/// was already current), which is why this only logs once it has something.
+async fn adopt_launch_stage(relaunch: fn() -> !) {
+    // Long enough to cover the winner's fetch, download and staging of every
+    // artifact in the set; short enough that a service box comes up current
+    // rather than a tick later. Nothing is lost if it's still mid-stage — the
+    // interval tick catches it, exactly as it would have before.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let Some(version) = staged_version() else {
+        return;
+    };
+    tracing::info!("self-update {version} staged by another half of this install; applying now");
+    match apply_now() {
+        Ok(Some(applied)) => {
+            tracing::info!("self-update applied {applied}; relaunching to run the new version");
+            relaunch();
+        }
+        Ok(None) => tracing::debug!("self-update {version} needed nothing applied here"),
+        Err(e) => tracing::warn!("self-update apply failed: {e}; retrying next tick"),
     }
 }
 
@@ -1156,6 +1203,84 @@ fn is_due(interval_hours: u32) -> bool {
     match last_check_at() {
         Some(at) => now_secs() - at >= (interval_hours as i64) * 3600,
         None => true,
+    }
+}
+
+/// How long a launch check stays claimed. A launch check deliberately ignores
+/// `check_interval_hours` — opening the app should catch a release even when
+/// the last check was minutes ago — but "launch" belongs to the *machine*
+/// coming up, not to each process that happens to link this crate. A desktop
+/// box starts two of them together: the GUI runs [`tick_forever_notify`] and
+/// the `allmystuff-serve` node it spawns runs [`tick_forever_unattended`],
+/// each forcing past the interval seconds apart. That is two identical fetches
+/// of the same feed on every single launch, and the budget it spends is
+/// smaller than it looks — the feed call is unauthenticated, and GitHub allows
+/// 60 of those per hour per IP, shared by every install behind one address.
+///
+/// So whoever gets there first does the launch check and anyone starting
+/// alongside it takes that answer. Wide enough to cover a node that comes up
+/// well after the GUI (cold Windows starts are slow) or a service that starts
+/// staggered; far short of any real interval, so a genuine relaunch later in
+/// the day still checks.
+const LAUNCH_CLAIM_SECS: i64 = 10 * 60;
+
+fn launch_claim_path() -> Result<PathBuf> {
+    Ok(updates_dir()?.join("launch_check.json"))
+}
+
+fn launch_claim_at() -> Option<i64> {
+    let p = launch_claim_path().ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
+    doc["at"].as_i64()
+}
+
+/// Claim this machine's launch check. True for the one process that wins it,
+/// false for the halves starting alongside it (they skip straight to their
+/// interval timer).
+///
+/// The claim is written *before* the fetch, not after: `last_check.json` is
+/// only stamped once a fetch succeeds — deliberately, so one offline moment
+/// can't burn a whole interval — which makes it useless for coordinating
+/// processes that start within a network round-trip of each other. That is
+/// exactly the window here: the GUI spawns the node a second or two after
+/// itself, so both would read a not-yet-written stamp and both fetch.
+///
+/// `create_new` is the atomic primitive — on all three OSes exactly one
+/// process can create a file that doesn't already exist, so the race has a
+/// single winner rather than a likely one. A claim older than
+/// [`LAUNCH_CLAIM_SECS`] is from a previous launch (or a process that died
+/// mid-check) and is cleared, or one crash would suppress every future launch
+/// check on the machine. Any error coordinating leaves this process checking:
+/// a duplicate fetch is the old behaviour, while a swallowed launch check is a
+/// release nobody hears about.
+fn claim_launch_check() -> bool {
+    let Ok(path) = launch_claim_path() else {
+        return true;
+    };
+    if let Some(at) = launch_claim_at() {
+        if now_secs() - at < LAUNCH_CLAIM_SECS {
+            return false;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = f.write_all(
+                serde_json::json!({ "at": now_secs() })
+                    .to_string()
+                    .as_bytes(),
+            );
+            true
+        }
+        // Someone else claimed it between our read and our create — they're
+        // doing the launch check, so we stand down.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
     }
 }
 
@@ -1864,6 +1989,51 @@ mod tests {
         // Once caught up, it's no longer behind — no churn on the next check.
         record_artifact_version(ArtifactKind::Serve, "0.2.1");
         assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.2.1"));
+
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
+    fn only_one_half_of_an_install_runs_the_launch_check() {
+        // The duplicate this claim exists to kill: on a desktop box the GUI
+        // ticker and the `allmystuff-serve` node it spawns both wake ~30s in
+        // and both force past the interval, fetching the same feed seconds
+        // apart on every single launch. Whoever claims it first checks; the
+        // half starting alongside stands down.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+
+        assert!(claim_launch_check(), "the first half to start claims it");
+        assert!(
+            !claim_launch_check(),
+            "the half starting alongside it must not fetch the same feed again"
+        );
+
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
+    fn a_stale_launch_claim_never_suppresses_a_later_launch() {
+        // The claim is a launch-scoped debounce, not a lock: it must not
+        // outlive the launch it belongs to. A process killed mid-check leaves
+        // its claim behind, and if that were honoured forever the machine
+        // would never run another launch check — the exact failure the claim
+        // was added to avoid, made permanent.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+
+        let path = launch_claim_path().unwrap();
+        let stale = now_secs() - LAUNCH_CLAIM_SECS - 1;
+        std::fs::write(&path, serde_json::json!({ "at": stale }).to_string()).unwrap();
+
+        assert!(
+            claim_launch_check(),
+            "a claim older than the debounce is from a previous launch"
+        );
+        // …and the fresh claim it just wrote is honoured again.
+        assert!(!claim_launch_check());
 
         std::env::remove_var("ALLMYSTUFF_HOME");
     }

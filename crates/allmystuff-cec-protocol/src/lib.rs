@@ -10,18 +10,24 @@
 //! peer-to-peer substrate, but with two deliberate twists that make it behave
 //! like AnyDesk rather than an ordinary always-on mesh:
 //!
-//! 1. **One shared support area, hub-shaped.** Every CEC node — the customer
+//! 1. **Signaling-only presence, Silent areas.** Every CEC node — the customer
 //!    running the CEC Support app, and every technician's AllMyStuff install —
-//!    lives on the one well-known mesh, [`HELP_NETWORK_ID`]
-//!    (`cecsupport-clients`). Under its hub topology (`CEC_HELP_HUBS`),
-//!    customers hold connections only to CEC-operated infra hubs — never to
-//!    each other — and see nobody. Raising a hand is a
-//!    [`SupportPresence`] beacon on the area; the customer's short
-//!    [`SupportId`](ids::SupportId) number is a display/verification label
-//!    derived from the device key (readable over the phone as the fallback
-//!    when the queue is crowded), never a room name. A mesh is just a
-//!    signaling namespace — one area carries discovery, hand-raising, and
-//!    the session itself.
+//!    lives on the one well-known **Silent** mesh, [`HELP_NETWORK_ID`]
+//!    (`cecsupport-clients`). MyOwnMesh is a mesh *signaling* system for
+//!    direct WebRTC peer-to-peer connections, and a Silent network uses only
+//!    that half: members are visible to each other at the signaling layer
+//!    (announces in the room) but **nothing ever connects on its own** — no
+//!    auto-dial, no roster gossip, no relaying of data or media through
+//!    anything (the sole data-path fallback anywhere is a TURN server when
+//!    NAT rules out a direct path, which is WebRTC's own machinery, not a
+//!    mesh hop). Raising a hand is **joining a second Silent room**,
+//!    [`ASK_NETWORK_ID`] (`cecsupport-asking`): presence in that room *is*
+//!    the queue entry, and lowering the hand is leaving it. The customer's
+//!    short [`SupportId`](ids::SupportId) number is a display/verification
+//!    label derived from the device key (readable over the phone as the
+//!    fallback when the queue is crowded), never a room name. A mesh is just
+//!    a signaling namespace — the standing area carries discoverability and
+//!    the session; the asking room carries exactly one bit, "help".
 //! 2. **Deliberate dial, then approve.** The technician answers a raised
 //!    hand (or resolves a phoned-in number to its device) and *explicitly*
 //!    dials that device on the area. The customer then approves with one of
@@ -65,13 +71,24 @@ pub use wire::{
 /// meshes also start with `cec-` but never match the digits-only tail.)
 pub const CEC_NETWORK_PREFIX: &str = "cec-";
 
-/// The one well-known **global help mesh** every CEC client shares. A customer
-/// who taps "Ask for help" joins it and beacons a [`SupportPresence`] there —
-/// the beacon (its `support_id` is their dialable number) is the whole signal.
-/// Technicians sit on the room and list the beacons; an actual session still
-/// goes through the customer's own number mesh and the consent handshake, so
-/// this room carries *want*, never access.
+/// The one well-known **standing support area** every CEC node lives on, from
+/// bring-up. A **Silent** mesh: residents are discoverable at the signaling
+/// layer (that's how a technician's pinned redial finds a rebooted customer,
+/// and how a phoned-in number resolves to a device) but nobody connects to
+/// anybody until a technician deliberately dials one device. Sessions ride
+/// this area as direct WebRTC connections; the consent handshake still gates
+/// everything, so the area carries *presence*, never access.
 pub const HELP_NETWORK_ID: &str = "cecsupport-clients";
+
+/// The well-known **asking room** — the help queue itself. Also Silent, and
+/// joined **only while this device's hand is up**: membership in this room is
+/// the entire "I need help" signal (technicians watching the queue read the
+/// room's signaling presence; the dialable number derives from each present
+/// device id), and leaving the room withdraws the ask. Nothing connects here,
+/// ever — a technician answers by dialing the device on [`HELP_NETWORK_ID`].
+/// Replaces the `cec.presence` channel beacons, which needed data-channel
+/// wires that a Silent area rightly never opens.
+pub const ASK_NETWORK_ID: &str = "cecsupport-asking";
 
 /// Domain-separation tag for the per-peer ed25519 auth handshake. Forked from
 /// `myownmesh-mesh-auth-v1:` so a signature obtained on a CEC mesh cannot be

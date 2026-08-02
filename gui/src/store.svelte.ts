@@ -258,6 +258,12 @@ import {
  *  old per-customer `cec-<number>` rooms: sessions ride the area now. */
 const CEC_AREA_NETWORK_ID = "cecsupport-clients";
 
+/** The CEC asking room (the node's `ASK_NETWORK_ID`) — the help queue itself.
+ *  Membership is the raised hand: a customer sits in it only while asking, a
+ *  watching technician reads it listen-only. Node-managed and transient, so
+ *  the Meshes list hides it like the area. */
+const CEC_ASK_NETWORK_ID = "cecsupport-asking";
+
 /** A stored customer unused for this long reads as "stale" — the cleanup nudge
  *  for a directory that grows as customers cycle out. Shared by the CEC tab's
  *  per-row badge and the "Remove stale" bulk curate action. */
@@ -998,7 +1004,10 @@ class AppStore {
    *  a technician's first dial) and driven from the CEC tab, so the Meshes list
    *  filters it out to keep client support separate from your own meshes. */
   isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
-    return net?.network_id === CEC_AREA_NETWORK_ID;
+    return (
+      net?.network_id === CEC_AREA_NETWORK_ID ||
+      net?.network_id === CEC_ASK_NETWORK_ID
+    );
   }
 
   /** Your meshes minus the CEC Support area — what the Meshes list actually

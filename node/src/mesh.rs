@@ -4476,6 +4476,7 @@ impl Mesh {
         let (network_id, config) = crate::cec::help_network_config();
         self.cec_join_silent(&network_id, config).await?;
         self.cec_migrate_area_to_silent().await;
+        self.cec_sweep_area_roster().await;
         self.cec_purge_legacy_rooms().await;
         self.cec_sweep_stale_asking_room().await;
         tracing::info!("CEC Support: on the support area {network_id} as number {number}");
@@ -4570,7 +4571,75 @@ impl Mesh {
         if let Err(e) = self.cec_join_silent(&area, config).await {
             tracing::warn!("CEC Support: re-join of the silent area failed: {e}");
         }
+        // The purge deleted the area's network config — including the pinned
+        // standing dials a technician holds toward every serviced customer
+        // (pins persist inside the network config). Re-arm them from the
+        // durable dialed directory so unattended reconnects survive the
+        // migration: each pin is a fire-and-forget reconnect intent the
+        // engine parks until that customer next announces. A customer node
+        // has no dialed records, so this is a no-op for them.
+        for record in self.cec.dialed_records() {
+            let canonical = crate::cec::pubkey_part(&record.node).to_string();
+            let _ = self
+                .client
+                .request(&Request::NetworkConnectPeer {
+                    network: area.clone(),
+                    peer: canonical,
+                    pin: true,
+                    wait_ms: 0,
+                })
+                .await;
+        }
         self.sync_networks().await;
+    }
+
+    /// Drop every area-roster entry this node has no deliberate CEC
+    /// relationship with. The open era auto-approved (and gossiped in)
+    /// every co-present stranger, and the migration's purge only heals a
+    /// room whose governed kind still reads `open` — a daemon that
+    /// restarted onto the silent config before the app's first post-update
+    /// run keeps its stranger roster. This sweep is the idempotent
+    /// belt-and-suspenders: legitimate entries (dialed customers, granted
+    /// or pending technicians) stay, strangers go.
+    async fn cec_sweep_area_roster(self: &Arc<Self>) {
+        let area = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
+        let data = match self
+            .client
+            .request(&Request::RosterList {
+                network: area.clone(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return,
+        };
+        let Some(entries) = data.get("roster").and_then(|v| v.as_array()) else {
+            return;
+        };
+        let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
+        let strangers: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.get("device_id").and_then(|v| v.as_str()))
+            .map(|id| pubkey_part(id).to_string())
+            .filter(|id| me.as_deref() != Some(id.as_str()))
+            .filter(|id| !self.cec.relationship_with(id))
+            .collect();
+        if strangers.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "CEC Support: dropping {} open-era stranger(s) from the area roster",
+            strangers.len()
+        );
+        for device_id in strangers {
+            let _ = self
+                .client
+                .request(&Request::RosterRemove {
+                    network: area.clone(),
+                    device_id,
+                })
+                .await;
+        }
     }
 
     /// Leave the asking room if this node has no live reason to be in it —
@@ -4683,6 +4752,7 @@ impl Mesh {
             let (network_id, config) = crate::cec::help_network_config();
             self.cec_join_silent(&network_id, config).await?;
             self.cec_migrate_area_to_silent().await;
+            self.cec_sweep_area_roster().await;
             // Listen-only: the queue is read by presence, never joined as a
             // presence — a watching technician must not read as a raised
             // hand in other technicians' queues.

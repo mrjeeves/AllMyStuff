@@ -76,7 +76,7 @@ crates/
 ├── allmystuff-bridge        # Inventory ──► graph Capabilities (+ presence summary)
 ├── allmystuff-session       # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
 ├── allmystuff-term          # `amst` — the command-line terminal (a mesh PTY in your own terminal)
-├── allmystuff-cec-protocol  # CEC Support's wire types: support ids, consent control, the help beacon
+├── allmystuff-cec-protocol  # CEC Support's wire types: support ids, consent control, the CEC room ids
 ├── allmystuff-cec-consent   # a customer's standing technician approvals (once / 3 hours / forever)
 ├── allmystuff-mobile-core   # the phone's model: viewer/controller capability set + NodeProfile (docs/MOBILE.md)
 ├── allmystuff-updater       # self-update: release feed, SHA-256 verify, stage-then-apply

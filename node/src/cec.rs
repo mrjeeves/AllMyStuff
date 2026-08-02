@@ -1571,7 +1571,10 @@ mod tests {
         // A device present in the asking room is a queue row with its number
         // derived from the device id — no label until a session brings one.
         assert!(cec.help_present(ME));
-        assert!(!cec.help_present(ME), "re-announce is a refresh, not a change");
+        assert!(
+            !cec.help_present(ME),
+            "re-announce is a refresh, not a change"
+        );
         let list = cec.help_list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["number"], support_id_from_device(ME));

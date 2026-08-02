@@ -2573,10 +2573,8 @@ impl Mesh {
                                 _ => false,
                             };
                             if changed {
-                                self.sink.emit(
-                                    "cec://help",
-                                    json!({ "waiting": self.cec.help_list() }),
-                                );
+                                self.sink
+                                    .emit("cec://help", json!({ "waiting": self.cec.help_list() }));
                             }
                         }
                     }
@@ -2702,9 +2700,7 @@ impl Mesh {
                 // — and, worse, the first-contact answer below would send our
                 // profile AND roster straight back to it. Drop before any
                 // state is touched.
-                if crate::cec::is_cec_network(&network)
-                    && !self.cec.relationship_with(&from)
-                {
+                if crate::cec::is_cec_network(&network) && !self.cec.relationship_with(&from) {
                     tracing::debug!(
                         "ignoring presence on {network} from {} — no CEC relationship",
                         short_id(&from)

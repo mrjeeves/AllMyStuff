@@ -475,7 +475,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
    speak the lane (myownmesh ≥ 0.2.4 — the actually-bundled daemon pin is
-   v0.2.9, see `.myownmesh-rev`), as PCM `AudioFrame`s over
+   v0.3.3, see `.myownmesh-rev`), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step
@@ -542,7 +542,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    daemon's job: myownmesh ≥ 0.2.2 reassembles access units
    sequence-aware, so packet loss or a late NACK retransmit costs one
    frame, never a corrupt unit in a decoder. (These are floor thresholds;
-   the actually-bundled daemon pin is v0.2.9 — see `.myownmesh-rev`.)
+   the actually-bundled daemon pin is v0.3.3 — see `.myownmesh-rev`.)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;

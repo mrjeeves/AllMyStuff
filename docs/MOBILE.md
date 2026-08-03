@@ -534,7 +534,7 @@ Beyond the desktop's existing Linux CI + minisign-signed releases:
 - **Store-owned updates**: the updater crate stays out of the mobile
   binary; the Settings tab already shows "About" instead. Fleet "upgrade
   this machine" pointed at a phone should surface "update from the store."
-- The daemon pin: the embedded engine follows `.myownmesh-rev` (v0.3.0
+- The daemon pin: the embedded engine follows `.myownmesh-rev` (v0.3.3
   today) via the git tags in `gui/mobile/Cargo.toml` — bump both together,
   exactly like the desktop's bundled-daemon pin.
 

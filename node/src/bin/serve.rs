@@ -39,6 +39,7 @@ use std::future::Future;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use allmystuff_node::control_client::ControlClient;
 use allmystuff_node::daemon_spawn::{self, DaemonChild};
@@ -94,7 +95,15 @@ fn reexec_self() -> ! {
             }
             #[cfg(not(unix))]
             {
-                if let Err(e) = std::process::Command::new(&exe).args(&args).spawn() {
+                // Windows cannot replace the current process image with
+                // `execve`. Mark the child as our hand-off successor so it
+                // waits for this process to release the one-node control
+                // socket instead of stepping aside as an unrelated duplicate.
+                if let Err(e) = std::process::Command::new(&exe)
+                    .args(&args)
+                    .env("ALLMYSTUFF_REEXEC_HANDOFF", "1")
+                    .spawn()
+                {
                     tracing::error!("couldn't relaunch: {e}");
                 }
             }
@@ -268,11 +277,35 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
     // before the mesh starts is also what makes two simultaneously-starting
     // nodes safe (see `bind_control_socket`).
     let shutdown = std::pin::pin!(shutdown);
-    let control_listener = match node_control::bind_control_socket().await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::info!("not starting a second node ({e:#})");
-            return ExitCode::SUCCESS;
+    // A Windows re-exec has to spawn before the old process can exit. The
+    // replacement can therefore reach this bind while its parent still owns
+    // the socket. Only a child explicitly marked by `reexec_self` retries;
+    // ordinary duplicate launches retain the immediate step-aside behavior.
+    #[cfg(windows)]
+    let mut handoff_retries = if std::env::var_os("ALLMYSTUFF_REEXEC_HANDOFF").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        100u8 // 5 seconds at 50 ms — generous for loaded Windows hosts.
+    } else {
+        0
+    };
+    #[cfg(not(windows))]
+    let mut handoff_retries = 0u8;
+
+    let control_listener = loop {
+        match node_control::bind_control_socket().await {
+            Ok(listener) => break listener,
+            Err(_) if handoff_retries > 0 => {
+                if handoff_retries == 100 {
+                    tracing::debug!("waiting for the previous node to release its control socket");
+                }
+                handoff_retries -= 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                tracing::info!("not starting a second node ({e:#})");
+                return ExitCode::SUCCESS;
+            }
         }
     };
 

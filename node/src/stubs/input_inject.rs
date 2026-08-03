@@ -18,7 +18,9 @@ impl Injector {
     }
 
     /// Dropped — no display server, no injection API, nothing held down.
-    pub fn apply(&self, route: &str, _action: InputAction) {
+    /// `_elevated` is carried for signature parity with the real injector;
+    /// there is no UAC/UIPI split here and nothing to elevate into.
+    pub fn apply(&self, route: &str, _action: InputAction, _elevated: bool) {
         tracing::debug!("input event for {route} dropped: capture-less build");
     }
 

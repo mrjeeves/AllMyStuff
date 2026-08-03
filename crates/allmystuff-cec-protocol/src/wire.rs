@@ -185,13 +185,24 @@ impl ApprovalScope {
 pub enum ConnectControl {
     /// Technician → customer: "I'd like to connect." `agent_name` is what the
     /// customer sees ("*Agent Name* is trying to connect to your computer");
-    /// `want_control` distinguishes view-only from full keyboard/mouse control.
+    /// `want_control` distinguishes view-only from full keyboard/mouse control;
+    /// `want_elevated` asks for **administrator reach** on top of control (see
+    /// [`Capability::Elevated`] in `allmystuff-cec-consent`), which is what
+    /// lets the session drive Event Viewer, Services, Device Manager and the
+    /// rest of Windows' elevated repair tooling.
+    ///
+    /// `want_elevated` defaults to `false`, so a technician build that predates
+    /// it asks for exactly what it always asked for, and a customer node that
+    /// predates it ignores the field and grants exactly what it always granted.
+    /// Escalation is never something a version skew can imply.
     Request {
         session_id: String,
         #[serde(default)]
         agent_name: String,
         #[serde(default)]
         want_control: bool,
+        #[serde(default)]
+        want_elevated: bool,
     },
     /// Customer → technician: approved, with the chosen [`ApprovalScope`].
     Approve {
@@ -231,6 +242,114 @@ pub enum AppControl {
     Unknown,
 }
 
+/// Why administrator reach is not in force on the customer's machine, so the
+/// technician's app can say something true instead of leaving them clicking a
+/// dead Event Viewer wondering which end is broken.
+///
+/// The distinction that matters in the field is **not granted** (the customer
+/// can fix it — ask them to approve admin access) versus **not effective** (the
+/// customer can't fix it from the prompt; the agent isn't installed in a way
+/// that can escalate, and it needs the background service).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElevationBlocker {
+    /// Nothing is blocking it — admin reach is live.
+    #[default]
+    None,
+    /// Administrator access is switched off for this PC as a whole — either the
+    /// customer declined it when the background service was installed, or they
+    /// have since turned it off in Settings. Nothing about *this* session can
+    /// change that; it is one switch in one place.
+    NotAllowedOnThisMachine,
+    /// The machine permits admin access, but this technician's grant is
+    /// view-only or plain control. Reconnect asking for it.
+    NotGranted,
+    /// Granted, but this agent process runs as the logged-in user at medium
+    /// integrity: Windows (UIPI) discards its input into elevated windows and
+    /// it cannot see the secure desktop. Needs the background service, which
+    /// runs as `LocalSystem` and can host the session at the required posture.
+    AgentNotPrivileged,
+    /// Granted, but no privileged background service is installed to escalate
+    /// through. The customer installs it from Settings (one UAC prompt).
+    ServiceMissing,
+    /// This isn't Windows — there is no UAC/UIPI split to escalate across, so
+    /// the whole question is moot and control is already whatever the OS allows.
+    NotApplicable,
+    /// Forward-compat: an unrecognised reason decodes here.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ElevationBlocker {
+    /// A sentence for the technician's session banner.
+    pub fn detail(self) -> &'static str {
+        match self {
+            ElevationBlocker::None => "Administrator access is active on this session.",
+            ElevationBlocker::NotAllowedOnThisMachine => {
+                "Administrator access is switched off for this PC. The customer can turn it on in CEC Support → Settings."
+            }
+            ElevationBlocker::NotGranted => {
+                "This session was approved for control only. Reconnect asking for administrator access."
+            }
+            ElevationBlocker::AgentNotPrivileged => {
+                "CEC Support is running without administrator rights, so Windows blocks input to elevated windows. Ask the customer to install the CEC Support background service."
+            }
+            ElevationBlocker::ServiceMissing => {
+                "The CEC Support background service isn't installed, so this session can't reach elevated windows. Ask the customer to install it from Settings."
+            }
+            ElevationBlocker::NotApplicable => {
+                "This machine isn't Windows — control is already at the level the OS allows."
+            }
+            ElevationBlocker::Unknown => "Administrator access is unavailable for an unknown reason.",
+        }
+    }
+}
+
+/// The customer's node telling the technician what administrator reach is
+/// actually in force, carried inside [`ControlMessage::Elevation`]. Sent when a
+/// session starts and again whenever the answer changes (a grant approved or
+/// revoked mid-session, the service installed).
+///
+/// It is purely **informational** — a status readout for the technician's UI.
+/// Nothing on the customer side trusts it and no gate reads it; enforcement is
+/// always the consent store, re-checked per frame on the machine that owns the
+/// screen. A peer that lies here only lies to its own operator's status line.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElevationReport {
+    /// The session this describes.
+    #[serde(default)]
+    pub session_id: String,
+    /// Whether the customer's live grant covers administrator reach.
+    #[serde(default)]
+    pub granted: bool,
+    /// Whether the agent can actually deliver it right now — granted *and*
+    /// running at a posture Windows will honour. This is the one the banner
+    /// should key on; `granted` alone will strand a technician who was approved
+    /// but is still being dropped by UIPI.
+    #[serde(default)]
+    pub effective: bool,
+    /// Why not, when `effective` is false.
+    #[serde(default)]
+    pub blocker: ElevationBlocker,
+}
+
+impl ElevationReport {
+    /// Build a report for `session_id` from the two facts the node knows.
+    pub fn new(session_id: impl Into<String>, granted: bool, blocker: ElevationBlocker) -> Self {
+        ElevationReport {
+            session_id: session_id.into(),
+            granted,
+            effective: granted && blocker == ElevationBlocker::None,
+            blocker,
+        }
+    }
+
+    /// The sentence to show the technician.
+    pub fn detail(&self) -> &'static str {
+        self.blocker.detail()
+    }
+}
+
 /// A free-text chat message exchanged between the connected technician and
 /// customer, carried inside [`ControlMessage::Chat`] on
 /// [`CHANNEL_CONTROL`](crate::CHANNEL_CONTROL) while a session is live. It is
@@ -266,6 +385,10 @@ pub enum ControlMessage {
     /// A chat message between the connected technician and customer, live only
     /// while a session is active.
     Chat(ChatMessage),
+    /// Customer → technician: what administrator reach is in force, and why not
+    /// when it isn't. Additive — a technician build that predates it decodes the
+    /// envelope to [`ControlMessage::Unknown`] and ignores it, exactly like chat.
+    Elevation(ElevationReport),
     /// Forward-compat catch-all.
     #[serde(other)]
     Unknown,
@@ -313,6 +436,7 @@ mod tests {
                 session_id: "s1".into(),
                 agent_name: "Alex at CEC".into(),
                 want_control: true,
+                want_elevated: true,
             }),
             ControlMessage::Connect(ConnectControl::Approve {
                 session_id: "s1".into(),
@@ -332,6 +456,11 @@ mod tests {
                 text: "Can you close the browser and re-open it?".into(),
                 ts: 1_700_000_000,
             }),
+            ControlMessage::Elevation(ElevationReport::new(
+                "s1",
+                true,
+                ElevationBlocker::ServiceMissing,
+            )),
         ];
         for m in msgs {
             let json = serde_json::to_string(&m).unwrap();
@@ -369,5 +498,75 @@ mod tests {
     fn approval_scope_wire_form_is_tagged() {
         let json = serde_json::to_string(&ApprovalScope::ThreeHours).unwrap();
         assert_eq!(json, r#"{"kind":"three_hours"}"#);
+    }
+
+    // ---- elevation ----------------------------------------------------------
+
+    #[test]
+    fn an_older_technicians_request_never_asks_for_elevation() {
+        // The skew that must not escalate: a Request from a build that predates
+        // `want_elevated` has no such field, and must read as "not asked for".
+        let req: ConnectControl = serde_json::from_str(
+            r#"{"kind":"request","session_id":"s1","agent_name":"Alex","want_control":true}"#,
+        )
+        .unwrap();
+        match req {
+            ConnectControl::Request {
+                want_control,
+                want_elevated,
+                ..
+            } => {
+                assert!(want_control);
+                assert!(!want_elevated, "a missing field must never imply admin");
+            }
+            other => panic!("decoded to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elevation_report_is_effective_only_when_granted_and_unblocked() {
+        let live = ElevationReport::new("s1", true, ElevationBlocker::None);
+        assert!(live.effective);
+
+        // Granted but the agent can't deliver it: not effective.
+        let stranded = ElevationReport::new("s1", true, ElevationBlocker::AgentNotPrivileged);
+        assert!(stranded.granted);
+        assert!(!stranded.effective);
+
+        // Not granted: not effective, whatever the posture.
+        let ungranted = ElevationReport::new("s1", false, ElevationBlocker::None);
+        assert!(!ungranted.effective);
+    }
+
+    #[test]
+    fn every_blocker_explains_itself() {
+        for b in [
+            ElevationBlocker::None,
+            ElevationBlocker::NotAllowedOnThisMachine,
+            ElevationBlocker::NotGranted,
+            ElevationBlocker::AgentNotPrivileged,
+            ElevationBlocker::ServiceMissing,
+            ElevationBlocker::NotApplicable,
+            ElevationBlocker::Unknown,
+        ] {
+            assert!(
+                !b.detail().is_empty(),
+                "{b:?} has no technician-facing text"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_blocker_and_missing_report_fields_decode() {
+        // A newer customer node naming a reason this build doesn't know.
+        let r: ElevationReport =
+            serde_json::from_str(r#"{"session_id":"s","granted":true,"blocker":"quantum_uac"}"#)
+                .unwrap();
+        assert_eq!(r.blocker, ElevationBlocker::Unknown);
+        // And a report carrying nothing at all still decodes to a safe default.
+        let empty: ElevationReport = serde_json::from_str("{}").unwrap();
+        assert!(!empty.granted);
+        assert!(!empty.effective);
+        assert_eq!(empty.blocker, ElevationBlocker::None);
     }
 }

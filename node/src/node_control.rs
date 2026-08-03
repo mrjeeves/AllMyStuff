@@ -1531,6 +1531,14 @@ pub async fn dispatch(
             json_result(mesh.cec_revoke(tech).await)
         }
         "cec_grants" => json_result(mesh.cec_grants().await),
+        // The machine-wide administrator-access setting: read it for the
+        // Settings panel and for the installer deciding whether the customer
+        // has ever been asked, and write it from the install prompt or Settings.
+        "cec_elevation" => json_result(mesh.cec_elevation().await),
+        "cec_set_elevation" => {
+            let allowed: bool = try_arg!(arg(a, "allowed"));
+            json_result(mesh.cec_set_elevation(allowed).await)
+        }
         "cec_viewing" => json_result(mesh.cec_viewing().await),
         "cec_dialed" => json_result(mesh.cec_dialed().await),
         "cec_cancel_dial" => json_result(mesh.cec_cancel_dial().await),

@@ -55,7 +55,15 @@ use parking_lot::Mutex;
 use allmystuff_session::InputAction;
 
 enum Cmd {
-    Event { route: String, action: InputAction },
+    Event {
+        route: String,
+        action: InputAction,
+        /// Whether this event is authorized to reach **elevated** windows.
+        /// Decided per event by the mesh's `sender_may_elevate` (machine
+        /// setting AND the sender's entitlement), never cached here — so
+        /// switching admin access off stops the very next keystroke.
+        elevated: bool,
+    },
     ReleaseRoute(String),
 }
 
@@ -78,11 +86,17 @@ impl Injector {
     /// Queue one event for injection. Starts the injector thread on first
     /// use; if the platform refuses (no display server, missing
     /// permissions) the failure is logged once and events are dropped.
-    pub fn apply(&self, route: &str, action: InputAction) {
+    ///
+    /// `elevated` says this event is authorized to reach elevated windows. On
+    /// Windows that decides whether the injector follows the *input desktop*
+    /// before typing — the difference between a click landing in Event Viewer
+    /// and being silently discarded by UIPI. Elsewhere it is inert.
+    pub fn apply(&self, route: &str, action: InputAction, elevated: bool) {
         self.send(
             Cmd::Event {
                 route: route.into(),
                 action,
+                elevated,
             },
             true,
         );
@@ -140,9 +154,37 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
     // next key resolves, and whatever is still down gets lifted when the
     // route goes away.
     let mut keys: HashMap<String, KeyTracker> = HashMap::new();
+    // Windows only: keeps this thread attached to whichever desktop is taking
+    // input. Without it every synthesized event goes to the desktop the thread
+    // started on, so the moment Windows switches to the secure desktop (a UAC
+    // prompt) the technician is typing into a desktop nobody is looking at.
+    // Inert off Windows.
+    let mut desktop = crate::win_privilege::DesktopFollower::new();
     while let Ok(cmd) = rx.recv() {
         let (route, action) = match cmd {
-            Cmd::Event { route, action } => (route, action),
+            Cmd::Event {
+                route,
+                action,
+                elevated,
+            } => {
+                // Follow the input desktop only for events authorized to reach
+                // elevated windows. An unelevated session deliberately stays on
+                // the desktop it started on: it must not be able to type at a
+                // UAC prompt, which is the one dialog whose whole purpose is to
+                // be answered by the person sitting at the machine.
+                if elevated && desktop.follow() {
+                    tracing::info!(
+                        "input: following desktop switch to {:?}{}",
+                        desktop.desktop_name(),
+                        if desktop.on_secure_desktop() {
+                            " (secure desktop — UAC prompt)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                (route, action)
+            }
             Cmd::ReleaseRoute(route) => {
                 if let Some(mut tracker) = keys.remove(&route) {
                     for k in tracker.release_all() {

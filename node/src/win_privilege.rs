@@ -193,6 +193,29 @@ pub fn blocker_for(
     }
 }
 
+/// Build a Windows command line with the executable and every argument quoted.
+///
+/// Hoisted out of the Win32 module and kept pure so it is tested on every
+/// platform, not just on the one CI runner that compiles the `cfg(windows)`
+/// half. The bug it exists to prevent is not hypothetical: this is launched
+/// from `C:\Program Files\…`, and an unquoted path there silently becomes two
+/// arguments, so the agent fails to start on exactly the installs that matter
+/// and works fine in every dev checkout.
+///
+/// Off Windows only the tests call it — which is the entire reason it lives out
+/// here rather than inside the `cfg(windows)` module.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_command(exe: &std::path::Path, args: &[&str]) -> String {
+    let mut s = format!("\"{}\"", exe.display());
+    for a in args {
+        s.push(' ');
+        s.push('"');
+        s.push_str(&a.replace('"', "\\\""));
+        s.push('"');
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Windows backend
 // ---------------------------------------------------------------------------
@@ -200,17 +223,24 @@ pub fn blocker_for(
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
+    use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
-        TokenIntegrityLevel, TokenUIAccess, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        SecurityImpersonation, SetTokenInformation, TokenElevation, TokenIntegrityLevel,
+        TokenPrimary, TokenSessionId, TokenUIAccess, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
+        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
 
     use super::{Integrity, Posture};
 
@@ -352,6 +382,200 @@ mod imp {
     pub fn active_console_session() -> u32 {
         // SAFETY: no arguments, no preconditions.
         unsafe { WTSGetActiveConsoleSessionId() }
+    }
+
+    /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
+    /// to the console — between a logoff and the next logon, or on a box whose
+    /// session is being transferred.
+    const NO_SESSION: u32 = 0xFFFF_FFFF;
+
+    /// Launch `exe args` as **`SYSTEM` in the interactive console session**.
+    ///
+    /// This is the whole point of the background service. A service runs in
+    /// session 0, which since Vista has no desktop at all — nothing there can
+    /// capture a screen or synthesize input, however privileged it is. Meanwhile
+    /// a process launched from the customer's own desktop has a desktop but only
+    /// medium integrity, so Windows discards its input into anything elevated.
+    /// Neither half can do the job alone.
+    ///
+    /// Duplicating the service's own `SYSTEM` token and retargeting it at the
+    /// console session produces the process that can: `SYSTEM` integrity *and*
+    /// a real desktop. That is what makes elevated windows clickable and the
+    /// secure desktop reachable.
+    ///
+    /// Requires `SeTcbPrivilege` to retarget the session, which `LocalSystem`
+    /// holds and an ordinary administrator does not — so this only ever
+    /// succeeds from the service, which is exactly the intended constraint.
+    ///
+    /// The child inherits the service's environment deliberately (null `lpEnvironment`):
+    /// its state must live under the service's `*_HOME`, not the console user's,
+    /// so a machine with several logins keeps one agent identity rather than
+    /// minting a new node per user.
+    ///
+    /// Returns the child's process handle, which the caller owns and must close
+    /// (see [`ConsoleAgent`], which does).
+    pub fn launch_in_console_session(exe: &Path, args: &[&str]) -> Result<*mut c_void, String> {
+        let session = active_console_session();
+        if session == NO_SESSION {
+            return Err("no interactive console session is attached".into());
+        }
+        if session == 0 {
+            // Session 0 is the service session — launching there would reproduce
+            // the exact desktop-less situation this function exists to escape.
+            return Err("the console session is session 0 (no interactive desktop)".into());
+        }
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: our own process; the access mask is what DuplicateTokenEx +
+        // CreateProcessAsUser need.
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                &mut token,
+            )
+        } == 0
+        {
+            return Err("opening this process's token failed".into());
+        }
+
+        let mut primary: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` is live; a primary token is what CreateProcessAsUser
+        // requires (an impersonation token is rejected).
+        let dup_ok = unsafe {
+            DuplicateTokenEx(
+                token,
+                TOKEN_ALL_ACCESS,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary,
+            )
+        };
+        // SAFETY: `token` came from a successful OpenProcessToken and is no
+        // longer needed once duplicated.
+        unsafe { CloseHandle(token) };
+        if dup_ok == 0 {
+            return Err("duplicating the service token failed".into());
+        }
+
+        // Retarget the duplicate at the console session. This is the step that
+        // needs SeTcbPrivilege, and the step that moves the child out of the
+        // desktop-less session 0.
+        // SAFETY: `primary` is a live primary token; TokenSessionId takes a DWORD.
+        let set_ok = unsafe {
+            SetTokenInformation(
+                primary,
+                TokenSessionId,
+                &session as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if set_ok == 0 {
+            // SAFETY: `primary` is ours and unused from here.
+            unsafe { CloseHandle(primary) };
+            return Err(format!(
+                "retargeting the token at session {session} failed (SeTcbPrivilege is required — \
+                 this must run as LocalSystem)"
+            ));
+        }
+
+        // `CreateProcessAsUserW` writes into the command line buffer, so it must
+        // be owned and mutable.
+        let mut cmdline: Vec<u16> = super::quote_command(exe, args)
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // `WinSta0\Default` is the interactive window station's ordinary desktop.
+        // The agent re-attaches to whatever desktop is taking input once it's
+        // running (see `DesktopFollower`); this is only where it starts.
+        let mut desktop: Vec<u16> = "WinSta0\\Default".encode_utf16().chain([0]).collect();
+
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        si.lpDesktop = desktop.as_mut_ptr();
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: `primary` is a session-retargeted primary token; `cmdline` is
+        // a NUL-terminated mutable UTF-16 buffer that outlives the call.
+        let ok = unsafe {
+            CreateProcessAsUserW(
+                primary,
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // don't inherit handles
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        // SAFETY: `primary` is ours; the child holds its own reference now.
+        unsafe { CloseHandle(primary) };
+        if ok == 0 {
+            return Err("CreateProcessAsUser into the console session failed".into());
+        }
+        // The thread handle is surplus — only the process handle is waited on.
+        // SAFETY: both handles came from a successful CreateProcessAsUser.
+        unsafe { CloseHandle(pi.hThread) };
+        Ok(pi.hProcess)
+    }
+
+    /// A child launched by [`launch_in_console_session`], closed on drop.
+    pub struct ConsoleAgent {
+        handle: *mut c_void,
+        /// The console session it was launched into. When the console moves to a
+        /// different session (logoff, fast user switching, an RDP takeover) this
+        /// child is stranded on a desktop nobody is at and has to be replaced.
+        session: u32,
+    }
+
+    // SAFETY: a process handle is valid from any thread of the process.
+    unsafe impl Send for ConsoleAgent {}
+
+    impl ConsoleAgent {
+        /// Launch and wrap. See [`launch_in_console_session`].
+        pub fn launch(exe: &Path, args: &[&str]) -> Result<ConsoleAgent, String> {
+            let session = active_console_session();
+            let handle = launch_in_console_session(exe, args)?;
+            Ok(ConsoleAgent { handle, session })
+        }
+
+        /// Whether the child is still running.
+        pub fn alive(&self) -> bool {
+            // SAFETY: `self.handle` is a live process handle this value owns.
+            // A zero timeout makes this a poll, not a wait.
+            let signalled = unsafe { WaitForSingleObject(self.handle, 0) };
+            signalled != WAIT_OBJECT_0
+        }
+
+        /// Whether the interactive console has moved to a different session than
+        /// the one this agent was launched into — i.e. it is now on a desktop
+        /// nobody is sitting at, and the supervisor should replace it.
+        pub fn session_moved(&self) -> bool {
+            let now = active_console_session();
+            now != NO_SESSION && now != self.session
+        }
+
+        /// Stop the child. Terminating is correct here rather than harsh: the
+        /// agent holds no user data and no in-flight writes worth draining, and
+        /// a stranded one must not outlive the session it was launched for.
+        pub fn stop(&self) {
+            // SAFETY: a live process handle this value owns.
+            unsafe { TerminateProcess(self.handle, 0) };
+        }
+    }
+
+    impl Drop for ConsoleAgent {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                // SAFETY: this value owns `handle` and is being destroyed.
+                unsafe { CloseHandle(self.handle) };
+            }
+        }
     }
 
     /// A handle to a desktop, closed on drop.
@@ -497,6 +721,23 @@ mod imp {
         0
     }
 
+    /// No session-0 split to escape: a Unix daemon that needs a display gets it
+    /// from the display server's own rules, not from token surgery.
+    pub struct ConsoleAgent;
+
+    impl ConsoleAgent {
+        pub fn launch(_exe: &std::path::Path, _args: &[&str]) -> Result<ConsoleAgent, String> {
+            Err("launching a console-session agent is a Windows-only mechanism".into())
+        }
+        pub fn alive(&self) -> bool {
+            false
+        }
+        pub fn session_moved(&self) -> bool {
+            false
+        }
+        pub fn stop(&self) {}
+    }
+
     /// A follower that never has anywhere to follow to.
     #[derive(Default)]
     pub struct DesktopFollower;
@@ -517,7 +758,7 @@ mod imp {
     }
 }
 
-pub use imp::{active_console_session, current_posture, DesktopFollower};
+pub use imp::{active_console_session, current_posture, ConsoleAgent, DesktopFollower};
 
 /// Whether this build targets Windows at all — the first question
 /// [`blocker_for`] asks, hoisted here so callers don't sprinkle `cfg!`.
@@ -666,5 +907,41 @@ mod tests {
     fn a_follower_starts_unattached() {
         let f = DesktopFollower::new();
         assert!(!f.on_secure_desktop());
+    }
+
+    #[test]
+    fn a_program_files_path_stays_one_argument() {
+        // The install path has a space in it. Unquoted, `CreateProcessAsUser`
+        // would try to run `C:\Program` — and only ever on a real install, never
+        // in a dev checkout, which is the worst possible place to find out.
+        let cmd = quote_command(
+            std::path::Path::new(r"C:\Program Files\CEC Support\cec-support.exe"),
+            &["run", "--session-agent"],
+        );
+        assert_eq!(
+            cmd,
+            r#""C:\Program Files\CEC Support\cec-support.exe" "run" "--session-agent""#
+        );
+    }
+
+    #[test]
+    fn an_argument_containing_a_quote_is_escaped() {
+        let cmd = quote_command(std::path::Path::new("agent.exe"), &[r#"a"b"#]);
+        assert_eq!(cmd, r#""agent.exe" "a\"b""#);
+    }
+
+    #[test]
+    fn no_arguments_is_just_the_quoted_exe() {
+        let cmd = quote_command(std::path::Path::new("agent.exe"), &[]);
+        assert_eq!(cmd, r#""agent.exe""#);
+    }
+
+    #[test]
+    fn a_console_agent_cannot_be_launched_off_windows() {
+        // The stub must fail loudly rather than pretend it launched something:
+        // a service that believes it has a session agent when it hasn't would
+        // sit there supervising nothing.
+        let r = ConsoleAgent::launch(std::path::Path::new("agent"), &[]);
+        assert!(r.is_err() || cfg!(windows));
     }
 }

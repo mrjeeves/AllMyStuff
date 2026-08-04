@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use allmystuff_cec_consent::{capabilities_for_request, Capability, ConsentStore};
+use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
 use allmystuff_cec_protocol::{
     format_support_id, support_id_from_device, ApprovalScope, ChatMessage, Role,
 };
@@ -76,10 +76,6 @@ pub struct PendingRequest {
     pub agent_name: String,
     /// Whether the technician asked for keyboard/mouse control (vs view-only).
     pub want_control: bool,
-    /// Whether the technician asked for administrator reach on top of control.
-    /// Recorded on the grant, but it only bites where the machine's one-time
-    /// admin-access setting is on — see [`Cec::approve`].
-    pub want_elevated: bool,
     /// The session id the technician minted for this attempt.
     pub session_id: String,
     /// A short, human-comparable code the customer can read back to confirm the
@@ -93,7 +89,6 @@ impl PendingRequest {
             "tech": self.tech,
             "agent_name": self.agent_name,
             "want_control": self.want_control,
-            "want_elevated": self.want_elevated,
             "session_id": self.session_id,
             "verification_code": self.verification_code,
         })
@@ -349,7 +344,7 @@ impl Cec {
         };
         let dialed = load_dialed(dialed_path.as_ref());
         let chats = load_chats(chats_path.as_ref());
-        let cec = Cec {
+        Cec {
             dialed_path,
             chats_path,
             inner: Mutex::new(CecInner {
@@ -367,12 +362,7 @@ impl Cec {
                 help_wanted: HashMap::new(),
                 chats,
             }),
-        };
-        // The capture path's secure-desktop switch is process-wide state, so it
-        // has to be seeded from the store the moment it's loaded — not left at
-        // its `false` default until someone happens to change the setting.
-        cec.publish_elevation_policy();
-        cec
+        }
     }
 
     /// Mirror the dialed directory to disk. Best-effort: a write failure warns
@@ -691,38 +681,16 @@ impl Cec {
             .unwrap_or_default()
     }
 
-    /// Whether the pending request from `tech` asked for administrator reach.
-    /// Absent request → `false`: a grant is never recorded as asking for admin
-    /// on the strength of a request nobody can find.
-    pub fn pending_want_elevated(&self, tech: &str) -> bool {
-        let inner = self.inner.lock();
-        let key = pubkey_part(tech);
-        inner
-            .pending
-            .iter()
-            .find(|p| pubkey_part(&p.tech) == key)
-            .map(|p| p.want_elevated)
-            .unwrap_or(false)
-    }
-
     /// Record the customer's approval of `tech` at `scope` in the consent
     /// store, dropping the matching pending request. A failed durable write
     /// (a `ThreeHours`/`Forever` grant that couldn't be saved) returns the
     /// error and records nothing — never a silent security downgrade.
-    ///
-    /// `want_elevated` is what the *technician asked for*, not a second thing
-    /// the customer is asked. Administrator reach was decided once, machine-wide,
-    /// when the background service was installed; the consent store ANDs this
-    /// grant against that setting on every privileged frame. So a technician
-    /// always asks, and a PC that doesn't permit it simply hands back a session
-    /// without it — no extra prompt in front of a customer whose PC is broken.
     pub fn approve(
         &self,
         tech: &str,
         agent_name: &str,
         scope: ApprovalScope,
         want_control: bool,
-        want_elevated: bool,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock();
         inner
@@ -730,7 +698,7 @@ impl Cec {
             .approve(
                 tech,
                 agent_name,
-                capabilities_for_request(want_control, want_elevated),
+                capabilities_for(want_control),
                 scope,
                 now_secs(),
             )
@@ -761,7 +729,6 @@ impl Cec {
     /// event.
     pub fn grants(&self) -> Vec<Value> {
         let inner = self.inner.lock();
-        let elevation_allowed = inner.consent.elevation_allowed();
         inner
             .consent
             .active_grants(now_secs())
@@ -773,80 +740,13 @@ impl Cec {
                     "scope": scope_str(g.scope),
                     "granted_at": g.granted_at,
                     "expires_at": g.expires_at,
-                    "control": g.allows(Capability::Control),
-                    // What this grant asked for, and what it actually gets.
-                    // They differ on a machine whose admin-access setting is
-                    // off, and the customer's access list must show the second
-                    // one — a row claiming "Admin access" on a PC that forbids
-                    // it is a lie about the customer's own security.
-                    "elevated_requested": g.allows(Capability::Elevated),
-                    "elevated": g.allows(Capability::Elevated) && elevation_allowed,
+                    "control": g
+                        .capabilities
+                        .iter()
+                        .any(|c| matches!(c, Capability::Control)),
                 })
             })
             .collect()
-    }
-
-    // ---- administrator access (machine-wide, decided once) -----------------
-
-    /// Whether this machine permits approved technicians to use administrator
-    /// access. `false` until the customer decides — an undecided machine is a
-    /// locked-down one.
-    pub fn elevation_allowed(&self) -> bool {
-        self.inner.lock().consent.elevation_allowed()
-    }
-
-    /// Whether the customer has ever been asked. `false` means the installer
-    /// should put the question in front of them — **once**.
-    pub fn elevation_decided(&self) -> bool {
-        self.inner.lock().consent.elevation_policy().is_some()
-    }
-
-    /// Record the machine-wide admin-access decision (the install-time answer,
-    /// or a later change from Settings). Persisted before it is believed.
-    pub fn set_elevation_allowed(&self, allowed: bool) -> Result<(), String> {
-        self.inner
-            .lock()
-            .consent
-            .set_elevation_policy(allowed, now_secs())
-            .map_err(|e| e.to_string())?;
-        self.publish_elevation_policy();
-        Ok(())
-    }
-
-    /// Push the stored admin-access decision down to the capture path's
-    /// secure-desktop switch. Called on load and on every change, so the two
-    /// can't drift — a stale `true` here would keep streaming UAC credential
-    /// prompts after the customer switched admin access off.
-    pub fn publish_elevation_policy(&self) {
-        let allowed = self.inner.lock().consent.elevation_allowed();
-        crate::win_privilege::set_secure_desktop_follow(allowed);
-    }
-
-    /// The machine's admin-access state, for `cec_elevation` and the Settings
-    /// panel: what the customer decided, what this process can actually
-    /// deliver, and — when those disagree — why.
-    pub fn elevation_status(&self) -> Value {
-        let (allowed, decided_at) = {
-            let inner = self.inner.lock();
-            match inner.consent.elevation_policy() {
-                Some(p) => (p.allowed, Some(p.decided_at)),
-                None => (false, None),
-            }
-        };
-        let posture = crate::win_privilege::current_posture();
-        json!({
-            "allowed": allowed,
-            "decided": decided_at.is_some(),
-            "decided_at": decided_at,
-            "applicable": crate::win_privilege::IS_WINDOWS,
-            // The posture half: granted is a policy question, this is a "can
-            // this process actually do it" question, and conflating them is how
-            // a customer ends up certain they enabled something that never
-            // worked.
-            "effective": allowed && posture.can_drive_elevated_windows(),
-            "can_follow_secure_desktop": posture.can_follow_secure_desktop(),
-            "integrity": posture.integrity.label(),
-        })
     }
 
     /// The per-frame enforcement check: whether `tech` currently holds a live
@@ -1417,14 +1317,13 @@ mod tests {
             tech: TECH.into(),
             agent_name: "Alex at CEC".into(),
             want_control: true,
-            want_elevated: true,
             session_id: "s1".into(),
             verification_code: verification_code(TECH, "s1"),
         });
         assert_eq!(cec.pending().len(), 1);
         assert!(!cec.is_allowed(TECH, Capability::Control));
 
-        cec.approve(TECH, "Alex at CEC", ApprovalScope::Once, true, true)
+        cec.approve(TECH, "Alex at CEC", ApprovalScope::Once, true)
             .unwrap();
         // The grant now gates control, and the pending request cleared.
         assert!(cec.is_allowed(TECH, Capability::Control));
@@ -1439,56 +1338,9 @@ mod tests {
     }
 
     #[test]
-    fn admin_access_needs_the_machine_setting_not_a_second_prompt() {
-        // End to end at the node level: a technician dials asking for admin,
-        // the customer approves the ordinary connect prompt (which has no admin
-        // question on it), and whether admin reach lands is decided entirely by
-        // the machine's install-time setting.
-        let cec = Cec::new(None);
-        cec.record_pending(PendingRequest {
-            tech: TECH.into(),
-            agent_name: "Alex at CEC".into(),
-            want_control: true,
-            want_elevated: true,
-            session_id: "s1".into(),
-            verification_code: verification_code(TECH, "s1"),
-        });
-        assert!(cec.pending_want_elevated(TECH));
-
-        // Machine has never been asked → approving grants control, not admin.
-        cec.approve(TECH, "Alex at CEC", ApprovalScope::Forever, true, true)
-            .unwrap();
-        assert!(cec.is_allowed(TECH, Capability::Control));
-        assert!(!cec.is_allowed(TECH, Capability::Elevated));
-
-        // The customer turns admin access on in Settings. The SAME grant now
-        // carries admin reach — nobody was re-prompted.
-        cec.set_elevation_allowed(true).unwrap();
-        assert!(cec.is_allowed(TECH, Capability::Elevated));
-
-        // And switching it back off drops it again, mid-session, immediately.
-        cec.set_elevation_allowed(false).unwrap();
-        assert!(!cec.is_allowed(TECH, Capability::Elevated));
-        assert!(cec.is_allowed(TECH, Capability::Control));
-    }
-
-    #[test]
-    fn elevation_status_reports_undecided_before_anyone_is_asked() {
-        let cec = Cec::new(None);
-        assert!(!cec.elevation_decided());
-        assert!(!cec.elevation_allowed());
-        let v = cec.elevation_status();
-        assert_eq!(v["allowed"], false);
-        assert_eq!(v["decided"], false);
-        // Never "effective" on a machine that hasn't allowed it, whatever the
-        // process posture happens to be on the box running this test.
-        assert_eq!(v["effective"], false);
-    }
-
-    #[test]
     fn view_only_grant_does_not_authorise_control() {
         let cec = Cec::new(None);
-        cec.approve(TECH, "Alex", ApprovalScope::Forever, false, false)
+        cec.approve(TECH, "Alex", ApprovalScope::Forever, false)
             .unwrap();
         assert!(cec.is_allowed(TECH, Capability::ScreenView));
         assert!(!cec.is_allowed(TECH, Capability::Control));

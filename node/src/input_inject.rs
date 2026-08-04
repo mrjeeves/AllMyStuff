@@ -55,15 +55,7 @@ use parking_lot::Mutex;
 use allmystuff_session::InputAction;
 
 enum Cmd {
-    Event {
-        route: String,
-        action: InputAction,
-        /// Whether this event is authorized to reach **elevated** windows.
-        /// Decided per event by the mesh's `sender_may_elevate` (machine
-        /// setting AND the sender's entitlement), never cached here — so
-        /// switching admin access off stops the very next keystroke.
-        elevated: bool,
-    },
+    Event { route: String, action: InputAction },
     ReleaseRoute(String),
 }
 
@@ -72,6 +64,11 @@ enum Cmd {
 /// queue normally holds a handful; this only ever bites a flood from an
 /// abusive controller, capping memory instead of growing it unbounded.
 const INPUT_QUEUE_CAP: usize = 4096;
+
+/// How often the injector re-asks which desktop is taking input. Long enough
+/// that a fast drag doesn't pay for it on every delta, short enough that a
+/// technician typing at a UAC prompt never notices the gap.
+const DESKTOP_CHECK_EVERY: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 pub struct Injector {
@@ -86,17 +83,11 @@ impl Injector {
     /// Queue one event for injection. Starts the injector thread on first
     /// use; if the platform refuses (no display server, missing
     /// permissions) the failure is logged once and events are dropped.
-    ///
-    /// `elevated` says this event is authorized to reach elevated windows. On
-    /// Windows that decides whether the injector follows the *input desktop*
-    /// before typing — the difference between a click landing in Event Viewer
-    /// and being silently discarded by UIPI. Elsewhere it is inert.
-    pub fn apply(&self, route: &str, action: InputAction, elevated: bool) {
+    pub fn apply(&self, route: &str, action: InputAction) {
         self.send(
             Cmd::Event {
                 route: route.into(),
                 action,
-                elevated,
             },
             true,
         );
@@ -160,28 +151,29 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
     // prompt) the technician is typing into a desktop nobody is looking at.
     // Inert off Windows.
     let mut desktop = crate::win_privilege::DesktopFollower::new();
+    // A desktop switch is a human opening a UAC prompt, not something that can
+    // happen between two mouse deltas — and asking costs three Win32 calls
+    // (`OpenInputDesktop`/`GetUserObjectInformationW`/`CloseDesktop`). Checking
+    // per event burned them on every pixel of a drag; this bounds it to one
+    // check per interval, which is imperceptible against a dialog appearing.
+    let mut checked_desktop_at: Option<Instant> = None;
     while let Ok(cmd) = rx.recv() {
         let (route, action) = match cmd {
-            Cmd::Event {
-                route,
-                action,
-                elevated,
-            } => {
-                // Follow the input desktop only for events authorized to reach
-                // elevated windows. An unelevated session deliberately stays on
-                // the desktop it started on: it must not be able to type at a
-                // UAC prompt, which is the one dialog whose whole purpose is to
-                // be answered by the person sitting at the machine.
-                if elevated && desktop.follow() {
-                    tracing::info!(
-                        "input: following desktop switch to {:?}{}",
-                        desktop.desktop_name(),
-                        if desktop.on_secure_desktop() {
-                            " (secure desktop — UAC prompt)"
-                        } else {
-                            ""
-                        }
-                    );
+            Cmd::Event { route, action } => {
+                let due = checked_desktop_at.is_none_or(|t| t.elapsed() >= DESKTOP_CHECK_EVERY);
+                if due {
+                    checked_desktop_at = Some(Instant::now());
+                    if desktop.follow() {
+                        tracing::info!(
+                            "input: following desktop switch to {:?}{}",
+                            desktop.desktop_name(),
+                            if desktop.on_secure_desktop() {
+                                " (secure desktop — UAC prompt)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
                 }
                 (route, action)
             }

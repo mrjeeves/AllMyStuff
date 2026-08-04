@@ -246,8 +246,14 @@ windows-sys = { version = "0.60", features = [
     # onto the monotonic clock for the M1 capture-age span (win_capture.rs).
     "Win32_System_Performance",
     # ProcessIdToSessionId validates that CEC Support only reuses an
-    # interactive-session media/input node and never starts one in Session 0.
+    # interactive-session media/input node and never starts one in Session 0;
+    # WTSGetActiveConsoleSessionId (win_privilege) names the session a human is
+    # actually sitting at, which is where a privileged session must be hosted.
     "Win32_System_RemoteDesktop",
+    # OpenInputDesktop/SetThreadDesktop/GetUserObjectInformationW — the desktop
+    # following in win_privilege that lets capture and input track the UAC
+    # secure desktop instead of freezing and going deaf on it.
+    "Win32_System_StationsAndDesktops",
     # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (daemon_spawn's kill-on-close job)
     # embeds IO_COUNTERS, which windows-sys gates behind Threading. The GUI
     # workspace got this feature via unification from another dep; the node

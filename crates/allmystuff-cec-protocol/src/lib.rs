@@ -62,7 +62,8 @@ pub use media::{
     decode_media_frame, encode_media_frame, MediaFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
 };
 pub use wire::{
-    AppControl, ApprovalScope, ChatMessage, ConnectControl, ControlMessage, Role, SupportPresence,
+    AppControl, ApprovalScope, ChatMessage, ConnectControl, ControlMessage, ElevationBlocker,
+    ElevationReport, Role, SupportPresence,
 };
 
 /// Prefix the retired per-number rooms carried (`cec-<9 digits>`). Kept

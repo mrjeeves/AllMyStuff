@@ -124,6 +124,9 @@ fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>
     // The duplication readback competes with whatever loaded the GPU/CPU —
     // the exact condition the stream exists for.
     crate::os_perf::boost_media_thread();
+    // Follows desktop switches so a UAC prompt is *captured* rather than
+    // freezing the stream — see the ACCESS_LOST arm below.
+    let mut desktop = crate::win_privilege::DesktopFollower::new();
     while !stop.load(Ordering::SeqCst) {
         match dup.next_frame(100) {
             Ok(Some(frame)) => {
@@ -142,6 +145,32 @@ fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>
                 tracing::debug!(
                     "duplication of {device_name} ({old_id:#x}) lost — re-acquiring by name"
                 );
+                // The secure-desktop case, and the reason this loop used to
+                // look like a freeze: a duplication belongs to the desktop its
+                // thread is attached to, so once Windows switches to `Winlogon`
+                // for a UAC prompt, re-acquiring from a thread still standing on
+                // `Default` rebuilds a duplication of a desktop nobody is
+                // looking at. Every re-acquire "succeeds" and every frame is the
+                // stale desktop, for as long as the prompt is up.
+                //
+                // Attaching to the input desktop first is what fixes it — but
+                // only when the customer enabled administrator access, because
+                // the secure desktop is where credential prompts live. Without
+                // that this is a no-op and the old behaviour stands. Attaching
+                // also needs SYSTEM (the `Winlogon` desktop admits nobody else),
+                // so on an unprivileged agent `follow` simply returns false and
+                // the retry loop below rides the prompt out as it always did.
+                if crate::win_privilege::secure_desktop_follow_allowed() && desktop.follow() {
+                    tracing::info!(
+                        "capture: following desktop switch to {:?}{}",
+                        desktop.desktop_name(),
+                        if desktop.on_secure_desktop() {
+                            " (secure desktop — UAC prompt)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 // DXGI requires the lost duplication interface to be
                 // released before DuplicateOutput is attempted again.
                 drop(dup.dup.take());

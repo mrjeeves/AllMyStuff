@@ -3383,7 +3383,15 @@ impl Mesh {
                         // seconds, so here a live CEC route just passes.
                         let route_ok = self.inbound_media_ok(&ev.route, &from, MediaKind::Input);
                         if route_ok && self.sender_may_drive_admitted(&from, DrivePlane::Input) {
-                            self.injector.apply(&ev.route, ev.action);
+                            // Whether THIS event may land in an elevated window
+                            // rides with it, re-decided per frame. Unlike the
+                            // route gate above it is deliberately not cached:
+                            // administrator reach is the one thing a customer
+                            // may switch off mid-repair and expect to stop
+                            // instantly, and the check is a lock plus a short
+                            // scan against a stream that moves at human speed.
+                            let elevated = self.sender_may_elevate(&from);
+                            self.injector.apply(&ev.route, ev.action, elevated);
                         } else {
                             // Refusing silently is how "controls just stopped
                             // working" went undiagnosable — say which gate
@@ -4961,12 +4969,21 @@ impl Mesh {
         // the GUI's waiting badge tells the truth instead of hanging.
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
+        // A technician always *asks* for administrator reach. Asking is free and
+        // costs the customer nothing: the customer's machine decides, from the
+        // one-time install setting plus the grant it records, and a PC that
+        // doesn't allow it simply hands back a session without it (plus an
+        // `ElevationReport` naming why). Asking only when a technician
+        // remembered to tick something would mean discovering the session can't
+        // open Event Viewer twenty minutes into a repair.
+        let want_elevated = true;
         self.cec.set_session(&session_id, "requested");
         let request = allmystuff_cec_protocol::ControlMessage::Connect(
             allmystuff_cec_protocol::ConnectControl::Request {
                 session_id: session_id.clone(),
                 agent_name,
                 want_control,
+                want_elevated,
             },
         );
         {
@@ -5037,7 +5054,14 @@ impl Mesh {
     ) -> Result<Value, String> {
         let scope = crate::cec::parse_scope(&scope)?;
         let agent_name = self.cec.pending_agent_name(&tech);
-        self.cec.approve(&tech, &agent_name, scope, want_control)?;
+        // Whether the technician asked for administrator reach is read from
+        // their pending request, not from the approve call: the customer's
+        // dialog has no admin question on it (that was answered once, at
+        // install). The consent store still ANDs it against the machine
+        // setting, so recording the ask can't widen anything by itself.
+        let want_elevated = self.cec.pending_want_elevated(&tech);
+        self.cec
+            .approve(&tech, &agent_name, scope, want_control, want_elevated)?;
         self.cec.set_session(&session_id, "active");
         // Bind the session to this technician so the consent sweep can end
         // exactly their sessions when the grant later lapses.
@@ -5204,6 +5228,37 @@ impl Mesh {
     /// `cec_grants` (customer): the live consent grants.
     pub async fn cec_grants(&self) -> Result<Value, String> {
         Ok(Value::Array(self.cec.grants()))
+    }
+
+    /// `cec_elevation` (customer): the machine-wide administrator-access
+    /// setting — what was decided, whether it has been decided at all, and
+    /// whether this process can actually deliver it.
+    pub async fn cec_elevation(&self) -> Result<Value, String> {
+        Ok(self.cec.elevation_status())
+    }
+
+    /// `cec_set_elevation` (customer): record the machine-wide administrator-access
+    /// decision. This is the install-time question's answer, and afterwards the
+    /// Settings toggle.
+    ///
+    /// Turning it **off** is a kill switch, so it does not merely change a
+    /// setting for future sessions: the consent store stops authorizing the
+    /// `Elevated` rung on the very next frame, and capture stops following the
+    /// secure desktop. Live sessions continue, unelevated.
+    pub async fn cec_set_elevation(self: &Arc<Self>, allowed: bool) -> Result<Value, String> {
+        self.cec.set_elevation_allowed(allowed)?;
+        tracing::info!(
+            "CEC Support: administrator access {} for this machine",
+            if allowed { "ALLOWED" } else { "switched off" }
+        );
+        let status = self.cec.elevation_status();
+        self.sink.emit("cec://elevation", status.clone());
+        // The access list's per-grant "Admin access" badges are derived from
+        // this setting, so they have to be re-emitted with it or the list keeps
+        // claiming reach the machine just withdrew.
+        self.sink
+            .emit("cec://grants", Value::Array(self.cec.grants()));
+        Ok(status)
     }
 
     /// `cec_dialed` (technician): the customers this node has dialed, for the
@@ -5545,6 +5600,7 @@ impl Mesh {
                     session_id,
                     agent_name,
                     want_control,
+                    want_elevated,
                 } => {
                     // The technician retransmits its Request every 2s until it
                     // sees an answer — because a single send can be dropped
@@ -5675,6 +5731,7 @@ impl Mesh {
                                     tech: from.clone(),
                                     agent_name: agent_name.clone(),
                                     want_control,
+                                    want_elevated,
                                     session_id: session_id.clone(),
                                     verification_code: verification_code.clone(),
                                 };
@@ -5686,6 +5743,15 @@ impl Mesh {
                                             "tech": from,
                                             "agent_name": agent_name,
                                             "want_control": want_control,
+                                            // Carried so the prompt can *tell*
+                                            // the customer this session will
+                                            // have admin reach. It is not a
+                                            // second question — the machine
+                                            // already answered that at install
+                                            // — but "approve" should never mean
+                                            // more than the customer can see.
+                                            "want_elevated": want_elevated,
+                                            "elevation_allowed": self.cec.elevation_allowed(),
                                             "session_id": session_id,
                                             "verification_code": verification_code,
                                         }),
@@ -11433,6 +11499,35 @@ impl Mesh {
             .out_grants_for(&person.id)
             .iter()
             .any(|g| grant_authorizes_plane(g, plane))
+    }
+
+    /// Whether `sender`'s input may reach **elevated windows** on this machine
+    /// — Event Viewer, Services, Device Manager, regedit, an administrator
+    /// shell — rather than being dropped by Windows' UIPI.
+    ///
+    /// Two independent yeses, both required:
+    ///
+    /// 1. **This machine allows it at all.** The customer's one-time,
+    ///    machine-wide admin-access decision, made with the install and
+    ///    switchable off in Settings. Checked first because it is the switch
+    ///    that must bite everyone at once.
+    /// 2. **This sender is entitled to it.** Either they can already drive this
+    ///    machine's control plane by ownership (the owner or a co-owned fleet
+    ///    member — AllMyStuff remote control of one's own PC), or they are a CEC
+    ///    technician holding a live grant that carries the `Elevated` rung.
+    ///
+    /// Note the share path is deliberately absent: a person-to-person "Control"
+    /// share lets someone drive the mouse, and quietly widening that to
+    /// administrator would hand out more than the owner chose to give. Shares
+    /// stay unelevated until there is an explicit share-level rung for it.
+    fn sender_may_elevate(&self, sender: &str) -> bool {
+        if !self.cec.elevation_allowed() {
+            return false;
+        }
+        self.sender_may_control(sender)
+            || self
+                .cec
+                .is_allowed(sender, allmystuff_cec_consent::Capability::Elevated)
     }
 
     /// Whether a **screen-viewing** (`Display`/`Video`) offer from `sender` is

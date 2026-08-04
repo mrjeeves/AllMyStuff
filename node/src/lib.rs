@@ -155,6 +155,12 @@ pub mod wake;
 // module is internally `cfg`-gated to a stub off Windows, exactly as it was
 // when it lived in the GUI binary.
 pub mod win_capture;
+// Windows privilege posture + desktop following: whether a support session can
+// actually reach elevated repair tooling (Event Viewer, Services, regedit) and
+// the UAC secure desktop, and why not when it can't. Declared on every target
+// like `win_capture` — the policy half is pure and unit-tested everywhere, and
+// the Win32 half is internally `cfg`-gated to a stub off Windows.
+pub mod win_privilege;
 // Wayland screen capture via the ScreenCast portal — Linux only.
 #[cfg(all(target_os = "linux", feature = "host"))]
 pub mod wayland_capture;

@@ -1255,7 +1255,7 @@ pub async fn dispatch(
             // only). Its config is node-owned; an edit could only break it.
             if target.as_deref() == Some(LOCAL_CLAIM_NETWORK_ID) {
                 return DispatchOut::Err(
-                    "the local claiming network has no settings to edit — it's the fixed \
+                    "the Local network has no settings to edit — it's the fixed \
                      mDNS passthrough for claiming and local pairing"
                         .into(),
                 );
@@ -1285,7 +1285,7 @@ pub async fn dispatch(
             // whenever it isn't deliberately parked.
             if network == LOCAL_CLAIM_NETWORK_ID {
                 return DispatchOut::Err(
-                    "the local claiming network can't be left — switch it off instead".into(),
+                    "the Local network can't be left — switch it off instead".into(),
                 );
             }
             sync_after(

@@ -30,6 +30,7 @@
   import SettingsPanel from "./SettingsPanel.svelte";
   import ClaimSheet from "./ClaimSheet.svelte";
   import FleetCodePrompt from "./FleetCodePrompt.svelte";
+  import KvmWifiModal from "./KvmWifiModal.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import ShareFlow from "./ShareFlow.svelte";
   import Console from "./Console.svelte";
@@ -304,6 +305,9 @@
   {/if}
   <ShareSheet />
   <ShareFlow />
+  {#if app.wifiFor}
+    <KvmWifiModal node={app.wifiFor} />
+  {/if}
   <Toasts />
 </div>
 {/if}

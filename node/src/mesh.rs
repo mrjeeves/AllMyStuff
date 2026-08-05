@@ -7339,7 +7339,7 @@ impl Mesh {
                     config: json!({
                         "id": LOCAL_CLAIM_NETWORK_ID,
                         "network_id": LOCAL_CLAIM_NETWORK_ID,
-                        "label": "Local claiming (this LAN)",
+                        "label": "Local (this LAN)",
                         "kind": "open",
                         "auto_approve": true,
                         "signaling": { "strategy": "none", "mdns": true },

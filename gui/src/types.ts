@@ -47,6 +47,56 @@ export interface Share {
   grants: Grant[];
 }
 
+/** NanoKVM JSON response envelope. HTTP success alone is not enough: `code`
+ * is the appliance-level result. */
+export interface KvmApiRsp<T = unknown> {
+  code: number;
+  msg?: string;
+  data?: T;
+}
+
+export interface KvmVersion {
+  current: string;
+  latest?: string;
+}
+
+/** Result of a KVM API call made by Rust, outside the webview's CORS policy. */
+export interface KvmApiCallResult {
+  status: number;
+  body: unknown;
+  error: { kind: "timeout" | "connect" | "other"; message: string } | null;
+}
+
+export interface KvmWifiStatusRaw {
+  supported?: boolean;
+  apMode?: boolean;
+  connected?: boolean;
+  ssid?: string;
+  wifi?: { ssid?: string } | null;
+}
+
+export interface KvmWifiStatus {
+  supported: boolean;
+  apMode: boolean;
+  connected: boolean;
+  ssid: string | null;
+}
+
+export interface KvmWifiNetwork {
+  ssid: string;
+  bssid?: string;
+  signal?: number;
+  security?: string;
+  frequency?: number;
+}
+
+export interface HostWifi {
+  supported: boolean;
+  current: string | null;
+  networks: KvmWifiNetwork[];
+  note: string | null;
+}
+
 // Relationship is internally tagged on `kind`. `mine` = a device you own or
 // manage; `shared` = someone you're connecting with for specific purposes;
 // `unclaimed` = on your mesh but not yet classified (a GUI-only state for

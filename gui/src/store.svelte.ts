@@ -4630,31 +4630,111 @@ class AppStore {
     return typeof rsp.msg === "string" && rsp.msg.trim() ? rsp.msg.trim() : fallback;
   }
 
-  /** Wake, power-cycle/hold, or reset the machine connected to a KVM. */
-  async kvmFeature(nodeId: string, action: "wake" | "power" | "reset") {
+  /** Wake or operate the physical power/reset lines on the machine connected
+   *  to a KVM. Wake is deliberately a keyboard event, not a disguised short
+   *  power press: the KVM's native mesh input sink turns the Shift tap into a
+   *  real USB-HID report at the attached machine. */
+  async kvmFeature(nodeId: string, action: "wake" | "short" | "long" | "reset") {
     const node = this.node(nodeId);
     if (!node) return;
+    const label =
+      action === "wake"
+        ? "Wake"
+        : action === "short"
+          ? "Short press"
+          : action === "long"
+            ? "Long press"
+            : "Reset";
     if (!this.backendConnected) {
-      this.toast("info", `${action[0].toUpperCase()}${action.slice(1)} sent via ${node.label}`);
+      this.toast("info", `${label} sent via ${node.label}`);
       return;
     }
+
+    if (action === "wake") {
+      const source = matchEndpoint(this.catalog, this.localId, "input", "provide");
+      const sink = matchEndpoint(this.catalog, nodeId, "input", "consume");
+      if (!source || !sink) {
+        this.toast("warn", `${node.label} hasn't published its keyboard path yet`);
+        return;
+      }
+
+      const routeId = `route:${source.id}→${sink.id}`;
+      const previous = this.routeStates[routeId]?.state;
+      const alreadyWired = previous === "active" || previous === "offered" || previous === "accepted";
+      let created = false;
+      let shiftDown = false;
+      const shift = (down: boolean): InputAction => ({
+        kind: "key",
+        key: "Shift",
+        code: "ShiftLeft",
+        down,
+      });
+      try {
+        if (previous !== "active") {
+          const offered = await connectRoute(source.id, sink.id, "input");
+          if (!offered) throw new Error("the keyboard route could not be offered");
+          created = !alreadyWired;
+
+          const deadline = Date.now() + 8_000;
+          while (this.routeStates[routeId]?.state !== "active" && Date.now() < deadline) {
+            await this.refreshSession();
+            const state = this.routeStates[routeId];
+            if (state?.state === "rejected" || state?.state === "torn_down") {
+              throw new Error(state.reason || "the KVM refused the keyboard route");
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          }
+          if (this.routeStates[routeId]?.state !== "active") {
+            throw new Error("the keyboard route did not become active");
+          }
+        }
+
+        await sendInput(routeId, shift(true));
+        shiftDown = true;
+        await new Promise<void>((resolve) => setTimeout(resolve, 80));
+        await sendInput(routeId, shift(false));
+        shiftDown = false;
+        // Input and route control use separate mesh lanes. Give the HID release
+        // time to land before tearing down a one-shot route so Shift can never
+        // be left held on the attached machine.
+        if (created) await new Promise<void>((resolve) => setTimeout(resolve, 200));
+        this.toast("info", `Wake sent via ${node.label}`);
+      } catch (error) {
+        // If transport failed between key-down and key-up, make one last
+        // release attempt before the route is removed. The KVM also clears its
+        // HID state when the route closes, but the explicit release is faster.
+        if (shiftDown) {
+          try {
+            await sendInput(routeId, shift(false));
+            await new Promise<void>((resolve) => setTimeout(resolve, 200));
+          } catch {
+            // The teardown below is the final release path.
+          }
+        }
+        this.toast("warn", `Couldn't wake via ${node.label}: ${errMsg(error)}`);
+      } finally {
+        if (created) await this.disconnect(routeId).catch(() => undefined);
+      }
+      return;
+    }
+
     const port = await this.kvmConsolePort(nodeId);
     if (port === null) {
       this.toast("warn", `${node.label} hasn't published a web UI yet`);
       return;
     }
     const type = action === "reset" ? "reset" : "power";
-    const duration = action === "power" ? 12_000 : 800;
+    const duration = action === "long" ? 12_000 : 800;
     const { rsp, reason } = await this.kvmApi(port, "/api/vm/gpio", {
       method: "POST",
       body: { type, duration },
     });
     if (!rsp || rsp.code !== 0) {
       const detail = rsp ? this.kvmMsg(rsp, "the KVM declined") : reason;
-      this.toast("warn", `Couldn't ${action} via ${node.label}: ${detail}`);
+      this.toast("warn", `Couldn't send ${label.toLowerCase()} via ${node.label}: ${detail}`);
       return;
     }
-    this.toast("info", `${action[0].toUpperCase()}${action.slice(1)} sent via ${node.label}`);
+    this.toast("info", `${label} sent via ${node.label}`);
   }
 
   isKvmUpdating(nodeId: string): boolean {
@@ -8502,7 +8582,11 @@ class AppStore {
     }
     const canon = canonicalNodeId(nodeId);
     this.beginRefresh(canon); // ring starts spinning, button disabled
-    if (this.isMe(nodeId)) {
+    // The graph's "This device" card is authoritative even during the brief
+    // startup window where the canonical local id is still converging. Its
+    // Refresh button must always take the full local scan path, never fall
+    // through to the peer/network path because `isMe` was temporarily stale.
+    if (n.kind === "this" || this.isMe(nodeId)) {
       // Self: fully awaitable, so "done" is the rescan resolving.
       try {
         await requestNodeRefresh(); // backend: re-scan + re-advertise to peers

@@ -867,8 +867,9 @@
           🌐 Open KVM
         </button>
         <div class="kvm-actions">
-          <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "wake")}>◉ Wake</button>
-          <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "power")}>⏻ Power</button>
+          <button class="btn small" title="Wake with a Shift key press" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "wake")}>⌨ Wake</button>
+          <button class="btn small" title="Pulse the power button" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "short")}>⏻ Short press</button>
+          <button class="btn small" title="Hold the power button for 12 seconds" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "long")}>⏻ Long press</button>
           <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "reset")}>↻ Reset</button>
         </div>
       </section>
@@ -902,8 +903,9 @@
                gets), so this globe stays the web-UI front door. -->
           <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🌐 Open KVM</button>
           <button class="btn small" onclick={() => app.openKvmWifi(node.id)}>⌁ Wi-Fi</button>
-          <button class="btn small" onclick={() => app.kvmFeature(node.id, "wake")}>◉ Wake</button>
-          <button class="btn small" onclick={() => app.kvmFeature(node.id, "power")}>⏻ Power</button>
+          <button class="btn small" title="Wake with a Shift key press" onclick={() => app.kvmFeature(node.id, "wake")}>⌨ Wake</button>
+          <button class="btn small" title="Pulse the power button" onclick={() => app.kvmFeature(node.id, "short")}>⏻ Short press</button>
+          <button class="btn small" title="Hold the power button for 12 seconds" onclick={() => app.kvmFeature(node.id, "long")}>⏻ Long press</button>
           <button class="btn small" onclick={() => app.kvmFeature(node.id, "reset")}>↻ Reset</button>
         </div>
         <div class="kvm-attach">

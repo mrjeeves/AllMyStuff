@@ -1153,7 +1153,7 @@
       return;
     }
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const menuHeight = MENU_PAD + 3 * MENU_ITEM_H;
+    const menuHeight = MENU_PAD + 4 * MENU_ITEM_H;
     const left = Math.max(8, Math.min(rect.left, window.innerWidth - MENU_W - 8));
     const top = rect.bottom + menuHeight + 8 > window.innerHeight
       ? Math.max(8, rect.top - menuHeight - 6)
@@ -1787,19 +1787,20 @@
     style="left: {kvmPowerMenu.left}px; top: {kvmPowerMenu.top}px;"
   >
     {#each [
-      { action: "wake", label: "Wake", detail: "tap the power button" },
-      { action: "power", label: "Power", detail: "hold the power button" },
+      { action: "wake", label: "Wake", detail: "send a Shift key press" },
+      { action: "short", label: "Short press", detail: "pulse the power button" },
+      { action: "long", label: "Long press", detail: "hold power for 12 seconds" },
       { action: "reset", label: "Reset", detail: "pulse the reset line" },
     ] as item (item.action)}
       <button
         class="nm-item"
         role="menuitem"
         onclick={() => {
-          void app.kvmFeature(kvmId, item.action as "wake" | "power" | "reset");
+          void app.kvmFeature(kvmId, item.action as "wake" | "short" | "long" | "reset");
           kvmPowerMenu = null;
         }}
       >
-        <span class="nm-icon" aria-hidden="true">{item.action === "reset" ? "↻" : "⏻"}</span>
+        <span class="nm-icon" aria-hidden="true">{item.action === "wake" ? "⌨" : item.action === "reset" ? "↻" : "⏻"}</span>
         <span class="nm-text">
           <span class="nm-label">{item.label}</span>
           <span class="nm-sub">{item.detail}</span>

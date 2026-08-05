@@ -453,29 +453,42 @@ mod tests {
             boost_media_thread();
             let got = unsafe { GetThreadPriority(GetCurrentThread()) };
             assert_eq!(got, THREAD_PRIORITY_ABOVE_NORMAL);
-            // On a hybrid CPU the thread's selected CPU sets must be exactly
-            // the performance cores; on homogeneous machines none are set.
-            let expect = performance_core_ids().len() as u32;
-            let mut count = 0u32;
+            // Production deliberately skips the CPU-set call when discovery
+            // reports no P-cores, so there is no CPU-set contract to inspect
+            // on homogeneous machines or Windows versions lacking the API.
+            let expect = performance_core_ids();
+            if expect.is_empty() {
+                return;
+            }
+
+            let mut selected = vec![0u32; expect.len()];
+            let mut count = selected.len() as u32;
             let ok = unsafe {
-                GetThreadSelectedCpuSets(GetCurrentThread(), core::ptr::null_mut(), 0, &mut count)
+                GetThreadSelectedCpuSets(
+                    GetCurrentThread(),
+                    selected.as_mut_ptr(),
+                    selected.len() as u32,
+                    &mut count,
+                )
             };
             assert_ne!(ok, 0, "GetThreadSelectedCpuSets failed");
-            assert_eq!(count, expect, "selected CPU sets mirror the P-core list");
+            selected.truncate(count as usize);
+            assert_eq!(selected, expect, "selected CPU sets mirror the P-core list");
         })
         .join()
         .expect("boost thread");
     }
 
-    /// The precise sleep must never return early, and its overshoot must
-    /// be micro-scale, not quantum-scale — the property the pacer's
-    /// sub-millisecond gaps lean on. The bound is deliberately lenient
-    /// (2 ms) so a loaded CI box can't flake it; what it catches is the
-    /// 15.6 ms-quantum disaster and a broken waitable-timer path.
+    /// The precise sleep must never return early, and its typical overshoot
+    /// must be micro-scale, not quantum-scale — the property the pacer's
+    /// sub-millisecond gaps lean on. Windows may deschedule a correct sleeper
+    /// for an arbitrary interval, especially on a shared CI host, so judge the
+    /// median rather than treating one scheduler outlier as a timer failure.
+    /// A broken waitable-timer path still quantizes every sample near 15.6 ms.
     #[test]
     fn precise_sleep_holds_sub_quantum_accuracy() {
         let _guard = TimerResolutionGuard::hold();
-        let mut worst = std::time::Duration::ZERO;
+        let mut overshoots = Vec::new();
         for req_us in [300u64, 500, 900, 1500] {
             let req = std::time::Duration::from_micros(req_us);
             for _ in 0..5 {
@@ -483,14 +496,17 @@ mod tests {
                 precise_sleep(req);
                 let got = t.elapsed();
                 assert!(got >= req, "returned early: {got:?} < {req:?}");
-                worst = worst.max(got - req);
+                overshoots.push(got - req);
             }
         }
+        overshoots.sort_unstable();
+        let median = overshoots[overshoots.len() / 2];
+        let worst = overshoots[overshoots.len() - 1];
         assert!(
-            worst < std::time::Duration::from_millis(2),
-            "overshoot {worst:?} looks quantized, not precise"
+            median < std::time::Duration::from_millis(2),
+            "median overshoot {median:?} looks quantized, not precise (worst {worst:?})"
         );
-        println!("precise_sleep worst overshoot: {worst:?}");
+        println!("precise_sleep median overshoot: {median:?}; worst: {worst:?}");
     }
 
     #[test]

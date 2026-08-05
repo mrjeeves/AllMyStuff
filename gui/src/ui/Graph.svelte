@@ -1077,6 +1077,22 @@
     renamingSelf = true;
   }
 
+  // Canvas/node drag handlers prevent the browser's default focus change, so
+  // `blur` alone cannot reliably see an outside click. Capture it before those
+  // handlers, commit the current draft, and let the original click continue.
+  $effect(() => {
+    if (!renamingSelf) return;
+    const self = app.catalog.nodes.find((n) => n.kind === "this");
+    function onOutsideDown(e: PointerEvent) {
+      const target = e.target as Element | null;
+      if (target?.closest?.(".node-label-input")) return;
+      if (self) void saveSelfRename(self);
+      else renamingSelf = false;
+    }
+    window.addEventListener("pointerdown", onOutsideDown, true);
+    return () => window.removeEventListener("pointerdown", onOutsideDown, true);
+  });
+
   async function saveSelfRename(n: MeshNode) {
     if (!renamingSelf || selfNameSaving) return;
     const clean = selfNameDraft.trim();
@@ -1085,12 +1101,17 @@
       renamingSelf = false;
       return;
     }
+    // Exit edit mode immediately; persistence can finish without leaving a
+    // stale input sitting onscreen after the user has clicked elsewhere.
+    renamingSelf = false;
     selfNameSaving = true;
     // Matching the hostname means "use the default" rather than storing a
     // redundant override that would later display as Name (Name).
-    await app.setIdentityLabel(clean === n.hostname?.trim() ? "" : clean);
-    selfNameSaving = false;
-    renamingSelf = false;
+    try {
+      await app.setIdentityLabel(clean === n.hostname?.trim() ? "" : clean);
+    } finally {
+      selfNameSaving = false;
+    }
   }
 
   function onNodeClick(n: MeshNode) {
@@ -1130,6 +1151,7 @@
   // anchored with `position: fixed` from the gear's on-screen rect.
   let nodeMenu = $state<{ id: string; left: number; top: number } | null>(null);
   let kvmPowerMenu = $state<{ kvmId: string; left: number; top: number } | null>(null);
+  let fleetMenu = $state<{ id: string; left: number; top: number } | null>(null);
   const MENU_W = 216;
   // Per-item height + container padding for the flip math below — the menu's
   // real height depends on which items this node offers.
@@ -1143,6 +1165,27 @@
   /** Two-step arm for the gear menu's "Forget this node" — same pattern as
    *  the reboot: a stray click must not drop a device off the graph. */
   let forgetNodeArmed = $state<string | null>(null);
+  /** Fleet eviction is deliberately two-step: the chip is an everyday status
+   *  surface, so an exploratory click must never remove a device. */
+  let fleetEvictArmed = $state<string | null>(null);
+
+  function fleetMenuHeight(nodeId: string): number {
+    const mn = app.node(nodeId);
+    if (!mn || app.isMe(nodeId) || mn.kind === "this") return MENU_PAD + MENU_ITEM_H;
+    const role = app.standingOf(mn).role;
+    const iOwn = app.myFleetRole === "owner";
+    const iManage = iOwn || app.myFleetRole === "manager";
+    let items = 1; // Fleet settings is always available.
+    if (role === "owner") {
+      if (iOwn) items += 1; // Demote to manager.
+    } else if (role === "manager") {
+      if (iOwn) items += 3; // Promote, demote, evict.
+    } else {
+      if (iOwn) items += 1; // Promote to manager.
+      if (iManage) items += 1; // Evict a plain member.
+    }
+    return MENU_PAD + items * MENU_ITEM_H;
+  }
 
   function menuHeight(nodeId: string): number {
     const mn = app.node(nodeId);
@@ -1158,6 +1201,8 @@
 
   function openNodeMenu(e: MouseEvent, nodeId: string) {
     e.stopPropagation();
+    fleetMenu = null;
+    fleetEvictArmed = null;
     restartDeviceArmed = null;
     forgetNodeArmed = null;
     if (nodeMenu?.id === nodeId) {
@@ -1182,6 +1227,8 @@
   function openKvmPowerMenu(e: MouseEvent, kvmId: string) {
     e.stopPropagation();
     nodeMenu = null;
+    fleetMenu = null;
+    fleetEvictArmed = null;
     if (kvmPowerMenu?.kvmId === kvmId) {
       kvmPowerMenu = null;
       return;
@@ -1195,21 +1242,47 @@
     kvmPowerMenu = { kvmId, left, top };
   }
 
+  function openFleetMenu(e: MouseEvent, nodeId: string) {
+    e.stopPropagation();
+    nodeMenu = null;
+    kvmPowerMenu = null;
+    restartDeviceArmed = null;
+    forgetNodeArmed = null;
+    fleetEvictArmed = null;
+    if (fleetMenu?.id === nodeId) {
+      fleetMenu = null;
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const menuHeight = fleetMenuHeight(nodeId);
+    const left = rect.left + MENU_W + 8 > window.innerWidth
+      ? Math.max(8, rect.right - MENU_W)
+      : Math.min(rect.left, window.innerWidth - MENU_W - 8);
+    const top = rect.bottom + menuHeight + 8 > window.innerHeight
+      ? Math.max(8, rect.top - menuHeight - 6)
+      : rect.bottom + 6;
+    fleetMenu = { id: nodeId, left, top };
+  }
+
   // Close the menu on any outside pointer-down (the gear + the menu are exempt
   // so they can toggle / be clicked), and on Escape.
   $effect(() => {
-    if (!nodeMenu && !kvmPowerMenu) return;
+    if (!nodeMenu && !kvmPowerMenu && !fleetMenu) return;
     function onDown(e: PointerEvent) {
       const t = e.target as Element | null;
-      if (!t?.closest?.(".node-menu, .node-gear, .kvm-power-trigger")) {
+      if (!t?.closest?.(".node-menu, .node-gear, .kvm-power-trigger, .fleet-trigger")) {
         nodeMenu = null;
         kvmPowerMenu = null;
+        fleetMenu = null;
+        fleetEvictArmed = null;
       }
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
         nodeMenu = null;
         kvmPowerMenu = null;
+        fleetMenu = null;
+        fleetEvictArmed = null;
       }
     }
     window.addEventListener("pointerdown", onDown);
@@ -1393,7 +1466,18 @@
         {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
         {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
         {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-        {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+        {#if st.inFleet}
+          <button
+            class="fleet-button fleet-trigger"
+            class:owner={st.role === "owner"}
+            class:manager={st.role === "manager"}
+            title="In your fleet · {st.role} · manage fleet"
+            aria-label={`${displayName(n)} fleet options`}
+            aria-haspopup="menu"
+            aria-expanded={fleetMenu?.id === n.id}
+            onclick={(e) => openFleetMenu(e, n.id)}
+          ><span>{st.role === "owner" ? "★ Owner" : st.role === "manager" ? "⚑ Manager" : "🔗 Fleet"}</span><span class="fleet-caret" aria-hidden="true">▾</span></button>
+        {/if}
         {#if !normalMode && n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
         {#if !normalMode && n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         {#if n.needsTurn && !n.online}
@@ -1421,10 +1505,10 @@
       >
         <span class="refresh-face" aria-hidden="true">
           <svg class="refresh-ring" viewBox="0 0 24 24">
-            <polyline points="22 5 22 10 17 10" />
-            <polyline points="2 19 2 14 7 14" />
-            <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
-            <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
+            <path d="M3.5 12A8.5 8.5 0 0 1 20.5 12" />
+            <polyline points="17.5 9 20.5 12 17.5 15" />
+            <path d="M20.5 12A8.5 8.5 0 0 1 3.5 12" />
+            <polyline points="6.5 9 3.5 12 6.5 15" />
           </svg>
           <span class="dot" class:on={n.online}></span>
         </span>
@@ -1852,6 +1936,126 @@
     </div>
   {/if}
 </div>
+
+<!-- Fleet actions live on the badge itself. Like the gear menu, this is a
+     viewport-fixed sibling of the transformed graph so it never scales,
+     clips, or wanders away from its trigger while near an edge. -->
+{#if fleetMenu}
+  {@const fleetId = fleetMenu.id}
+  {@const fleetNode = app.node(fleetId)}
+  {@const fleetSt = fleetNode ? app.standingOf(fleetNode) : null}
+  {@const fleetSelf = app.isMe(fleetId) || fleetNode?.kind === "this"}
+  {@const iOwn = app.myFleetRole === "owner"}
+  {@const iManage = iOwn || app.myFleetRole === "manager"}
+  <div
+    class="node-menu fleet-menu"
+    role="menu"
+    aria-label={`${fleetNode ? displayName(fleetNode) : "Device"} fleet options`}
+    style="left: {fleetMenu.left}px; top: {fleetMenu.top}px;"
+  >
+    {#if !fleetSelf && fleetSt?.role === "owner" && iOwn}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          void app.grantFleetRole(fleetId, "manager");
+          fleetMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">↓</span>
+        <span class="nm-text">
+          <span class="nm-label">Demote to manager</span>
+          <span class="nm-sub">remove owner authority</span>
+        </span>
+      </button>
+    {:else if !fleetSelf && fleetSt?.role === "manager" && iOwn}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          void app.grantFleetRole(fleetId, "owner");
+          fleetMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">★</span>
+        <span class="nm-text">
+          <span class="nm-label">Promote to owner</span>
+          <span class="nm-sub">grant full fleet authority</span>
+        </span>
+      </button>
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          void app.withdrawFleetRole(fleetId);
+          fleetMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">↓</span>
+        <span class="nm-text">
+          <span class="nm-label">Demote to member</span>
+          <span class="nm-sub">remove management authority</span>
+        </span>
+      </button>
+    {:else if !fleetSelf && fleetSt?.role !== "owner" && fleetSt?.role !== "manager" && iOwn}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          void app.grantFleetRole(fleetId, "manager");
+          fleetMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">↑</span>
+        <span class="nm-text">
+          <span class="nm-label">Promote to manager</span>
+          <span class="nm-sub">grant device-management authority</span>
+        </span>
+      </button>
+    {/if}
+
+    {#if !fleetSelf && ((fleetSt?.role === "manager" && iOwn) || (fleetSt?.role !== "owner" && fleetSt?.role !== "manager" && iManage))}
+      <button
+        class="nm-item evict"
+        class:armed={fleetEvictArmed === fleetId}
+        role="menuitem"
+        onclick={() => {
+          if (fleetEvictArmed === fleetId) {
+            fleetEvictArmed = null;
+            void app.kickFleetMember(fleetId);
+            fleetMenu = null;
+          } else {
+            fleetEvictArmed = fleetId;
+            setTimeout(() => {
+              if (fleetEvictArmed === fleetId) fleetEvictArmed = null;
+            }, 3500);
+          }
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">✕</span>
+        <span class="nm-text">
+          <span class="nm-label">Evict from fleet</span>
+          <span class="nm-sub">{fleetEvictArmed === fleetId ? "click again to confirm" : "remove this device from your fleet"}</span>
+        </span>
+      </button>
+    {/if}
+
+    <button
+      class="nm-item fleet-settings-item"
+      role="menuitem"
+      onclick={() => {
+        fleetMenu = null;
+        app.openSettings("fleet");
+      }}
+    >
+      <span class="nm-icon" aria-hidden="true">⚙</span>
+      <span class="nm-text">
+        <span class="nm-label">Fleet settings</span>
+        <span class="nm-sub">name, members, roles &amp; fleet key</span>
+      </span>
+    </button>
+  </div>
+{/if}
 
 {#if kvmPowerMenu}
   {@const kvmId = kvmPowerMenu.kvmId}
@@ -2601,8 +2805,8 @@
     flex: 1;
   }
   .node-label {
-    font-weight: 650;
-    font-size: 0.9rem;
+    font: inherit;
+    line-height: 1.2;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2640,8 +2844,7 @@
     color: var(--ink);
     padding: 0.16rem 0.3rem;
     font: inherit;
-    font-size: 0.9rem;
-    font-weight: 650;
+    line-height: 1.2;
     outline: 2px solid var(--accent-soft);
   }
   .node-sub {
@@ -2675,6 +2878,8 @@
     stroke-width: 2;
     stroke-linecap: round;
     stroke-linejoin: round;
+    transform-box: fill-box;
+    transform-origin: center;
     opacity: 0.6;
     transition:
       opacity 0.12s ease,
@@ -2689,6 +2894,11 @@
      press-rotate to jank against it. */
   .status-refresh.spinning {
     pointer-events: none;
+    color: var(--ink-faint);
+    background: var(--surface-2);
+    border-color: var(--line);
+    box-shadow: none;
+    opacity: 0.58;
   }
   .status-refresh.spinning .refresh-ring {
     opacity: 1;
@@ -2715,6 +2925,13 @@
     background: var(--ok);
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
+  .refresh-face .dot {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 1;
+  }
   /* The settings gear is a cbtn with a glyph face instead of an icon — sized a
      touch larger than the console icons so it reads clearly. It sits right of
      the divider (which carries the flex slack), so it's pinned to the right of
@@ -2737,6 +2954,8 @@
     flex-direction: column;
     gap: 0.12rem;
     animation: nmenu 0.12s ease;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
   }
   @keyframes nmenu {
     from {
@@ -2767,6 +2986,18 @@
   }
   .nm-item.armed .nm-label {
     color: var(--danger);
+  }
+  .fleet-menu .nm-item.evict:not(.armed) .nm-icon,
+  .fleet-menu .nm-item.evict:not(.armed) .nm-label {
+    color: var(--danger);
+  }
+  .fleet-menu .nm-item.evict:hover {
+    background: var(--danger-soft);
+  }
+  .fleet-menu .fleet-settings-item {
+    margin-top: 0.12rem;
+    border-top: 1px solid var(--line);
+    border-radius: 0 0 var(--r-sm) var(--r-sm);
   }
   .nm-icon {
     font-size: 0.95rem;
@@ -2849,6 +3080,13 @@
     width: 1.5rem;
     height: 1.5rem;
     flex: none;
+  }
+  /* The generic Normal-button SVG rule above shrinks ordinary action glyphs.
+     Refresh is different: its SVG is the ring *around* the centred status dot,
+     so it must fill this dedicated face instead of sitting at its top-left. */
+  .node.normal .status-refresh .refresh-ring {
+    width: 100%;
+    height: 100%;
   }
   .node.normal .node-gear {
     font-size: 1rem;
@@ -3014,14 +3252,57 @@
     background: var(--bronze-soft);
     color: var(--bronze);
   }
-  /* All fleet-role tags stay green; the ★ owner / ⚑ manager / 🔗 fleet
-     glyph + word is what tells them apart (no per-role colour vomit). */
-  .tag.fleet {
-    background: var(--c-fleet-soft);
-    color: var(--c-fleet-ink);
+  /* Fleet membership is actionable, so this deliberately reads as a compact
+     green button rather than another passive pill in the metadata row. */
+  .fleet-button {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 1.8rem;
+    font-family: inherit;
+    font-size: 0.72rem;
+    font-weight: 700;
+    line-height: 1.2;
+    padding: 0.28rem 0.62rem;
+    border: 1px solid color-mix(in oklch, var(--c-fleet) 78%, var(--surface));
+    border-radius: var(--r-sm);
+    color: oklch(0.96 0.035 150);
+    background: linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--c-fleet) 42%, var(--surface)),
+      color-mix(in oklch, var(--c-fleet) 27%, var(--surface))
+    );
+    cursor: pointer;
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.2), 0 2px 5px -3px var(--c-fleet);
+    transition: border-color 0.12s ease, filter 0.12s ease, transform 0.08s ease,
+      box-shadow 0.12s ease;
   }
-  .tag.fleet.owner {
+  .fleet-trigger:hover,
+  .fleet-trigger[aria-expanded="true"] {
+    border-color: var(--c-fleet);
+    filter: brightness(1.12);
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.25), 0 3px 8px -3px var(--c-fleet);
+  }
+  .fleet-trigger:active {
+    transform: translateY(1px);
+    box-shadow: inset 0 1px 3px oklch(0 0 0 / 0.25);
+  }
+  .fleet-trigger:focus-visible {
+    outline: 2px solid var(--c-fleet);
+    outline-offset: 2px;
+  }
+  .fleet-button.owner {
     font-weight: 750;
+  }
+  .fleet-caret {
+    font-size: 0.62rem;
+    opacity: 0.78;
+    transition: transform 0.12s ease;
+  }
+  .fleet-trigger[aria-expanded="true"] .fleet-caret {
+    transform: rotate(180deg);
   }
   .tag.meshonly {
     background: var(--surface-2);

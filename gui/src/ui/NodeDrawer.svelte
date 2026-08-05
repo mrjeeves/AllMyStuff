@@ -448,12 +448,12 @@
          rule the far side enforces before acting. -->
     {#if isKvm && node}
       <button
-        class="btn console-open upgrade-open"
+        class="btn console-open"
         disabled={app.isKvmUpdating(node.id)}
         title="Update this KVM's firmware, or reboot it when already current"
         onclick={() => app.updateKvm(node.id)}
       >
-        ⬆ {app.isKvmUpdating(node.id) ? "Updating KVM…" : "Update KVM"}
+        ⬆ {app.isKvmUpdating(node.id) ? "Updating…" : "Update"}
       </button>
     {:else if isRemoteApp && inMyFleet && app.upgradeAvailable(node)}
       <button

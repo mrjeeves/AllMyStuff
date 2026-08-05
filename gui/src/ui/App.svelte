@@ -22,8 +22,6 @@
   } from "../tauri";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
-  import NetworkMenu from "./NetworkMenu.svelte";
-  import VenueMenu from "./VenueMenu.svelte";
   import Sidebar from "./Sidebar.svelte";
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
@@ -150,90 +148,19 @@
       </div>
     </div>
 
-    <div class="summary">
-      <button
-        class="chip yours"
-        onclick={() => app.openSettings("fleet")}
-        title="Your fleet — name it, see its key and members"
-      >
-        <b>{app.mineCount}</b> yours{#if app.fleetName}&nbsp;· {app.fleetName}{/if}
-      </button>
-      <button
-        class="chip shared"
-        onclick={() => app.openSettings("sharing")}
-        title="People & fleets you're sharing with"
-      >
-        <b>{app.sharedCount}</b> shared
-      </button>
-      <span class="net-anchor">
-        <!-- One networks control: the colored presence dot is the icon, the
-             name carries a chevron into a menu that holds both the on/off
-             switches and the network-settings button (no separate button). -->
-        <button
-          class="chip net"
-          class:live={app.backendConnected && app.networks.length > 0}
-          onclick={(e) => {
-            e.stopPropagation();
-            app.netMenuOpen = !app.netMenuOpen;
-          }}
-          title="Your meshes — switch them on or off, or open mesh settings"
-          aria-haspopup="menu"
-          aria-expanded={app.netMenuOpen}
-        >
-          <span class="net-dot"></span>
-          {!app.backendConnected
-            ? app.meshStatus === "disconnected"
-              ? "mesh reconnecting…"
-              : "demo mode"
-            : app.meshStatus === "disconnected"
-              ? "mesh reconnecting…"
-              : app.networks.length > 1
-                ? `${app.networks.length} meshes`
-                : app.activeNetwork
-                  ? app.meshLabel(app.activeNetwork)
-                  : app.disabledNets.length > 0
-                    ? "meshes off"
-                    : "no mesh"}
-          {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
-          <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
-        </button>
-        {#if app.netMenuOpen}
-          <NetworkMenu />
-        {/if}
-      </span>
-    </div>
+    <button
+      class="experience-toggle"
+      class:advanced={app.uiMode === "advanced"}
+      onclick={() => app.setUiMode(app.uiMode === "normal" ? "advanced" : "normal")}
+      aria-label={`Switch to ${app.uiMode === "normal" ? "Advanced" : "Normal"} mode`}
+      title="Normal keeps the graph simple; Advanced restores every tool and panel"
+    >
+      <span class:lit={app.uiMode === "normal"}>Normal</span>
+      <i aria-hidden="true"></i>
+      <span class:lit={app.uiMode === "advanced"}>Advanced</span>
+    </button>
 
     <div class="actions">
-      <!-- The venues pill: the sibling of the meshes pill, for the venues your
-           meshes call out at. Same dropdown-with-switches shape; it shimmers
-           when driving a mesh just turned a venue back on. It lives with the
-           header controls (not the status pills) so portrait phones keep it
-           up top when the pills dock along the bottom edge. -->
-      <span class="net-anchor">
-        <button
-          class="chip venue"
-          class:live={app.backendConnected && app.venueCounts.on > 0}
-          class:shimmer={app.venuePillShimmer}
-          onclick={(e) => {
-            e.stopPropagation();
-            app.venueMenuOpen = !app.venueMenuOpen;
-          }}
-          title="Your venues — the signaling/relay sets your meshes call out at"
-          aria-haspopup="menu"
-          aria-expanded={app.venueMenuOpen}
-        >
-          <span class="net-dot"></span>
-          {app.venueCounts.total === 0
-            ? "no venues"
-            : app.venueCounts.on === app.venueCounts.total
-              ? `${app.venueCounts.total} ${app.venueCounts.total === 1 ? "venue" : "venues"}`
-              : `${app.venueCounts.on}/${app.venueCounts.total} venues`}
-          <span class="net-chevron" class:open={app.venueMenuOpen} aria-hidden="true">▾</span>
-        </button>
-        {#if app.venueMenuOpen}
-          <VenueMenu />
-        {/if}
-      </span>
       <!-- The clock-skew warning: this machine's clock is well out of line
            with its peers' (estimated passively from traffic that was already
            flowing). Persistent while it holds — a wrong clock quietly breaks
@@ -273,7 +200,7 @@
   <main class="stage">
     <Sidebar />
     <Graph />
-    <NodeDrawer />
+    {#if app.uiMode === "advanced"}<NodeDrawer />{/if}
     <RoomPanel />
   </main>
 
@@ -359,122 +286,66 @@
     font-size: 0.72rem;
     color: var(--ink-faint);
   }
-  .summary {
-    display: flex;
-    gap: 0.4rem;
+  /* One unmistakable two-position control replaces the old fleet/mesh/venue
+     status chips. The selected half sits physically lower, like a pressed
+     rocker, while the inactive half dims hard enough to read at a glance. */
+  .experience-toggle {
     margin-left: auto;
-  }
-  .chip.yours,
-  .chip.shared,
-  .chip.net,
-  .chip.venue {
-    cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease,
-      filter 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
-  }
-  /* The summary pills wear their concept's colour at rest, the same hues the
-     "How it connects" explainer teaches: fleet = green (your own pack),
-     sharing = violet (lending to a person) — matching the mesh/venue pills. */
-  .chip.yours {
-    background: var(--c-fleet-soft);
-    border-color: var(--c-fleet-soft);
-    color: var(--c-fleet-ink);
-  }
-  .chip.shared {
-    background: var(--c-share-soft);
-    border-color: var(--c-share-soft);
-    color: var(--c-share-ink);
-  }
-  /* Every header pill is clickable, so they share one obvious hover — a small
-     lift, a brighter fill, a shadow and a firmer edge. */
-  .chip.yours:hover,
-  .chip.shared:hover,
-  .chip.net:hover,
-  .chip.venue:hover {
-    filter: brightness(1.12);
-    transform: translateY(-1px);
-    box-shadow: var(--shadow-sm), 0 5px 12px -5px oklch(0 0 0 / 0.45);
-    border-color: currentColor;
-  }
-  .net-anchor {
-    position: relative;
-    display: inline-flex;
-  }
-  .net-off {
-    font-size: 0.64rem;
-    font-weight: 700;
-    color: var(--ink-faint);
-    background: var(--surface);
-    border-radius: var(--r-pill);
-    padding: 0 0.3rem;
-  }
-  .chip b {
+    display: inline-grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.28rem 0.38rem 0.42rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    background: linear-gradient(180deg, var(--surface-2), var(--surface));
     color: var(--ink);
+    box-shadow:
+      0 5px 0 oklch(0.08 0.02 285 / 0.9),
+      0 8px 18px oklch(0 0 0 / 0.28);
+    perspective: 220px;
+    cursor: pointer;
+    transform-origin: center;
   }
-  .chip.net {
-    background: var(--danger-soft);
-    color: var(--danger);
-    border-color: oklch(0.7 0.19 14 / 0.35);
+  .experience-toggle:active {
+    transform: translateY(3px) rotateX(-5deg);
+    box-shadow: 0 2px 0 oklch(0.08 0.02 285 / 0.9);
   }
-  /* Live mesh wears the mesh concept colour (magenta); the no-mesh state keeps
-     the red warning above — that's connection status, not identity. */
-  .chip.net.live {
-    background: var(--c-mesh-soft);
-    color: var(--c-mesh-ink);
-    border-color: var(--c-mesh);
+  .experience-toggle.advanced {
+    animation: mode-flip 0.34s cubic-bezier(0.2, 0.8, 0.25, 1);
   }
-  /* The presence dot *is* the networks icon — colored from the chip (red
-     when there's no live network, green when joined) and given a soft halo
-     once live so it reads as lit rather than greyed. */
-  .net-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: currentColor;
-    flex-shrink: 0;
+  .experience-toggle:not(.advanced) {
+    animation: mode-flip-back 0.34s cubic-bezier(0.2, 0.8, 0.25, 1);
   }
-  .chip.net.live .net-dot {
-    box-shadow: 0 0 0 3px var(--c-mesh-soft);
+  .experience-toggle span {
+    min-width: 4.4rem;
+    padding: 0.32rem 0.5rem;
+    border-radius: var(--r-sm);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    opacity: 0.28;
+    transform: translateY(-1px);
+    transition: opacity 0.18s ease, transform 0.18s ease, background 0.18s ease,
+      box-shadow 0.18s ease;
   }
-  .net-chevron {
-    font-size: 0.62rem;
-    line-height: 1;
-    margin-left: 0.05rem;
-    opacity: 0.7;
-    transition: transform 0.12s ease;
+  .experience-toggle span.lit {
+    opacity: 1;
+    transform: translateY(2px);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    box-shadow: inset 0 2px 5px oklch(0 0 0 / 0.28);
   }
-  .net-chevron.open {
-    transform: rotate(180deg);
+  .experience-toggle i {
+    width: 1px;
+    height: 1.2rem;
+    background: var(--line-strong);
   }
-  /* The venues pill is the calmer sibling of the meshes pill — neutral when
-     idle, accent-lit when venues are on, so it doesn't compete with the
-     red/green mesh status. */
-  .chip.venue {
-    background: var(--surface);
-    color: var(--ink-soft);
-    border-color: var(--line-strong);
+  @keyframes mode-flip {
+    45% { transform: rotateX(18deg) scale(0.98); }
   }
-  .chip.venue.live {
-    background: var(--c-venue-soft);
-    color: var(--c-venue-ink);
-    border-color: var(--c-venue-soft);
-  }
-  /* A brief glow when driving a mesh just turned a venue back on. */
-  .chip.venue.shimmer {
-    animation: venue-shimmer 1.1s ease;
-  }
-  @keyframes venue-shimmer {
-    0% {
-      box-shadow: 0 0 0 0 var(--c-venue-soft);
-    }
-    35% {
-      box-shadow: 0 0 0 6px var(--c-venue-soft);
-      background: var(--c-venue-soft);
-      color: var(--c-venue-ink);
-    }
-    100% {
-      box-shadow: 0 0 0 0 transparent;
-    }
+  @keyframes mode-flip-back {
+    45% { transform: rotateX(-18deg) scale(0.98); }
   }
   .actions {
     display: flex;
@@ -619,33 +490,17 @@
     .tag {
       display: none;
     }
-    .summary .chip,
-    .actions .chip {
-      max-width: 46vw;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
     .actions {
       margin-left: auto;
     }
-  }
-
-  /* Landscape phones: the pills wrap onto a second header row. */
-  @media (max-width: 700px) and (orientation: landscape) {
-    .summary {
+    .experience-toggle {
       order: 3;
       flex: 1 1 100%;
-      margin-left: 0;
-      flex-wrap: wrap;
-      min-width: 0;
+      margin: 0 auto;
+      width: min(19rem, 100%);
     }
   }
 
-  /* Portrait phones: the header splits — the status pills leave it and
-     dock along the bottom edge, inside the thumb's reach, over the stage.
-     The stage keeps its full height (the dock overlays it; the graph pans,
-     and the drawers already float at this width). */
   /* Phone header: the version tag is noise there — About in Settings
      owns it (and the App Store owns updates). */
   @media (max-width: 700px) {
@@ -654,30 +509,4 @@
     }
   }
 
-  @media (max-width: 700px) and (orientation: portrait) {
-    /* The dock is position:fixed INSIDE the header — and the header's
-       backdrop-filter would make itself the containing block for fixed
-       descendants, pinning the dock to the header's own bottom edge (on
-       top of the controls) instead of the viewport's. Portrait drops the
-       header blur (near-opaque paint instead) so the dock escapes to the
-       real bottom of the screen. */
-    .topbar {
-      backdrop-filter: none;
-      background: oklch(0.135 0.022 285 / 0.95);
-    }
-    .summary {
-      position: fixed;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      margin-left: 0;
-      justify-content: center;
-      flex-wrap: wrap;
-      padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
-      background: oklch(0.135 0.022 285 / 0.74);
-      backdrop-filter: blur(14px) saturate(1.2);
-      border-top: 1px solid var(--line);
-      z-index: 30;
-    }
-  }
 </style>

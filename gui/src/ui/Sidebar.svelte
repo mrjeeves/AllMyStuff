@@ -47,6 +47,7 @@
   let collapsed = $state(loadCollapsed());
   let resizing = $state(false);
   let el = $state<HTMLElement | null>(null);
+  const normalMode = $derived(app.uiMode === "normal");
 
   const roomAttention = $derived(
     Object.values(app.roomKnocks).reduce((n, ks) => n + ks.length, 0),
@@ -73,6 +74,10 @@
   }
 
   function select(tab: "rooms" | "sites" | "help") {
+    // A notification tab peeking into Normal mode is also the intentional
+    // escape hatch to its full panel: selecting it promotes the workspace to
+    // Advanced, then opens the requested tab.
+    if (normalMode) app.setUiMode("advanced");
     app.sidebarTab = tab;
     if (collapsed) setCollapsed(false);
     if (tab !== "rooms") app.roomDraftOpen = false;
@@ -121,6 +126,7 @@
 <aside
   class="sidebar"
   class:collapsed
+  class:normal={normalMode}
   class:resizing
   bind:this={el}
   style={collapsed ? "" : `width: ${width}px`}
@@ -130,7 +136,7 @@
     enabled: () => isMobile() && !collapsed,
   }}
 >
-  {#if collapsed}
+  {#if collapsed || normalMode}
     <!-- The thin rail: tapping anywhere expands it (into the last-open tab);
          the two icons expand straight into their own tab. -->
     <div class="rail">
@@ -146,6 +152,7 @@
       </button>
       <button class="rail-btn" title="Rooms" aria-label="Rooms" onclick={() => select("rooms")}>
         🪩
+        {#if app.rooms.length > 0}<span class="rail-count">{app.rooms.length}</span>{/if}
         {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
       </button>
       {#if app.cecEnabled}
@@ -239,6 +246,41 @@
   }
   .sidebar.collapsed {
     width: 2.75rem;
+  }
+  /* Normal mode gives the graph the entire stage. The rail lives just outside
+     the viewport; only badge-bearing tabs peek in, then the whole cluster
+     glides into reach on hover/focus. Selecting one enters Advanced mode. */
+  .sidebar.normal {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 0;
+    border: 0;
+    background: transparent;
+    overflow: visible;
+  }
+  .sidebar.normal .rail {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 2.75rem;
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    opacity: 0.16;
+    transform: translateX(-2.3rem);
+    transition: transform 0.22s ease, opacity 0.22s ease, box-shadow 0.22s ease;
+  }
+  .sidebar.normal .rail:has(.rail-count, .rail-attn) {
+    opacity: 0.7;
+    transform: translateX(-1.75rem);
+  }
+  .sidebar.normal .rail:hover,
+  .sidebar.normal .rail:focus-within {
+    opacity: 1;
+    transform: translateX(0);
+    box-shadow: var(--shadow-md);
+  }
+  .sidebar.normal .rail-open {
+    display: none;
   }
   /* Phone-width stages: the open panel floats over the graph (see the
      device drawer's twin rule). */

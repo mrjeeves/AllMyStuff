@@ -10,6 +10,7 @@
   // select (the device drawer opens from that). Everything below that touches
   // pointer behaviour is gated on this so desktop stays exactly as it was.
   const mobile = isMobile();
+  const normalMode = $derived(app.uiMode === "normal");
 
   // Viewport size tracked via ResizeObserver so the layout fits its container
   // (same approach as the MyOwnMesh NodeMap). We OBSERVE the outer canvas —
@@ -46,8 +47,8 @@
     return () => ro.disconnect();
   });
 
-  const NODE_W = 214;
-  const NODE_H = 86;
+  const nodeW = $derived(normalMode ? 340 : 214);
+  const nodeH = $derived(normalMode ? 166 : 86);
 
   type Placed = { node: MeshNode; x: number; y: number };
 
@@ -231,6 +232,7 @@
     // The phone has no toggle, so this only ever runs on desktop — but guard
     // anyway so mobile can never be knocked off the list.
     if (mobile) return;
+    if (normalMode && v === "radial") v = "grid";
     view = v;
     panX = 0;
     panY = 0;
@@ -257,8 +259,8 @@
   // The grid's geometry: one section per fleet, nodes wrapped into rows —
   // sub-banded by mesh when the fleet spans more than one mesh combination.
   const GRID_MARGIN = 28;
-  const CELL_W = NODE_W + 26;
-  const CELL_H = NODE_H + 64; // node + meta rows + breathing room
+  const cellW = $derived(nodeW + 26);
+  const cellH = $derived(nodeH + 64); // node + meta rows + breathing room
   const SECTION_HEAD = 34;
   const SECTION_SUBHEAD = 24; // one mesh sub-band label inside a section
   const SECTION_GAP = 26;
@@ -272,13 +274,13 @@
       const placed: Placed[] = [];
       const sections: Section[] = [];
       const subheads: SubHead[] = [];
-      const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / CELL_W));
+      const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / cellW));
       let y = GRID_MARGIN;
       for (const g of fleetGroups) {
         // The section keeps one column count for the whole fleet, so the mesh
         // sub-bands stay aligned instead of each re-fitting its own width.
         const useCols = Math.min(cols, Math.max(1, g.nodes.length));
-        const w = useCols * CELL_W + 2 * SECTION_PAD;
+        const w = useCols * cellW + 2 * SECTION_PAD;
         const x0 = Math.max(GRID_MARGIN, (width - w) / 2);
         const subs = meshSubsOf(g.nodes);
         const showSubs = subs.length > 1;
@@ -299,11 +301,11 @@
             const row = Math.floor(i / useCols);
             placed.push({
               node: n,
-              x: x0 + SECTION_PAD + col * CELL_W + CELL_W / 2,
-              y: innerY + row * CELL_H + CELL_H / 2 - 10,
+              x: x0 + SECTION_PAD + col * cellW + cellW / 2,
+              y: innerY + row * cellH + cellH / 2 - 10,
             });
           });
-          innerY += Math.ceil(sub.nodes.length / useCols) * CELL_H;
+          innerY += Math.ceil(sub.nodes.length / useCols) * cellH;
         }
         const h = innerY - y + SECTION_PAD;
         sections.push({ key: g.key, label: g.label, x: x0, y, w, h, count: g.nodes.length });
@@ -499,6 +501,16 @@
   let panX = $state(0);
   let panY = $state(0);
   let zoom = $state(1);
+
+  // Normal has exactly two unscaled document views. If someone switches over
+  // from an Advanced radial/zoomed workspace, land them on a clean grid.
+  $effect(() => {
+    if (!normalMode || mobile) return;
+    if (view === "radial") view = "grid";
+    if (zoom !== 1) zoom = 1;
+    panX = 0;
+    panY = 0;
+  });
   const MIN_ZOOM = 0.4;
   const MAX_ZOOM = 2.2;
   const clampZoom = (z: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
@@ -642,7 +654,7 @@
     function onKey(e: KeyboardEvent) {
       // The list scrolls, it doesn't scale — leave the zoom shortcut to the
       // graph views (mirrors the `isList` bail-out in `onWheel`).
-      if (!hovering || isList || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (normalMode || !hovering || isList || !(e.ctrlKey || e.metaKey) || e.altKey) return;
       if (e.key === "-" || e.key === "_") {
         e.preventDefault();
         void applyZoom(width / 2, height / 2, zoom / 1.2);
@@ -750,7 +762,7 @@
 
   function onWheel(e: WheelEvent) {
     // The list owns its own native scroll — the canvas never zooms there.
-    if (isList) return;
+    if (normalMode || isList) return;
     // Grid reads like a list: a bare wheel scrolls it (let the scroller do its
     // thing — don't preventDefault), and zoom is the deliberate Ctrl/⌘ gesture.
     // Radial has nothing to scroll, so the wheel keeps zooming there.
@@ -1045,20 +1057,40 @@
     claimRevealed = null;
   }
 
-  /** The KVM whose self-reboot button is armed (two-step confirm, like the
-   *  gear menu's Restart device). Disarms itself after a beat. */
-  let kvmRebootArmed = $state<string | null>(null);
-  let kvmRebootDisarm: ReturnType<typeof setTimeout> | undefined;
-  function kvmRebootClick(n: MeshNode) {
-    if (kvmRebootArmed !== n.id) {
-      kvmRebootArmed = n.id;
-      clearTimeout(kvmRebootDisarm);
-      kvmRebootDisarm = setTimeout(() => (kvmRebootArmed = null), 3000);
+  // This Device's graph label is the fastest place to rename the machine.
+  // The existing identity setter handles persistence and presence gossip.
+  let renamingSelf = $state(false);
+  let selfNameDraft = $state("");
+  let selfNameSaving = $state(false);
+  let selfNameInput = $state<HTMLInputElement | null>(null);
+
+  $effect(() => {
+    if (!renamingSelf) return;
+    void tick().then(() => {
+      selfNameInput?.focus();
+      selfNameInput?.select();
+    });
+  });
+
+  function beginSelfRename(n: MeshNode) {
+    selfNameDraft = n.label;
+    renamingSelf = true;
+  }
+
+  async function saveSelfRename(n: MeshNode) {
+    if (!renamingSelf || selfNameSaving) return;
+    const clean = selfNameDraft.trim();
+    if (!clean) {
+      selfNameDraft = n.label;
+      renamingSelf = false;
       return;
     }
-    clearTimeout(kvmRebootDisarm);
-    kvmRebootArmed = null;
-    app.restartNodeDevice(n.id);
+    selfNameSaving = true;
+    // Matching the hostname means "use the default" rather than storing a
+    // redundant override that would later display as Name (Name).
+    await app.setIdentityLabel(clean === n.hostname?.trim() ? "" : clean);
+    selfNameSaving = false;
+    renamingSelf = false;
   }
 
   function onNodeClick(n: MeshNode) {
@@ -1080,13 +1112,13 @@
       // attach dropdown so only one drop-out ever shows at a time.
       claimRevealed = claimRevealed === n.id ? null : n.id;
       app.kvmRevealed = null;
-      app.selectNode(n.id);
+      if (!normalMode) app.selectNode(n.id);
     } else {
       claimRevealed = null;
       app.kvmRevealed = null;
       // Clicking a device always selects it and keeps it selected — re-clicking
       // the focused node no longer toggles it off (close the drawer to deselect).
-      app.selectNode(n.id);
+      if (!normalMode) app.selectNode(n.id);
     }
   }
 
@@ -1114,10 +1146,12 @@
 
   function menuHeight(nodeId: string): number {
     const mn = app.node(nodeId);
+    const cons = mn ? app.consoleAccess(mn) : null;
     const items =
       1 +
+      (normalMode && cons?.terminal ? 1 : 0) +
       (app.canRestartApp(mn) ? 1 : 0) +
-      (app.canRestartDevice(mn) ? 1 : 0) +
+      (!app.isKvm(mn) && app.canRestartDevice(mn) ? 1 : 0) +
       (mn && mn.kind !== "this" && !app.isMe(nodeId) ? 1 : 0); // Forget this node
     return MENU_PAD + items * MENU_ITEM_H;
   }
@@ -1188,10 +1222,10 @@
 </script>
 
 <!-- The small console glyphs for the card buttons: remote desktop, files,
-     terminal, sites, plus the KVM set (its web console, its self-reboot, the
+     terminal, sites, updates, plus the KVM set (Wi-Fi, firmware update, the
      attach link, and the attached machine's power/reset). Stroke uses
      currentColor. -->
-{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "reboot" | "link" | "power" | "reset" | "wifi")}
+{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "update" | "link" | "power" | "reset" | "wifi")}
   {#if kind === "remote"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
@@ -1211,10 +1245,10 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="11" rx="2" /><rect x="5" y="18" width="14" height="3" rx="1" />
     </svg>
-  {:else if kind === "reboot"}
-    <!-- Reboot the KVM itself: a restart loop with a power tick. -->
+  {:else if kind === "update"}
+    <!-- Update the app/firmware: download arrow inside a restart loop. -->
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M20 12a8 8 0 1 1-3-6.2" /><polyline points="17 3 17 6.5 20.5 6.5" /><path d="M12 8.5v4" />
+      <path d="M20 12a8 8 0 1 1-3-6.2" /><polyline points="17 3 17 6.5 20.5 6.5" /><path d="M12 7v7m0 0-3-3m3 3 3-3" />
     </svg>
   {:else if kind === "link"}
     <!-- Attach: the chain link that drops the target picker out. -->
@@ -1258,6 +1292,7 @@
   <div
     class="node"
     class:list={!placed}
+    class:normal={normalMode}
     class:self={st.self}
     class:shared={st.kind === "shared"}
     class:mine={st.mine && !st.self}
@@ -1272,7 +1307,7 @@
     class:offline={!n.online}
     data-node-id={n.id}
     style={placed
-      ? `left: ${placed.x - NODE_W / 2}px; top: ${placed.y - NODE_H / 2}px; width: ${NODE_W}px; min-height: ${NODE_H}px;`
+      ? `left: ${placed.x - nodeW / 2}px; top: ${placed.y - nodeH / 2}px; width: ${nodeW}px; min-height: ${nodeH}px;`
       : null}
     onpointerdown={(e) => onNodePointerDown(e, n)}
     onpointermove={(e) => onNodePointerMove(e, n)}
@@ -1300,9 +1335,41 @@
     <div class="node-top">
       <span class="avatar">{nodeAvatar(n)}</span>
       <div class="node-id">
-        <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
+        {#if st.self && renamingSelf}
+          <input
+            class="node-label-input"
+            aria-label="This device name"
+            bind:value={selfNameDraft}
+            bind:this={selfNameInput}
+            disabled={selfNameSaving}
+            onclick={(e) => e.stopPropagation()}
+            onblur={() => void saveSelfRename(n)}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void saveSelfRename(n);
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                renamingSelf = false;
+              }
+            }}
+          />
+        {:else if st.self}
+          <button
+            class="node-label node-label-edit"
+            title="Rename this device"
+            onclick={(e) => {
+              e.stopPropagation();
+              beginSelfRename(n);
+            }}
+          >{normalMode ? n.label : displayName(n)}<span aria-hidden="true">✎</span></button>
+        {:else}
+          <div class="node-label" title={displayName(n)}>{normalMode ? n.label : displayName(n)}</div>
+        {/if}
         <div class="node-sub">
-          {#if st.shared}
+          {#if normalMode && st.app}
+            {n.hostname?.trim() || n.label}
+          {:else if st.shared}
             shared with {st.shared.name}
           {:else if !st.app}
             on the mesh · not running AllMyStuff
@@ -1327,8 +1394,8 @@
         {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
         {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
         {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-        {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-        {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+        {#if !normalMode && n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+        {#if !normalMode && n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         {#if n.needsTurn && !n.online}
           <!-- The daemon's ICE watchdog verdict, surfaced: this link keeps
                failing with no relay in play. Without the chip the device
@@ -1352,13 +1419,16 @@
           void app.refreshNode(n.id);
         }}
       >
-        <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
-          <polyline points="22 5 22 10 17 10" />
-          <polyline points="2 19 2 14 7 14" />
-          <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
-          <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
-        </svg>
-        <span class="dot" class:on={n.online}></span>
+        <span class="refresh-face" aria-hidden="true">
+          <svg class="refresh-ring" viewBox="0 0 24 24">
+            <polyline points="22 5 22 10 17 10" />
+            <polyline points="2 19 2 14 7 14" />
+            <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
+            <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
+          </svg>
+          <span class="dot" class:on={n.online}></span>
+        </span>
+        <span class="action-label refresh-label">Refresh</span>
       </button>
     </div>
     <!-- Bottom button row: the consoles you can open on this device (your
@@ -1367,39 +1437,42 @@
     <div class="node-consoles">
       {#if cons.remote}
         <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}<span class="action-label">Remote</span></button>
       {/if}
-      {#if cons.files}
+      {#if cons.files && !normalMode}
         <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}<span class="action-label">Files</span></button>
       {/if}
-      {#if cons.terminal}
+      {#if cons.terminal && !normalMode}
         <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}<span class="action-label">Terminal</span></button>
       {/if}
       {#if cons.sites}
         <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}<span class="action-label">Sites</span></button>
+      {/if}
+      {#if app.canUpdateAllMyStuff(n)}
+        <button class="cbtn update-action" data-tip="Update AllMyStuff" aria-label="Update AllMyStuff on {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.updateAllMyStuff(n.id); }}>{@render cicon("update")}<span class="action-label">Update</span></button>
       {/if}
       {#if app.kvmAllowed(n)}
         <!-- A KVM's extra controls, alongside the generic Remote Control +
-             Sites (globe) buttons every node gets now: reboot the KVM
-             itself (two-step arm), and the attach link, which drops the
+             Sites (globe) buttons every node gets now: update the KVM
+             itself, and the attach link, which drops the
              target picker out under the card. Its web UI opens from the
              Sites globe (which routes through openKVM), so there's no
              separate "Open KVM" button. -->
         <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}</button>
-        {#if app.canRestartDevice(n)}
-          <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
-            data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
-            aria-label="Reboot {displayName(n)} (the KVM itself)"
-            onclick={(e) => { e.stopPropagation(); kvmRebootClick(n); }}>{@render cicon("reboot")}</button>
-        {/if}
+          onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}<span class="action-label">Wi-Fi</span></button>
+        <button class="cbtn"
+          disabled={app.isKvmUpdating(n.id)}
+          data-tip="Update this KVM"
+          aria-label="Update {displayName(n)} (the KVM itself)"
+          onclick={(e) => { e.stopPropagation(); void app.updateKvm(n.id); }}>{@render cicon("update")}<span class="action-label">{app.isKvmUpdating(n.id) ? "Updating…" : "Update"}</span></button>
         <button class="cbtn" class:active={app.kvmRevealed === n.id}
           data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
           aria-expanded={app.kvmRevealed === n.id}
-          onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}</button>
+          onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}<span class="action-label">Attach</span></button>
       {/if}
       {#if !app.isKvm(n)}
         {@const kvmHere = app.kvmAttachedTo(n.id)}
@@ -1411,7 +1484,7 @@
             aria-label="Power menu for {displayName(n)} via KVM"
             aria-haspopup="menu"
             aria-expanded={kvmPowerMenu?.kvmId === kvmHere.id}
-            onclick={(e) => openKvmPowerMenu(e, kvmHere.id)}>{@render cicon("power")}</button>
+            onclick={(e) => openKvmPowerMenu(e, kvmHere.id)}>{@render cicon("power")}<span class="action-label">Power</span></button>
         {/if}
       {/if}
       <span class="cbtn-sep" aria-hidden="true"></span>
@@ -1422,7 +1495,7 @@
         aria-haspopup="menu"
         aria-expanded={nodeMenu?.id === n.id}
         onclick={(e) => openNodeMenu(e, n.id)}
-      >⚙</button>
+      >⚙<span class="action-label">Settings</span></button>
     </div>
     <!-- Claimable affordances drop out from *under* the node, floating
          below it so they never disturb the graph's layout. -->
@@ -1747,13 +1820,15 @@
        drop away in the list too — it scrolls, it doesn't scale. -->
   {#if !mobile}
     <div class="zoombar">
-      <button
-        class="zbtn"
-        class:active={view === "radial"}
-        title="Radial view — this device in the centre"
-        aria-label="Radial view"
-        onclick={() => setView("radial")}>◎</button
-      >
+      {#if !normalMode}
+        <button
+          class="zbtn"
+          class:active={view === "radial"}
+          title="Radial view — this device in the centre"
+          aria-label="Radial view"
+          onclick={() => setView("radial")}>◎</button
+        >
+      {/if}
       <button
         class="zbtn"
         class:active={view === "grid"}
@@ -1768,7 +1843,7 @@
         aria-label="List view, grouped by fleet"
         onclick={() => setView("list")}>☰</button
       >
-      {#if !isList}
+      {#if !normalMode && !isList}
         <span class="zsep"></span>
         <button class="zbtn" title="Zoom out (Ctrl/⌘ −)" onclick={() => applyZoom(width / 2, height / 2, zoom / 1.2)}>−</button>
         <button class="zbtn wide" title="Reset view (Ctrl/⌘ 0)" onclick={resetView}>{Math.round(zoom * 100)}%</button>
@@ -1816,6 +1891,7 @@
 {#if nodeMenu}
   {@const menuId = nodeMenu.id}
   {@const mn = app.node(menuId)}
+  {@const menuCons = mn ? app.consoleAccess(mn) : null}
   <div class="node-menu" role="menu" style="left: {nodeMenu.left}px; top: {nodeMenu.top}px;">
     <button
       class="nm-item"
@@ -1835,6 +1911,22 @@
         >
       </span>
     </button>
+    {#if normalMode && menuCons?.terminal}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          app.openConsoleKind(menuId, "terminal");
+          nodeMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">⌨</span>
+        <span class="nm-text">
+          <span class="nm-label">Open Terminal</span>
+          <span class="nm-sub">open a shell on this machine</span>
+        </span>
+      </button>
+    {/if}
     {#if app.canRestartApp(mn)}
       <button
         class="nm-item"
@@ -1853,7 +1945,7 @@
         </span>
       </button>
     {/if}
-    {#if app.canRestartDevice(mn)}
+    {#if !app.isKvm(mn) && app.canRestartDevice(mn)}
       <!-- The step past an app relaunch: reboot the whole machine. Two-step
            arm (the fleet-kick pattern) — a reboot is disruptive enough that a
            stray click must not fire it. -->
@@ -2269,6 +2361,10 @@
     gap: 0.4rem;
     transition: transform 0.1s ease, box-shadow 0.12s ease, border-color 0.12s ease;
   }
+  .node.normal {
+    padding: 0.72rem 0.78rem 0.68rem;
+    gap: 0.55rem;
+  }
   .node:hover {
     transform: translateY(-2px);
     box-shadow: var(--shadow-lg), 0 0 0 1px var(--accent-soft),
@@ -2511,6 +2607,43 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .node-label-edit {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: text;
+    text-align: left;
+  }
+  .node-label-edit span {
+    flex: none;
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    opacity: 0.55;
+  }
+  .node-label-edit:hover span,
+  .node-label-edit:focus-visible span {
+    color: var(--accent-ink);
+    opacity: 1;
+  }
+  .node-label-input {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    color: var(--ink);
+    padding: 0.16rem 0.3rem;
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 650;
+    outline: 2px solid var(--accent-soft);
+  }
   .node-sub {
     font-size: 0.72rem;
     color: var(--ink-faint);
@@ -2524,7 +2657,14 @@
   .status-refresh {
     flex-shrink: 0;
   }
-  .status-refresh .refresh-ring {
+  .refresh-face {
+    position: relative;
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+  }
+  .refresh-face .refresh-ring {
     position: absolute;
     inset: 0;
     width: 100%;
@@ -2671,6 +2811,54 @@
     gap: 0.26rem;
     margin-top: 0.15rem;
   }
+  .action-label {
+    display: none;
+  }
+  .node.normal .node-consoles {
+    flex-wrap: wrap;
+    gap: 0.42rem;
+  }
+  .node.normal .cbtn {
+    display: inline-flex;
+    gap: 0.38rem;
+    width: auto;
+    min-width: 2.25rem;
+    height: 2.2rem;
+    padding: 0 0.65rem;
+    border-radius: var(--r-md);
+    font-weight: 750;
+  }
+  .node.normal .cbtn .action-label {
+    display: inline;
+    white-space: nowrap;
+    font-size: 0.75rem;
+  }
+  .node.normal .cbtn :global(svg) {
+    width: 1.05rem;
+    height: 1.05rem;
+    transform: none;
+  }
+  .node.normal .status-refresh {
+    width: auto;
+    min-width: 5.4rem;
+    height: 2rem;
+    padding: 0 0.65rem 0 0.42rem;
+    border-radius: var(--r-md);
+  }
+  .node.normal .status-refresh .refresh-face {
+    width: 1.5rem;
+    height: 1.5rem;
+    flex: none;
+  }
+  .node.normal .node-gear {
+    font-size: 1rem;
+  }
+  .node.normal .cbtn-sep {
+    display: none;
+  }
+  .node.normal .node-gear {
+    margin-left: 0 !important;
+  }
   /* A hairline divider that caps the action buttons and sets the gear apart —
      it carries the flex slack (margin-left:auto), so the row reads
      "actions … │ ⚙" with the rule sitting right against the gear. */
@@ -2720,19 +2908,10 @@
     color: var(--accent-ink);
     background: var(--accent-soft);
   }
-  /* The KVM self-reboot button, armed: one more click acts. Same red the
-     gear menu's armed Restart-device row uses. */
-  .cbtn.armed-danger {
-    border-color: var(--danger);
-    color: var(--danger);
-    background: var(--danger-soft);
-    animation: arm-pulse 0.9s ease-in-out infinite;
-  }
-  @keyframes arm-pulse {
-    50% {
-      background: var(--danger-soft);
-      opacity: 0.65;
-    }
+  .cbtn.update-action {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
   }
   .cbtn :global(svg) {
     width: 0.9rem;

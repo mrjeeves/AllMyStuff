@@ -572,6 +572,19 @@ function loadCecAliases(): Record<string, string> {
   }
 }
 
+type UiMode = "normal" | "advanced";
+const UI_MODE_STORE_KEY = "allmystuff.uiMode.v1";
+
+/** The native app opens in the deliberately quiet, graph-first experience.
+ *  Once someone opts into Advanced we remember that choice on this machine. */
+function loadUiMode(): UiMode {
+  try {
+    return localStorage.getItem(UI_MODE_STORE_KEY) === "advanced" ? "advanced" : "normal";
+  } catch {
+    return "normal";
+  }
+}
+
 class AppStore {
   // Under the real app the graph is built entirely from the live scan + mesh
   // presence, so it starts empty and fills with *your* stuff. The demo
@@ -580,6 +593,7 @@ class AppStore {
   catalog = $state<Catalog>(isTauri() ? emptyCatalog() : demoCatalog());
 
   // ---- interaction state ------------------------------------------
+  uiMode = $state<UiMode>(loadUiMode());
   selectedNodeId = $state<string | null>(null);
   /** A "centre the graph on this node" request. Bumped by [`focusNode`]; the
    *  graph watches the `seq` and pans to the node once per new request (so a
@@ -1564,6 +1578,9 @@ class AppStore {
     // applies its own due/policy rules; this closes the gap where no timer had
     // run yet and the app only displayed yesterday's persisted status.
     void this.checkUpdates();
+    // Card-level update affordances need the channel version even when the
+    // details drawer never mounts (Normal mode's default).
+    void this.loadLatestRelease();
     await this.loadDisabledNetworks();
     this.startMeshPolling();
     await onSubscription((s) => {
@@ -2497,6 +2514,21 @@ class AppStore {
   }
 
   // ---- selection ---------------------------------------------------
+  setUiMode(mode: UiMode) {
+    this.uiMode = mode;
+    if (mode === "normal") {
+      // Normal mode has no details drawer or card drop-outs. Clear their
+      // latent state so switching back never acts on a stale selection.
+      this.selectedNodeId = null;
+      this.kvmRevealed = null;
+    }
+    try {
+      localStorage.setItem(UI_MODE_STORE_KEY, mode);
+    } catch {
+      /* private mode — keep the choice for this session */
+    }
+  }
+
   selectNode(id: string | null) {
     this.selectedNodeId = id;
   }
@@ -8540,6 +8572,34 @@ class AppStore {
   upgradeAvailable(node: MeshNode | null | undefined): boolean {
     if (!node || node.kind === "this" || !isAppNode(node) || this.isKvm(node)) return false;
     return isOlderVersion(node.version, this.latestRelease ?? undefined);
+  }
+
+  /** Whether a card can offer an actionable AllMyStuff update. Only this
+   *  machine and our own fleet members may be updated; the receiver enforces
+   *  the same ownership rule, but hiding unauthorized buttons keeps the graph
+   *  honest before a request is sent. */
+  canUpdateAllMyStuff(node: MeshNode | null | undefined): boolean {
+    if (!node || !isAppNode(node) || this.isKvm(node)) return false;
+    const standing = this.standingOf(node);
+    if (!standing.self && !standing.mine) return false;
+    const current = standing.self
+      ? this.updateInfo?.current_version ?? node.version
+      : node.version;
+    const latest = this.latestRelease ?? this.updateOutcome?.latest ?? this.updateOutcome?.version;
+    return isOlderVersion(current, latest);
+  }
+
+  /** The card's single Update action. Remote fleet machines take the existing
+   *  signed upgrade path; this machine opens the updater's full status/policy
+   *  pane so staged, blocked, and package-manager installs remain explicit. */
+  updateAllMyStuff(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (node.kind === "this" || this.isMe(nodeId)) {
+      this.openSettings("updates");
+      return;
+    }
+    this.upgradeRemote(nodeId);
   }
 
   /** Ask a fleet machine to update itself to the channel's latest release and

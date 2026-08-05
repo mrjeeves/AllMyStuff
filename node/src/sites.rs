@@ -214,6 +214,17 @@ impl SitesProxy {
             .map(|(route, _)| route.clone())
     }
 
+    /// Whether the client mapping's accept task has already exited. A finished
+    /// task means the local port is no longer listening even though the mapping
+    /// record still exists — a failed/expired route offer must be rebuilt,
+    /// never returned as healthy.
+    pub fn mapping_task_finished(&self, route: &str) -> Option<bool> {
+        self.mappings
+            .lock()
+            .get(route)
+            .map(|mapping| mapping.accept_handle.is_finished())
+    }
+
     /// The local ports already bound by this device — what
     /// [`allmystuff_bridge::sites::allocate_local_port`] avoids reusing.
     pub fn taken_local_ports(&self) -> BTreeSet<u16> {
@@ -329,5 +340,27 @@ mod tests {
         assert!(proxy.is_port_exposed(8080));
         assert!(proxy.is_port_exposed(5432));
         assert!(!proxy.is_port_exposed(22), "never exposed → never proxied");
+    }
+
+    #[tokio::test]
+    async fn mapping_task_marks_an_exited_accept_task_stale() {
+        let proxy = SitesProxy {
+            exposed: Mutex::new(BTreeMap::new()),
+            path: None,
+            conns: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(HashMap::new()),
+        };
+        // Keep a finished handle in the mapping exactly like an offer that
+        // expired before the host accepted it.
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        proxy.add_mapping(
+            "route:dead".into(),
+            ClientMapping::new("peer-a".into(), 80, 47000, finished),
+        );
+
+        assert_eq!(proxy.mapping_task_finished("route:dead"), Some(true));
     }
 }

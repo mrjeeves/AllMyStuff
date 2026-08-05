@@ -10519,14 +10519,37 @@ impl Mesh {
         if pubkey_part(&node) == pubkey_part(&me) {
             return Err("that's this device".into());
         }
-        // Already mapped? Hand back the existing local port (idempotent).
-        if let Some((_, _, lp)) = self
+        // Already mapped? Hand back the existing local port only while its
+        // accept task is alive. A route offer that expires/rejects causes that
+        // task to exit and drop the listener; retaining its mapping produced a
+        // permanent zombie where every later click reopened dead localhost.
+        if let Some((route_id, _, local_port)) = self
             .sites
             .list_mappings()
             .into_iter()
             .find(|(n, hp, _)| pubkey_part(n) == pubkey_part(&node) && *hp == port)
         {
-            return Ok(lp);
+            let accept_finished = self.sites.mapping_task_finished(&route_id).unwrap_or(true);
+            if !accept_finished {
+                return Ok(local_port);
+            }
+            tracing::warn!(
+                "site mapping {}:{} on :{} had no listener — rebuilding",
+                short_id(&node),
+                port,
+                local_port
+            );
+            self.sites.stop_route(&route_id);
+            {
+                let mut st = self.state.lock();
+                if let Some(s) = st.session.as_mut() {
+                    let _ = s.teardown(&route_id);
+                }
+            }
+            let listener = self.bind_exact_local_port(local_port).await?;
+            self.establish_site_route(node, port, listener, local_port)
+                .await?;
+            return Ok(local_port);
         }
         // Bind a local listener, preferring the same port number, then a free
         // one — the OS is the final arbiter, so retry on a lost race.
@@ -10748,6 +10771,27 @@ impl Mesh {
             // give up and the listener closes with this task.
             if !mesh.await_route_active(&route_id).await {
                 tracing::warn!("site route {route_id} never went active — not accepting");
+                // Do not leave a zombie mapping whose listener disappears with
+                // this task. Clear the failed route from a separate task (it
+                // owns this task's JoinHandle) and run the existing bounded
+                // same-port recovery loop. If this was already one of that
+                // loop's attempts, its in-flight guard makes the nested heal a
+                // no-op and the parent attempt continues normally.
+                if let Some((node, failed_port, local_port)) = mesh.sites.mapping_details(&route_id)
+                {
+                    let healer = mesh.clone();
+                    let failed_route = route_id.clone();
+                    crate::spawn(async move {
+                        healer.sites.stop_route(&failed_route);
+                        {
+                            let mut st = healer.state.lock();
+                            if let Some(s) = st.session.as_mut() {
+                                let _ = s.teardown(&failed_route);
+                            }
+                        }
+                        healer.remap_site_route(node, failed_port, local_port).await;
+                    });
+                }
                 return;
             }
             let mut next_conn: u64 = 0;

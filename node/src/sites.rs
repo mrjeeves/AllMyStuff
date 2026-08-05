@@ -235,12 +235,16 @@ impl SitesProxy {
             .collect()
     }
 
-    /// Every live mapping as `(node, host_port, local_port)`, for the UI.
-    pub fn list_mappings(&self) -> Vec<(String, u16, u16)> {
+    /// Every live mapping as `(route_id, node, host_port, local_port)`.
+    ///
+    /// Keep the map key in this internal projection: callers doing lifecycle
+    /// work must address the mapping by route id, not accidentally substitute
+    /// the node id from the public three-field UI shape.
+    pub fn list_mappings(&self) -> Vec<(String, String, u16, u16)> {
         self.mappings
             .lock()
-            .values()
-            .map(|m| (m.node.clone(), m.host_port, m.local_port))
+            .iter()
+            .map(|(route, m)| (route.clone(), m.node.clone(), m.host_port, m.local_port))
             .collect()
     }
 
@@ -362,5 +366,9 @@ mod tests {
         );
 
         assert_eq!(proxy.mapping_task_finished("route:dead"), Some(true));
+        assert_eq!(
+            proxy.list_mappings(),
+            vec![("route:dead".into(), "peer-a".into(), 80, 47000)]
+        );
     }
 }

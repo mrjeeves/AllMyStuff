@@ -10414,7 +10414,11 @@ impl Mesh {
     /// Every site this device currently has mapped: `(node, host_port,
     /// local_port)`.
     pub fn site_mappings(&self) -> Vec<(String, u16, u16)> {
-        self.sites.list_mappings()
+        self.sites
+            .list_mappings()
+            .into_iter()
+            .map(|(_, node, host_port, local_port)| (node, host_port, local_port))
+            .collect()
     }
 
     // ---- remote site management (a fleet device's drawer) -------------
@@ -10523,11 +10527,11 @@ impl Mesh {
         // accept task is alive. A route offer that expires/rejects causes that
         // task to exit and drop the listener; retaining its mapping produced a
         // permanent zombie where every later click reopened dead localhost.
-        if let Some((route_id, _, local_port)) = self
+        if let Some((route_id, _, _, local_port)) = self
             .sites
             .list_mappings()
             .into_iter()
-            .find(|(n, hp, _)| pubkey_part(n) == pubkey_part(&node) && *hp == port)
+            .find(|(_, n, hp, _)| pubkey_part(n) == pubkey_part(&node) && *hp == port)
         {
             let accept_finished = self.sites.mapping_task_finished(&route_id).unwrap_or(true);
             if !accept_finished {

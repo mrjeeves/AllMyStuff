@@ -74,10 +74,8 @@
   }
 
   function select(tab: "rooms" | "sites" | "help") {
-    // A notification tab peeking into Normal mode is also the intentional
-    // escape hatch to its full panel: selecting it promotes the workspace to
-    // Advanced, then opens the requested tab.
-    if (normalMode) app.setUiMode("advanced");
+    // Sites, Rooms, and Help are useful without the device-detail tooling.
+    // Opening this panel therefore never changes the workspace mode.
     app.sidebarTab = tab;
     if (collapsed) setCollapsed(false);
     if (tab !== "rooms") app.roomDraftOpen = false;
@@ -136,7 +134,7 @@
     enabled: () => isMobile() && !collapsed,
   }}
 >
-  {#if collapsed || normalMode}
+  {#if collapsed}
     <!-- The thin rail: tapping anywhere expands it (into the last-open tab);
          the two icons expand straight into their own tab. -->
     <div class="rail">
@@ -247,10 +245,10 @@
   .sidebar.collapsed {
     width: 2.75rem;
   }
-  /* Normal mode gives the graph the entire stage. The rail lives just outside
-     the viewport; only badge-bearing tabs peek in, then the whole cluster
-     glides into reach on hover/focus. Selecting one enters Advanced mode. */
-  .sidebar.normal {
+  /* Normal mode gives the closed graph the entire stage. Its rail lives just
+     outside the viewport; opening it restores the regular docked panel without
+     enabling Advanced's device-detail tooling. */
+  .sidebar.normal.collapsed {
     position: absolute;
     inset: 0 auto 0 0;
     width: 0;
@@ -258,7 +256,7 @@
     background: transparent;
     overflow: visible;
   }
-  .sidebar.normal .rail {
+  .sidebar.normal.collapsed .rail {
     position: absolute;
     left: 0;
     top: 0;
@@ -269,18 +267,15 @@
     transform: translateX(-2.3rem);
     transition: transform 0.22s ease, opacity 0.22s ease, box-shadow 0.22s ease;
   }
-  .sidebar.normal .rail:has(.rail-count, .rail-attn) {
+  .sidebar.normal.collapsed .rail:has(.rail-count, .rail-attn) {
     opacity: 0.7;
     transform: translateX(-1.75rem);
   }
-  .sidebar.normal .rail:hover,
-  .sidebar.normal .rail:focus-within {
+  .sidebar.normal.collapsed .rail:hover,
+  .sidebar.normal.collapsed .rail:focus-within {
     opacity: 1;
     transform: translateX(0);
     box-shadow: var(--shadow-md);
-  }
-  .sidebar.normal .rail-open {
-    display: none;
   }
   /* Phone-width stages: the open panel floats over the graph (see the
      device drawer's twin rule). */

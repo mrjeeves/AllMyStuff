@@ -391,6 +391,8 @@
           {@const isSelf = app.isMe(m.device)}
           {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
           {@const isManager = app.fleetRoleOf(m.device) === "manager"}
+          {@const memberNode = app.machineByAnyId(m.device)}
+          {@const isKvm = app.isKvm(memberNode)}
           <li class:owner={isOwner}>
             <div class="m-id-wrap">
               <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
@@ -434,7 +436,18 @@
               {#if !isSelf}
                 {@const iOwn = app.myFleetRole === "owner"}
                 {@const iManage = iOwn || app.myFleetRole === "manager"}
-                {#if isOwner}
+                {#if isKvm}
+                  {#if (isManager && iOwn) || (!isOwner && !isManager && iManage)}
+                    <button
+                      class="kick"
+                      class:armed={armed === m.device}
+                      title="Evict this KVM from the fleet — KVMs are fixed-role appliances and cannot be promoted or demoted"
+                      onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                    >
+                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                    </button>
+                  {/if}
+                {:else if isOwner}
                   {#if iOwn}
                     <button
                       class="role-btn down"

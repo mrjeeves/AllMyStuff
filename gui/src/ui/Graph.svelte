@@ -1176,6 +1176,12 @@
     const iOwn = app.myFleetRole === "owner";
     const iManage = iOwn || app.myFleetRole === "manager";
     let items = 1; // Fleet settings is always available.
+    if (app.isKvm(mn)) {
+      // KVMs are fixed-role fleet appliances: eviction is their only member
+      // action. Respect the same role authority as every other eviction.
+      if ((role === "manager" && iOwn) || (role !== "owner" && role !== "manager" && iManage)) items += 1;
+      return MENU_PAD + items * MENU_ITEM_H;
+    }
     if (role === "owner") {
       if (iOwn) items += 1; // Demote to manager.
     } else if (role === "manager") {
@@ -1523,7 +1529,7 @@
         <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}<span class="action-label">Remote</span></button>
       {/if}
-      {#if cons.files && !normalMode}
+      {#if cons.files}
         <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}<span class="action-label">Files</span></button>
       {/if}
@@ -1945,6 +1951,7 @@
   {@const fleetNode = app.node(fleetId)}
   {@const fleetSt = fleetNode ? app.standingOf(fleetNode) : null}
   {@const fleetSelf = app.isMe(fleetId) || fleetNode?.kind === "this"}
+  {@const fleetKvm = app.isKvm(fleetNode)}
   {@const iOwn = app.myFleetRole === "owner"}
   {@const iManage = iOwn || app.myFleetRole === "manager"}
   <div
@@ -1953,7 +1960,7 @@
     aria-label={`${fleetNode ? displayName(fleetNode) : "Device"} fleet options`}
     style="left: {fleetMenu.left}px; top: {fleetMenu.top}px;"
   >
-    {#if !fleetSelf && fleetSt?.role === "owner" && iOwn}
+    {#if !fleetSelf && !fleetKvm && fleetSt?.role === "owner" && iOwn}
       <button
         class="nm-item"
         role="menuitem"
@@ -1968,7 +1975,7 @@
           <span class="nm-sub">remove owner authority</span>
         </span>
       </button>
-    {:else if !fleetSelf && fleetSt?.role === "manager" && iOwn}
+    {:else if !fleetSelf && !fleetKvm && fleetSt?.role === "manager" && iOwn}
       <button
         class="nm-item"
         role="menuitem"
@@ -1997,7 +2004,7 @@
           <span class="nm-sub">remove management authority</span>
         </span>
       </button>
-    {:else if !fleetSelf && fleetSt?.role !== "owner" && fleetSt?.role !== "manager" && iOwn}
+    {:else if !fleetSelf && !fleetKvm && fleetSt?.role !== "owner" && fleetSt?.role !== "manager" && iOwn}
       <button
         class="nm-item"
         role="menuitem"

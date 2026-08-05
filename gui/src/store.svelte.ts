@@ -1260,6 +1260,10 @@ class AppStore {
 
   /** Grant a fleet member a role (owner-only; backend enforces + may need MFA). */
   async grantFleetRole(device: string, role: "manager" | "owner") {
+    if (this.isKvm(this.machineByAnyId(device))) {
+      this.toast("warn", "KVMs are fixed-role fleet members and cannot be promoted");
+      return;
+    }
     await this.runFleetGov(role === "owner" ? "Make owner" : "Make manager", (code) =>
       fleetGrantRole(device, role, code),
     );
@@ -1267,6 +1271,10 @@ class AppStore {
 
   /** Withdraw a fleet member's role, back to a plain member (owner-only). */
   async withdrawFleetRole(device: string) {
+    if (this.isKvm(this.machineByAnyId(device))) {
+      this.toast("warn", "KVMs are fixed-role fleet members and cannot be demoted");
+      return;
+    }
     await this.runFleetGov("Withdraw role", (code) => fleetRevokeRole(device, code));
   }
 

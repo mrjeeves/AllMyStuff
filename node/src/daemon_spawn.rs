@@ -17,6 +17,63 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::control_client::{ControlClient, Request};
 
+/// The old CEC support area and its corrected replacement deliberately share
+/// a well-known network id. Legacy clients therefore announce `Open/0` while
+/// current clients announce `Silent/0`. MyOwnMesh reports that immutable
+/// mismatch on every signaling heartbeat even though neither zero-transition
+/// state can converge into the other. Keep the first diagnostic per peer, but
+/// do not let the same compatibility fact consume the AllMyStuff log forever.
+fn stable_open_silent_drift_key(line: &str) -> Option<String> {
+    let (_, drift) = line.split_once("governance: governance drift with ")?;
+    let legacy_mismatch = drift.ends_with("local Silent/0 vs theirs Open/0")
+        || drift.ends_with("local Open/0 vs theirs Silent/0");
+    legacy_mismatch.then(|| drift.to_string())
+}
+
+fn should_emit_daemon_line(
+    line: &str,
+    seen_open_silent_drift: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> bool {
+    let Some(key) = stable_open_silent_drift_key(line) else {
+        return true;
+    };
+    // A poisoned diagnostic cache must never hide logs; fail open.
+    seen_open_silent_drift
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(true)
+}
+
+/// Forward a spawned daemon's output to the node's inherited stream while
+/// applying the narrow compatibility dedupe above. The mesh control protocol
+/// uses its local socket, not stdio, so piping the human log cannot affect it.
+fn pump_daemon_output<R: std::io::Read + Send + 'static>(
+    reader: R,
+    stderr: bool,
+    seen_open_silent_drift: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        use std::io::Write as _;
+        for line in std::io::BufReader::new(reader)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if !should_emit_daemon_line(&line, &seen_open_silent_drift) {
+                continue;
+            }
+            if stderr {
+                // Keep draining even if our own stderr disappeared. Dropping
+                // this reader would eventually fill the child's pipe and let
+                // human-facing logging stall the mesh daemon.
+                let _ = writeln!(std::io::stderr(), "{line}");
+            } else {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+        }
+    });
+}
+
 /// Stop a supervised child gracefully: on unix send `SIGTERM` and give it
 /// up to ~2s to exit on its own — a clean shutdown that lets the daemon
 /// cascade its own teardown — then `SIGKILL` whatever's left. On Windows
@@ -688,8 +745,11 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        // Capture only to forward line-for-line below. This lets AllMyStuff
+        // dedupe one known legacy CEC mismatch while preserving every other
+        // daemon diagnostic verbatim.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // The daemon is a console-subsystem binary and this GUI is windowless,
     // so without CREATE_NO_WINDOW Windows would give the child its own
     // console window, parked on screen for the app's whole lifetime. The
@@ -711,7 +771,7 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
             });
         }
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
     // Record this daemon as ours, so a future run's self-heal can recognise
@@ -722,6 +782,14 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     let start_time = daemon_identity(child.id()).map(|(_, t)| t);
     write_pidfile(child.id(), start_time);
     tie_daemon_lifetime(&child);
+    let seen_open_silent_drift =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Some(stdout) = child.stdout.take() {
+        pump_daemon_output(stdout, false, seen_open_silent_drift.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        pump_daemon_output(stderr, true, seen_open_silent_drift);
+    }
     let handle = DaemonChild::new(child);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
@@ -788,6 +856,41 @@ mod tests {
         assert!((0, 10, 0) > (0, 2, 4));
         assert!((1, 0, 0) > (0, 10, 0));
         assert!((0, 2, 4) >= (0, 2, 4));
+    }
+
+    #[test]
+    fn legacy_open_silent_drift_logs_once_per_peer() {
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        let first = "2026-08-05T14:28:24Z INFO governance: governance drift with old-peer: local Silent/0 vs theirs Open/0";
+        let heartbeat = "2026-08-05T14:31:25Z INFO governance: governance drift with old-peer: local Silent/0 vs theirs Open/0";
+        let other_peer = "2026-08-05T14:31:26Z INFO governance: governance drift with another-peer: local Silent/0 vs theirs Open/0";
+
+        assert!(should_emit_daemon_line(first, &seen));
+        assert!(!should_emit_daemon_line(heartbeat, &seen));
+        assert!(should_emit_daemon_line(other_peer, &seen));
+    }
+
+    #[test]
+    fn meaningful_governance_drift_is_never_deduped() {
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        let closed =
+            "INFO governance: governance drift with peer: local Closed/4 vs theirs Closed/3";
+        let transitioned =
+            "INFO governance: governance drift with peer: local Silent/1 vs theirs Open/0";
+
+        assert!(should_emit_daemon_line(closed, &seen));
+        assert!(should_emit_daemon_line(closed, &seen));
+        assert!(should_emit_daemon_line(transitioned, &seen));
+        assert!(should_emit_daemon_line(transitioned, &seen));
+    }
+
+    #[test]
+    fn reverse_open_silent_drift_is_also_the_same_legacy_case() {
+        let line = "INFO governance: governance drift with peer: local Open/0 vs theirs Silent/0";
+        assert_eq!(
+            stable_open_silent_drift_key(line).as_deref(),
+            Some("peer: local Open/0 vs theirs Silent/0")
+        );
     }
 
     // The pidfile env reads/writes a process-global (`MYOWNMESH_HOME`), so

@@ -553,6 +553,8 @@
       {@const iOwn = app.myFleetRole === "owner"}
       {@const iManage = iOwn || app.myFleetRole === "manager"}
       {@const canActHere = st.role === "owner" || st.role === "manager" ? iOwn : iManage}
+      {@const fleetKvm = app.isKvm(node)}
+      {@const canEvictHere = st.role === "owner" ? false : st.role === "manager" ? iOwn : iManage}
       <section class="block fleet-ctl">
         <div class="block-head">
           <h4>🔗 Fleet</h4>
@@ -582,6 +584,11 @@
               {st.offering ? "🔓 Stop offering" : "🔒 Make claimable"}
             </button>
           {/if}
+        {:else if fleetKvm && canEvictHere}
+          <p class="hint">KVMs are fixed-role fleet appliances. They can be evicted, but never promoted or demoted.</p>
+          <div class="fleet-actions">
+            <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so this KVM loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
+          </div>
         {:else if canActHere}
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
           <div class="fleet-actions">
@@ -606,6 +613,10 @@
             A <b>manager</b> can admit and evict members; an <b>owner</b> has
             full authority over roles. Promote stages up one layer at a time;
             withdrawing steps back down the same way.
+          </p>
+        {:else if fleetKvm}
+          <p class="hint">
+            KVMs are fixed-role fleet appliances and can only be evicted. This device does not have authority to evict this KVM.
           </p>
         {:else}
           <p class="hint">

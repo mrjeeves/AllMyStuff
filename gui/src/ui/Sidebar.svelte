@@ -13,7 +13,10 @@
   import HelpTab from "./HelpTab.svelte";
 
   const WIDTH_KEY = "allmystuff.sidebar.width.v1";
-  const COLLAPSED_KEY = "allmystuff.sidebar.collapsed.v1";
+  // v2 adopts the corrected product default once for existing installs: the
+  // left Rooms/Sites sidebar starts closed. After that first launch the user's
+  // own expand/collapse choice is persisted normally under this key.
+  const COLLAPSED_KEY = "allmystuff.sidebar.collapsed.v2";
   const MIN_W = 232;
   const MAX_W = 520;
   // Default to the narrow (min) width, expanded — the panel stays out of the
@@ -29,14 +32,14 @@
     }
   }
   function loadCollapsed(): boolean {
-    // A phone starts with the panel as a rail — the graph is the whole
-    // screen's job there. The user's own toggle (persisted) still wins.
+    // Start as a rail on every viewport. The user's own toggle (persisted)
+    // still wins after the corrected default has been applied once.
     try {
       const stored = localStorage.getItem(COLLAPSED_KEY);
       if (stored !== null) return stored === "1";
-      return isMobile();
+      return true;
     } catch {
-      return isMobile();
+      return true;
     }
   }
 

@@ -215,9 +215,10 @@
   }
 
   let width = $state(loadWidth());
-  // Start out of the way on every viewport. Selecting a node is the explicit
-  // gesture that opens details; the local fallback alone does not.
-  let collapsed = $state(true);
+  // A phone launches with the drawer tucked away — the graph is the screen.
+  // On desktop the right-side details remain open by default; it was the left
+  // Rooms/Sites sidebar that was meant to start collapsed.
+  let collapsed = $state(isMobile());
   let resizing = $state(false);
 
   // A fresh selection always re-opens the panel — you clicked a node to see
@@ -236,10 +237,15 @@
   $effect(() => {
     const id = node?.id ?? null;
     const explicit = !!app.selectedNode;
-    if (explicit && (id !== shownId || !wasExplicit)) collapsed = false;
-    else if (!explicit && wasExplicit) collapsed = true;
-    shownId = id;
-    wasExplicit = explicit;
+    if (id !== shownId || explicit !== wasExplicit) {
+      shownId = id;
+      wasExplicit = explicit;
+      if (isMobile()) {
+        collapsed = !explicit;
+      } else {
+        collapsed = false;
+      }
+    }
   });
 
   // When a remote AllMyStuff machine is shown, learn the channel's latest

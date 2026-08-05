@@ -16,26 +16,6 @@
 //! even if the wire "you're revoked" message is lost. That mirrors AllMyStuff's
 //! rule that authorization is re-checked per frame, never cached for a session.
 //!
-//! ## Three questions, asked at three different moments
-//!
-//! [`ApprovalScope`] answers *how long*, per technician, at the connect prompt.
-//! [`Capability`] answers *how far* — a three-rung ladder (see-the-screen →
-//! drive-it → drive-it-as-Administrator) where each rung implies the ones below
-//! and nothing implies a rung above.
-//!
-//! The top rung has its own clock. [`ElevationPolicy`] is a **machine-wide**
-//! decision made **once, with the install**, not a question re-asked per
-//! session: a customer whose PC is broken should not be adjudicating a
-//! consent dialog at the start of every repair, because a prompt shown that
-//! often stops being read. So administrator access is a setting — decided
-//! while a technician is on the phone explaining the install, shown in
-//! Settings afterwards, and switchable off there.
-//!
-//! Being a setting does not make it weaker than a prompt. It is re-read on
-//! every privileged frame exactly like a grant is, so switching it off drops
-//! admin reach mid-repair for every technician at once. What changed is *when
-//! the customer is asked*, not *how well the answer is enforced*.
-//!
 //! ## Time is injected, never read
 //!
 //! Every method that cares about expiry takes `now` (unix seconds) as an
@@ -53,14 +33,6 @@ use thiserror::Error;
 pub use allmystuff_cec_protocol::ApprovalScope;
 
 /// What a technician is allowed to do once approved.
-///
-/// These form a **ladder**: each rung implies every rung below it (see
-/// [`Capability::covers`]). Nothing implies a rung *above* it — in particular
-/// an ordinary `Control` grant never confers [`Elevated`], because "drive the
-/// mouse" and "drive the machine as Administrator" are different decisions and
-/// the customer must make the second one deliberately.
-///
-/// [`Elevated`]: Capability::Elevated
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
@@ -70,82 +42,26 @@ pub enum Capability {
     ///
     /// [`ScreenView`]: Capability::ScreenView
     Control,
-    /// Drive the customer's machine **with administrator reach** (implies
-    /// [`Control`]): input that lands in elevated windows (Event Viewer,
-    /// Services, Device Manager, regedit, an admin PowerShell) and a screen
-    /// stream that keeps painting across Windows' *secure desktop* — the
-    /// separate desktop UAC's consent dialog runs on.
-    ///
-    /// Without this, Windows itself stops a support session dead: UIPI (User
-    /// Interface Privilege Isolation) silently discards synthesized input aimed
-    /// at any window running at a higher integrity level than the sender, and
-    /// the secure desktop is a different desktop object that an ordinary
-    /// medium-integrity process can neither capture nor type into. The
-    /// technician sees the repair tool and cannot touch it.
-    ///
-    /// It is a real escalation, so it takes two independent yeses: the
-    /// technician asks for it (`want_elevated`, recorded on the grant) **and**
-    /// the machine permits it ([`ElevationPolicy`], the customer's one-time
-    /// install decision). Both are re-read on every privileged frame, so it
-    /// dies the instant either the grant is revoked or the setting is switched
-    /// off.
-    ///
-    /// [`Control`]: Capability::Control
-    Elevated,
 }
 
 impl Capability {
-    /// Position on the capability ladder. Higher covers lower.
-    fn rank(self) -> u8 {
-        match self {
-            Capability::ScreenView => 0,
-            Capability::Control => 1,
-            Capability::Elevated => 2,
-        }
-    }
-
-    /// Whether holding `self` satisfies a request for `wanted`. `Elevated`
-    /// implies `Control` implies `ScreenView`; never the other way round.
+    /// Whether holding `self` satisfies a request for `wanted`. `Control`
+    /// implies `ScreenView`; `ScreenView` does not imply `Control`.
     fn covers(self, wanted: Capability) -> bool {
-        self.rank() >= wanted.rank()
+        self == wanted || (self == Capability::Control && wanted == Capability::ScreenView)
     }
 }
 
 /// The safe minimum a grant carries when its `capabilities` field is absent
-/// (an older persisted grant): view-only, never control, never elevated. A
-/// missing field must never widen access.
+/// (an older persisted grant): view-only, never control. A missing field must
+/// never widen access.
 fn default_capabilities() -> Vec<Capability> {
     vec![Capability::ScreenView]
 }
 
 /// Map the wire `want_control` flag to the capability set a grant should carry.
-/// Shorthand for [`capabilities_for_request`] with no elevation asked for — the
-/// shape every caller that predates admin access still wants.
 pub fn capabilities_for(want_control: bool) -> Vec<Capability> {
-    capabilities_for_request(want_control, false)
-}
-
-/// Map the wire request flags to the capability set a grant should carry.
-///
-/// `want_elevated` records that the *technician asked* for administrator reach.
-/// It is only half the answer — [`ConsentStore::is_allowed`] also requires the
-/// machine's [`ElevationPolicy`] to be on — so recording it here never widens
-/// anything on its own, and a view-only technician still can't reach admin
-/// even on a machine that permits it.
-///
-/// `want_elevated` implies control whether or not the technician also set
-/// `want_control`: administrator reach that couldn't move the mouse would be a
-/// grant with nothing to drive, and honouring the pair separately would let a
-/// malformed request record "elevated but view-only", a state no gate below
-/// knows how to read. Normalizing here keeps the stored ladder consistent.
-pub fn capabilities_for_request(want_control: bool, want_elevated: bool) -> Vec<Capability> {
-    if want_elevated {
-        vec![
-            Capability::ScreenView,
-            Capability::Control,
-            Capability::Elevated,
-        ]
-    } else if want_control {
+    if want_control {
         vec![Capability::ScreenView, Capability::Control]
     } else {
         vec![Capability::ScreenView]
@@ -188,14 +104,6 @@ impl Grant {
     fn covers(&self, cap: Capability) -> bool {
         self.capabilities.iter().any(|held| held.covers(cap))
     }
-
-    /// Whether this grant confers `cap`, ignoring expiry. For *display* — the
-    /// customer's access list showing a "Control" or "Admin access" badge —
-    /// never for enforcement, which goes through [`ConsentStore::is_allowed`]
-    /// so the clock is always consulted.
-    pub fn allows(&self, cap: Capability) -> bool {
-        self.covers(cap)
-    }
 }
 
 /// Errors from a durable consent operation.
@@ -210,42 +118,12 @@ pub enum ConsentError {
     Persist(#[from] std::io::Error),
 }
 
-/// The machine-wide answer to "may CEC support sessions use administrator
-/// access on this PC?" — asked **once**, when the background service is
-/// installed, and never again.
-///
-/// Admin reach is deliberately not a per-session question. The customer is
-/// someone whose PC is broken; making them adjudicate a UAC-shaped prompt at
-/// the start of every repair trains them to click through it, which is worse
-/// for them than one considered decision made at install time while a
-/// technician is explaining it. So the elevation rung is a *setting*, decided
-/// with the install (which already costs one UAC prompt to register a service),
-/// visible in Settings, and revocable there at any time.
-///
-/// It is still a live gate, not just an install-time input: [`ConsentStore::is_allowed`]
-/// consults it on every privileged frame, so switching it off in Settings drops
-/// administrator reach mid-session for every technician at once — the machine-wide
-/// twin of "Forget this technician".
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ElevationPolicy {
-    /// Whether approved technicians may use administrator access here.
-    pub allowed: bool,
-    /// Unix seconds the customer decided, for the Settings line ("allowed since
-    /// 3 March"). Display only.
-    #[serde(default)]
-    pub decided_at: u64,
-}
-
 /// On-disk shape. Only persistent grants (`ThreeHours`, `Forever`) are written;
 /// `Once` grants live in [`ConsentStore::ephemeral`] and never touch disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Persisted {
     #[serde(default)]
     version: u32,
-    /// The machine-wide elevation decision, absent until the customer makes it.
-    /// Absent means **not allowed** — an undecided machine is a locked-down one.
-    #[serde(default)]
-    elevation: Option<ElevationPolicy>,
     /// Loaded **per-grant tolerantly** (see [`de_lenient_grants`]): an unreadable
     /// grant is dropped on its own instead of failing the whole load. Previously
     /// one grant a reader build couldn't parse (a scope/shape skew from a
@@ -285,9 +163,6 @@ pub struct ConsentStore {
     persistent: Vec<Grant>,
     /// `Once` grants for the current run only. Never serialised.
     ephemeral: Vec<Grant>,
-    /// The machine-wide admin-access decision, `None` until the customer makes
-    /// it. Checked live by [`ConsentStore::is_allowed`], not just at approve time.
-    elevation: Option<ElevationPolicy>,
 }
 
 impl ConsentStore {
@@ -303,7 +178,6 @@ impl ConsentStore {
             path: Some(path),
             persistent: loaded.grants,
             ephemeral: Vec::new(),
-            elevation: loaded.elevation,
         }
     }
 
@@ -355,54 +229,12 @@ impl ConsentStore {
     /// Whether `technician` currently holds a live grant covering `cap`. This
     /// is the per-frame enforcement check; it consults both the in-memory
     /// `Once` grants and the persisted ones, filtered by `now`.
-    ///
-    /// [`Capability::Elevated`] carries a second, machine-wide condition: the
-    /// customer's install-time admin-access decision must also still be on.
-    /// Checking it *here* rather than only when the grant was made is what makes
-    /// the Settings switch a real kill switch — turning it off drops
-    /// administrator reach on the next frame for every technician at once,
-    /// without having to walk and rewrite the stored grants.
     pub fn is_allowed(&self, technician: &str, cap: Capability, now: u64) -> bool {
-        if cap == Capability::Elevated && !self.elevation_allowed() {
-            return false;
-        }
         let key = pubkey_part(technician);
         self.persistent
             .iter()
             .chain(self.ephemeral.iter())
             .any(|g| g.technician == key && g.is_live(now) && g.covers(cap))
-    }
-
-    /// The machine-wide admin-access decision, or `None` if the customer has
-    /// never been asked (a fresh install that hasn't run the service installer).
-    /// The caller uses `None` to know it should *ask* — once.
-    pub fn elevation_policy(&self) -> Option<ElevationPolicy> {
-        self.elevation
-    }
-
-    /// Whether administrator access is permitted on this machine at all.
-    /// Undecided reads as **not allowed**: absence must never widen reach.
-    pub fn elevation_allowed(&self) -> bool {
-        matches!(self.elevation, Some(p) if p.allowed)
-    }
-
-    /// Record the customer's machine-wide admin-access decision — the one made
-    /// with the install, and afterwards only from Settings.
-    ///
-    /// Persisted like a durable grant: a failed write returns the error and
-    /// changes nothing, so a machine can never believe it allows administrator
-    /// access that its disk doesn't record.
-    pub fn set_elevation_policy(&mut self, allowed: bool, now: u64) -> Result<(), ConsentError> {
-        let previous = self.elevation;
-        self.elevation = Some(ElevationPolicy {
-            allowed,
-            decided_at: now,
-        });
-        if let Err(e) = self.save() {
-            self.elevation = previous; // roll back; never acknowledge unsaved state
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Whether `technician` has **any** grant record here, live or lapsed.
@@ -490,7 +322,6 @@ impl ConsentStore {
         };
         let doc = Persisted {
             version: STORE_VERSION,
-            elevation: self.elevation,
             grants: self.persistent.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&doc).expect("consent store serialises");
@@ -798,235 +629,5 @@ mod tests {
         // The good grant survived; only the broken one was dropped.
         assert!(s.is_allowed(good, Capability::ScreenView, T0 + 10));
         assert_eq!(s.active_grants(T0 + 10).len(), 1);
-    }
-
-    // ---- the elevation rung -------------------------------------------------
-
-    /// A store whose machine-wide admin-access decision is already "yes" — the
-    /// state a PC is in after the install-time question was answered.
-    fn tempstore_admin_allowed() -> (tempfile::TempDir, ConsentStore) {
-        let (dir, mut s) = tempstore();
-        s.set_elevation_policy(true, T0).unwrap();
-        (dir, s)
-    }
-
-    #[test]
-    fn an_undecided_machine_allows_no_elevation() {
-        // A fresh install has never been asked. Absence must read as "no".
-        let (_dir, s) = tempstore();
-        assert_eq!(s.elevation_policy(), None);
-        assert!(!s.elevation_allowed());
-    }
-
-    #[test]
-    fn the_install_time_decision_persists_and_is_not_re_asked() {
-        // The whole point: answered once, still answered after a restart, so
-        // nothing has to prompt the customer again.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("consent.json");
-        {
-            let mut s = ConsentStore::load(&path);
-            s.set_elevation_policy(true, T0).unwrap();
-        }
-        let reloaded = ConsentStore::load(&path);
-        assert!(reloaded.elevation_allowed());
-        assert_eq!(reloaded.elevation_policy().unwrap().decided_at, T0);
-    }
-
-    #[test]
-    fn a_session_gets_admin_with_no_second_prompt() {
-        // The customer answered at install. A technician dials in asking for
-        // admin reach and simply has it — no further consent step anywhere.
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Elevated, T0));
-    }
-
-    #[test]
-    fn turning_the_setting_off_bites_existing_grants_immediately() {
-        // The kill switch. An already-granted, already-running technician loses
-        // admin reach on the next frame — without rewriting a single grant.
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Elevated, T0));
-
-        s.set_elevation_policy(false, T0 + 5).unwrap();
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0 + 6));
-        // …and only the top rung goes. The session keeps working, unelevated.
-        assert!(s.is_allowed(TECH, Capability::Control, T0 + 6));
-        assert!(s.is_allowed(TECH, Capability::ScreenView, T0 + 6));
-    }
-
-    #[test]
-    fn the_machine_setting_alone_does_not_elevate_anyone() {
-        // Permitting admin on the machine is not granting it to a person: a
-        // view-only technician stays view-only on a PC that allows admin.
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for(false),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::ScreenView, T0));
-        assert!(!s.is_allowed(TECH, Capability::Control, T0));
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0));
-    }
-
-    #[test]
-    fn a_grant_asking_for_admin_on_a_disallowing_machine_gets_none() {
-        // Both halves are required, and the machine half is the one that
-        // decides. The grant records the ask; the policy withholds the reach.
-        let (_dir, mut s) = tempstore(); // never decided → not allowed
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0));
-        assert!(s.is_allowed(TECH, Capability::Control, T0));
-    }
-
-    #[test]
-    fn control_never_confers_elevation() {
-        // The whole point of the separate rung: approving "take control" must
-        // NOT hand over administrator reach — even on a machine that permits
-        // admin, which is what makes this assertion mean something.
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for(true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Control, T0));
-        assert!(s.is_allowed(TECH, Capability::ScreenView, T0));
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0));
-    }
-
-    #[test]
-    fn elevated_covers_the_whole_ladder() {
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Elevated, T0));
-        assert!(s.is_allowed(TECH, Capability::Control, T0));
-        assert!(s.is_allowed(TECH, Capability::ScreenView, T0));
-    }
-
-    #[test]
-    fn elevation_request_implies_control() {
-        // A request for admin reach without control is normalized rather than
-        // stored as an unreadable "elevated but view-only" grant.
-        let caps = capabilities_for_request(false, true);
-        assert!(caps.contains(&Capability::Control));
-        assert!(caps.contains(&Capability::Elevated));
-        assert!(caps.contains(&Capability::ScreenView));
-    }
-
-    #[test]
-    fn revoke_drops_elevation_immediately() {
-        // Admin reach must die on revoke exactly like control does — the
-        // per-frame check is the whole enforcement story.
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::Forever,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Elevated, T0));
-        assert!(s.revoke(TECH).unwrap());
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0));
-    }
-
-    #[test]
-    fn elevation_expires_with_its_grant() {
-        let (_dir, mut s) = tempstore_admin_allowed();
-        s.approve(
-            TECH,
-            "Alex",
-            capabilities_for_request(true, true),
-            ApprovalScope::ThreeHours,
-            T0,
-        )
-        .unwrap();
-        assert!(s.is_allowed(TECH, Capability::Elevated, T0 + THREE_HOURS_SECS - 1));
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0 + THREE_HOURS_SECS));
-    }
-
-    #[test]
-    fn a_legacy_grant_is_never_read_as_elevated() {
-        // A grant persisted before this rung existed has no `capabilities`
-        // field at all. It must load as view-only — an absent field widening
-        // all the way to administrator would be the worst possible default.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("consent.json");
-        let legacy = format!(
-            r#"{{ "version": 1, "grants": [
-                {{ "technician": "{TECH}", "agent_name": "Alex",
-                   "scope": "forever", "granted_at": {T0} }}
-            ] }}"#
-        );
-        std::fs::write(&path, legacy).unwrap();
-        let s = ConsentStore::load(&path);
-        assert!(s.is_allowed(TECH, Capability::ScreenView, T0));
-        assert!(!s.is_allowed(TECH, Capability::Control, T0));
-        assert!(!s.is_allowed(TECH, Capability::Elevated, T0));
-    }
-
-    #[test]
-    fn elevated_grants_round_trip_through_disk() {
-        // Both halves must survive a restart together: the machine's install-time
-        // decision AND the technician's grant. If either failed to reload the
-        // customer would be re-prompted (or silently downgraded) after a reboot
-        // mid-repair, which is exactly what the install-once model exists to avoid.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("consent.json");
-        {
-            let mut s = ConsentStore::load(&path);
-            s.set_elevation_policy(true, T0).unwrap();
-            s.approve(
-                TECH,
-                "Alex",
-                capabilities_for_request(true, true),
-                ApprovalScope::Forever,
-                T0,
-            )
-            .unwrap();
-        }
-        let reloaded = ConsentStore::load(&path);
-        assert!(reloaded.elevation_allowed());
-        assert!(reloaded.is_allowed(TECH, Capability::Elevated, T0));
-        assert!(reloaded.active_grants(T0)[0].allows(Capability::Elevated));
     }
 }

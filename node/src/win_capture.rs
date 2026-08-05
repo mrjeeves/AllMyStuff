@@ -153,14 +153,13 @@ fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>
                 // looking at. Every re-acquire "succeeds" and every frame is the
                 // stale desktop, for as long as the prompt is up.
                 //
-                // Attaching to the input desktop first is what fixes it — but
-                // only when the customer enabled administrator access, because
-                // the secure desktop is where credential prompts live. Without
-                // that this is a no-op and the old behaviour stands. Attaching
-                // also needs SYSTEM (the `Winlogon` desktop admits nobody else),
-                // so on an unprivileged agent `follow` simply returns false and
-                // the retry loop below rides the prompt out as it always did.
-                if crate::win_privilege::secure_desktop_follow_allowed() && desktop.follow() {
+                // Attaching to the input desktop first is what fixes it.
+                // Attaching needs SYSTEM (the `Winlogon` desktop admits nobody
+                // else), so on an unprivileged agent `follow` simply returns
+                // false and the retry loop below rides the prompt out as it
+                // always did. This is only reached on `ACCESS_LOST` — a desktop
+                // switch — never per frame.
+                if desktop.follow() {
                     tracing::info!(
                         "capture: following desktop switch to {:?}{}",
                         desktop.desktop_name(),

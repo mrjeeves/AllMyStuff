@@ -32,17 +32,21 @@
 //! the second, and that is only reachable when the session is hosted by the
 //! `LocalSystem` background service.
 //!
-//! ## Consent still governs, always
+//! ## What this module is not
 //!
-//! Nothing here decides *whether* to escalate. That is two separate yeses held
-//! elsewhere — the machine's one-time `ElevationPolicy` and the technician's
-//! `Capability::Elevated` grant, both in `allmystuff_cec_consent` and both
-//! re-read on every privileged frame. This module answers the other half:
-//! given that it was allowed, can this process actually deliver it, and if not,
-//! what should the technician be told. A posture is a capability of the
-//! *process*, never an authorization — nothing here may be used to skip a gate.
-
-use allmystuff_cec_protocol::ElevationBlocker;
+//! Nothing here decides *whether* someone may drive this machine. That is the
+//! ordinary route/ownership gate the mesh already applies before an event ever
+//! reaches the injector; a session that passes it gets the reach the host
+//! process has, and this module's job is only to make sure that reach isn't
+//! silently thrown away by UIPI or lost on a desktop switch. A posture is a
+//! capability of the *process*, never an authorization.
+//!
+//! ## Cost
+//!
+//! [`DesktopFollower::follow`] is three Win32 calls even when nothing changed,
+//! so it is not free to call per event. The injector rate-limits it; capture
+//! calls it only when DXGI reports `ACCESS_LOST`, which *is* the desktop
+//! switch. Neither path runs it per frame.
 
 /// Windows' mandatory integrity levels, ordered so comparisons read the way
 /// UIPI actually works: a process may synthesize input into a window whose
@@ -142,54 +146,6 @@ impl Posture {
     /// customer's own desktop session.
     pub fn can_follow_secure_desktop(self) -> bool {
         self.integrity >= Integrity::System
-    }
-}
-
-/// Decide what to tell the technician about administrator reach on this
-/// session.
-///
-/// Pure, so the wording a technician sees in the field is decided by something
-/// that can be exhaustively tested rather than by whichever branch a Win32 call
-/// happened to take. The order encodes the triage a technician would otherwise
-/// have to do out loud: *is it even a Windows question* → *does this PC allow
-/// admin at all* → *does this session's grant include it* → *can we deliver it*
-/// → *is the fix "install the service" or "it's installed and still can't"*.
-///
-/// Each answer names something exactly one person can act on, which is the
-/// whole job: a wrong-but-plausible message here sends a technician chasing a
-/// setting on the wrong machine while the customer waits.
-pub fn blocker_for(
-    is_windows: bool,
-    machine_allows: bool,
-    granted: bool,
-    posture: Posture,
-    service_installed: bool,
-) -> ElevationBlocker {
-    if !is_windows {
-        // No UAC/UIPI split to cross: control is already whatever the OS allows.
-        return ElevationBlocker::NotApplicable;
-    }
-    if !machine_allows {
-        // The machine-wide switch, checked first: when it's off, nothing about
-        // this session or this technician's grant is the reason, and saying
-        // otherwise would send someone to reconnect over and over.
-        return ElevationBlocker::NotAllowedOnThisMachine;
-    }
-    if !granted {
-        // Checked before posture on purpose. A session that wasn't granted admin
-        // must report the grant gap even when the process happens to be running
-        // as SYSTEM and could technically do anything — consent is the reason,
-        // and naming the posture instead would invite a technician to go chase
-        // a non-problem.
-        return ElevationBlocker::NotGranted;
-    }
-    if posture.can_drive_elevated_windows() {
-        return ElevationBlocker::None;
-    }
-    if !service_installed {
-        ElevationBlocker::ServiceMissing
-    } else {
-        ElevationBlocker::AgentNotPrivileged
     }
 }
 
@@ -670,8 +626,11 @@ mod imp {
         /// caller holding desktop-derived state (a DXGI duplication) knows to
         /// rebuild it.
         ///
-        /// Cheap enough for a per-frame call: the common case opens the input
-        /// desktop, sees the same name, and drops the handle again.
+        /// Not free: even the unchanged case opens the input desktop, reads its
+        /// name, and drops the handle — three Win32 calls. Callers on a hot path
+        /// (the injector, once per input event) rate-limit it; callers that need
+        /// a truthful answer at a specific moment (capture, on `ACCESS_LOST`)
+        /// ask directly.
         pub fn follow(&mut self) -> bool {
             let Some((desktop, name)) = open_input_desktop() else {
                 // Nothing to attach to — a locked session with no input desktop
@@ -760,39 +719,9 @@ mod imp {
 
 pub use imp::{active_console_session, current_posture, ConsoleAgent, DesktopFollower};
 
-/// Whether this build targets Windows at all — the first question
-/// [`blocker_for`] asks, hoisted here so callers don't sprinkle `cfg!`.
+/// Whether this build targets Windows at all, hoisted here so callers don't
+/// sprinkle `cfg!`.
 pub const IS_WINDOWS: bool = cfg!(windows);
-
-/// Whether screen capture may follow the desktop switch onto the **secure
-/// desktop**. Off until the node turns it on from the customer's machine-wide
-/// admin-access setting.
-///
-/// This is a process-wide switch rather than a parameter because the capture
-/// pump is spawned deep in the media stack with no view of consent, and the
-/// question it answers is a property of the machine, not of one stream.
-///
-/// It is separate from the input path — and defaults to *off* — because the
-/// secure desktop is not just another window. It is where Windows puts the
-/// "enter an administrator password" prompt, so streaming it turns "let them
-/// see my screen" into "let them watch me type a password". Following it is
-/// therefore tied to the customer having deliberately enabled administrator
-/// access for support, and a machine that never enabled it keeps the old
-/// behaviour exactly: the stream holds the last frame until the prompt closes.
-static SECURE_DESKTOP_FOLLOW: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Turn secure-desktop capture on or off. Called by the node whenever the
-/// customer's admin-access setting is loaded or changed, so switching it off in
-/// Settings stops the UAC prompt being streamed from the next re-acquire.
-pub fn set_secure_desktop_follow(allowed: bool) {
-    SECURE_DESKTOP_FOLLOW.store(allowed, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether capture may follow onto the secure desktop right now.
-pub fn secure_desktop_follow_allowed() -> bool {
-    SECURE_DESKTOP_FOLLOW.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 #[cfg(test)]
 mod tests {
@@ -848,59 +777,6 @@ mod tests {
         assert!(p.can_drive_elevated_windows());
         // …but it is not SYSTEM, so the secure desktop stays out of reach.
         assert!(!p.can_follow_secure_desktop());
-    }
-
-    #[test]
-    fn the_machine_switch_is_reported_before_anything_else() {
-        // A PC with admin access switched off says so, even when the session
-        // was granted it and the process could technically deliver it. Any
-        // other message here has the technician reconnecting in a loop against
-        // a setting that reconnecting cannot touch.
-        let b = blocker_for(true, false, true, posture(Integrity::System, false), true);
-        assert_eq!(b, ElevationBlocker::NotAllowedOnThisMachine);
-    }
-
-    #[test]
-    fn consent_is_reported_before_posture() {
-        // Even running as SYSTEM on a PC that allows admin, a session that
-        // wasn't granted it reports the grant gap — not a posture problem that
-        // doesn't exist.
-        let b = blocker_for(true, true, false, posture(Integrity::System, false), true);
-        assert_eq!(b, ElevationBlocker::NotGranted);
-    }
-
-    #[test]
-    fn granted_and_privileged_is_unblocked() {
-        let b = blocker_for(true, true, true, posture(Integrity::High, false), true);
-        assert_eq!(b, ElevationBlocker::None);
-    }
-
-    #[test]
-    fn granted_but_stuck_names_the_fix() {
-        // No service installed: the customer can fix this, and the message says so.
-        assert_eq!(
-            blocker_for(true, true, true, Posture::standard_user(), false),
-            ElevationBlocker::ServiceMissing
-        );
-        // Service installed and still medium integrity: a different problem,
-        // and it must not tell the customer to install what they already have.
-        assert_eq!(
-            blocker_for(true, true, true, Posture::standard_user(), true),
-            ElevationBlocker::AgentNotPrivileged
-        );
-    }
-
-    #[test]
-    fn non_windows_is_never_blocked_on_elevation() {
-        assert_eq!(
-            blocker_for(false, true, true, Posture::standard_user(), false),
-            ElevationBlocker::NotApplicable
-        );
-        // …including when nothing was allowed or granted: there is no rung here.
-        assert_eq!(
-            blocker_for(false, false, false, Posture::standard_user(), false),
-            ElevationBlocker::NotApplicable
-        );
     }
 
     #[test]

@@ -956,7 +956,7 @@
     // Hit-test what's under the cursor: another device, or a fleet band.
     const hit = document.elementFromPoint(e.clientX, e.clientY);
     const overNode = hit?.closest?.(".node")?.getAttribute("data-node-id") ?? null;
-    if (overNode && overNode !== n.id) {
+    if (overNode && overNode !== n.id && app.canReceiveShare(overNode)) {
       dragOverId = overNode;
       dragOverSection = null;
     } else {
@@ -1097,6 +1097,7 @@
   // layer, so the menu is rendered OUTSIDE that layer (a top-level sibling) and
   // anchored with `position: fixed` from the gear's on-screen rect.
   let nodeMenu = $state<{ id: string; left: number; top: number } | null>(null);
+  let kvmPowerMenu = $state<{ kvmId: string; left: number; top: number } | null>(null);
   const MENU_W = 216;
   // Per-item height + container padding for the flip math below — the menu's
   // real height depends on which items this node offers.
@@ -1144,16 +1145,38 @@
     nodeMenu = { id: nodeId, left, top };
   }
 
+  function openKvmPowerMenu(e: MouseEvent, kvmId: string) {
+    e.stopPropagation();
+    nodeMenu = null;
+    if (kvmPowerMenu?.kvmId === kvmId) {
+      kvmPowerMenu = null;
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const menuHeight = MENU_PAD + 3 * MENU_ITEM_H;
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - MENU_W - 8));
+    const top = rect.bottom + menuHeight + 8 > window.innerHeight
+      ? Math.max(8, rect.top - menuHeight - 6)
+      : rect.bottom + 6;
+    kvmPowerMenu = { kvmId, left, top };
+  }
+
   // Close the menu on any outside pointer-down (the gear + the menu are exempt
   // so they can toggle / be clicked), and on Escape.
   $effect(() => {
-    if (!nodeMenu) return;
+    if (!nodeMenu && !kvmPowerMenu) return;
     function onDown(e: PointerEvent) {
       const t = e.target as Element | null;
-      if (!t?.closest?.(".node-menu, .node-gear")) nodeMenu = null;
+      if (!t?.closest?.(".node-menu, .node-gear, .kvm-power-trigger")) {
+        nodeMenu = null;
+        kvmPowerMenu = null;
+      }
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") nodeMenu = null;
+      if (e.key === "Escape") {
+        nodeMenu = null;
+        kvmPowerMenu = null;
+      }
     }
     window.addEventListener("pointerdown", onDown);
     window.addEventListener("keydown", onKey);
@@ -1168,7 +1191,7 @@
      terminal, sites, plus the KVM set (its web console, its self-reboot, the
      attach link, and the attached machine's power/reset). Stroke uses
      currentColor. -->
-{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "reboot" | "link" | "power" | "reset")}
+{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "reboot" | "link" | "power" | "reset" | "wifi")}
   {#if kind === "remote"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
@@ -1197,6 +1220,10 @@
     <!-- Attach: the chain link that drops the target picker out. -->
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M10 13.5a4 4 0 0 0 6 .5l2.5-2.5a4 4 0 0 0-5.7-5.7L11.5 7" /><path d="M14 10.5a4 4 0 0 0-6-.5L5.5 12.5a4 4 0 0 0 5.7 5.7L12.5 17" />
+    </svg>
+  {:else if kind === "wifi"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+      <path d="M4 9.5a12 12 0 0 1 16 0M7 13a7.5 7.5 0 0 1 10 0M10 16.5a3 3 0 0 1 4 0" /><circle cx="12" cy="20" r=".8" fill="currentColor" stroke="none" />
     </svg>
   {:else if kind === "power"}
     <!-- The attached machine's power button, driven through the KVM's GPIO. -->
@@ -1361,6 +1388,8 @@
              target picker out under the card. Its web UI opens from the
              Sites globe (which routes through openKVM), so there's no
              separate "Open KVM" button. -->
+        <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}</button>
         {#if app.canRestartDevice(n)}
           <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
             data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
@@ -1378,12 +1407,11 @@
           <!-- This machine is wired into a KVM you control: its physical
                power and reset lines ride the KVM's GPIO, so they belong
                on THIS card — they act on this machine. -->
-          <button class="cbtn" data-tip="Power (via {displayName(kvmHere)})"
-            aria-label="Press {displayName(n)}'s power button via its KVM"
-            onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "power"); }}>{@render cicon("power")}</button>
-          <button class="cbtn" data-tip="Reset (via {displayName(kvmHere)})"
-            aria-label="Hard-reset {displayName(n)} via its KVM"
-            onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "reset"); }}>{@render cicon("reset")}</button>
+          <button class="cbtn kvm-power-trigger" data-tip="Power (via KVM)"
+            aria-label="Power menu for {displayName(n)} via KVM"
+            aria-haspopup="menu"
+            aria-expanded={kvmPowerMenu?.kvmId === kvmHere.id}
+            onclick={(e) => openKvmPowerMenu(e, kvmHere.id)}>{@render cicon("power")}</button>
         {/if}
       {/if}
       <span class="cbtn-sep" aria-hidden="true"></span>
@@ -1749,6 +1777,37 @@
     </div>
   {/if}
 </div>
+
+{#if kvmPowerMenu}
+  {@const kvmId = kvmPowerMenu.kvmId}
+  <div
+    class="node-menu kvm-power-menu"
+    role="menu"
+    aria-label="Power (via KVM)"
+    style="left: {kvmPowerMenu.left}px; top: {kvmPowerMenu.top}px;"
+  >
+    {#each [
+      { action: "wake", label: "Wake", detail: "tap the power button" },
+      { action: "power", label: "Power", detail: "hold the power button" },
+      { action: "reset", label: "Reset", detail: "pulse the reset line" },
+    ] as item (item.action)}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          void app.kvmFeature(kvmId, item.action as "wake" | "power" | "reset");
+          kvmPowerMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">{item.action === "reset" ? "↻" : "⏻"}</span>
+        <span class="nm-text">
+          <span class="nm-label">{item.label}</span>
+          <span class="nm-sub">{item.detail}</span>
+        </span>
+      </button>
+    {/each}
+  </div>
+{/if}
 
 <!-- The per-node actions menu, rendered at the component root (outside the
      panned/zoomed `.nodes` layer) so its `position: fixed` anchors to the

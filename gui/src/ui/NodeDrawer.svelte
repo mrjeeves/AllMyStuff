@@ -215,8 +215,9 @@
   }
 
   let width = $state(loadWidth());
-  // A phone launches with the drawer tucked away — the graph is the screen.
-  let collapsed = $state(isMobile());
+  // Start out of the way on every viewport. Selecting a node is the explicit
+  // gesture that opens details; the local fallback alone does not.
+  let collapsed = $state(true);
   let resizing = $state(false);
 
   // A fresh selection always re-opens the panel — you clicked a node to see
@@ -235,15 +236,10 @@
   $effect(() => {
     const id = node?.id ?? null;
     const explicit = !!app.selectedNode;
-    if (id !== shownId || explicit !== wasExplicit) {
-      shownId = id;
-      wasExplicit = explicit;
-      if (isMobile()) {
-        collapsed = !explicit;
-      } else {
-        collapsed = false;
-      }
-    }
+    if (explicit && (id !== shownId || !wasExplicit)) collapsed = false;
+    else if (!explicit && wasExplicit) collapsed = true;
+    shownId = id;
+    wasExplicit = explicit;
   });
 
   // When a remote AllMyStuff machine is shown, learn the channel's latest
@@ -444,7 +440,16 @@
          self-updater and restarts; its next presence advert (the new
          version) makes this button disappear. Fleet/owner only — the same
          rule the far side enforces before acting. -->
-    {#if isRemoteApp && inMyFleet && app.upgradeAvailable(node)}
+    {#if isKvm && node}
+      <button
+        class="btn console-open upgrade-open"
+        disabled={app.isKvmUpdating(node.id)}
+        title="Update this KVM's firmware, or reboot it when already current"
+        onclick={() => app.updateKvm(node.id)}
+      >
+        ⬆ {app.isKvmUpdating(node.id) ? "Updating KVM…" : "Update KVM"}
+      </button>
+    {:else if isRemoteApp && inMyFleet && app.upgradeAvailable(node)}
       <button
         class="btn console-open upgrade-open"
         title="Update {displayName(node)} to {app.latestRelease} and restart it"
@@ -629,7 +634,9 @@
       {:else if st.shared}
         <div class="block-head">
           <h4>What {st.shared.name} can do</h4>
-          <button class="btn small add-share" onclick={manageShare}>⚙ Manage share</button>
+          {#if !app.isKvm(node)}
+            <button class="btn small add-share" onclick={manageShare}>⚙ Manage share</button>
+          {/if}
         </div>
         {#if outGrants.length === 0}
           <p class="muted">Nothing yet — use <b>Manage share</b> to let {st.shared.name} open one of your device's consoles.</p>
@@ -670,26 +677,32 @@
             same kind of authorization you'll use to share with people.
           </p>
           <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
-          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+          {#if !app.isKvm(node)}
+            <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+          {/if}
         </div>
       {:else if st.kind === "theirs"}
         <p class="muted">
           This device already has an owner, so you can't adopt it. If they
           want to share it with you, you'll get exactly what they allow.
         </p>
-        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+        {#if !app.isKvm(node)}
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+        {/if}
       {:else if st.kind === "free"}
         <p class="muted">
           This device hasn't been put up for adoption. You can't just take
           ownership — start AllMyStuff on it in claim mode (or toggle
           “allow adoption” there), then claim it from here.
         </p>
-        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+        {#if !app.isKvm(node)}
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
+        {/if}
       {:else}
         <p class="muted own-note">
           {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
-        {#if !st.self}
+        {#if !st.self && !app.isKvm(node)}
           <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
         {/if}
       {/if}
@@ -853,6 +866,11 @@
         <button class="btn small primary" onclick={() => controllingKvm && app.openKVM(controllingKvm.id)}>
           🌐 Open KVM
         </button>
+        <div class="kvm-actions">
+          <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "wake")}>◉ Wake</button>
+          <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "power")}>⏻ Power</button>
+          <button class="btn small" onclick={() => controllingKvm && app.kvmFeature(controllingKvm.id, "reset")}>↻ Reset</button>
+        </div>
       </section>
     {/if}
 
@@ -883,6 +901,8 @@
                "🖥 Remote Control" button above (the generic one every machine
                gets), so this globe stays the web-UI front door. -->
           <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🌐 Open KVM</button>
+          <button class="btn small" onclick={() => app.openKvmWifi(node.id)}>⌁ Wi-Fi</button>
+          <button class="btn small" onclick={() => app.kvmFeature(node.id, "wake")}>◉ Wake</button>
           <button class="btn small" onclick={() => app.kvmFeature(node.id, "power")}>⏻ Power</button>
           <button class="btn small" onclick={() => app.kvmFeature(node.id, "reset")}>↻ Reset</button>
         </div>

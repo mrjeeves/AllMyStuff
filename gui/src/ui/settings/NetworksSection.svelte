@@ -198,7 +198,7 @@
                 <span class="net-name">{app.meshLabel(n)}<span class="badge claim-badge" title="The built-in LAN-only mesh other devices use to find this one for claiming and pairing — mDNS only, never leaves your network">📡 local</span>{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
                 <span class="net-sub">mDNS passthrough for claiming and local pairing — this LAN only, nothing to configure</span>
               </div>
-              <button class="btn small" title="Switch local claiming and pairing off (turn it back on here or from the pill menu)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Turn off</button>
+              <button class="btn small" title="Switch Local and pairing off (turn it back on here or from the pill menu)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Turn off</button>
             </li>
           {:else}
             <li class:on={app.rosterNetwork === n.config_id}>
@@ -219,7 +219,7 @@
         {#each app.disabledNets as c (c.id)}
           <li class="off">
             <div class="net-main">
-              <span class="net-name">{app.isLocalClaimMesh(c) ? "Local claiming" : networkDisplayName(c)}<span class="badge off-badge">{app.isLocalClaimMesh(c) ? "off" : "disabled"}</span></span>
+              <span class="net-name">{app.isLocalClaimMesh(c) ? "Local" : networkDisplayName(c)}<span class="badge off-badge">{app.isLocalClaimMesh(c) ? "off" : "disabled"}</span></span>
               {#if app.isLocalClaimMesh(c)}
                 <span class="net-sub">switched off — this device can't be found for claiming or local pairing</span>
               {:else}

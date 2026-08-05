@@ -29,7 +29,7 @@ compile_error!(
     "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
 );
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
 // client of the per-machine node's control socket (see
@@ -42,6 +42,8 @@ use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_autostart::ManagerExt;
 
 mod backend_recovery;
+#[allow(dead_code)] // parsers for the other desktop OSes are exercised by this module's tests
+mod host_wifi;
 mod window_behavior;
 
 use backend_recovery::{
@@ -2006,6 +2008,75 @@ async fn update_latest_version() -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Wi-Fi networks visible to this computer. This gives a headless KVM a
+/// useful picker even when the appliance is not online yet or cannot scan.
+#[tauri::command]
+fn host_wifi_scan() -> Value {
+    serde_json::to_value(host_wifi::scan()).unwrap_or(Value::Null)
+}
+
+/// Call a NanoKVM JSON endpoint through its loopback site tunnel. Keeping this
+/// outside the webview avoids cross-origin preflights and opaque CORS errors.
+#[tauri::command]
+async fn kvm_api(
+    port: u16,
+    path: String,
+    method: Option<String>,
+    body: Option<Value>,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Err(format!("invalid device path {path}"));
+    }
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms.unwrap_or(12_000)))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("couldn't start the request: {e}"))?;
+
+    let verb = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+    let mut request = match verb.as_str() {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "DELETE" => client.delete(&url),
+        other => return Err(format!("unsupported method {other}")),
+    };
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let (kind, message) = if error.is_timeout() {
+                ("timeout", "the KVM didn't answer in time".to_string())
+            } else if error.is_connect() {
+                (
+                    "connect",
+                    "couldn't reach the KVM's console tunnel".to_string(),
+                )
+            } else {
+                ("other", format!("couldn't reach the KVM: {error}"))
+            };
+            return Ok(json!({
+                "status": 0,
+                "body": Value::Null,
+                "error": { "kind": kind, "message": message },
+            }));
+        }
+    };
+
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    Ok(json!({
+        "status": status,
+        "body": serde_json::from_str::<Value>(&text).ok(),
+        "error": Value::Null,
+    }))
+}
+
 /// Pi / aarch64 Linux WebKitGTK rendering workaround — paint on the CPU so
 /// the animated SVG graph doesn't corrupt or wedge the compositor. Kept in
 /// sync with MyOwnMesh and MyOwnLLM.
@@ -2463,25 +2534,23 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         return;
     }
     match event {
-        tauri::WindowEvent::CloseRequested { api, .. } => {
+        tauri::WindowEvent::CloseRequested { api, .. }
             if window
                 .state::<window_behavior::WindowBehavior>()
-                .close_to_tray()
-            {
-                // Keep the process (and the tray) alive; the window just hides.
-                api.prevent_close();
-                let _ = window.hide();
-            }
+                .close_to_tray() =>
+        {
+            // Keep the process (and the tray) alive; the window just hides.
+            api.prevent_close();
+            let _ = window.hide();
         }
         // No portable "minimized" event — catch the resize and check the state.
-        tauri::WindowEvent::Resized(_) => {
+        tauri::WindowEvent::Resized(_)
             if window
                 .state::<window_behavior::WindowBehavior>()
                 .minimize_to_tray()
-                && window.is_minimized().unwrap_or(false)
-            {
-                let _ = window.hide();
-            }
+                && window.is_minimized().unwrap_or(false) =>
+        {
+            let _ = window.hide();
         }
         _ => {}
     }
@@ -2675,6 +2744,8 @@ fn main() {
             update_relaunch,
             update_set_prefs,
             update_latest_version,
+            host_wifi_scan,
+            kvm_api,
             service_status,
             service_install,
             service_start,
@@ -2739,16 +2810,16 @@ fn main() {
             // someone happened to open Settings → Updates, which is what made
             // an app that *was* checking look like one that never did.
             let update_handle = app.handle().clone();
-            tauri::async_runtime::spawn(allmystuff_updater::tick_forever_notify(
-                move |outcome| match serde_json::to_value(outcome) {
+            tauri::async_runtime::spawn(allmystuff_updater::tick_forever_notify(move |outcome| {
+                match serde_json::to_value(outcome) {
                     Ok(payload) => {
                         if let Err(e) = update_handle.emit("update://checked", payload) {
                             tracing::warn!("couldn't emit the self-update outcome: {e}");
                         }
                     }
                     Err(e) => tracing::warn!("couldn't serialise the self-update outcome: {e}"),
-                },
-            ));
+                }
+            }));
             Ok(())
         })
         .build(tauri::generate_context!())

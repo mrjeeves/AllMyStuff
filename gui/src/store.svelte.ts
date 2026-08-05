@@ -74,6 +74,8 @@ import {
   fleetMfaStatus,
   isMobile,
   isTauri,
+  hostWifiScan,
+  kvmApiCall,
   kvmAttach,
   kvmDetach,
   kvmMeshAdd,
@@ -226,6 +228,13 @@ import {
   type SiteMapping,
   type InputAction,
   type InventorySummary,
+  type HostWifi,
+  type KvmApiCallResult,
+  type KvmApiRsp,
+  type KvmVersion,
+  type KvmWifiNetwork,
+  type KvmWifiStatus,
+  type KvmWifiStatusRaw,
   type MediaKind,
   type MeshNode,
   type Standing,
@@ -304,6 +313,36 @@ export interface PendingJoin {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+interface KvmApiOutcome<T> {
+  rsp: KvmApiRsp<T> | null;
+  timedOut: boolean;
+  reason: string | null;
+}
+
+function normalizeWifi(data: KvmWifiStatusRaw): KvmWifiStatus {
+  const ssid = (data.ssid ?? data.wifi?.ssid ?? "").trim();
+  return {
+    supported: !!data.supported,
+    apMode: !!data.apMode,
+    connected: !!data.connected,
+    ssid: ssid || null,
+  };
+}
+
+function sortNetworks(list: KvmWifiNetwork[]): KvmWifiNetwork[] {
+  return list
+    .filter((network) => !!network?.ssid)
+    .slice()
+    .sort((a, b) => (b.signal ?? -999) - (a.signal ?? -999));
+}
+
+function demoWifiNetworks(): KvmWifiNetwork[] {
+  return [
+    { ssid: "Office Wi-Fi", signal: -48, security: "WPA2" },
+    { ssid: "Guest", signal: -67, security: "WPA2" },
+  ];
 }
 
 /** A short, readable device id for labels when no friendly name is known. */
@@ -642,6 +681,20 @@ class AppStore {
    *  (opened from the link button in its card's button bar) — the same
    *  one-at-a-time reveal model as the claim drawer. Null = none showing. */
   kvmRevealed = $state<string | null>(null);
+  // KVM Wi-Fi modal state. The mapped console port is reused for the modal's
+  // status, scan and write calls so one open does not create several tunnels.
+  wifiFor = $state<string | null>(null);
+  wifiStatus = $state<KvmWifiStatus | null>(null);
+  wifiScan = $state<KvmWifiNetwork[] | null>(null);
+  wifiScanSource = $state<"kvm" | "host" | null>(null);
+  wifiHostCurrent = $state<string | null>(null);
+  wifiHostNote = $state<string | null>(null);
+  wifiLoading = $state(false);
+  wifiScanning = $state(false);
+  wifiBusy = $state(false);
+  wifiError = $state<string | null>(null);
+  private wifiPort: number | null = null;
+  private kvmUpdating = $state<Record<string, boolean>>({});
   /** The latched clock-skew warning: this machine's wall clock is well out
    *  of line with its peers' (estimated passively — no extra calls to any
    *  node). Null = in sync (or nothing measurable). Drives the topbar pill;
@@ -1036,7 +1089,7 @@ class AppStore {
       const name = this.fleetName || this.fleetOwnerName();
       if (name) return `${name}'s Fleet`;
     }
-    if (this.isLocalClaimMesh(net)) return "Local claiming";
+    if (this.isLocalClaimMesh(net)) return "Local";
     return networkDisplayName(net);
   }
 
@@ -1501,12 +1554,16 @@ class AppStore {
     await this.loadOwnedFleet();
     await this.loadSites();
     await onNodeSites((e) => this.applyNodeSites(e));
-    await this.loadUpdateStatus();
     // The background ticker's verdict. Registered here (not in the Updates
     // pane) so a release found while the user is anywhere in the app still
     // surfaces — the pane only mounts when you go looking for it, which is
     // exactly the trap that made auto-update feel like it never ran.
     await onUpdateChecked((o) => this.applyUpdateChecked(o));
+    await this.loadUpdateStatus();
+    // Do one real feed check while the main window starts. The updater still
+    // applies its own due/policy rules; this closes the gap where no timer had
+    // run yet and the app only displayed yesterday's persisted status.
+    void this.checkUpdates();
     await this.loadDisabledNetworks();
     this.startMeshPolling();
     await onSubscription((s) => {
@@ -2616,6 +2673,13 @@ class AppStore {
     return st.mine || st.self;
   }
 
+  /** KVM appliances are headless passthroughs, never share recipients. */
+  canReceiveShare(id: string | null): boolean {
+    if (!id) return false;
+    const node = this.node(id);
+    return !!node && isAppNode(node) && !this.isKvm(node);
+  }
+
   /** Open the builder, optionally pre-filling the sender (one of your devices),
    *  the receiver (a node id of any device in the receiving fleet), and the
    *  consoles to pre-toggle (for "Manage share"). A non-owned device offered as
@@ -2626,7 +2690,9 @@ class AppStore {
   openShareFlow(sender?: string | null, receiver?: string | null, caps?: ShareCap[]) {
     if (sender !== undefined) this.shareFlowSender = this.isMyDevice(sender) ? sender : null;
     if (!this.isMyDevice(this.shareFlowSender)) this.shareFlowSender = this.localId;
-    if (receiver !== undefined) this.shareFlowReceiver = receiver;
+    if (receiver !== undefined) {
+      this.shareFlowReceiver = this.canReceiveShare(receiver) ? receiver : null;
+    }
     this.shareFlowInitialCaps = caps ?? [];
     this.shareFlowOpen = true;
   }
@@ -2640,7 +2706,7 @@ class AppStore {
   shareFleetOptions(): { personId: string; name: string; nodeId: string; devices: number }[] {
     const byPerson = new Map<string, { personId: string; name: string; nodeId: string; devices: number }>();
     for (const n of this.catalog.nodes) {
-      if (!isAppNode(n) || this.isMyDevice(n.id) || !n.owner) continue;
+      if (!isAppNode(n) || this.isKvm(n) || this.isMyDevice(n.id) || !n.owner) continue;
       const p = this.personFor(n);
       const existing = byPerson.get(p.id);
       if (existing) existing.devices += 1;
@@ -2656,7 +2722,11 @@ class AppStore {
     if (!n) return null;
     const p = this.personFor(n);
     const devices = this.catalog.nodes.filter(
-      (x) => isAppNode(x) && !this.isMyDevice(x.id) && this.personFor(x).id === p.id,
+      (x) =>
+        isAppNode(x) &&
+        !this.isKvm(x) &&
+        !this.isMyDevice(x.id) &&
+        this.personFor(x).id === p.id,
     ).length;
     return { name: p.name, devices };
   }
@@ -2819,6 +2889,10 @@ class AppStore {
     const recv = this.node(receiver);
     if (!recv || !isAppNode(recv)) {
       this.toast("warn", "That device can't receive a share");
+      return 0;
+    }
+    if (this.isKvm(recv)) {
+      this.toast("warn", "KVMs are passthrough devices and can't receive shares");
       return 0;
     }
     // Establish the share with the receiver's fleet/person, then record the
@@ -4510,33 +4584,343 @@ class AppStore {
     this.openSite(m);
   }
 
-  /** Drive a KVM feature button (Power / Reset) — ensure its web UI is mapped,
-   *  then POST NanoKVM's GPIO endpoint through the tunnel. Auth is bypassed
-   *  over the mesh, so no token is needed. No-op (a toast) in web mode. */
-  async kvmFeature(nodeId: string, action: "power" | "reset") {
+  /** Resolve and map a KVM's published web console to one local tunnel port. */
+  private async kvmConsolePort(nodeId: string): Promise<number | null> {
     const node = this.node(nodeId);
     const site = this.kvmWebSite(node);
-    if (!node || !site) {
-      this.toast("warn", `${node?.label ?? "This KVM"} hasn't published a web UI yet`);
-      return;
-    }
-    if (!this.backendConnected) {
-      this.toast("info", `${action === "power" ? "Power" : "Reset"} sent to ${node.label}`);
-      return;
-    }
+    if (!node || !site) return null;
     await this.mapSite(nodeId, site);
-    const m = this.siteMappingFor(nodeId, site.id);
-    if (!m) return; // mapSite already toasted the failure
+    return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
+  }
+
+  /** Call one KVM JSON endpoint outside the webview's CORS boundary. */
+  private async kvmApi<T>(
+    port: number,
+    path: string,
+    init?: { method?: string; body?: unknown; timeoutMs?: number },
+  ): Promise<KvmApiOutcome<T>> {
+    let out: KvmApiCallResult;
     try {
-      const res = await fetch(`http://localhost:${m.localPort}/api/vm/gpio`, {
+      out = await kvmApiCall(port, path, init);
+    } catch (error) {
+      return { rsp: null, timedOut: false, reason: errMsg(error) };
+    }
+    if (out.error) {
+      return { rsp: null, timedOut: out.error.kind === "timeout", reason: out.error.message };
+    }
+    const body = out.body as { code?: unknown; msg?: unknown } | null;
+    const envelope = !!body && typeof body === "object" && typeof body.code === "number";
+    if (out.status === 401 || out.status === 403) {
+      return { rsp: null, timedOut: false, reason: "The KVM refused mesh authorisation." };
+    }
+    if (out.status === 404) {
+      return { rsp: null, timedOut: false, reason: "This KVM doesn't offer that." };
+    }
+    if (out.status < 200 || out.status >= 300) {
+      const detail = envelope && typeof body!.msg === "string" ? `: ${body!.msg}` : "";
+      return { rsp: null, timedOut: false, reason: `The KVM answered HTTP ${out.status}${detail}.` };
+    }
+    if (!envelope) {
+      return { rsp: null, timedOut: false, reason: "The KVM sent an unexpected reply." };
+    }
+    return { rsp: body as KvmApiRsp<T>, timedOut: false, reason: null };
+  }
+
+  private kvmMsg(rsp: KvmApiRsp, fallback: string): string {
+    return typeof rsp.msg === "string" && rsp.msg.trim() ? rsp.msg.trim() : fallback;
+  }
+
+  /** Wake, power-cycle/hold, or reset the machine connected to a KVM. */
+  async kvmFeature(nodeId: string, action: "wake" | "power" | "reset") {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (!this.backendConnected) {
+      this.toast("info", `${action[0].toUpperCase()}${action.slice(1)} sent via ${node.label}`);
+      return;
+    }
+    const port = await this.kvmConsolePort(nodeId);
+    if (port === null) {
+      this.toast("warn", `${node.label} hasn't published a web UI yet`);
+      return;
+    }
+    const type = action === "reset" ? "reset" : "power";
+    const duration = action === "power" ? 12_000 : 800;
+    const { rsp, reason } = await this.kvmApi(port, "/api/vm/gpio", {
+      method: "POST",
+      body: { type, duration },
+    });
+    if (!rsp || rsp.code !== 0) {
+      const detail = rsp ? this.kvmMsg(rsp, "the KVM declined") : reason;
+      this.toast("warn", `Couldn't ${action} via ${node.label}: ${detail}`);
+      return;
+    }
+    this.toast("info", `${action[0].toUpperCase()}${action.slice(1)} sent via ${node.label}`);
+  }
+
+  isKvmUpdating(nodeId: string): boolean {
+    return !!this.kvmUpdating[canonicalNodeId(nodeId)];
+  }
+
+  /** Update KVM firmware when available; otherwise reboot the appliance. */
+  async updateKvm(nodeId: string): Promise<void> {
+    const key = canonicalNodeId(nodeId);
+    if (this.kvmUpdating[key]) return;
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (!this.backendConnected) {
+      this.toast("info", "Update sent to the KVM");
+      return;
+    }
+    this.kvmUpdating = { ...this.kvmUpdating, [key]: true };
+    try {
+      const port = await this.kvmConsolePort(nodeId);
+      if (port === null) {
+        this.toast("warn", `${node.label} hasn't published a console yet`);
+        return;
+      }
+      const version = await this.kvmApi<KvmVersion>(port, "/api/application/version");
+      if (!version.rsp || version.rsp.code !== 0) {
+        const detail = version.rsp
+          ? this.kvmMsg(version.rsp, "the KVM declined")
+          : version.reason;
+        this.toast("warn", `Couldn't check the KVM firmware: ${detail}`);
+        return;
+      }
+      const current = (version.rsp.data?.current ?? "").trim();
+      const latest = (version.rsp.data?.latest ?? "").trim();
+      if (latest && latest !== current) {
+        this.toast("info", `Installing ${latest} on the KVM — this takes a few minutes`);
+        const update = await this.kvmApi(port, "/api/application/update", {
+          method: "POST",
+          body: {},
+          timeoutMs: 300_000,
+        });
+        if (update.timedOut) {
+          this.toast("info", `The KVM is installing ${latest} and will restart when done`);
+        } else if (!update.rsp || update.rsp.code !== 0) {
+          const detail = update.rsp
+            ? this.kvmMsg(update.rsp, "the KVM declined")
+            : update.reason;
+          this.toast("warn", `Couldn't update the KVM: ${detail}`);
+        } else {
+          this.toast("ok", `KVM updated to ${latest}; it is restarting`);
+        }
+        return;
+      }
+      const reboot = await this.kvmApi(port, "/api/vm/system/reboot", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ type: action }),
+        body: {},
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      this.toast("info", `${action === "power" ? "Power" : "Reset"} sent to ${node.label}`);
-    } catch (e) {
-      this.toast("warn", `Couldn't ${action} ${node.label}: ${String(e)}`);
+      if (reboot.timedOut || reboot.rsp?.code === 0) {
+        this.toast("info", `KVM is current${current ? ` (${current})` : ""}; rebooting it now`);
+      } else {
+        const detail = reboot.rsp
+          ? this.kvmMsg(reboot.rsp, "the KVM declined")
+          : reboot.reason;
+        this.toast("warn", `KVM is current, but reboot failed: ${detail}`);
+      }
+    } finally {
+      const { [key]: removed, ...rest } = this.kvmUpdating;
+      void removed;
+      this.kvmUpdating = rest;
+    }
+  }
+
+  get wifiKvmLabel(): string {
+    return this.node(this.wifiFor ?? "")?.label ?? "KVM";
+  }
+
+  async openKvmWifi(nodeId: string): Promise<void> {
+    this.wifiFor = nodeId;
+    this.wifiStatus = null;
+    this.wifiScan = null;
+    this.wifiScanSource = null;
+    this.wifiHostCurrent = null;
+    this.wifiHostNote = null;
+    this.wifiError = null;
+    this.wifiPort = null;
+    await this.loadKvmWifi(nodeId);
+  }
+
+  closeKvmWifi(): void {
+    this.wifiFor = null;
+    this.wifiStatus = null;
+    this.wifiScan = null;
+    this.wifiScanSource = null;
+    this.wifiHostCurrent = null;
+    this.wifiHostNote = null;
+    this.wifiError = null;
+    this.wifiPort = null;
+    this.wifiLoading = false;
+    this.wifiScanning = false;
+    this.wifiBusy = false;
+  }
+
+  async loadKvmWifi(nodeId: string): Promise<void> {
+    if (!this.backendConnected) {
+      this.wifiStatus = { supported: true, apMode: false, connected: false, ssid: null };
+      this.wifiScan = demoWifiNetworks();
+      this.wifiScanSource = "host";
+      this.wifiHostCurrent = this.wifiScan[0]?.ssid ?? null;
+      return;
+    }
+    this.wifiLoading = true;
+    this.wifiError = null;
+    try {
+      const port = this.wifiPort ?? (await this.kvmConsolePort(nodeId));
+      if (!port) {
+        this.wifiError = "Couldn't reach this KVM's console.";
+        return;
+      }
+      this.wifiPort = port;
+      const { rsp, reason } = await this.kvmApi<KvmWifiStatusRaw>(port, "/api/network/wifi");
+      if (!rsp || rsp.code !== 0 || !rsp.data) {
+        this.wifiPort = null;
+        this.wifiError = rsp
+          ? this.kvmMsg(rsp, "The KVM couldn't report its Wi-Fi settings.")
+          : (reason ?? "Couldn't read the KVM's Wi-Fi settings.");
+        return;
+      }
+      this.wifiStatus = normalizeWifi(rsp.data);
+      if (this.wifiStatus.supported) await this.scanKvmWifi(nodeId);
+      await this.loadHostWifi();
+    } finally {
+      this.wifiLoading = false;
+    }
+  }
+
+  async scanKvmWifi(nodeId: string): Promise<void> {
+    if (!this.backendConnected) {
+      this.wifiScan = demoWifiNetworks();
+      return;
+    }
+    const port = this.wifiPort ?? (await this.kvmConsolePort(nodeId));
+    if (!port) return;
+    this.wifiPort = port;
+    this.wifiScanning = true;
+    try {
+      const { rsp } = await this.kvmApi<{ wifiList?: KvmWifiNetwork[] }>(
+        port,
+        "/api/network/wifi/scan",
+        { timeoutMs: 20_000 },
+      );
+      const list = rsp?.data?.wifiList;
+      if (rsp?.code === 0 && Array.isArray(list)) {
+        this.wifiScan = sortNetworks(list);
+        this.wifiScanSource = "kvm";
+      }
+    } finally {
+      this.wifiScanning = false;
+    }
+  }
+
+  async rescanWifi(nodeId: string): Promise<void> {
+    if (this.wifiBusy) return;
+    if (this.wifiStatus?.supported) await this.scanKvmWifi(nodeId);
+    if (this.wifiScanSource === "kvm") return;
+    this.wifiScan = null;
+    this.wifiScanSource = null;
+    this.wifiScanning = true;
+    try {
+      await this.loadHostWifi();
+    } finally {
+      this.wifiScanning = false;
+    }
+  }
+
+  private async loadHostWifi(): Promise<void> {
+    let host: HostWifi;
+    try {
+      host = await hostWifiScan();
+    } catch {
+      return;
+    }
+    this.wifiHostCurrent = host.current;
+    if (this.wifiScan === null && host.networks.length > 0) {
+      this.wifiScan = sortNetworks(host.networks);
+      this.wifiScanSource = "host";
+    }
+    this.wifiHostNote = this.wifiScan === null ? host.note : null;
+  }
+
+  async connectKvmWifi(nodeId: string, ssid: string, password: string): Promise<void> {
+    const name = ssid.trim();
+    if (!name || this.wifiBusy) return;
+    this.wifiError = null;
+    if (!this.backendConnected) {
+      this.wifiStatus = { supported: true, apMode: false, connected: true, ssid: name };
+      this.toast("ok", `Connected the KVM to ${name}`);
+      return;
+    }
+    const port = this.wifiPort ?? (await this.kvmConsolePort(nodeId));
+    if (!port) {
+      this.wifiError = "Couldn't reach this KVM's console.";
+      return;
+    }
+    this.wifiPort = port;
+    this.wifiBusy = true;
+    try {
+      const { rsp, timedOut, reason } = await this.kvmApi(port, "/api/network/wifi/connect", {
+        method: "POST",
+        body: { ssid: name, password },
+        timeoutMs: 40_000,
+      });
+      if (rsp?.code === 0) {
+        this.toast("ok", `Connected the KVM to ${name}`);
+        await this.loadKvmWifi(nodeId);
+        void this.refreshNode(nodeId);
+      } else if (rsp) {
+        this.wifiError = password
+          ? this.kvmMsg(rsp, "Couldn't connect. Check the network name and password.")
+          : "This KVM won't accept an empty password, so it can't join an open network.";
+      } else if (timedOut) {
+        this.wifiError = "Sent the Wi-Fi details. The KVM may be reconnecting on its new network.";
+        void this.refreshNode(nodeId);
+      } else {
+        this.wifiError = reason ?? "Couldn't send the Wi-Fi details.";
+      }
+    } finally {
+      this.wifiBusy = false;
+    }
+  }
+
+  promptDisconnectKvmWifi(nodeId: string, ssid: string | null): void {
+    const network = ssid ? `\"${ssid}\"` : "the current network";
+    if (window.confirm(`Disconnect this KVM from ${network}? It may go offline if Wi-Fi is its only connection.`)) {
+      void this.disconnectKvmWifi(nodeId);
+    }
+  }
+
+  async disconnectKvmWifi(nodeId: string): Promise<void> {
+    if (this.wifiBusy) return;
+    this.wifiError = null;
+    if (!this.backendConnected) {
+      this.wifiStatus = { supported: true, apMode: false, connected: false, ssid: null };
+      return;
+    }
+    const port = this.wifiPort ?? (await this.kvmConsolePort(nodeId));
+    if (!port) {
+      this.wifiError = "Couldn't reach this KVM's console.";
+      return;
+    }
+    this.wifiPort = port;
+    this.wifiBusy = true;
+    try {
+      const { rsp, timedOut, reason } = await this.kvmApi(port, "/api/network/wifi/disconnect", {
+        method: "POST",
+        timeoutMs: 20_000,
+      });
+      if (rsp?.code === 0) {
+        await this.loadKvmWifi(nodeId);
+      } else if (rsp) {
+        this.wifiError = this.kvmMsg(rsp, "Couldn't disconnect the Wi-Fi.");
+      } else if (timedOut) {
+        this.wifiError = "Sent the disconnect request. The KVM may be reconnecting.";
+      } else {
+        this.wifiError = reason ?? "Couldn't disconnect the Wi-Fi.";
+      }
+    } finally {
+      this.wifiBusy = false;
     }
   }
 
@@ -6601,7 +6985,7 @@ class AppStore {
     // The local claiming mesh can't be left, only switched off — the node
     // refuses the remove too (and would re-join on the next ownership check).
     if (this.isLocalClaimMesh({ network_id: configId })) {
-      this.toast("warn", "Local claiming can't be left — switch it off instead.");
+      this.toast("warn", "Local can't be left — switch it off instead.");
       return;
     }
     try {
@@ -6847,7 +7231,7 @@ class AppStore {
     // passthrough for claiming and local pairing. The node refuses the write
     // too; refusing here keeps venue sweeps quiet instead of toasting errors.
     if (this.isLocalClaimMesh(cfg)) {
-      this.toast("warn", "Local claiming has no venue — it's LAN-only by design.");
+      this.toast("warn", "Local has no venue — it's LAN-only by design.");
       return false;
     }
     const next: NetworkConfigFull = {
@@ -8074,7 +8458,7 @@ class AppStore {
    *  the drawer additionally gates on the machine being yours (owner/fleet),
    *  the same rule the far side enforces before acting. */
   upgradeAvailable(node: MeshNode | null | undefined): boolean {
-    if (!node || node.kind === "this" || !isAppNode(node)) return false;
+    if (!node || node.kind === "this" || !isAppNode(node) || this.isKvm(node)) return false;
     return isOlderVersion(node.version, this.latestRelease ?? undefined);
   }
 

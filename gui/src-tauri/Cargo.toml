@@ -55,6 +55,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 parking_lot = "0.12"
 # Resolves the user's home for the persisted "Always On" window preference
 # (window_behavior.rs), mirroring the node's networks store.

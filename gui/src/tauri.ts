@@ -12,6 +12,8 @@ import type {
   IdentityInfo,
   InputAction,
   InventorySummary,
+  HostWifi,
+  KvmApiCallResult,
   ListeningService,
   MediaKind,
   Person,
@@ -102,6 +104,30 @@ export interface SessionSnapshot {
    *  disk, so the GUI reclassifies a peer as *shared* with its grants across
    *  a restart. Absent — nothing shared yet — is empty. */
   shares?: Share[];
+}
+
+/** Networks the host computer can see. Used when a KVM cannot scan itself. */
+export async function hostWifiScan(): Promise<HostWifi> {
+  const out = await tryInvoke<HostWifi>("host_wifi_scan", {});
+  return out ?? { supported: false, current: null, networks: [], note: null };
+}
+
+/** Call a KVM JSON endpoint through its mapped mesh site from Rust, avoiding
+ * webview CORS and preflight restrictions. */
+export async function kvmApiCall(
+  port: number,
+  path: string,
+  opts?: { method?: string; body?: unknown; timeoutMs?: number },
+): Promise<KvmApiCallResult> {
+  if (!isTauri()) throw new Error("not available in the browser preview");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<KvmApiCallResult>("kvm_api", {
+    port,
+    path,
+    method: opts?.method,
+    body: opts?.body,
+    timeoutMs: opts?.timeoutMs,
+  });
 }
 
 export function isTauri(): boolean {

@@ -230,6 +230,16 @@
       <Files host={app.filesNodeId} windowed={false} />
     {/key}
   {/if}
+  {#if app.mappedFiles}
+    {#key app.mappedFiles.route}
+      <Files
+        host={app.mappedFiles.host}
+        mappedRoute={app.mappedFiles.route}
+        mappedLabel={app.mappedFiles.label}
+        windowed={false}
+      />
+    {/key}
+  {/if}
   <ShareSheet />
   <ShareFlow />
   {#if app.wifiFor}

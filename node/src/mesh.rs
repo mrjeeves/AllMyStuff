@@ -9013,6 +9013,39 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Storage if is_mapped_drive_route(route) => {
+                if from_node == me && to_node != me {
+                    match mapped_drive_root(route, &me) {
+                        Some(root) => {
+                            self.files.map_root(&route.id, root.clone());
+                            tracing::info!(
+                                "route {} active — mapping {} to {}",
+                                route.id,
+                                root.display(),
+                                short_id(&to_node)
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                "route {} refused — source is not a mounted local volume",
+                                route.id
+                            );
+                            let mesh = self.clone();
+                            let rid = route.id.clone();
+                            crate::spawn(async move {
+                                let _ = mesh.disconnect(rid).await;
+                            });
+                        }
+                    }
+                } else if to_node == me && from_node != me {
+                    self.files.ensure_queue(&route.id);
+                    tracing::info!(
+                        "route {} active — drive mapped from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             MediaKind::Generic if is_shared_route(route) => {
                 // A room's Shared Files fetch lane — the files plumbing,
                 // but token-gated instead of owner/fleet (see
@@ -10180,14 +10213,15 @@ impl Mesh {
         let Some(me) = self.local_node_id() else {
             return;
         };
-        let (hosts_here, views_here, shared) = {
+        let (hosts_here, views_here, shared, mapped) = {
             let st = self.state.lock();
             let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
                 return;
             };
             let shared = is_shared_route(&r.route);
+            let mapped = is_mapped_drive_route(&r.route);
             if !(r.is_active()
-                && (is_files_route(&r.route) || shared)
+                && (is_files_route(&r.route) || shared || mapped)
                 && pubkey_part(r.peer.as_str()) == pubkey_part(from))
             {
                 tracing::debug!(
@@ -10200,6 +10234,7 @@ impl Mesh {
                 node_of(r.route.from.as_str()) == me,
                 node_of(r.route.to.as_str()) == me,
                 shared,
+                mapped,
             )
         };
         if hosts_here && shared {
@@ -10233,8 +10268,18 @@ impl Mesh {
                 other => tracing::debug!("shared-files host ignoring {other:?}"),
             }
         } else if hosts_here {
-            if !self.sender_may_drive(from, DrivePlane::Files) {
+            // A Storage route is itself the local user's explicit, scoped
+            // offer of one volume. Ordinary `:files` remains the privileged
+            // whole-machine browser and re-clears owner/fleet/share/CEC.
+            if !mapped && !self.sender_may_drive(from, DrivePlane::Files) {
                 tracing::warn!("dropped file request from {from}: not an authorized controller");
+                return;
+            }
+            let root = mapped
+                .then(|| self.files.mapped_root(&frame.route))
+                .flatten();
+            if mapped && root.is_none() {
+                tracing::warn!("dropped mapped-drive request from {from}: route has no local root");
                 return;
             }
             match &frame.event {
@@ -10242,7 +10287,9 @@ impl Mesh {
                 // must land in arrival order (the viewer sends them
                 // sequentially), and a piece is one small append.
                 FileEvent::Write { .. } => {
-                    if let Some(reply) = crate::files::write_piece(&frame.event) {
+                    if let Some(reply) =
+                        crate::files::write_piece_in_root(&frame.event, root.as_deref())
+                    {
                         self.send_file_event(frame.route.clone(), from.to_string(), reply);
                     }
                 }
@@ -10251,7 +10298,7 @@ impl Mesh {
                 | FileEvent::Mkdir { .. }
                 | FileEvent::Rename { .. }
                 | FileEvent::Delete { .. } => {
-                    self.start_files_request(&frame.route, from, frame.event);
+                    self.start_files_request_in_root(&frame.route, from, frame.event, root);
                 }
                 // Response kinds (and `Fetch`, which only a `:shared` route
                 // serves) landing on the files host are a confused peer.
@@ -10287,7 +10334,17 @@ impl Mesh {
     /// unlike a shell, a request/response op is simply retried by the
     /// viewer.
     fn start_files_request(self: &Arc<Self>, route_id: &str, peer: &str, event: FileEvent) {
-        let mut rx = self.files.handle(route_id, event);
+        self.start_files_request_in_root(route_id, peer, event, None);
+    }
+
+    fn start_files_request_in_root(
+        self: &Arc<Self>,
+        route_id: &str,
+        peer: &str,
+        event: FileEvent,
+        root: Option<std::path::PathBuf>,
+    ) {
+        let mut rx = self.files.handle_in_root(route_id, event, root);
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();
@@ -10354,7 +10411,7 @@ impl Mesh {
             let kind_ok = if want_shared {
                 is_shared_route(&r.route)
             } else {
-                is_files_route(&r.route)
+                is_files_route(&r.route) || is_mapped_drive_route(&r.route)
             };
             if !(r.is_active() && kind_ok && node_of(r.route.to.as_str()) == me) {
                 return Err("route isn't an active files session here".into());
@@ -12673,6 +12730,32 @@ fn is_files_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":files")
 }
 
+/// An explicit drive mapping: one physical Storage capability is offered to
+/// the other machine's synthetic `:storage-in` sink. Unlike `:files`, this is
+/// scoped to that one mounted volume and the active route is the lease.
+fn is_mapped_drive_route(route: &Route) -> bool {
+    route.media == MediaKind::Storage
+        && route.to.as_str().ends_with(":storage-in")
+        && !route.from.as_str().ends_with(":storage-in")
+}
+
+/// Resolve the route's source capability against a fresh local inventory.
+/// The peer never supplies a root: it must exactly name a currently mounted
+/// volume this node advertised, and only its recorded mount point is retained.
+fn mapped_drive_root(route: &Route, me: &str) -> Option<std::path::PathBuf> {
+    if !is_mapped_drive_route(route) || node_of(route.from.as_str()) != me {
+        return None;
+    }
+    let prefix = format!("{me}:");
+    let local_cap = route.from.as_str().strip_prefix(&prefix)?;
+    allmystuff_inventory::scan()
+        .storage
+        .into_iter()
+        .find(|volume| volume.id == local_cap)
+        .and_then(|volume| volume.mount_point)
+        .map(std::path::PathBuf::from)
+}
+
 /// Whether `route` is a room **Shared Files** fetch session: generic media
 /// whose source endpoint is a machine's `…:shared` handle. Unlike a files
 /// route it is *not* owner/fleet gated — any room member may open one — but
@@ -12724,6 +12807,12 @@ fn route_drive_plane(route: &Route) -> Option<DrivePlane> {
     if is_terminal_route(route) {
         Some(DrivePlane::Terminal)
     } else if is_files_route(route) {
+        Some(DrivePlane::Files)
+    } else if is_mapped_drive_route(route) {
+        // This matters at offer admission: a peer cannot fabricate a route
+        // that makes this machine source one of its disks. A locally-created
+        // mapping is already active on the source side and does not pass
+        // through the inbound-offer gate there.
         Some(DrivePlane::Files)
     } else if is_site_route(route) {
         Some(DrivePlane::Sites)
@@ -12818,6 +12907,9 @@ fn privileged_offer_refusal(route: &Route, hosts_here: bool, authorized: bool) -
     }
     if is_files_route(route) {
         return Some("not authorized: file access needs owner/fleet or a share".into());
+    }
+    if is_mapped_drive_route(route) {
+        return Some("not authorized: drive mapping needs owner/fleet or a share".into());
     }
     if is_site_route(route) {
         return Some("not authorized: site access needs owner/fleet or a share".into());
@@ -14225,6 +14317,18 @@ mod tests {
 
         let storage = term_route("host:files", "me:files-view:1", MediaKind::Storage);
         assert!(!is_files_route(&storage), "media is part of the contract");
+    }
+
+    #[test]
+    fn mapped_drive_routes_require_storage_and_the_dedicated_sink() {
+        let mapped = term_route("host:disk:E:\\", "viewer:storage-in", MediaKind::Storage);
+        assert!(is_mapped_drive_route(&mapped));
+        assert_eq!(route_drive_plane(&mapped), Some(DrivePlane::Files));
+
+        let wrong_sink = term_route("host:disk:E:\\", "viewer:disk:C:\\", MediaKind::Storage);
+        assert!(!is_mapped_drive_route(&wrong_sink));
+        let wrong_media = term_route("host:disk:E:\\", "viewer:storage-in", MediaKind::Generic);
+        assert!(!is_mapped_drive_route(&wrong_media));
     }
 
     #[test]

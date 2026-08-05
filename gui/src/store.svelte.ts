@@ -285,6 +285,7 @@ export type SettingsTab =
   | "devices"
   | "fleet"
   | "sharing"
+  | "drives"
   | "always_on"
   | "updates"
   // The secret CEC Support tab — shown only when a technician reveals it with
@@ -861,6 +862,9 @@ class AppStore {
   /** The remote machine the in-page files popover is open on (web preview
    *  only — the desktop opens a dedicated window per machine). */
   filesNodeId = $state<string | null>(null);
+  /** An already-active Storage route opened as a volume-scoped file browser.
+   *  Closing the browser leaves the mapping in place; Unmap owns teardown. */
+  mappedFiles = $state<{ host: string; route: string; label: string } | null>(null);
   /** Per-app-run counter so each files session mints a unique viewer-side
    *  endpoint (`{me}:files-view:…`) — unique endpoint, unique route id. */
   private filesViewSeq = 0;
@@ -4036,6 +4040,95 @@ class AppStore {
    *  windows close themselves, tearing their route down first. */
   closeFiles() {
     this.filesNodeId = null;
+    this.mappedFiles = null;
+  }
+
+  /** Physical volumes on this machine that can be explicitly mapped. */
+  get localDrives(): Capability[] {
+    return this.catalog.capabilities.filter(
+      (c) => this.isMe(c.node) && c.media === "storage" && c.origin === "storage",
+    );
+  }
+
+  /** App machines that can receive a mapped drive. KVMs stay excluded: they
+   *  are headless passthroughs, not storage destinations. */
+  get driveTargets(): MeshNode[] {
+    return this.catalog.nodes.filter(
+      (n) => !this.isMe(n.id) && n.online && isAppNode(n) && !this.isKvm(n),
+    );
+  }
+
+  get driveMappings(): Array<{
+    route: Route;
+    direction: "in" | "out";
+    drive: string;
+    machine: string;
+    host: string;
+  }> {
+    const out = [] as Array<{
+      route: Route;
+      direction: "in" | "out";
+      drive: string;
+      machine: string;
+      host: string;
+    }>;
+    for (const route of this.catalog.routes) {
+      if (route.media !== "storage" || !route.to.endsWith(":storage-in")) continue;
+      const from = this.capability(route.from);
+      const to = this.capability(route.to);
+      const fromNode = from?.node ?? this.capNodeOf(route.from);
+      const toNode = to?.node ?? this.capNodeOf(route.to);
+      const driveLabel = from?.label ?? route.from.split(":disk:").at(-1) ?? "Mapped drive";
+      if (this.isMe(toNode)) {
+        out.push({
+          route,
+          direction: "in",
+          drive: driveLabel,
+          machine: this.node(fromNode)?.label ?? fromNode,
+          host: fromNode,
+        });
+      } else if (this.isMe(fromNode)) {
+        out.push({
+          route,
+          direction: "out",
+          drive: driveLabel,
+          machine: this.node(toNode)?.label ?? toNode,
+          host: fromNode,
+        });
+      }
+    }
+    return out;
+  }
+
+  mapDrive(capabilityId: string, targetNodeId: string) {
+    const drive = this.capability(capabilityId);
+    if (!drive || !this.isMe(drive.node) || drive.media !== "storage" || drive.origin !== "storage") {
+      this.toast("warn", "Pick a drive attached to this machine");
+      return;
+    }
+    if (!this.driveTargets.some((n) => sameMachine(n.id, targetNodeId))) {
+      this.toast("warn", "That machine can't receive a mapped drive");
+      return;
+    }
+    const sink = matchEndpoint(this.catalog, targetNodeId, "storage", "consume");
+    if (!sink || sink.origin !== "storage-in") {
+      this.toast("warn", "Update that machine before mapping a drive to it");
+      return;
+    }
+    const leg = this.ownedConnect(capabilityId, sink.id);
+    if (!leg) this.toast("warn", "The drive mapping couldn't be started");
+  }
+
+  openMappedDrive(routeId: string) {
+    const mapping = this.driveMappings.find((m) => m.route.id === routeId && m.direction === "in");
+    if (!mapping) return;
+    this.settingsOpen = false;
+    this.mappedFiles = { host: mapping.host, route: mapping.route.id, label: mapping.drive };
+  }
+
+  unmapDrive(routeId: string) {
+    if (this.mappedFiles?.route === routeId) this.mappedFiles = null;
+    void this.disconnect(routeId);
   }
 
   /** Open one files *session* to `hostNodeId`: a generic route from the

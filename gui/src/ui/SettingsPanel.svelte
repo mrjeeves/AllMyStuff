@@ -11,6 +11,7 @@
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
   import DevicesSection from "./settings/DevicesSection.svelte";
+  import DrivesSection from "./settings/DrivesSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
   import CecSection from "./settings/CecSection.svelte";
 
@@ -22,6 +23,7 @@
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
+    { id: "drives", label: "Drives", icon: "▣" },
     { id: "devices", label: "Devices", icon: "🖥" },
     // The secret CEC Support tab — only present once this install is in the
     // technician context (unlocked, or the node reports a CEC role). Placed
@@ -82,6 +84,8 @@
         <FleetSection />
       {:else if app.settingsTab === "sharing"}
         <SharingSection />
+      {:else if app.settingsTab === "drives"}
+        <DrivesSection />
       {:else if app.settingsTab === "devices"}
         <DevicesSection />
       {:else if app.settingsTab === "cec"}

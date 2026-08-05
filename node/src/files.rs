@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -49,6 +49,10 @@ pub struct FilesPlane {
     /// in-flight ops — `stop` flips it so a teardown ends a download
     /// mid-stream instead of pumping bytes at a gone peer.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Active Storage routes are explicit volume mappings. Their route id is
+    /// bound to the host's real mount root when the route activates; requests
+    /// never trust a peer-supplied filesystem path as that root.
+    roots: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl Default for FilesPlane {
@@ -62,6 +66,7 @@ impl FilesPlane {
         FilesPlane {
             queues: ByteQueues::new(MAX_QUEUED_BYTES),
             cancels: Mutex::new(HashMap::new()),
+            roots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -77,13 +82,26 @@ impl FilesPlane {
         route_id: &str,
         event: FileEvent,
     ) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        self.handle_in_root(route_id, event, None)
+    }
+
+    /// Execute a request inside one explicitly mapped volume. `root = None`
+    /// keeps the owner/fleet whole-machine Files behaviour; a mapped drive
+    /// always supplies a root and all viewer paths are treated as virtual
+    /// paths below it. Symlinks and `..` cannot escape the volume.
+    pub fn handle_in_root(
+        &self,
+        route_id: &str,
+        event: FileEvent,
+        root: Option<PathBuf>,
+    ) -> tokio::sync::mpsc::Receiver<FileEvent> {
         let (tx, rx) = tokio::sync::mpsc::channel::<FileEvent>(OP_QUEUE);
         let cancel = self.cancel_flag(route_id);
         let rid = route_id.to_string();
         let _ = std::thread::Builder::new()
             .name(format!("amst-files-op {rid}"))
             .spawn(move || {
-                if let Some(reply) = run_op(event, &tx, &cancel) {
+                if let Some(reply) = run_op(event, &tx, &cancel, root.as_deref()) {
                     let _ = tx.blocking_send(reply);
                 }
             });
@@ -106,6 +124,15 @@ impl FilesPlane {
             flag.store(true, Ordering::Relaxed);
         }
         self.queues.remove(route_id);
+        self.roots.lock().remove(route_id);
+    }
+
+    pub fn map_root(&self, route_id: &str, root: PathBuf) {
+        self.roots.lock().insert(route_id.to_string(), root);
+    }
+
+    pub fn mapped_root(&self, route_id: &str) -> Option<PathBuf> {
+        self.roots.lock().get(route_id).cloned()
     }
 
     // ---- viewer side ----------------------------------------------------
@@ -144,36 +171,59 @@ fn run_op(
     event: FileEvent,
     tx: &tokio::sync::mpsc::Sender<FileEvent>,
     cancel: &AtomicBool,
+    root: Option<&Path>,
 ) -> Option<FileEvent> {
     match event {
-        FileEvent::List { req, path } => Some(match list_dir(&path) {
+        FileEvent::List { req, path } => Some(match list_dir(&path, root) {
             Ok((path, entries)) => FileEvent::Entries {
                 req,
                 path,
-                home: home_dir_string(),
+                home: if root.is_some() {
+                    "/".into()
+                } else {
+                    home_dir_string()
+                },
                 entries,
             },
             Err(reason) => FileEvent::Err { req, reason },
         }),
-        FileEvent::Read { req, path } => match stream_read(req, &path, tx, cancel) {
+        FileEvent::Read { req, path } => match stream_read(req, &path, tx, cancel, root) {
             Ok(()) => None, // the chunk stream (ending in eof) is the reply
             Err(reason) => Some(FileEvent::Err { req, reason }),
         },
         FileEvent::Mkdir { req, path } => Some(reply(
             req,
-            std::fs::create_dir_all(resolve(&path)).map_err(|e| e.to_string()),
+            (|| {
+                let p = resolve_for(&path, root)?;
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())
+            })(),
         )),
         FileEvent::Rename { req, from, to } => {
-            let dst = resolve(&to);
-            let r = if dst.exists() {
-                Err("something already has that name".to_string())
-            } else {
-                std::fs::rename(resolve(&from), dst).map_err(|e| e.to_string())
-            };
+            let r = (|| {
+                if root.is_some() && (scoped_is_root(&from) || scoped_is_root(&to)) {
+                    return Err("the mapped drive root can't be renamed".to_string());
+                }
+                let src = resolve_for(&from, root)?;
+                let dst = resolve_for(&to, root)?;
+                if dst.exists() {
+                    Err("something already has that name".to_string())
+                } else {
+                    std::fs::rename(src, dst).map_err(|e| e.to_string())
+                }
+            })();
             Some(reply(req, r))
         }
         FileEvent::Delete { req, path } => {
-            let p = resolve(&path);
+            if root.is_some() && scoped_is_root(&path) {
+                return Some(FileEvent::Err {
+                    req,
+                    reason: "the mapped drive root can't be deleted".into(),
+                });
+            }
+            let p = match resolve_for(&path, root) {
+                Ok(p) => p,
+                Err(reason) => return Some(FileEvent::Err { req, reason }),
+            };
             // Never follow a symlink into deleting what it points at —
             // remove the link itself.
             let r = match std::fs::symlink_metadata(&p) {
@@ -207,6 +257,11 @@ fn reply(req: u64, r: Result<(), String>) -> FileEvent {
 /// Returns the reply to send, if any (`Ok` only once the `eof` piece is
 /// on disk; errors always answer).
 pub fn write_piece(event: &FileEvent) -> Option<FileEvent> {
+    write_piece_in_root(event, None)
+}
+
+/// The scoped twin of [`write_piece`] used by an explicit drive mapping.
+pub fn write_piece_in_root(event: &FileEvent, root: Option<&Path>) -> Option<FileEvent> {
     let FileEvent::Write {
         req,
         path,
@@ -217,7 +272,10 @@ pub fn write_piece(event: &FileEvent) -> Option<FileEvent> {
     else {
         return None;
     };
-    let p = resolve(path);
+    let p = match resolve_for(path, root) {
+        Ok(p) => p,
+        Err(reason) => return Some(FileEvent::Err { req: *req, reason }),
+    };
     let r = (|| -> std::io::Result<()> {
         let mut f = if *append {
             std::fs::OpenOptions::new().append(true).open(&p)?
@@ -255,6 +313,85 @@ fn resolve(path: &str) -> PathBuf {
     }
 }
 
+fn resolve_for(path: &str, root: Option<&Path>) -> Result<PathBuf, String> {
+    match root {
+        None => Ok(resolve(path)),
+        Some(root) => resolve_scoped(root, path),
+    }
+}
+
+/// Resolve a viewer's virtual path below `root`. Mapped-drive paths always use
+/// `/` in the UI regardless of the host OS. Parent traversal is rejected, and
+/// the nearest existing ancestor is canonicalized so a symlink cannot turn a
+/// harmless-looking child into an escape from the mapped volume.
+fn resolve_scoped(root: &Path, logical: &str) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("mapped drive is unavailable: {e}"))?;
+    let mut out = root.clone();
+    let clean = logical
+        .strip_prefix('~')
+        .unwrap_or(logical)
+        .trim_start_matches(['/', '\\']);
+    for part in Path::new(clean).components() {
+        match part {
+            Component::Normal(name) => out.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("that path leaves the mapped drive".into());
+            }
+        }
+    }
+
+    let mut ancestor = out.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| "that path leaves the mapped drive".to_string())?;
+    }
+    let real = ancestor
+        .canonicalize()
+        .map_err(|e| format!("couldn't resolve that path: {e}"))?;
+    if !real.starts_with(&root) {
+        return Err("that path leaves the mapped drive".into());
+    }
+    if out.exists() {
+        let real_out = out
+            .canonicalize()
+            .map_err(|e| format!("couldn't resolve that path: {e}"))?;
+        if !real_out.starts_with(&root) {
+            return Err("that path leaves the mapped drive".into());
+        }
+    }
+    Ok(out)
+}
+
+fn scoped_display_path(path: &str) -> Result<String, String> {
+    let mut names = Vec::new();
+    let clean = path
+        .strip_prefix('~')
+        .unwrap_or(path)
+        .trim_start_matches(['/', '\\']);
+    for part in Path::new(clean).components() {
+        match part {
+            Component::Normal(name) => names.push(name.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("that path leaves the mapped drive".into());
+            }
+        }
+    }
+    Ok(if names.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", names.join("/"))
+    })
+}
+
+fn scoped_is_root(path: &str) -> bool {
+    matches!(path.trim(), "" | "/" | "\\" | "~" | "~/" | "~\\")
+}
+
 fn home_dir_string() -> String {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -262,8 +399,8 @@ fn home_dir_string() -> String {
         .into_owned()
 }
 
-fn list_dir(path: &str) -> Result<(String, Vec<FileEntry>), String> {
-    let dir = resolve(path);
+fn list_dir(path: &str, root: Option<&Path>) -> Result<(String, Vec<FileEntry>), String> {
+    let dir = resolve_for(path, root)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let Ok(entry) = entry else { continue };
@@ -294,7 +431,11 @@ fn list_dir(path: &str) -> Result<(String, Vec<FileEntry>), String> {
             symlink,
         });
     }
-    Ok((dir.to_string_lossy().into_owned(), entries))
+    let shown = match root {
+        Some(_) => scoped_display_path(path)?,
+        None => dir.to_string_lossy().into_owned(),
+    };
+    Ok((shown, entries))
 }
 
 /// Stream one file as `Chunk` events (the last marked `eof`), checking
@@ -305,8 +446,9 @@ fn stream_read(
     path: &str,
     tx: &tokio::sync::mpsc::Sender<FileEvent>,
     cancel: &AtomicBool,
+    root: Option<&Path>,
 ) -> Result<(), String> {
-    let p = resolve(path);
+    let p = resolve_for(path, root)?;
     let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         return Err("that's a folder".into());
@@ -619,5 +761,77 @@ mod tests {
         assert_eq!(resolve("plain"), home.join("plain"));
         let abs = if cfg!(windows) { "C:\\x" } else { "/x" };
         assert_eq!(resolve(abs), Path::new(abs));
+    }
+
+    #[test]
+    fn mapped_drive_is_rooted_and_uses_virtual_paths() {
+        let root = tempdir("mapped");
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/note.txt"), b"mapped").unwrap();
+        let plane = FilesPlane::new();
+
+        let events = drain(plane.handle_in_root(
+            "mapped-1",
+            FileEvent::List {
+                req: 1,
+                path: "~".into(),
+            },
+            Some(root.clone()),
+        ));
+        assert!(matches!(
+            events.as_slice(),
+            [FileEvent::Entries { path, home, entries, .. }]
+                if path == "/" && home == "/" && entries.iter().any(|e| e.name == "docs")
+        ));
+
+        let events = drain(plane.handle_in_root(
+            "mapped-1",
+            FileEvent::Read {
+                req: 2,
+                path: "/docs/note.txt".into(),
+            },
+            Some(root.clone()),
+        ));
+        assert!(
+            matches!(events.as_slice(), [FileEvent::Chunk { data, eof: true, .. }] if data == b"mapped")
+        );
+
+        let events = drain(plane.handle_in_root(
+            "mapped-1",
+            FileEvent::Delete {
+                req: 3,
+                path: "/".into(),
+            },
+            Some(root.clone()),
+        ));
+        assert!(matches!(
+            events.as_slice(),
+            [FileEvent::Err { req: 3, reason }] if reason.contains("root can't be deleted")
+        ));
+        assert!(
+            root.exists(),
+            "a mapped root must never delete the drive itself"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mapped_drive_rejects_parent_escape() {
+        let root = tempdir("mapped-escape");
+        let plane = FilesPlane::new();
+        let events = drain(plane.handle_in_root(
+            "mapped-2",
+            FileEvent::List {
+                req: 9,
+                path: "/../".into(),
+            },
+            Some(root.clone()),
+        ));
+        assert!(matches!(
+            events.as_slice(),
+            [FileEvent::Err { req: 9, reason }] if reason.contains("leaves the mapped drive")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

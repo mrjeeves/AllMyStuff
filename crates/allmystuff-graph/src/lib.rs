@@ -504,6 +504,32 @@ mod tests {
             .match_endpoint(&"box".into(), MediaKind::Audio, GrantRole::Consume)
             .expect("box can sink audio");
         assert_eq!(picked.id, "box:spkZ".into());
+
+        // Storage auto-routing must land on the app's dedicated mapped-drive
+        // sink, not loop back into an attached physical disk (even a default).
+        cat.capabilities.push(
+            Capability::new(
+                "box",
+                "box:disk:C:\\",
+                "System drive",
+                MediaKind::Storage,
+                Flow::Duplex,
+                "disk",
+            )
+            .as_default(true),
+        );
+        cat.capabilities.push(Capability::new(
+            "box",
+            "box:storage-in",
+            "Mapped drives",
+            MediaKind::Storage,
+            Flow::Sink,
+            "storage-in",
+        ));
+        let picked = cat
+            .match_endpoint(&"box".into(), MediaKind::Storage, GrantRole::Consume)
+            .expect("box can receive a mapped drive");
+        assert_eq!(picked.id, "box:storage-in".into());
     }
 
     // ---- serde --------------------------------------------------------

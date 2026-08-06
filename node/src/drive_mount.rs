@@ -116,7 +116,7 @@ impl DriveMounts {
             server_task.abort();
             return Err(error);
         }
-        if let Err(error) = label_native(&mount, &label, &route).await {
+        if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
         }
         let info = NativeDriveInfo {
@@ -148,7 +148,8 @@ impl DriveMounts {
                     active.info.route
                 );
             }
-            if let Err(error) = clear_native_label(&active.info.mount).await {
+            if let Err(error) = clear_native_label(&active.info.mount, Some(active.info.port)).await
+            {
                 tracing::warn!(
                     "couldn't clear native drive label for {}: {error}",
                     active.info.mount
@@ -308,11 +309,19 @@ async fn unmount_native(_mount: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-async fn label_native(mount: &str, label: &str, route: &str) -> Result<(), String> {
+async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
     let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
-    let key = format!(
+    let drive_icon_key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+    );
+    // Explorer does not use DriveIcons for a WebDAV network drive. It keys
+    // that mount by its UNC transport path and reads `_LabelFromReg` from
+    // MountPoints2. Keep DriveIcons too (it covers older shells), but this is
+    // the value that changes "DavWWWRoot (\\localhost@12345)" into the name
+    // the user chose in AllMyStuff.
+    let mount_point_key = format!(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
     );
     let marked = tokio::process::Command::new("reg.exe")
         .args(["add", &marker, "/ve", "/t", "REG_SZ", "/d", route, "/f"])
@@ -322,35 +331,96 @@ async fn label_native(mount: &str, label: &str, route: &str) -> Result<(), Strin
     if !marked.status.success() {
         return Err(String::from_utf8_lossy(&marked.stderr).trim().to_string());
     }
+    let port_string = port.to_string();
+    let port_marked = tokio::process::Command::new("reg.exe")
+        .args([
+            "add",
+            &marker,
+            "/v",
+            "Port",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            &port_string,
+            "/f",
+        ])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't record the AllMyStuff drive port: {error}"))?;
+    if !port_marked.status.success() {
+        return Err(String::from_utf8_lossy(&port_marked.stderr)
+            .trim()
+            .to_string());
+    }
     let output = tokio::process::Command::new("reg.exe")
-        .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
+        .args([
+            "add",
+            &drive_icon_key,
+            "/ve",
+            "/t",
+            "REG_SZ",
+            "/d",
+            label,
+            "/f",
+        ])
         .output()
         .await
         .map_err(|error| format!("couldn't launch the Explorer label update: {error}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
+    let mount_label = tokio::process::Command::new("reg.exe")
+        .args([
+            "add",
+            &mount_point_key,
+            "/v",
+            "_LabelFromReg",
+            "/t",
+            "REG_SZ",
+            "/d",
+            label,
+            "/f",
+        ])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't set the Explorer network-drive label: {error}"))?;
+    if !mount_label.status.success() {
+        return Err(String::from_utf8_lossy(&mount_label.stderr)
+            .trim()
+            .to_string());
+    }
     refresh_explorer_drive_labels().await;
     Ok(())
 }
 
 #[cfg(not(windows))]
-async fn label_native(_mount: &str, _label: &str, _route: &str) -> Result<(), String> {
+async fn label_native(_mount: &str, _label: &str, _route: &str, _port: u16) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(windows)]
-async fn clear_native_label(mount: &str) -> Result<(), String> {
+async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
     let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
-    let key = format!(
+    let drive_icon_key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
     // A missing key is already the desired state, so deletion is best-effort.
     let _ = tokio::process::Command::new("reg.exe")
-        .args(["delete", &key, "/f"])
+        .args(["delete", &drive_icon_key, "/f"])
         .output()
         .await;
+    if let Some(port) = port {
+        let mount_point_key = format!(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+        );
+        // Leave Explorer's mount-history key intact; it owns that history.
+        // Remove only the display value AllMyStuff authored.
+        let _ = tokio::process::Command::new("reg.exe")
+            .args(["delete", &mount_point_key, "/v", "_LabelFromReg", "/f"])
+            .output()
+            .await;
+    }
     let _ = tokio::process::Command::new("reg.exe")
         .args(["delete", &marker, "/f"])
         .output()
@@ -360,7 +430,7 @@ async fn clear_native_label(mount: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-async fn clear_native_label(_mount: &str) -> Result<(), String> {
+async fn clear_native_label(_mount: &str, _port: Option<u16>) -> Result<(), String> {
     Ok(())
 }
 
@@ -395,10 +465,26 @@ async fn cleanup_stale_native_mounts() {
         .collect::<Vec<_>>();
     for letter in letters {
         let mount = format!("{letter}:");
+        let marker = format!(r"{base}\{letter}");
+        let port = tokio::process::Command::new("reg.exe")
+            .args(["query", &marker, "/v", "Port"])
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| parse_registry_dword(&output.stdout));
         tracing::info!("cleaning stale AllMyStuff drive mapping {mount}");
         let _ = unmount_native(&mount).await;
-        let _ = clear_native_label(&mount).await;
+        let _ = clear_native_label(&mount, port.and_then(|p| u16::try_from(p).ok())).await;
     }
+}
+
+#[cfg(windows)]
+fn parse_registry_dword(bytes: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("0x"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
 }
 
 #[cfg(not(windows))]
@@ -706,5 +792,16 @@ fn map_remote_error(reason: &str) -> FsError {
         FsError::Forbidden
     } else {
         FsError::GeneralFailure
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::parse_registry_dword;
+
+    #[test]
+    fn parses_allmystuff_drive_marker_port() {
+        let output = b"    Port    REG_DWORD    0xf05d\r\n";
+        assert_eq!(parse_registry_dword(output), Some(61_533));
     }
 }

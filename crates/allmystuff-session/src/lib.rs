@@ -216,7 +216,9 @@ impl Session {
 
     /// Drop a peer that left, tearing down any routes with it.
     pub fn drop_peer(&mut self, id: &NodeId) -> Vec<Effect> {
-        self.peers.remove(id);
+        let canonical = canonical_node(id.as_str());
+        self.peers
+            .retain(|node, _| canonical_node(node.as_str()) != canonical);
         self.reap_peer_routes(id)
     }
 
@@ -231,7 +233,9 @@ impl Session {
         let ids: Vec<String> = self
             .routes
             .iter()
-            .filter(|(_, r)| &r.peer == id && r.is_active())
+            .filter(|(_, r)| {
+                canonical_node(r.peer.as_str()) == canonical_node(id.as_str()) && r.is_active()
+            })
             .map(|(rid, _)| rid.clone())
             .collect();
         for rid in ids {
@@ -615,6 +619,19 @@ impl Session {
     }
 }
 
+/// Session profiles carry display ids (`pubkey-ABCDE`) while a route peer is
+/// often the daemon's bare pubkey. Treat both spellings as the same node when
+/// reaping a restarted peer; exact string equality left mapped drives and
+/// streams attached to the dead incarnation.
+fn canonical_node(device_id: &str) -> &str {
+    if let Some((head, tail)) = device_id.rsplit_once('-') {
+        if tail.len() == 5 && tail.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return head;
+        }
+    }
+    device_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,6 +980,24 @@ mod tests {
         assert_eq!(s.peer(&"this".into()).is_some(), had_peer);
         // A second reap finds nothing active — it never double-stops.
         assert!(s.reap_peer_routes(&"this".into()).is_empty());
+    }
+
+    #[test]
+    fn restarted_display_id_reaps_routes_recorded_against_the_bare_pubkey() {
+        let mut s = Session::new("desk");
+        s.handle(
+            "peerpubkey".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                drive: None,
+                session: None,
+            }),
+        );
+        let effects = s.reap_peer_routes(&"peerpubkey-A1B2C".into());
+        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
     }
 
     #[test]

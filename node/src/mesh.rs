@@ -121,7 +121,14 @@ pub struct Mesh {
     drive_mounts: DriveMounts,
     /// Explicit inbound pull requests. A drive pushed at us is fleet-only;
     /// this token is what lets a Files share/support source answer a pull.
-    drive_pull_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    drive_pull_tokens: Mutex<HashMap<String, DrivePullRequest>>,
+    /// Successful receiver-initiated mappings, keyed by their current route.
+    /// The route is one connection incarnation; this is the user's intent and
+    /// survives a source laptop's sleep/restart for the life of this app.
+    drive_reconnects: Mutex<HashMap<String, DriveReconnect>>,
+    /// Old route ids currently being rebuilt, so repeated presence adverts do
+    /// not launch duplicate offers for the same native drive.
+    drive_reconnect_inflight: Mutex<std::collections::HashSet<String>>,
     /// Remote KVM-media operations awaiting source acknowledgement and final
     /// completion. Kept viewer-side so a peer cannot spoof a result without
     /// both the unguessable request id and the expected source identity.
@@ -403,6 +410,27 @@ struct KvmMediaRequest {
     label: String,
     made: Instant,
     acknowledged: Option<oneshot::Sender<()>>,
+}
+
+/// A receiver-initiated native-drive pull. The request token is also the
+/// authorization proof for the source's inbound offer; retaining the user's
+/// selections lets the receiver rebuild the mapping when that source reports
+/// a fresh incarnation after sleep or an app restart.
+#[derive(Clone)]
+struct DrivePullRequest {
+    source: String,
+    root: String,
+    label: String,
+    mount: String,
+    made: Instant,
+}
+
+#[derive(Clone)]
+struct DriveReconnect {
+    source: String,
+    root: String,
+    label: String,
+    mount: String,
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -1040,6 +1068,8 @@ impl Mesh {
             files: FilesPlane::new(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
+            drive_reconnects: Mutex::new(HashMap::new()),
+            drive_reconnect_inflight: Mutex::new(std::collections::HashSet::new()),
             kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
@@ -2706,6 +2736,23 @@ impl Mesh {
         network: String,
         payload: Value,
     ) {
+        // Reject CEC strangers before recording *any* app-layer state about
+        // them. The standing support room is world-joinable; during migration
+        // an old Open roster can briefly establish a data channel before the
+        // room is healed back to Silent. Recording that contact first left a
+        // CEC-only network provenance behind even though the presence itself
+        // was rejected, which in turn kept the technician machine eligible for
+        // the AllMyStuff graph until the next full node restart.
+        if channel == CHANNEL_PRESENCE
+            && crate::cec::is_cec_network(&network)
+            && !self.cec.relationship_with(&from)
+        {
+            tracing::debug!(
+                "ignoring presence on {network} from {} — no CEC relationship",
+                short_id(&from)
+            );
+            return;
+        }
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
         // several networks we're on).
@@ -2727,13 +2774,6 @@ impl Mesh {
                 // — and, worse, the first-contact answer below would send our
                 // profile AND roster straight back to it. Drop before any
                 // state is touched.
-                if crate::cec::is_cec_network(&network) && !self.cec.relationship_with(&from) {
-                    tracing::debug!(
-                        "ignoring presence on {network} from {} — no CEC relationship",
-                        short_id(&from)
-                    );
-                    return;
-                }
                 // Never silently discard a node-information update on a parse
                 // slip: a peer's presence is how we learn its name, owner,
                 // sites, version and fleet, so a dropped advert is a node that
@@ -2828,6 +2868,13 @@ impl Mesh {
                             .map(|s| s.apply_presence(profile))
                             .unwrap_or(false)
                     };
+                    // A mapped drive is user intent, not an ICE-session lease.
+                    // If the source laptop woke into a fresh incarnation, the
+                    // route reap above made its old drive route terminal; this
+                    // re-requests it using the same path/name/letter. Calling
+                    // on every advert is safe: active routes and in-flight
+                    // reconnects are both filtered inside.
+                    self.reconnect_drive_pulls(node_id.as_str());
                     // Self-heal the fleet: if a device we still list as a fleet
                     // member now advertises a *positively different* owner, it
                     // has been re-claimed — evict it so the roster reflects
@@ -2982,25 +3029,33 @@ impl Mesh {
                         // Authorized for this exact plane: owner/fleet, or a
                         // share grant the owner extended for it. Non-privileged
                         // routes (`None` plane) are never refused here.
-                        let explicit_drive_pull = if is_mapped_drive_route(route) {
+                        let accepted_drive_pull = if is_mapped_drive_route(route) {
                             drive
                                 .as_ref()
                                 .and_then(|offer| offer.request.as_ref())
-                                .is_some_and(|request| {
+                                .and_then(|request| {
                                     let mut pulls = self.drive_pull_tokens.lock();
-                                    let matches =
-                                        pulls.get(request).is_some_and(|(source, made)| {
-                                            same_node(source, &from)
-                                                && made.elapsed() < Duration::from_secs(120)
-                                        });
-                                    if matches {
-                                        pulls.remove(request);
-                                    }
-                                    matches
+                                    let matches = pulls.get(request).is_some_and(|pull| {
+                                        same_node(&pull.source, &from)
+                                            && pull.made.elapsed() < Duration::from_secs(120)
+                                    });
+                                    matches.then(|| pulls.remove(request)).flatten()
                                 })
                         } else {
-                            false
+                            None
                         };
+                        let explicit_drive_pull = accepted_drive_pull.is_some();
+                        if let Some(pull) = accepted_drive_pull {
+                            self.drive_reconnects.lock().insert(
+                                route.id.clone(),
+                                DriveReconnect {
+                                    source: pull.source,
+                                    root: pull.root,
+                                    label: pull.label,
+                                    mount: pull.mount,
+                                },
+                            );
+                        }
                         // Drive pushes TO this machine are fleet-only. A
                         // receiver-minted pull token is the explicit exception:
                         // it lets this user pull FROM a Files share/support
@@ -3231,6 +3286,14 @@ impl Mesh {
                                     disposition = "commit",
                                     "inbound route teardown"
                                 );
+                                if matches!(media, Some(MediaKind::Storage)) {
+                                    // A teardown deliberately sent by the
+                                    // source is a real unmap. Peer-restart
+                                    // reaps never arrive through this arm, so
+                                    // those retain their reconnect intent.
+                                    self.drive_reconnects.lock().remove(route_id);
+                                    self.drive_reconnect_inflight.lock().remove(route_id);
+                                }
                                 self.process_effects(effects).await;
                                 self.emit_snapshot();
                                 return;
@@ -4376,10 +4439,17 @@ impl Mesh {
             .collect::<String>();
         self.drive_pull_tokens
             .lock()
-            .retain(|_, (_, made)| made.elapsed() < Duration::from_secs(120));
-        self.drive_pull_tokens
-            .lock()
-            .insert(request.clone(), (source.clone(), Instant::now()));
+            .retain(|_, pull| pull.made.elapsed() < Duration::from_secs(120));
+        self.drive_pull_tokens.lock().insert(
+            request.clone(),
+            DrivePullRequest {
+                source: source.clone(),
+                root: root.clone(),
+                label: label.clone(),
+                mount: mount.clone(),
+                made: Instant::now(),
+            },
+        );
         if let Err(error) = self
             .send_control(
                 &source,
@@ -4404,6 +4474,86 @@ impl Mesh {
         }
         self.drive_pull_tokens.lock().remove(&request);
         Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
+    }
+
+    /// Rebuild receiver-initiated drive routes whose source has returned with
+    /// a fresh app/session incarnation. The Windows drive letter is briefly
+    /// unavailable while the old route is reaped, then is claimed again with
+    /// the same label and mount instead of disappearing permanently.
+    fn reconnect_drive_pulls(self: &Arc<Self>, peer: &str) {
+        let canonical = pubkey_part(peer);
+        let intents: Vec<(String, DriveReconnect)> = self
+            .drive_reconnects
+            .lock()
+            .iter()
+            .filter(|(_, intent)| same_node(&intent.source, canonical))
+            .map(|(route, intent)| (route.clone(), intent.clone()))
+            .collect();
+        if intents.is_empty() {
+            return;
+        }
+        let active: std::collections::HashSet<String> = {
+            let st = self.state.lock();
+            intents
+                .iter()
+                .filter(|(route, _)| {
+                    st.session
+                        .as_ref()
+                        .and_then(|session| session.route(route))
+                        .is_some_and(|route| route.is_active())
+                })
+                .map(|(route, _)| route.clone())
+                .collect()
+        };
+        for (old_route, intent) in intents {
+            if active.contains(&old_route)
+                || !self
+                    .drive_reconnect_inflight
+                    .lock()
+                    .insert(old_route.clone())
+            {
+                continue;
+            }
+            let mesh = self.clone();
+            crate::spawn(async move {
+                // StopMedia unmaps asynchronously. Let Windows release the old
+                // WebDAV letter before offering its replacement.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let mut last_error = None;
+                for retry_delay in [0u64, 3_000, 8_000] {
+                    if retry_delay != 0 {
+                        tokio::time::sleep(Duration::from_millis(retry_delay)).await;
+                    }
+                    match mesh
+                        .drive_map_from(
+                            intent.source.clone(),
+                            intent.root.clone(),
+                            intent.label.clone(),
+                            intent.mount.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            mesh.drive_reconnects.lock().remove(&old_route);
+                            last_error = None;
+                            tracing::info!(
+                                "native drive from {} reconnected after the source returned",
+                                short_id(&intent.source)
+                            );
+                            break;
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                mesh.drive_reconnect_inflight.lock().remove(&old_route);
+                if let Some(error) = last_error {
+                    tracing::warn!(
+                        "native drive from {} is still unavailable after reconnect attempts: {error}",
+                        short_id(&intent.source)
+                    );
+                }
+            });
+        }
     }
 
     /// [`connect`](Self::connect) with an optional terminal **session** to
@@ -4637,6 +4787,11 @@ impl Mesh {
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        // An explicit disconnect means "forget this mapping", not merely
+        // "this connection incarnation ended". Automatic peer-restart reaps
+        // bypass this command and intentionally retain the reconnect intent.
+        self.drive_reconnects.lock().remove(&route_id);
+        self.drive_reconnect_inflight.lock().remove(&route_id);
         if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
             // Do not infer intent from watcher *presence*: unwatch is a
             // separate fire-and-forget command and can lag. A window that polls
@@ -4960,15 +5115,81 @@ impl Mesh {
             "CEC Support: dropping {} open-era stranger(s) from the area roster",
             strangers.len()
         );
-        for device_id in strangers {
+        for device_id in &strangers {
             let _ = self
                 .client
                 .request(&Request::RosterRemove {
                     network: area.clone(),
-                    device_id,
+                    device_id: device_id.clone(),
                 })
                 .await;
         }
+        // RosterRemove fixes the daemon, but it cannot retract a profile the
+        // app session already accepted during the Open→Silent startup window.
+        // Purge that residue too. Keep peers with durable non-CEC standing
+        // (fleet ownership or an explicit share), and keep a peer whose
+        // recorded provenance is another network; those are real AllMyStuff
+        // nodes that merely happen to be co-resident in Support as well.
+        let protected: std::collections::HashSet<String> = strangers
+            .iter()
+            .filter(|peer| self.peer_has_durable_non_cec_standing(peer))
+            .cloned()
+            .collect();
+        let (effects, dropped) = {
+            let mut st = self.state.lock();
+            let purgeable: std::collections::HashSet<String> = strangers
+                .into_iter()
+                .filter(|peer| !protected.contains(peer))
+                .filter(|peer| {
+                    st.peer_networks
+                        .get(peer)
+                        .is_none_or(|network| crate::cec::is_cec_network(network))
+                })
+                .collect();
+            for peer in &purgeable {
+                st.peer_networks.remove(peer);
+                st.peer_features.remove(peer);
+                st.peer_links.remove(peer);
+                st.peer_boots.remove(peer);
+            }
+            let mut effects = Vec::new();
+            let mut dropped = 0usize;
+            if let Some(session) = st.session.as_mut() {
+                let gone: Vec<NodeId> = session
+                    .peers()
+                    .filter(|profile| purgeable.contains(pubkey_part(profile.node.as_str())))
+                    .map(|profile| profile.node.clone())
+                    .collect();
+                for peer in gone {
+                    effects.extend(session.drop_peer(&peer));
+                    dropped += 1;
+                }
+            }
+            (effects, dropped)
+        };
+        if dropped > 0 {
+            tracing::info!(
+                "CEC Support: cleared {dropped} CEC-only stranger profile(s) from the AllMyStuff session"
+            );
+            self.process_effects(effects).await;
+            self.emit_snapshot();
+        }
+    }
+
+    /// Whether a peer has a reason to stay in the AllMyStuff catalog even if
+    /// an obsolete CEC area roster also names it. These stores are durable and
+    /// authoritative; unlike the support roster, they express deliberate
+    /// user relationships.
+    fn peer_has_durable_non_cec_standing(&self, peer: &str) -> bool {
+        let canonical = pubkey_part(peer);
+        self.ownership
+            .owner()
+            .is_some_and(|owner| pubkey_part(&owner) == canonical)
+            || self
+                .ownership
+                .any_fleet_member(|member| pubkey_part(member) == canonical)
+            || self.fleet_authorized.lock().contains(canonical)
+            || self.shares.person_for_node(canonical).is_some()
     }
 
     /// Leave the asking room if this node has no live reason to be in it —
@@ -9511,6 +9732,14 @@ impl Mesh {
                             .await
                         {
                             Ok(info) => {
+                                if let Some(intent) =
+                                    mesh.drive_reconnects.lock().get_mut(&route_id)
+                                {
+                                    // Empty means "pick one" only on the first
+                                    // mount. A reconnect must reclaim the same
+                                    // letter/mount point the user already sees.
+                                    intent.mount = info.mount.clone();
+                                }
                                 tracing::info!(
                                     "route {} active — native drive {} mounted from {}",
                                     route_id,

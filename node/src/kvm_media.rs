@@ -7,6 +7,7 @@
 //! storage gadget, and re-enumerates USB at the attached computer.
 
 use reqwest::multipart::{Form, Part};
+#[cfg(target_os = "windows")]
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};

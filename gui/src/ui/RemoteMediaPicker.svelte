@@ -81,7 +81,11 @@
     void watchFiles(routeId, receive).then((stop) => {
       stopWatch = stop;
       volumesReq = nextReq++;
-      void fileSend(routeId!, { kind: "volumes", req: volumesReq });
+      void fileSend(routeId!, { kind: "volumes", req: volumesReq }).catch(() => {
+        // Older peers may not support removable-volume inventory yet. File
+        // browsing still works, so keep the picker usable for ISO/IMG media.
+        volumes = [];
+      });
       list("~");
     });
   });

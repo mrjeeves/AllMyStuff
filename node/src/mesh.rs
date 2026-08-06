@@ -10644,7 +10644,19 @@ impl Mesh {
                         self.send_file_event(frame.route.clone(), from.to_string(), reply);
                     }
                 }
-                FileEvent::List { .. }
+                FileEvent::Volumes { req } if mapped => {
+                    self.send_file_event(
+                        frame.route.clone(),
+                        from.to_string(),
+                        FileEvent::Err {
+                            req: *req,
+                            reason: "volume inventory is unavailable on a scoped drive route"
+                                .into(),
+                        },
+                    );
+                }
+                FileEvent::Volumes { .. }
+                | FileEvent::List { .. }
                 | FileEvent::Read { .. }
                 | FileEvent::Stat { .. }
                 | FileEvent::ReadRange { .. }
@@ -10746,18 +10758,9 @@ impl Mesh {
         // other request rides a `:files` route (the file manager). Pairing
         // the event to its route keeps a shared lane fetch-only.
         let want_shared = matches!(event, FileEvent::Fetch { .. });
-        match event {
-            FileEvent::List { .. }
-            | FileEvent::Read { .. }
-            | FileEvent::Stat { .. }
-            | FileEvent::ReadRange { .. }
-            | FileEvent::Fetch { .. }
-            | FileEvent::Write { .. }
-            | FileEvent::WriteRange { .. }
-            | FileEvent::Mkdir { .. }
-            | FileEvent::Rename { .. }
-            | FileEvent::Delete { .. } => {}
-            _ => return Err("responses come from the host, not the viewer".into()),
+        let want_volumes = matches!(event, FileEvent::Volumes { .. });
+        if !is_viewer_file_request(&event) {
+            return Err("responses come from the host, not the viewer".into());
         }
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let peer = {
@@ -10769,6 +10772,10 @@ impl Mesh {
                 .ok_or("unknown route")?;
             let kind_ok = if want_shared {
                 is_shared_route(&r.route)
+            } else if want_volumes {
+                // Volume inventory is machine-wide metadata. A mapped-drive
+                // route is deliberately scoped to one offered root.
+                is_files_route(&r.route)
             } else {
                 is_files_route(&r.route) || is_mapped_drive_route(&r.route)
             };
@@ -13703,6 +13710,23 @@ fn append_chunk(path: &Path, data: &[u8], first: bool) -> std::io::Result<()> {
     opts.open(path)?.write_all(data)
 }
 
+fn is_viewer_file_request(event: &FileEvent) -> bool {
+    matches!(
+        event,
+        FileEvent::Volumes { .. }
+            | FileEvent::List { .. }
+            | FileEvent::Read { .. }
+            | FileEvent::Stat { .. }
+            | FileEvent::ReadRange { .. }
+            | FileEvent::Fetch { .. }
+            | FileEvent::Write { .. }
+            | FileEvent::WriteRange { .. }
+            | FileEvent::Mkdir { .. }
+            | FileEvent::Rename { .. }
+            | FileEvent::Delete { .. }
+    )
+}
+
 fn parse_media(s: &str) -> MediaKind {
     match s {
         "audio" => MediaKind::Audio,
@@ -13784,6 +13808,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn volume_inventory_is_a_viewer_file_request() {
+        assert!(is_viewer_file_request(&FileEvent::Volumes { req: 7 }));
+        assert!(!is_viewer_file_request(&FileEvent::VolumeList {
+            req: 7,
+            volumes: Vec::new(),
+        }));
+    }
 
     #[test]
     fn video_route_generation_fences_same_id_successors() {

@@ -31,9 +31,14 @@
   const mobile = isMobile();
   import { displayName, humanBytes, type FileEntry, type FileEvent } from "../types";
 
-  let { host, windowed = false }: { host: string; windowed?: boolean } = $props();
+  let {
+    host,
+    windowed = false,
+    mappedRoute = null,
+    mappedLabel = "",
+  }: { host: string; windowed?: boolean; mappedRoute?: string | null; mappedLabel?: string } = $props();
 
-  const node = $derived(app.node(host));
+  const node = $derived(app.machineByAnyId(host));
 
   type Status = "connecting" | "live" | "rejected" | "ended" | "offline";
   let status = $state<Status>("connecting");
@@ -504,7 +509,9 @@
   async function endAll() {
     if (closing) return;
     closing = true;
-    const teardown = routeId ? app.filesDisconnect(routeId) : Promise.resolve();
+    // A normal Files window owns its temporary route. A mapped drive does not:
+    // closing the browser leaves the mapping alive until the user taps Unmap.
+    const teardown = routeId && !mappedRoute ? app.filesDisconnect(routeId) : Promise.resolve();
     if (windowed) {
       await Promise.race([teardown, new Promise((r) => setTimeout(r, 600))]);
       void closeThisWindow();
@@ -516,7 +523,7 @@
   }
 
   onMount(() => {
-    routeId = app.filesConnect(host);
+    routeId = mappedRoute ?? app.filesConnect(host);
     if (!routeId) {
       status = "offline";
       note = "Live file browsing needs the desktop app.";
@@ -573,7 +580,7 @@
         <div class="who">
           <span class="ico">🗂</span>
           <div class="meta">
-            <div class="name">{displayName(node)}</div>
+            <div class="name">{mappedLabel || displayName(node)}</div>
             <div class="sub">
               <span class="dot" class:on={node.online}></span>
               {node.online ? "online" : "offline"} · files

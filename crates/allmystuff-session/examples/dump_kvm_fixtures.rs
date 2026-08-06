@@ -94,6 +94,7 @@ fn main() {
             // full membership list — fleet mesh included.
             joining_mesh: "cec-kvm-ab3de-fg7hj".into(),
             meshes: vec!["amber-turing-x3k9q".into(), "den-site-mesh".into()],
+            virtual_media: None,
         }),
         // 0 = unstamped: keeps the pinned Go fixtures byte-identical (zero
         // serializes without the key). Real sends stamp it per send.
@@ -113,6 +114,7 @@ fn main() {
         web: "tcp:80".into(),
         joining_mesh: "cec-kvm-ab3de-fg7hj".into(),
         meshes: vec!["cec-kvm-ab3de-fg7hj".into()],
+        virtual_media: None,
     });
     fixtures.insert("node_profile_kvm_claimable", to_value(&claimable));
 
@@ -177,6 +179,7 @@ fn main() {
             video: Vec::new(),
             audio: Vec::new(),
             session: None,
+            drive: None,
         })),
     );
     fixtures.insert(

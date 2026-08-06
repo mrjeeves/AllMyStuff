@@ -852,6 +852,32 @@ pub async fn dispatch(
                     .await,
             )
         }
+        "drive_map" => {
+            let target: String = try_arg!(arg(a, "target"));
+            let root: String = try_arg!(arg(a, "root"));
+            let label: String = try_arg!(arg(a, "label"));
+            let mount: String = try_arg!(arg(a, "mount"));
+            json_result(mesh.drive_map(target, root, label, mount).await)
+        }
+        "drive_map_from" => {
+            let source: String = try_arg!(arg(a, "source"));
+            let root: String = try_arg!(arg(a, "root"));
+            let label: String = try_arg!(arg(a, "label"));
+            let mount: String = try_arg!(arg(a, "mount"));
+            json_result(mesh.drive_map_from(source, root, label, mount).await)
+        }
+        "native_drives" => DispatchOut::Json(json!(mesh.native_drives())),
+        "kvm_media_stage" => {
+            let source: String = try_arg!(arg(a, "source"));
+            let kvm: String = try_arg!(arg(a, "kvm"));
+            let path: String = try_arg!(arg(a, "path"));
+            let label: String = try_arg!(arg(a, "label"));
+            json_result(mesh.kvm_media_stage_from(source, kvm, path, label).await)
+        }
+        "kvm_media_unmount" => {
+            let kvm: String = try_arg!(arg(a, "kvm"));
+            json_result(mesh.kvm_media_unmount(kvm).await)
+        }
         "disconnect_route" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.disconnect(route_id).await)

@@ -72,6 +72,7 @@ pub fn offer_route(
         video,
         audio,
         session: None,
+        drive: None,
     }))
 }
 
@@ -158,6 +159,7 @@ pub fn offer_terminal(
         video: Vec::new(),
         audio: Vec::new(),
         session: attach,
+        drive: None,
     })
 }
 
@@ -171,6 +173,7 @@ pub fn offer_files(host: &NodeId, me: &NodeId, nonce: &str) -> ControlMessage {
         video: Vec::new(),
         audio: Vec::new(),
         session: None,
+        drive: None,
     })
 }
 

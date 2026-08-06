@@ -126,6 +126,17 @@ pub fn capabilities_with_screens(
         Flow::Sink,
         "viewer",
     ));
+    // The landing point for a drive another machine explicitly maps here.
+    // Physical volumes remain Storage sources/duplex endpoints; this synthetic
+    // sink prevents the graph from pretending a remote USB drive is being
+    // copied *onto* one of this machine's real disks.
+    caps.push(mk(
+        format!("{n}:storage-in"),
+        "Mapped drives".into(),
+        MediaKind::Storage,
+        Flow::Sink,
+        "storage-in",
+    ));
 
     // ---- physical devices -------------------------------------------
     //
@@ -327,6 +338,13 @@ mod tests {
         let viewer = by_origin("viewer").expect("video in");
         assert_eq!((viewer.media, viewer.flow), (MediaKind::Video, Flow::Sink));
         assert_eq!(viewer.id.as_str(), "this:video-in");
+
+        let mapped = by_origin("storage-in").expect("mapped drives");
+        assert_eq!(
+            (mapped.media, mapped.flow),
+            (MediaKind::Storage, Flow::Sink)
+        );
+        assert_eq!(mapped.id.as_str(), "this:storage-in");
 
         // The clipboard bridge: duplex, so a console can paste into it (and,
         // later, pull from it for cross-machine copy/paste).

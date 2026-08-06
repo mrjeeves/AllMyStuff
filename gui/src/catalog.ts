@@ -233,7 +233,7 @@ function validateRoute(cat: Catalog, from: string, to: string): ConnectResult {
   return { ok: true, route: { id: routeId(from, to), from, to, media } };
 }
 
-const MACHINE_ORIGINS = new Set(["screen", "control", "controller", "system", "viewer"]);
+const MACHINE_ORIGINS = new Set(["screen", "control", "controller", "system", "viewer", "storage-in"]);
 
 /** Sort key (lower = preferred), mirroring the Rust `endpoint_rank`: a
  *  synthetic machine endpoint first, then the category's current default

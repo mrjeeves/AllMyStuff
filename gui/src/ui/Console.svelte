@@ -55,6 +55,7 @@
   import ConsoleKeys from "./ConsoleKeys.svelte";
   import ModePill from "./ModePill.svelte";
   import EffectiveReadout from "./EffectiveReadout.svelte";
+  import DrivePanel from "./DrivePanel.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
 
@@ -67,6 +68,9 @@
     node
       ? app.consoleAccess(node)
       : { remote: false, files: false, terminal: false, sites: false, audio: false, control: false, clipboard: false },
+  );
+  const drivesAllowed = $derived(
+    !!node && (kvmSource ? app.kvmAllowed(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
   );
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
@@ -363,7 +367,7 @@
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
-  type MenuKind = "session" | "screens" | "video";
+  type MenuKind = "session" | "screens" | "drives" | "video";
   let openMenu = $state<MenuKind | null>(null);
   let openSub = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
   // The advanced rows' disclosure remembers the old slider/pills toggle:
@@ -2149,6 +2153,15 @@
               >
             {/if}
           {/if}
+          {#if drivesAllowed}
+            <button
+              class="kbtn slim"
+              class:open={openMenu === "drives"}
+              title={kvmSource ? "Present install media to the attached computer through this KVM" : "Map a local drive or folder onto this machine"}
+              aria-label="Mapped drives"
+              onclick={() => toggleMenu("drives")}>💾</button
+            >
+          {/if}
           <span class="vsep"></span>
           <button
             class="kbtn"
@@ -2180,6 +2193,7 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
+            class:drives-menu={openMenu === "drives"}
             style:transform={vertical
               ? `translateY(calc(-50% + ${menuShift}px))`
               : `translateX(calc(-50% + ${menuShift}px))`}
@@ -2242,10 +2256,17 @@
                   </button>
                 {/if}
               {/if}
+              {#if drivesAllowed}
+                <button class="mrow" onclick={() => toggleMenu("drives")}>
+                  <span class="micon">💾</span>Drives
+                </button>
+              {/if}
               <div class="msep"></div>
               <button class="mrow danger" onclick={endSession}>
                 <span class="micon">⏻</span>End session
               </button>
+            {:else if openMenu === "drives"}
+              <DrivePanel target={node.id} />
             {:else if openMenu === "screens"}
               {#each inputs as inp (inp.id)}
                 {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
@@ -2936,6 +2957,11 @@
     box-shadow: var(--shadow-lg);
     padding: 0.35rem;
     animation: drop 0.12s ease;
+  }
+  .kvmenu.drives-menu {
+    box-sizing: border-box;
+    width: min(22rem, calc(100vw - 1rem));
+    overflow-x: hidden;
   }
   @keyframes drop {
     from {

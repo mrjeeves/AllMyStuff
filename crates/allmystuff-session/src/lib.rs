@@ -26,16 +26,17 @@ use std::collections::HashMap;
 
 use allmystuff_graph::{NodeId, Route};
 use allmystuff_protocol::{
-    AppControl, ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
+    AppControl, ControlMessage, DriveRouteOffer, NodeProfile, OwnershipControl, RouteControl,
+    ShareControl,
 };
 
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
     ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, FileEntry, FileEvent,
-    FileFrame, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent, TermFrame,
-    VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
-    SITE_CHUNK_BYTES,
+    FileFrame, FileVolume, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent,
+    TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState,
+    CLIPBOARD_CHUNK_BYTES, SITE_CHUNK_BYTES,
 };
 
 /// Which side of a route we are.
@@ -93,6 +94,9 @@ pub struct LiveRoute {
     /// N" and to re-attach. Skipped on the wire when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term_session: Option<String>,
+    /// Receiver-side native mount request for a mapped Storage route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive: Option<DriveRouteOffer>,
 }
 
 impl LiveRoute {
@@ -212,7 +216,9 @@ impl Session {
 
     /// Drop a peer that left, tearing down any routes with it.
     pub fn drop_peer(&mut self, id: &NodeId) -> Vec<Effect> {
-        self.peers.remove(id);
+        let canonical = canonical_node(id.as_str());
+        self.peers
+            .retain(|node, _| canonical_node(node.as_str()) != canonical);
         self.reap_peer_routes(id)
     }
 
@@ -227,7 +233,9 @@ impl Session {
         let ids: Vec<String> = self
             .routes
             .iter()
-            .filter(|(_, r)| &r.peer == id && r.is_active())
+            .filter(|(_, r)| {
+                canonical_node(r.peer.as_str()) == canonical_node(id.as_str()) && r.is_active()
+            })
             .map(|(rid, _)| rid.clone())
             .collect();
         for rid in ids {
@@ -269,6 +277,19 @@ impl Session {
         audio: Vec<String>,
         session: Option<String>,
     ) -> ControlMessage {
+        self.offer_with_drive(route, peer, video, audio, session, None)
+    }
+
+    /// Offer a route carrying an optional native-drive mount request.
+    pub fn offer_with_drive(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        session: Option<String>,
+        drive: Option<DriveRouteOffer>,
+    ) -> ControlMessage {
         let peer = peer.into();
         self.routes.insert(
             route.id.clone(),
@@ -280,6 +301,7 @@ impl Session {
                 video: video.clone(),
                 audio: audio.clone(),
                 term_session: session.clone(),
+                drive: drive.clone(),
             },
         );
         ControlMessage::Route(RouteControl::Offer {
@@ -287,6 +309,7 @@ impl Session {
             video,
             audio,
             session,
+            drive,
         })
     }
 
@@ -381,6 +404,7 @@ impl Session {
                 video,
                 audio,
                 session,
+                drive,
             } => {
                 // A duplicate Offer for a route we have already accepted and
                 // started. The daemon redelivers the same Offer once per
@@ -426,6 +450,7 @@ impl Session {
                         // real id once it opens the shell, via
                         // [`set_term_session`](Self::set_term_session).
                         term_session: session,
+                        drive,
                     },
                 );
                 if accept {
@@ -594,6 +619,19 @@ impl Session {
     }
 }
 
+/// Session profiles carry display ids (`pubkey-ABCDE`) while a route peer is
+/// often the daemon's bare pubkey. Treat both spellings as the same node when
+/// reaping a restarted peer; exact string equality left mapped drives and
+/// streams attached to the dead incarnation.
+fn canonical_node(device_id: &str) -> &str {
+    if let Some((head, tail)) = device_id.rsplit_once('-') {
+        if tail.len() == 5 && tail.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return head;
+        }
+    }
+    device_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +789,7 @@ mod tests {
                 route: route("t1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: Some("term-2".into()),
             }),
         );
@@ -775,6 +814,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -804,6 +844,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -815,6 +856,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 // A re-offer might still carry the viewer's original ask;
                 // honouring it must not clobber the resolved id below.
                 session: Some("term-1".into()),
@@ -848,6 +890,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -884,6 +927,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -906,6 +950,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -925,6 +970,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -934,6 +980,24 @@ mod tests {
         assert_eq!(s.peer(&"this".into()).is_some(), had_peer);
         // A second reap finds nothing active — it never double-stops.
         assert!(s.reap_peer_routes(&"this".into()).is_empty());
+    }
+
+    #[test]
+    fn restarted_display_id_reaps_routes_recorded_against_the_bare_pubkey() {
+        let mut s = Session::new("desk");
+        s.handle(
+            "peerpubkey".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                drive: None,
+                session: None,
+            }),
+        );
+        let effects = s.reap_peer_routes(&"peerpubkey-A1B2C".into());
+        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
     }
 
     #[test]
@@ -991,6 +1055,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -1054,6 +1119,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );

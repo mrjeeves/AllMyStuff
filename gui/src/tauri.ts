@@ -76,6 +76,7 @@ export interface SessionSnapshot {
       web?: string;
       joining_mesh?: string;
       meshes?: string[];
+      virtual_media?: { source: string; label: string; file: string };
     };
     /** The AllMyStuff version the peer is running, from its advert. Absent
      *  from an older peer — "unknown". */
@@ -99,6 +100,7 @@ export interface SessionSnapshot {
      *  is attached to (multi-attach). Absent on non-terminal routes, and from
      *  an older peer. */
     term_session?: string | null;
+    drive?: { label: string; mount: string } | null;
   }>;
   /** Durable share relationships (person + unioned grants) the node has on
    *  disk, so the GUI reclassifies a peer as *shared* with its grants across
@@ -337,6 +339,56 @@ export function sendVideoFeedback(
 
 export function disconnectRoute(routeId: string): Promise<null> {
   return tryInvoke("disconnect_route", { routeId });
+}
+
+export async function mapNativeDrive(
+  target: string,
+  root: string,
+  label: string,
+  mount: string,
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("drive_map", { target, root, label, mount });
+}
+
+export async function mapNativeDriveFrom(
+  source: string,
+  root: string,
+  label: string,
+  mount: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("drive_map_from", { source, root, label, mount });
+}
+
+export async function stageKvmMedia(
+  source: string,
+  kvm: string,
+  path: string,
+  label: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_media_stage", { source, kvm, path, label });
+}
+
+export async function unmountKvmMedia(kvm: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_media_unmount", { kvm });
+}
+
+export async function pickKvmMediaImage(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "Bootable disk images", extensions: ["iso", "img"] }],
+  });
+  return typeof picked === "string" ? picked : null;
 }
 
 /** Claim a device as yours. The claim only takes if that device is in claim
@@ -1016,6 +1068,39 @@ export async function onDeviceRestart(
   );
 }
 
+export interface DriveMountEvent {
+  route: string;
+  from: string;
+  mount?: string;
+  label?: string;
+  error?: string | null;
+}
+export async function onDriveMount(
+  cb: (e: DriveMountEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<DriveMountEvent>("allmystuff://drive-mount", (e) =>
+    cb(e.payload),
+  );
+}
+
+export interface KvmMediaEvent {
+  from: string;
+  kvm: string;
+  label: string;
+  error?: string | null;
+}
+export async function onKvmMedia(
+  cb: (e: KvmMediaEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<KvmMediaEvent>("allmystuff://kvm-media", (e) =>
+    cb(e.payload),
+  );
+}
+
 /** Progress of a registered download (`allmystuff://file-progress`),
  *  throttled backend-side. */
 export async function onFileProgress(
@@ -1090,6 +1175,23 @@ export async function pickFilesToShare(): Promise<string[]> {
   } catch (e) {
     console.warn("file picker failed:", e);
     return [];
+  }
+}
+
+/** Pick one local drive or folder to expose as a native remote drive. */
+export async function pickDriveFolder(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      multiple: false,
+      directory: true,
+      title: "Choose a drive or folder to map",
+    });
+    return typeof picked === "string" ? picked : null;
+  } catch (error) {
+    console.warn("drive folder picker failed:", error);
+    return null;
   }
 }
 

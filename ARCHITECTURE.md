@@ -663,6 +663,17 @@ stream straight into the local Downloads folder (unique-ified names,
 partials deleted on failure or teardown), and the window just renders
 `allmystuff://file-progress` / `file-saved` events.
 
+**A mapped drive** reuses those exact file frames but changes the authority
+and root. Every machine advertises a synthetic `…:storage-in` sink; connecting
+one scanned physical storage capability to it creates a `Storage` route. The
+source binds that route id to the matching, currently mounted inventory volume
+when it activates. Requests see a virtual `/` rooted there, never the host's
+home or absolute paths; `..`, symlink escapes, and deleting/renaming the mapped
+root are refused. The active route is the explicit lease, so the receiver may
+browse and edit that one volume without gaining the whole-machine `:files`
+permission. AllMyStuff exposes this in Settings → Drives, while CECSupport uses
+the same route and frame contract in its Drive mapping card. No KVM participates.
+
 ## Persistent state
 
 AllMyStuff rides on MyOwnMesh's identity + roster (under `~/.myownmesh/`,
@@ -697,10 +708,6 @@ goes to everyone.
 
 ## Next milestones
 
-- **Storage transport** over the same route pipe that audio, screen,
-  camera, and input already use — the one scanned media still showing
-  active without a stream behind it. (Camera video landed: see the
-  camera-route paragraph above.)
 - **Per-device audio routing** — map a specific scanned device to a `cpal`
   device (audio still uses the default input/output; monitors are routed
   per-screen and cameras per-device now), and an audio codec (Opus) so

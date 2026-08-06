@@ -81,14 +81,22 @@ import {
   kvmMeshAdd,
   kvmMeshRemove,
   linkStatus,
+  mapNativeDrive,
+  mapNativeDriveFrom,
+  pickKvmMediaImage,
+  stageKvmMedia as stageKvmMediaNative,
+  unmountKvmMedia as unmountKvmMediaNative,
   onClockSkew,
   onControlRefused,
   onDeviceRestart,
+  onDriveMount,
   onFileProgress,
   onFileSaved,
+  onKvmMedia,
   onMeshEvent,
   openFilesWindow,
   pickFilesToShare,
+  pickDriveFolder,
   roomShareFiles,
   roomSetSharePeers,
   roomUnshare,
@@ -848,6 +856,7 @@ class AppStore {
    *  snapshot. A terminal tab watches its own route here to tell
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
+  driveMounts = $state<Record<string, { label: string; mount: string }>>({});
   /** The resolved host-side terminal session id per terminal route id, from
    *  the snapshot (the host echoes it on `Accept` for a shared shell). A
    *  terminal tab reads it to label which shell it's on and to re-query the
@@ -1546,6 +1555,25 @@ class AppStore {
     await onDeviceRestart((e) => {
       const who = this.node(e.from)?.label ?? shortId(e.from);
       this.toast("warn", `Restarting this device — asked by ${who}`);
+    });
+    await onDriveMount((e) => {
+      const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
+      if (e.error) {
+        delete this.driveMounts[e.route];
+        this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
+      } else {
+        this.driveMounts[e.route] = {
+          label: e.label || "Remote drive",
+          mount: e.mount!,
+        };
+        this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
+      }
+    });
+    await onKvmMedia((e) => {
+      const kvm = this.nodeByCanonical(e.kvm)?.label ?? "the KVM";
+      if (e.error)
+        this.toast("warn", `Couldn't stage ${e.label || "virtual media"} on ${kvm}: ${e.error}`);
+      else this.toast("ok", `${e.label || "Virtual media"} is mounted on ${kvm}`);
     });
     // The passive clock-skew verdict (this machine's clock vs its peers',
     // measured off traffic that was already flowing): keep the topbar pill
@@ -2356,6 +2384,13 @@ class AppStore {
             web: p.kvm.web || undefined,
             joiningMesh: p.kvm.joining_mesh || undefined,
             meshes: p.kvm.meshes?.length ? p.kvm.meshes : undefined,
+            virtualMedia: p.kvm.virtual_media
+              ? {
+                  source: p.kvm.virtual_media.source,
+                  label: p.kvm.virtual_media.label,
+                  file: p.kvm.virtual_media.file,
+                }
+              : undefined,
           }
         : undefined;
       // The AllMyStuff version it's running — let it tell when the machine
@@ -2441,13 +2476,21 @@ class AppStore {
       const id = lr.route.id;
       const exists = this.catalog.routes.some((r) => r.id === id);
       if (active && !exists) {
-        this.catalog.routes.push({ ...lr.route });
+        this.catalog.routes.push({ ...lr.route, drive: lr.drive ?? null });
+      } else if (active && exists) {
+        const route = this.catalog.routes.find((route) => route.id === id);
+        if (route) route.drive = lr.drive ?? route.drive ?? null;
       } else if (!active && exists) {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
       }
     }
     this.routeStates = states;
     this.routeSessions = sessions;
+    for (const routeId of Object.keys(this.driveMounts)) {
+      if (!states[routeId] || states[routeId].state !== "active") {
+        delete this.driveMounts[routeId];
+      }
+    }
 
     // A console leg the far side REFUSED: the controlled machine rejects the
     // control/clipboard route when our events fail its authorization gate
@@ -4036,6 +4079,181 @@ class AppStore {
    *  windows close themselves, tearing their route down first. */
   closeFiles() {
     this.filesNodeId = null;
+  }
+
+  /** App machines that can receive a mapped drive. KVMs stay excluded: they
+   *  are headless passthroughs, not storage destinations. */
+  get driveTargets(): MeshNode[] {
+    return this.catalog.nodes.filter(
+      (n) => !this.isMe(n.id) && n.online && isAppNode(n) && !this.isKvm(n),
+    );
+  }
+
+  /** Remote machines whose filesystem this user is authorized to browse and
+   * therefore choose as the source of an inbound native mapping. */
+  get driveSources(): MeshNode[] {
+    return this.catalog.nodes.filter(
+      (node) => !this.isMe(node.id) && node.online && !this.isKvm(node) && this.filesAllowed(node),
+    );
+  }
+
+  get driveMappings(): Array<{
+    route: Route;
+    direction: "in" | "out";
+    drive: string;
+    machine: string;
+    host: string;
+    target: string;
+    mount: string;
+    status: "connecting" | "mounted" | "shared";
+  }> {
+    const out = [] as Array<{
+      route: Route;
+      direction: "in" | "out";
+      drive: string;
+      machine: string;
+      host: string;
+      target: string;
+      mount: string;
+      status: "connecting" | "mounted" | "shared";
+    }>;
+    for (const route of this.catalog.routes) {
+      if (route.media !== "storage" || !route.to.endsWith(":storage-in")) continue;
+      const from = this.capability(route.from);
+      const to = this.capability(route.to);
+      const fromNode = from?.node ?? this.capNodeOf(route.from);
+      const toNode = to?.node ?? this.capNodeOf(route.to);
+      const mounted = this.driveMounts[route.id];
+      const driveLabel = mounted?.label ?? route.drive?.label ?? from?.label ?? "Mapped drive";
+      const mount = mounted?.mount ?? route.drive?.mount ?? "";
+      if (this.isMe(toNode)) {
+        out.push({
+          route,
+          direction: "in",
+          drive: driveLabel,
+          machine: this.machineByAnyId(fromNode)?.label ?? shortId(fromNode),
+          host: fromNode,
+          target: toNode,
+          mount,
+          status: mounted ? "mounted" : "connecting",
+        });
+      } else if (this.isMe(fromNode)) {
+        out.push({
+          route,
+          direction: "out",
+          drive: driveLabel,
+          machine: this.machineByAnyId(toNode)?.label ?? shortId(toNode),
+          host: fromNode,
+          target: toNode,
+          mount,
+          status: "shared",
+        });
+      }
+    }
+    return out;
+  }
+
+  pickDriveSource(): Promise<string | null> {
+    return pickDriveFolder();
+  }
+
+  pickKvmMediaImage(): Promise<string | null> {
+    return pickKvmMediaImage();
+  }
+
+  /** Eligible virtual-media sources for a KVM. Its attached computer is
+   * deliberately excluded: that circular source disappears during the very
+   * reboot into BIOS/Setup for which virtual media exists. */
+  kvmMediaSources(kvmId: string): MeshNode[] {
+    const kvm = this.machineByAnyId(kvmId);
+    const attached = kvm?.kvm?.attachedTo;
+    return this.catalog.nodes.filter(
+      (node) =>
+        node.online &&
+        isAppNode(node) &&
+        !this.isKvm(node) &&
+        (!attached || !sameMachine(node.id, attached)) &&
+        (this.isMe(node.id) || this.filesAllowed(node)),
+    );
+  }
+
+  async stageKvmMedia(kvm: string, source: string, path: string, label: string): Promise<boolean> {
+    const kvmNode = this.machineByAnyId(kvm);
+    const sourceNode = this.machineByAnyId(source);
+    if (!this.isKvm(kvmNode) || !sourceNode) return false;
+    if (kvmNode!.kvm?.attachedTo && sameMachine(kvmNode!.kvm!.attachedTo!, sourceNode.id)) {
+      this.toast("warn", "The attached computer can't source this KVM's virtual media");
+      return false;
+    }
+    try {
+      await stageKvmMediaNative(sourceNode.id, kvmNode!.id, path, label);
+      if (this.isMe(sourceNode.id))
+        this.toast("ok", `${label || "Virtual media"} is mounted on ${kvmNode!.label}`);
+      return true;
+    } catch (error) {
+      this.toast("warn", errMsg(error));
+      return false;
+    }
+  }
+
+  async unmountKvmMedia(kvm: string): Promise<void> {
+    const node = this.machineByAnyId(kvm);
+    if (!this.isKvm(node)) return;
+    try {
+      await unmountKvmMediaNative(node!.id);
+      this.toast("ok", `Virtual media ejected from ${node!.label}`);
+    } catch (error) {
+      this.toast("warn", errMsg(error));
+    }
+  }
+
+  async mapFolderToNode(
+    targetNodeId: string,
+    root: string,
+    label: string,
+    mount = "",
+  ): Promise<boolean> {
+    if (!this.driveTargets.some((node) => sameMachine(node.id, targetNodeId))) {
+      this.toast("warn", "That machine can't receive a mapped drive");
+      return false;
+    }
+    try {
+      const route = await mapNativeDrive(targetNodeId, root, label, mount);
+      if (!route) {
+        this.toast("warn", "Native drive mapping requires the desktop app");
+        return false;
+      }
+      const target = this.machineByAnyId(targetNodeId)?.label || "the other computer";
+      this.toast("ok", `${label || "Drive"} is being mapped onto ${target}`);
+      return true;
+    } catch (error) {
+      this.toast("warn", String(error));
+      return false;
+    }
+  }
+
+  async mapFolderFromNode(
+    sourceNodeId: string,
+    root: string,
+    label: string,
+    mount = "",
+  ): Promise<boolean> {
+    if (!this.driveSources.some((node) => sameMachine(node.id, sourceNodeId))) {
+      this.toast("warn", "That machine hasn't shared Files access with you");
+      return false;
+    }
+    try {
+      await mapNativeDriveFrom(sourceNodeId, root, label, mount);
+      this.toast("ok", `${label || "Drive"} is connecting to this computer`);
+      return true;
+    } catch (error) {
+      this.toast("warn", String(error));
+      return false;
+    }
+  }
+
+  unmapDrive(routeId: string) {
+    void this.disconnect(routeId);
   }
 
   /** Open one files *session* to `hostNodeId`: a generic route from the

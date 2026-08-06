@@ -22,11 +22,11 @@ pub mod control;
 // Re-export the most-used items at the crate root.
 pub use app::{
     claim_code_from_bytes, claim_code_network_id, format_claim_code, AppControl, ControlMessage,
-    InventorySummary, KvmAdvert, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
-    OwnershipControl, RoomAccess, RoomEvent, RoomMessage, RouteControl, ShareControl, SharedEntry,
-    SharedFileMeta, SiteAdvert, SiteControl, SiteService, TerminalSessionInfo, APP_ID,
-    CAP_TAG_ALLMYSTUFF, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, CLAIM_CODE_BYTES, FEATURE_CAMERA, FEATURE_FILES, FEATURE_KVM,
+    DriveRouteOffer, InventorySummary, KvmAdvert, KvmControl, KvmVirtualMediaAdvert, NodeProfile,
+    OwnedMember, OwnedRoster, OwnershipControl, RoomAccess, RoomEvent, RoomMessage, RouteControl,
+    ShareControl, SharedEntry, SharedFileMeta, SiteAdvert, SiteControl, SiteService,
+    TerminalSessionInfo, APP_ID, CAP_TAG_ALLMYSTUFF, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED,
+    CHANNEL_PRESENCE, CHANNEL_ROOMS, CLAIM_CODE_BYTES, FEATURE_CAMERA, FEATURE_FILES, FEATURE_KVM,
     FEATURE_MEDIA_LANES, FEATURE_ROOMS, FEATURE_SITES, FEATURE_TERMINAL, LOCAL_CLAIM_NETWORK_ID,
     PROTOCOL_VERSION,
 };

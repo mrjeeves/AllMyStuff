@@ -24,14 +24,14 @@
     live: NetworkSummary | null;
   }
   const meshRows = $derived.by((): MeshRow[] => {
-    const live: MeshRow[] = (Array.isArray(app.networks) ? app.networks : []).map((n) => ({
+    const live: MeshRow[] = (Array.isArray(app.normalNetworks) ? app.normalNetworks : []).map((n) => ({
       key: n.network_id || n.config_id,
       configId: n.config_id,
       label: app.meshLabel(n),
       on: true,
       live: n,
     }));
-    const off: MeshRow[] = (Array.isArray(app.disabledNets) ? app.disabledNets : []).map(
+    const off: MeshRow[] = (Array.isArray(app.normalDisabledNets) ? app.normalDisabledNets : []).map(
       (c: NetworkConfigFull) => ({
         key: c.network_id || c.id,
         configId: c.id,
@@ -73,7 +73,7 @@
 <div class="net-menu" role="menu" aria-label="Your meshes">
   <div class="menu-head">Your meshes</div>
 
-  {#if app.networks.length === 0 && app.disabledNets.length === 0}
+  {#if app.normalNetworks.length === 0 && app.normalDisabledNets.length === 0}
     <p class="menu-empty">
       No meshes yet — join or import one from
       <button class="linkish" onclick={() => (close(), app.openSettings("networks"))}>Settings</button>.

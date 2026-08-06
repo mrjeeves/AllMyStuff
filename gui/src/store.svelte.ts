@@ -1082,14 +1082,14 @@ class AppStore {
     return net?.network_id === LOCAL_CLAIM_NETWORK_ID;
   }
 
-  /** Whether a mesh in the list is the **CEC Support area** — the one shared
-   *  mesh every CEC session rides. It's node-managed (joined at bring-up, or on
-   *  a technician's first dial) and driven from the CEC tab, so the Meshes list
-   *  filters it out to keep client support separate from your own meshes. */
+  /** Whether a mesh is managed by CEC Support: its public discovery/asking
+   *  directories or a private `cec-<Support ID>` session room. These are
+   *  lifecycle-owned by the support workflow, never user meshes. */
   isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
     return (
       net?.network_id === CEC_AREA_NETWORK_ID ||
-      net?.network_id === CEC_ASK_NETWORK_ID
+      net?.network_id === CEC_ASK_NETWORK_ID ||
+      /^cec-\d{9}$/.test(net?.network_id ?? "")
     );
   }
 
@@ -1097,6 +1097,11 @@ class AppStore {
    *  shows. Client support lives in the (secret) CEC tab instead. */
   normalNetworks = $derived.by(() =>
     this.networks.filter((n) => !this.isManagedCecMesh(n)),
+  );
+
+  /** Parked user meshes, excluding CEC's private/public workflow rooms. */
+  normalDisabledNets = $derived.by(() =>
+    this.disabledNets.filter((n) => !this.isManagedCecMesh(n)),
   );
 
   /** The fleet owner's display name, read from the signed roster (the member
@@ -1422,6 +1427,13 @@ class AppStore {
     const nets = Array.isArray(this.networks) ? this.networks : [];
     return nets.find((n) => n.config_id === this.sessionNetwork) ?? nets[0] ?? null;
   });
+  /** Header-facing active mesh. CEC's managed rooms must never replace the
+   *  user's Meshes pill label merely because one became the session primary. */
+  activeNormalNetwork = $derived.by(() =>
+    this.normalNetworks.find((n) => n.config_id === this.sessionNetwork) ??
+    this.normalNetworks[0] ??
+    null,
+  );
   /** Devices waiting to be let onto the roster network. */
   pendingPeers = $derived(
     (Array.isArray(this.livePeers) ? this.livePeers : []).filter(
@@ -5983,6 +5995,94 @@ class AppStore {
     return room.access ?? "invite";
   }
 
+  /** Whether `room` is exactly a private two-device room between this
+   *  machine and `peer` — no third member can ever be folded into a DM. */
+  private isDirectRoomWith(room: VirtualRoom, peer: string): boolean {
+    const members = [...new Set(room.members.map(canonicalNodeId))];
+    return (
+      members.length === 2 &&
+      members.some((m) => this.isMe(m)) &&
+      members.some((m) => sameMachine(m, peer))
+    );
+  }
+
+  /** Drop a duplicate DM locally without sending `close`: either participant
+   *  may discover the duplicate, while Close remains the host's authority. */
+  private removeMergedRoom(roomId: string) {
+    if (this.isJoined(roomId)) this.unjoinRoom(roomId);
+    else this.clearRoomShares(roomId);
+    this.rooms = this.rooms.filter((r) => r.id !== roomId);
+    const { [roomId]: _chat, ...chat } = this.roomChat;
+    const { [roomId]: _unread, ...unread } = this.roomUnread;
+    const { [roomId]: _presence, ...presence } = this.roomPresence;
+    const { [roomId]: _knocks, ...knocks } = this.roomKnocks;
+    this.roomChat = chat;
+    this.roomUnread = unread;
+    this.roomPresence = presence;
+    this.roomKnocks = knocks;
+  }
+
+  /** Open the DM-like room for one external machine. Concurrent creation can
+   *  leave each side hosting a copy; choose the same lowest room id on both
+   *  ends, remove every duplicate locally, and send a merge statement so the
+   *  peer repairs its own saved list too. */
+  openDirectRoom(peerId: string) {
+    const node = this.machineByAnyId(peerId);
+    if (!node || !isAppNode(node) || this.isKvm(node) || this.isMe(node.id)) return;
+    if (this.isCecCustomer(node.id)) {
+      this.toast("warn", "CEC Support sessions stay separate from your personal rooms");
+      return;
+    }
+    if (!this.roomsSupported(node)) {
+      this.toast("warn", `${node.label} needs a newer AllMyStuff before it can use Rooms`);
+      return;
+    }
+
+    const me = canonicalNodeId(this.localId);
+    const peer = canonicalNodeId(node.id);
+    let direct = this.rooms.filter((room) => this.isDirectRoomWith(room, peer));
+    if (direct.length === 0) {
+      const mine = this.node(this.localId)?.label?.trim() || "This device";
+      const theirs = node.label.trim() || node.hostname?.trim() || shortId(peer);
+      const room: VirtualRoom = {
+        id: newRoomId(me),
+        name: [mine, theirs].sort((a, b) => a.localeCompare(b)).join(" + "),
+        members: [me, peer],
+        owner: me,
+        access: "invite",
+      };
+      this.rooms.push(room);
+      this.saveRooms();
+      this.broadcastRoom(room, this.inviteMessage(room));
+      direct = [room];
+    }
+
+    direct.sort((a, b) => a.id.localeCompare(b.id));
+    const keep = direct[0];
+    const duplicates = direct.slice(1);
+    if (duplicates.length > 0) {
+      for (const duplicate of duplicates) this.removeMergedRoom(duplicate.id);
+      this.saveRooms();
+      if (this.backendConnected) {
+        for (const duplicate of duplicates) {
+          void roomSend([peer], {
+            room: duplicate.id,
+            name: keep.name,
+            kind: "merge",
+            into: keep.id,
+            members: keep.members,
+            access: this.roomAccess(keep),
+          });
+        }
+      }
+      // If we host the winner, re-state it too; this heals an invite the peer
+      // missed while asleep before the merge arrived.
+      if (this.isRoomHost(keep)) this.broadcastRoom(keep, this.inviteMessage(keep));
+      this.toast("info", `Merged ${duplicates.length + 1} private rooms with ${node.label}`);
+    }
+    this.joinRoom(keep.id);
+  }
+
   /** Make a room — you're its **host**: the id is minted under this
    *  device, the roster and name answer to it, and closing it ends the
    *  room for everyone. A room of just this node is fine; invite
@@ -6851,6 +6951,48 @@ class AppStore {
         if (host && !sameMachine(host, sender)) return;
         this.pendingKnocks = this.pendingKnocks.filter((id) => id !== msg.room);
         this.toast("warn", `The host declined your ask to join${existing ? ` “${existing.name}”` : ""}`);
+        break;
+      }
+      case "merge": {
+        // A DM merge is deliberately symmetric: either authenticated member
+        // may converge duplicates, but only for the exact two-device pair and
+        // only onto the deterministic lowest id. It cannot rewrite a group.
+        const members = [...new Set(msg.members.map(canonicalNodeId))];
+        const validPair =
+          members.length === 2 &&
+          members.some((m) => this.isMe(m)) &&
+          members.some((m) => sameMachine(m, sender));
+        if (!validPair || msg.into === msg.room) return;
+        const candidates = this.rooms.filter((room) => this.isDirectRoomWith(room, sender));
+        const sourceKnown = candidates.some((room) => room.id === msg.room);
+        const targetKnown = candidates.some((room) => room.id === msg.into);
+        if (!sourceKnown && !targetKnown) return;
+        const ids = [...new Set([...candidates.map((room) => room.id), msg.into])].sort();
+        if (ids[0] !== msg.into) return;
+
+        let target = this.rooms.find((room) => room.id === msg.into);
+        if (!target) {
+          const owner = roomHostFromId(msg.into);
+          if (!owner || (!this.isMe(owner) && !sameMachine(owner, sender))) return;
+          target = {
+            id: msg.into,
+            name: msg.name?.trim() || "Private room",
+            members,
+            owner,
+            access: msg.access,
+          };
+          this.rooms.push(target);
+        }
+        for (const room of [...this.rooms]) {
+          if (room.id !== target.id && this.isDirectRoomWith(room, sender)) {
+            this.removeMergedRoom(room.id);
+          }
+        }
+        target.name = msg.name?.trim() || target.name;
+        target.members = members;
+        target.access = msg.access ?? target.access;
+        this.saveRooms();
+        if (this.isRoomHost(target)) this.broadcastRoom(target, this.inviteMessage(target));
         break;
       }
     }

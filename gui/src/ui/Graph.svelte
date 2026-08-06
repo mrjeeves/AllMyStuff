@@ -1194,8 +1194,10 @@
     const items =
       1 +
       (normalMode && cons?.terminal ? 1 : 0) +
-      (normalMode && mn && app.kvmAllowed(mn) ? 2 : 0) +
-      (app.canRestartApp(mn) ? 1 : 0) +
+      (normalMode && cons?.files ? 1 : 0) +
+      (normalMode && mn && app.isKvm(mn) && cons?.sites ? 1 : 0) +
+      (normalMode && mn && app.kvmAllowed(mn) ? 3 : 0) +
+      (!app.isKvm(mn) && app.canRestartApp(mn) ? 1 : 0) +
       (!app.isKvm(mn) && app.canRestartDevice(mn) ? 1 : 0) +
       (mn && mn.kind !== "this" && !app.isMe(nodeId) ? 1 : 0); // Forget this node
     return MENU_PAD + items * MENU_ITEM_H;
@@ -1564,7 +1566,7 @@
         <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}<span class="action-label">Remote</span></button>
       {/if}
-      {#if cons.files}
+      {#if cons.files && !normalMode}
         <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}<span class="action-label">Files</span></button>
       {/if}
@@ -1577,7 +1579,7 @@
         <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}<span class="action-label">Terminal</span></button>
       {/if}
-      {#if cons.sites}
+      {#if cons.sites && (!normalMode || !app.isKvm(n))}
         <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}<span class="action-label">Sites</span></button>
       {/if}
@@ -1596,11 +1598,13 @@
           <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
             onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}<span class="action-label">Wi-Fi</span></button>
         {/if}
-        <button class="cbtn"
-          disabled={app.isKvmUpdating(n.id)}
-          data-tip="Update this KVM"
-          aria-label="Update {displayName(n)} (the KVM itself)"
-          onclick={(e) => { e.stopPropagation(); void app.updateKvm(n.id); }}>{@render cicon("update")}<span class="action-label">{app.isKvmUpdating(n.id) ? "Updating…" : "Update"}</span></button>
+        {#if !normalMode}
+          <button class="cbtn"
+            disabled={app.isKvmUpdating(n.id)}
+            data-tip="Update this KVM"
+            aria-label="Update {displayName(n)} (the KVM itself)"
+            onclick={(e) => { e.stopPropagation(); void app.updateKvm(n.id); }}>{@render cicon("update")}<span class="action-label">{app.isKvmUpdating(n.id) ? "Updating…" : "Update"}</span></button>
+        {/if}
         {#if !normalMode}
           <button class="cbtn" class:active={app.kvmRevealed === n.id}
             data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
@@ -2201,7 +2205,51 @@
         </span>
       </button>
     {/if}
+    {#if normalMode && menuCons?.files}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          app.openConsoleKind(menuId, "files");
+          nodeMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">{@render cicon("files")}</span>
+        <span class="nm-text">
+          <span class="nm-label">Files</span>
+          <span class="nm-sub">browse files on this machine</span>
+        </span>
+      </button>
+    {/if}
+    {#if normalMode && mn && app.isKvm(mn) && menuCons?.sites}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          app.openConsoleKind(menuId, "sites");
+          nodeMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">{@render cicon("sites")}</span>
+        <span class="nm-text">
+          <span class="nm-label">Sites</span>
+          <span class="nm-sub">open this KVM's web interface</span>
+        </span>
+      </button>
+    {/if}
     {#if normalMode && mn && app.kvmAllowed(mn)}
+      <button
+        class="nm-item"
+        role="menuitem"
+        disabled={app.isKvmUpdating(menuId)}
+        onclick={() => {
+          nodeMenu = null;
+          void app.updateKvm(menuId);
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">{@render cicon("update")}</span>
+        <span class="nm-text"><span class="nm-label">{app.isKvmUpdating(menuId) ? "Updating…" : "Update"}</span><span class="nm-sub">update this KVM</span></span>
+      </button>
       <button
         class="nm-item"
         role="menuitem"
@@ -2225,7 +2273,7 @@
         <span class="nm-text"><span class="nm-label">Attach</span><span class="nm-sub">choose the machine behind this KVM</span></span>
       </button>
     {/if}
-    {#if app.canRestartApp(mn)}
+    {#if !app.isKvm(mn) && app.canRestartApp(mn)}
       <button
         class="nm-item"
         role="menuitem"

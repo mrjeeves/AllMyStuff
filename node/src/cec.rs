@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,11 @@ struct CecInner {
     /// grant lapses. Keyed by session id, like [`Self::sessions`]; customer
     /// side only.
     session_tech: HashMap<String, String>,
+    /// KVMs temporarily exposed by a customer this technician is actively
+    /// controlling. These are deliberately memory-only leases: the customer's
+    /// 2-second heartbeat renews them, and a dead app/session loses them within
+    /// a few seconds instead of creating unattended appliance access.
+    support_kvms: HashMap<String, SupportKvm>,
     /// Cancellation flag for the in-flight dial (one at a time — the GUI
     /// serializes dials). `begin_dial` mints a fresh flag; `cancel_dial` trips
     /// it; the discovery poll and the connect-request re-send loop both honor
@@ -277,6 +282,11 @@ struct CecInner {
     /// Holds both received lines and the echoes of ones this node sent, so a
     /// peer's history is the whole conversation. Mirrored to `chats_path`.
     chats: HashMap<String, Vec<ChatMessage>>,
+}
+
+struct SupportKvm {
+    customer: String,
+    until: Instant,
 }
 
 /// Where a queue row came from — which lifecycle rules apply to it.
@@ -356,6 +366,7 @@ impl Cec {
                 dialed,
                 sessions: HashMap::new(),
                 session_tech: HashMap::new(),
+                support_kvms: HashMap::new(),
                 dial_cancel: None,
                 asking_help: false,
                 watching_help: false,
@@ -930,10 +941,95 @@ impl Cec {
     /// anyone's graph, and this node's profile is never volunteered to one.
     pub fn relationship_with(&self, peer: &str) -> bool {
         let key = pubkey_part(peer);
+        let mut inner = self.inner.lock();
+        let now = Instant::now();
+        inner.support_kvms.retain(|_, lease| lease.until > now);
+        inner.dialed.contains_key(key)
+            || inner.consent.known(key)
+            || inner.pending.iter().any(|p| pubkey_part(&p.tech) == key)
+            || inner.support_kvms.contains_key(key)
+    }
+
+    /// The customer that announced this transient support KVM, if its lease is
+    /// still live. The presence gate uses this to require the appliance's own
+    /// authoritative `kvm.attached_to` advert to agree with the announcement.
+    pub fn support_kvm_customer(&self, kvm: &str) -> Option<String> {
+        let key = pubkey_part(kvm);
+        let mut inner = self.inner.lock();
+        let now = Instant::now();
+        inner.support_kvms.retain(|_, lease| lease.until > now);
+        inner
+            .support_kvms
+            .get(key)
+            .map(|lease| lease.customer.clone())
+    }
+
+    /// A direct CEC relationship independent of transient KVM passthrough.
+    /// Directly dialed KVMs keep their normal profile rules even if they also
+    /// happen to be the appliance attached to another active customer.
+    pub fn direct_relationship_with(&self, peer: &str) -> bool {
+        let key = pubkey_part(peer);
         let inner = self.inner.lock();
         inner.dialed.contains_key(key)
             || inner.consent.known(key)
             || inner.pending.iter().any(|p| pubkey_part(&p.tech) == key)
+    }
+
+    /// Whether `customer` currently has an active CEC session with this node.
+    /// Used on the technician side to authenticate a customer's announcement
+    /// that an attached KVM is available for this exact support session.
+    pub fn has_active_session_with(&self, customer: &str) -> bool {
+        let key = pubkey_part(customer);
+        let inner = self.inner.lock();
+        inner.session_tech.iter().any(|(session, peer)| {
+            pubkey_part(peer) == key
+                && inner
+                    .sessions
+                    .get(session)
+                    .is_some_and(|state| state == "active")
+        })
+    }
+
+    /// Admit one customer-announced KVM through the CEC presence filter for a
+    /// short renewable lease. Returns false for malformed or implausibly long
+    /// leases; callers must never allow a wire value to mint standing access.
+    pub fn note_support_kvm(&self, customer: &str, kvm: &str, expires_in: u64) -> bool {
+        const MAX_LEASE: u64 = 15;
+        if customer.is_empty() || kvm.is_empty() || expires_in == 0 || expires_in > MAX_LEASE {
+            return false;
+        }
+        let key = pubkey_part(kvm).to_string();
+        self.inner.lock().support_kvms.insert(
+            key,
+            SupportKvm {
+                customer: pubkey_part(customer).to_string(),
+                until: Instant::now() + Duration::from_secs(expires_in),
+            },
+        );
+        true
+    }
+
+    /// Drop expired support-KVM discovery leases and return their ids so the
+    /// mesh can remove the now-inaccessible transient graph profiles.
+    pub fn prune_support_kvms(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        let expired: Vec<String> = inner
+            .support_kvms
+            .iter()
+            .filter(|(_, lease)| lease.until <= now)
+            .map(|(kvm, _)| kvm.clone())
+            .collect();
+        for kvm in &expired {
+            if let Some(lease) = inner.support_kvms.remove(kvm) {
+                tracing::info!(
+                    "CEC support KVM {} from customer {} expired",
+                    kvm,
+                    lease.customer
+                );
+            }
+        }
+        expired
     }
 
     /// Whether this node has ever acted as a technician (its role flipped on
@@ -1393,6 +1489,24 @@ mod tests {
         // sweep can't resurrect a stale "ended" for a reused technician.
         cec.set_session("s1", "ended");
         assert!(cec.end_sessions_for(TECH).is_empty());
+    }
+
+    #[test]
+    fn support_kvm_requires_active_customer_session_and_short_lease() {
+        let cec = Cec::new(None);
+        cec.set_session("s1", "active");
+        cec.bind_session("s1", TECH);
+        assert!(cec.has_active_session_with(&format!("{TECH}-AB12C")));
+
+        assert!(cec.note_support_kvm(TECH, "kvm-pub", 8));
+        assert!(cec.relationship_with("kvm-pub"));
+        assert_eq!(cec.support_kvm_customer("kvm-pub").as_deref(), Some(TECH));
+        assert!(!cec.direct_relationship_with("kvm-pub"));
+        assert!(!cec.note_support_kvm(TECH, "forever-kvm", 3_600));
+        assert!(!cec.relationship_with("forever-kvm"));
+
+        cec.set_session("s1", "ended");
+        assert!(!cec.has_active_session_with(TECH));
     }
 
     #[test]

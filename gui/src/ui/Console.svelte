@@ -61,6 +61,9 @@
 
   const node = $derived(app.consoleNode);
   const kvmSource = $derived(app.isKvm(node ?? undefined));
+  const consoleKvm = $derived(
+    node ? (kvmSource ? node : app.kvmAttachedTo(node.id)) : undefined,
+  );
   // What this machine actually shared with us — the console activates with
   // whatever subset is available and hides the toggles for the rest (a
   // screen-only share shows the screen, no inert Audio/Control buttons).
@@ -70,8 +73,14 @@
       : { remote: false, files: false, terminal: false, sites: false, audio: false, control: false, clipboard: false },
   );
   const drivesAllowed = $derived(
-    !!node && (kvmSource ? app.kvmAllowed(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
+    !!node && (kvmSource ? app.kvmDoors(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
   );
+  const kvmMediaAllowed = $derived(
+    !!node &&
+      !!consoleKvm &&
+      (kvmSource ? app.kvmDoors(consoleKvm) : app.kvmPassthroughDoors(consoleKvm, node)),
+  );
+  const kvmPowerAllowed = $derived(kvmMediaAllowed);
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
   const selected = $derived<Capability | null>(
@@ -367,7 +376,7 @@
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
-  type MenuKind = "session" | "screens" | "drives" | "video";
+  type MenuKind = "session" | "screens" | "drives" | "kvm-media" | "power" | "video";
   let openMenu = $state<MenuKind | null>(null);
   let openSub = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
   // The advanced rows' disclosure remembers the old slider/pills toggle:
@@ -2162,6 +2171,26 @@
               onclick={() => toggleMenu("drives")}>💾</button
             >
           {/if}
+          {#if !kvmSource && kvmMediaAllowed}
+            <button
+              class="kbtn slim"
+              class:open={openMenu === "kvm-media"}
+              title="Present install or recovery media through the KVM attached to this computer"
+              aria-label="KVM drives"
+              onclick={() => toggleMenu("kvm-media")}>💿</button
+            >
+          {/if}
+          {#if kvmPowerAllowed}
+            <button
+              class="kbtn slim"
+              class:open={openMenu === "power"}
+              title="Power controls for the computer attached to this KVM"
+              aria-label="Power via KVM"
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "power"}
+              onclick={() => toggleMenu("power")}>⏻</button
+            >
+          {/if}
           <span class="vsep"></span>
           <button
             class="kbtn"
@@ -2193,7 +2222,7 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
-            class:drives-menu={openMenu === "drives"}
+            class:drives-menu={openMenu === "drives" || openMenu === "kvm-media"}
             style:transform={vertical
               ? `translateY(calc(-50% + ${menuShift}px))`
               : `translateX(calc(-50% + ${menuShift}px))`}
@@ -2261,12 +2290,52 @@
                   <span class="micon">💾</span>Drives
                 </button>
               {/if}
+              {#if !kvmSource && kvmMediaAllowed}
+                <button class="mrow" onclick={() => toggleMenu("kvm-media")}>
+                  <span class="micon">💿</span>KVM drives
+                </button>
+              {/if}
+              {#if kvmPowerAllowed}
+                <button class="mrow" onclick={() => toggleMenu("power")}>
+                  <span class="micon">⏻</span>Power
+                </button>
+              {/if}
               <div class="msep"></div>
               <button class="mrow danger" onclick={endSession}>
                 <span class="micon">⏻</span>End session
               </button>
             {:else if openMenu === "drives"}
               <DrivePanel target={node.id} />
+            {:else if openMenu === "kvm-media" && consoleKvm}
+              <DrivePanel target={consoleKvm.id} />
+            {:else if openMenu === "power"}
+              <div class="mhead">
+                <span class="mavatar">⏻</span>
+                <div class="mid">
+                  <div class="mname">Power via {consoleKvm ? displayName(consoleKvm) : "KVM"}</div>
+                  <div class="msub">Controls the computer attached to this KVM</div>
+                </div>
+              </div>
+              <div class="msep"></div>
+              {#each [
+                { action: "wake", icon: "⌨", label: "Wake", detail: "send a Shift key press" },
+                { action: "short", icon: "⏻", label: "Short press", detail: "pulse the power button" },
+                { action: "long", icon: "⏻", label: "Long press", detail: "hold power for 12 seconds" },
+                { action: "reset", icon: "↻", label: "Reset", detail: "pulse the reset line" },
+              ] as item (item.action)}
+                <button
+                  class="mrow power-row"
+                  onclick={() => {
+                    openMenu = null;
+                    if (consoleKvm) {
+                      void app.kvmFeature(consoleKvm.id, item.action as "wake" | "short" | "long" | "reset");
+                    }
+                  }}
+                >
+                  <span class="micon">{item.icon}</span>
+                  <span class="power-copy"><strong>{item.label}</strong><small>{item.detail}</small></span>
+                </button>
+              {/each}
             {:else if openMenu === "screens"}
               {#each inputs as inp (inp.id)}
                 {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
@@ -3083,6 +3152,20 @@
     width: 1.4rem;
     text-align: center;
     flex-shrink: 0;
+  }
+  .power-copy {
+    min-width: 0;
+    display: grid;
+    gap: 0.08rem;
+  }
+  .power-copy strong {
+    color: inherit;
+    font-size: 0.84rem;
+  }
+  .power-copy small {
+    color: #8f88aa;
+    font-size: 0.68rem;
+    font-weight: 500;
   }
   .mlabel {
     min-width: 0;

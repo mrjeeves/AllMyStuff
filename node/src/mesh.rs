@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -124,8 +124,10 @@ pub struct Mesh {
     drive_pull_tokens: Mutex<HashMap<String, DrivePullRequest>>,
     /// Successful receiver-initiated mappings, keyed by their current route.
     /// The route is one connection incarnation; this is the user's intent and
-    /// survives a source laptop's sleep/restart for the life of this app.
+    /// survives either app restarting and a source laptop sleeping.
     drive_reconnects: Mutex<HashMap<String, DriveReconnect>>,
+    /// Crash-safe backing store for the receiver-owned mapping intents.
+    drive_reconnect_path: Option<PathBuf>,
     /// Old route ids currently being rebuilt, so repeated presence adverts do
     /// not launch duplicate offers for the same native drive.
     drive_reconnect_inflight: Mutex<std::collections::HashSet<String>>,
@@ -425,12 +427,62 @@ struct DrivePullRequest {
     made: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DriveReconnect {
     source: String,
     root: String,
     label: String,
     mount: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedDriveReconnects {
+    #[serde(default)]
+    mappings: Vec<DriveReconnect>,
+}
+
+fn drive_reconnect_store_path() -> Option<PathBuf> {
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".myownmesh").join("allmystuff-drives.json"))
+}
+
+fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconnect> {
+    let persisted: PersistedDriveReconnects = path
+        .as_ref()
+        .map(|path| crate::persist::load_json(path))
+        .unwrap_or_default();
+    persisted
+        .mappings
+        .into_iter()
+        .enumerate()
+        .map(|(index, mapping)| (format!("saved:{index}"), mapping))
+        .collect()
+}
+
+fn persist_drive_reconnects(
+    path: &Option<PathBuf>,
+    mappings: &HashMap<String, DriveReconnect>,
+) -> bool {
+    let Some(path) = path else { return true };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut durable = Vec::new();
+    for mapping in mappings.values() {
+        if !durable.contains(mapping) {
+            durable.push(mapping.clone());
+        }
+    }
+    durable.sort_by(|a, b| {
+        (&a.source, &a.root, &a.mount, &a.label).cmp(&(&b.source, &b.root, &b.mount, &b.label))
+    });
+    let persisted = PersistedDriveReconnects { mappings: durable };
+    match serde_json::to_string_pretty(&persisted) {
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -1049,6 +1101,8 @@ impl Mesh {
         // Audio's 8 buffers are ~160 ms of slack.
         let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
         let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
+        let drive_reconnect_path = drive_reconnect_store_path();
+        let drive_reconnects = load_drive_reconnects(&drive_reconnect_path);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -1068,7 +1122,8 @@ impl Mesh {
             files: FilesPlane::new(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
-            drive_reconnects: Mutex::new(HashMap::new()),
+            drive_reconnects: Mutex::new(drive_reconnects),
+            drive_reconnect_path,
             drive_reconnect_inflight: Mutex::new(std::collections::HashSet::new()),
             kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
@@ -2150,7 +2205,15 @@ impl Mesh {
                 // missed frame self-heals on the next change.
                 if last_viewing.as_ref() != Some(&viewing) {
                     mesh.sink.emit("cec://viewing", cec_viewing_value(&viewing));
-                    last_viewing = Some(viewing);
+                    last_viewing = Some(viewing.clone());
+                }
+                // A customer computer with an attached KVM lends that
+                // appliance to the technician only while an input/control
+                // route is genuinely live. Both halves are short leases:
+                // discovery on the technician and authority on the KVM.
+                mesh.refresh_kvm_support(&viewing).await;
+                for kvm in mesh.cec.prune_support_kvms() {
+                    mesh.drop_transient_support_kvm(&kvm).await;
                 }
             }
         });
@@ -2753,6 +2816,29 @@ impl Mesh {
             );
             return;
         }
+        // A customer may temporarily introduce its attached KVM, but the
+        // appliance's own authoritative binding must corroborate that exact
+        // customer. This prevents a customer from naming an arbitrary support-
+        // room peer and using the exception to inject it into the tech's graph.
+        if channel == CHANNEL_PRESENCE
+            && crate::cec::is_cec_network(&network)
+            && !self.cec.direct_relationship_with(&from)
+        {
+            if let Some(customer) = self.cec.support_kvm_customer(&from) {
+                let attached = payload
+                    .get("kvm")
+                    .and_then(|kvm| kvm.get("attached_to"))
+                    .and_then(Value::as_str);
+                if attached.is_none_or(|node| !same_node(node, &customer)) {
+                    tracing::warn!(
+                        "ignoring transient KVM presence from {}: attachment does not match customer {}",
+                        short_id(&from),
+                        short_id(&customer)
+                    );
+                    return;
+                }
+            }
+        }
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
         // several networks we're on).
@@ -3045,17 +3131,6 @@ impl Mesh {
                             None
                         };
                         let explicit_drive_pull = accepted_drive_pull.is_some();
-                        if let Some(pull) = accepted_drive_pull {
-                            self.drive_reconnects.lock().insert(
-                                route.id.clone(),
-                                DriveReconnect {
-                                    source: pull.source,
-                                    root: pull.root,
-                                    label: pull.label,
-                                    mount: pull.mount,
-                                },
-                            );
-                        }
                         // Drive pushes TO this machine are fleet-only. A
                         // receiver-minted pull token is the explicit exception:
                         // it lets this user pull FROM a Files share/support
@@ -3066,6 +3141,30 @@ impl Mesh {
                             route_drive_plane(route)
                                 .is_none_or(|plane| self.sender_may_drive(&from, plane))
                         };
+                        if authorized && is_mapped_drive_route(route) {
+                            let reconnect = accepted_drive_pull
+                                .map(|pull| DriveReconnect {
+                                    source: pull.source,
+                                    root: pull.root,
+                                    label: pull.label,
+                                    mount: pull.mount,
+                                })
+                                .or_else(|| {
+                                    let offer = drive.as_ref()?;
+                                    Some(DriveReconnect {
+                                        source: pubkey_part(from.as_str()).to_string(),
+                                        root: offer.root.clone()?,
+                                        label: offer.label.clone(),
+                                        mount: offer.mount.clone(),
+                                    })
+                                });
+                            if let Some(reconnect) = reconnect {
+                                self.drive_reconnects
+                                    .lock()
+                                    .insert(route.id.clone(), reconnect);
+                                self.persist_drive_reconnects();
+                            }
+                        }
                         // CEC screen gate: a customer only lets a dialed
                         // technician view its screen while a live consent grant
                         // covers it — the screen twin of the per-plane
@@ -3291,8 +3390,12 @@ impl Mesh {
                                     // source is a real unmap. Peer-restart
                                     // reaps never arrive through this arm, so
                                     // those retain their reconnect intent.
-                                    self.drive_reconnects.lock().remove(route_id);
+                                    let forgot =
+                                        self.drive_reconnects.lock().remove(route_id).is_some();
                                     self.drive_reconnect_inflight.lock().remove(route_id);
+                                    if forgot {
+                                        self.persist_drive_reconnects();
+                                    }
                                 }
                                 self.process_effects(effects).await;
                                 self.emit_snapshot();
@@ -4251,6 +4354,7 @@ impl Mesh {
             } else {
                 label.trim().to_string()
             },
+            root: Some(root.to_string_lossy().into_owned()),
             mount: mount.trim().to_string(),
             request,
         };
@@ -4299,6 +4403,118 @@ impl Mesh {
             .attached_to
             .as_ref()
             .map(ToString::to_string)
+    }
+
+    /// KVM appliances whose authoritative binding points at this local node.
+    /// A machine can technically have more than one attached appliance, so the
+    /// support bridge treats this as a set rather than silently picking one.
+    fn locally_attached_kvms(&self) -> Vec<String> {
+        let Some(me) = self.local_node_id() else {
+            return Vec::new();
+        };
+        let st = self.state.lock();
+        st.session
+            .as_ref()
+            .map(|session| {
+                session
+                    .peers()
+                    .filter(|profile| {
+                        profile
+                            .kvm
+                            .as_ref()
+                            .and_then(|kvm| kvm.attached_to.as_ref())
+                            .is_some_and(|attached| same_node(attached.as_str(), &me))
+                    })
+                    .map(|profile| profile.node.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Renew the two short leases behind customer-computer -> attached-KVM
+    /// passthrough. The customer tells its technician which KVM to expect, then
+    /// tells that KVM which technician may drive it. The appliance independently
+    /// verifies that this sender is its recorded attached computer.
+    async fn refresh_kvm_support(
+        &self,
+        viewing: &std::collections::BTreeMap<String, (bool, bool)>,
+    ) {
+        const LEASE_SECS: u64 = 8;
+        let kvms = self.locally_attached_kvms();
+        if kvms.is_empty() {
+            return;
+        }
+        for (technician, (_, controlling)) in viewing {
+            if !*controlling {
+                continue;
+            }
+            for kvm in &kvms {
+                // Discovery goes first so the KVM's immediate targeted greet
+                // cannot race the technician's strict CEC presence filter.
+                let available = ControlMessage::App(AppControl::KvmSupportAvailable {
+                    kvm: NodeId::from(kvm.clone()),
+                    expires_in: LEASE_SECS,
+                });
+                if let Err(error) = self.send_control(technician, &available).await {
+                    tracing::debug!(
+                        "couldn't announce support KVM {} to technician {}: {error}",
+                        short_id(kvm),
+                        short_id(technician)
+                    );
+                    continue;
+                }
+                let grant = ControlMessage::App(AppControl::KvmSupportGrant {
+                    technician: technician.clone(),
+                    expires_in: LEASE_SECS,
+                });
+                if let Err(error) = self.send_control(kvm, &grant).await {
+                    tracing::debug!(
+                        "couldn't delegate technician {} to attached KVM {}: {error}",
+                        short_id(technician),
+                        short_id(kvm)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remove a transient KVM profile after its customer heartbeat lapses. A
+    /// KVM that is also ours/shared or directly dialed remains: those are
+    /// independent relationships and must not be torn down with passthrough.
+    async fn drop_transient_support_kvm(self: &Arc<Self>, kvm: &str) {
+        if self.cec.relationship_with(kvm) || self.peer_has_durable_non_cec_standing(kvm) {
+            return;
+        }
+        let (effects, dropped) = {
+            let mut st = self.state.lock();
+            st.peer_networks.remove(kvm);
+            st.peer_features.remove(kvm);
+            st.peer_links.remove(kvm);
+            st.peer_boots.remove(kvm);
+            let mut effects = Vec::new();
+            let mut dropped = false;
+            if let Some(session) = st.session.as_mut() {
+                let node = {
+                    session
+                        .peers()
+                        .find(|profile| same_node(profile.node.as_str(), kvm))
+                        .map(|profile| profile.node.clone())
+                };
+                if let Some(node) = node {
+                    effects.extend(session.drop_peer(&node));
+                    dropped = true;
+                }
+            }
+            (effects, dropped)
+        };
+        if dropped {
+            tracing::info!(
+                "CEC support KVM {} is no longer delegated — removing its transient graph profile",
+                short_id(kvm)
+            );
+            self.process_effects(effects).await;
+            self.emit_snapshot();
+        }
     }
 
     /// Stage local install/firmware media on a KVM's USB mass-storage gadget.
@@ -4476,6 +4692,13 @@ impl Mesh {
         Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
     }
 
+    fn persist_drive_reconnects(&self) {
+        let mappings = self.drive_reconnects.lock();
+        if !persist_drive_reconnects(&self.drive_reconnect_path, &mappings) {
+            tracing::error!("couldn't save native drive mappings");
+        }
+    }
+
     /// Rebuild receiver-initiated drive routes whose source has returned with
     /// a fresh app/session incarnation. The Windows drive letter is briefly
     /// unavailable while the old route is reaped, then is claimed again with
@@ -4535,6 +4758,7 @@ impl Mesh {
                     {
                         Ok(()) => {
                             mesh.drive_reconnects.lock().remove(&old_route);
+                            mesh.persist_drive_reconnects();
                             last_error = None;
                             tracing::info!(
                                 "native drive from {} reconnected after the source returned",
@@ -4790,8 +5014,11 @@ impl Mesh {
         // An explicit disconnect means "forget this mapping", not merely
         // "this connection incarnation ended". Automatic peer-restart reaps
         // bypass this command and intentionally retain the reconnect intent.
-        self.drive_reconnects.lock().remove(&route_id);
+        let forgot = self.drive_reconnects.lock().remove(&route_id).is_some();
         self.drive_reconnect_inflight.lock().remove(&route_id);
+        if forgot {
+            self.persist_drive_reconnects();
+        }
         if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
             // Do not infer intent from watcher *presence*: unwatch is a
             // separate fire-and-forget command and can lag. A window that polls
@@ -6251,6 +6478,10 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
                     self.cec.set_session(&session_id, "active");
+                    // Bind the technician-side session as well. This is the
+                    // proof checked when the approved customer announces the
+                    // KVM physically attached to it.
+                    self.cec.bind_session(&session_id, &from);
                     // The customer just approved — this connection is now in
                     // active use. Stamp its `last_used` (and re-emit the peer so
                     // the CEC tab's time-since refreshes) so the technician's
@@ -6649,6 +6880,35 @@ impl Mesh {
     /// rule a terminal/remote-control offer is screened by), so a command
     /// from anyone else is logged and dropped.
     async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
+        if let AppControl::KvmSupportAvailable { kvm, expires_in } = &message {
+            // This announcement is meaningful only from a customer with whom
+            // we have an active support session. It is not an authority claim:
+            // the KVM separately receives and validates the customer's grant.
+            if !self.cec.has_active_session_with(from.as_str()) {
+                tracing::warn!(
+                    "support-KVM announcement from {} ignored: no active customer session",
+                    short_id(from.as_str())
+                );
+                return;
+            }
+            if !self
+                .cec
+                .note_support_kvm(from.as_str(), kvm.as_str(), *expires_in)
+            {
+                tracing::warn!(
+                    "invalid support-KVM lease from {} ignored",
+                    short_id(from.as_str())
+                );
+            }
+            return;
+        }
+        // The ordinary AllMyStuff node never consumes a KVM grant. It is sent
+        // to the appliance bridge, whose attached-computer check is the
+        // authority boundary. Ignore it here without passing it through the
+        // unrelated owner/fleet app-command gate.
+        if matches!(&message, AppControl::KvmSupportGrant { .. }) {
+            return;
+        }
         if let AppControl::StageKvmMediaResult {
             request,
             complete,
@@ -6838,7 +7098,10 @@ impl Mesh {
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
-            AppControl::StageKvmMediaResult { .. } | AppControl::Unknown => {}
+            AppControl::KvmSupportGrant { .. }
+            | AppControl::KvmSupportAvailable { .. }
+            | AppControl::StageKvmMediaResult { .. }
+            | AppControl::Unknown => {}
         }
     }
 
@@ -9720,6 +9983,7 @@ impl Mesh {
                         .and_then(|live| live.drive.clone())
                         .unwrap_or(DriveRouteOffer {
                             label: "Remote drive".into(),
+                            root: None,
                             mount: String::new(),
                             request: None,
                         });
@@ -9740,6 +10004,7 @@ impl Mesh {
                                     // letter/mount point the user already sees.
                                     intent.mount = info.mount.clone();
                                 }
+                                mesh.persist_drive_reconnects();
                                 tracing::info!(
                                     "route {} active — native drive {} mounted from {}",
                                     route_id,
@@ -15435,5 +15700,34 @@ mod tests {
         assert_eq!(audio_capture_source(&mic), CaptureSource::Mic);
         let bare = term_route("me", "them:system-audio", MediaKind::Audio);
         assert_eq!(audio_capture_source(&bare), CaptureSource::Mic);
+    }
+
+    #[test]
+    fn native_drive_mapping_intents_survive_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "amst-drive-intents-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        let path = Some(dir.join("allmystuff-drives.json"));
+        let intent = super::DriveReconnect {
+            source: "source-key".into(),
+            root: "/Volumes/Install Media".into(),
+            label: "Windows installer".into(),
+            mount: "X:".into(),
+        };
+        let mappings = std::collections::HashMap::from([
+            ("route:old".into(), intent.clone()),
+            // Duplicate routes can briefly coexist during a reconnect, but
+            // the durable store records the user's mapping only once.
+            ("route:new".into(), intent.clone()),
+        ]);
+
+        assert!(super::persist_drive_reconnects(&path, &mappings));
+        let loaded = super::load_drive_reconnects(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.values().next(), Some(&intent));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -136,6 +136,7 @@ dependencies = [
  "opus",
  "parking_lot",
  "pipewire",
+ "plist",
  "portable-pty",
  "reqwest 0.12.28",
  "serde",

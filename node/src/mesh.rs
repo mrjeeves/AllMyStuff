@@ -2973,7 +2973,7 @@ impl Mesh {
                         );
                         let hosts_here = self
                             .local_node_id()
-                            .is_some_and(|me| node_of(route.from.as_str()) == me);
+                            .is_some_and(|me| route_sources_on(route, &me));
                         // Authorized for this exact plane: owner/fleet, or a
                         // share grant the owner extended for it. Non-privileged
                         // routes (`None` plane) are never refused here.
@@ -10472,8 +10472,8 @@ impl Mesh {
                 return;
             }
             (
-                node_of(r.route.from.as_str()) == me,
-                node_of(r.route.to.as_str()) == me,
+                route_sources_on(&r.route, &me),
+                route_sinks_on(&r.route, &me),
             )
         };
         if hosts_here {
@@ -10727,8 +10727,8 @@ impl Mesh {
                 return;
             }
             (
-                node_of(r.route.from.as_str()) == me,
-                node_of(r.route.to.as_str()) == me,
+                route_sources_on(&r.route, &me),
+                route_sinks_on(&r.route, &me),
                 shared,
                 mapped,
             )
@@ -10931,7 +10931,7 @@ impl Mesh {
             } else {
                 is_files_route(&r.route) || is_mapped_drive_route(&r.route)
             };
-            if !(r.is_active() && kind_ok && node_of(r.route.to.as_str()) == me) {
+            if !(r.is_active() && kind_ok && route_sinks_on(&r.route, &me)) {
                 return Err("route isn't an active files session here".into());
             }
             r.peer.to_string()
@@ -11569,8 +11569,8 @@ impl Mesh {
                         && pubkey_part(r.peer.as_str()) == pubkey_part(from) =>
                 {
                     Some((
-                        node_of(r.route.from.as_str()) == me,
-                        node_of(r.route.to.as_str()) == me,
+                        route_sources_on(&r.route, &me),
+                        route_sinks_on(&r.route, &me),
                     ))
                 }
                 _ => None,
@@ -11923,7 +11923,7 @@ impl Mesh {
         };
         r.is_active()
             && r.route.media == media
-            && node_of(r.route.to.as_str()) == me
+            && route_sinks_on(&r.route, &me)
             && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
     }
 
@@ -11940,7 +11940,7 @@ impl Mesh {
         inbound_video_disposition_from_facts(
             route.map(|r| &r.state),
             route.is_some_and(|r| matches!(r.route.media, MediaKind::Display | MediaKind::Video)),
-            route.is_some_and(|r| node_of(r.route.to.as_str()) == me),
+            route.is_some_and(|r| route_sinks_on(&r.route, &me)),
             route.is_some_and(|r| pubkey_part(r.peer.as_str()) == pubkey_part(sender)),
         )
     }
@@ -11963,7 +11963,7 @@ impl Mesh {
                 "route state {:?} · media {:?} · sinks here: {} · sender is its peer: {}",
                 r.state,
                 r.route.media,
-                node_of(r.route.to.as_str()) == me,
+                route_sinks_on(&r.route, &me),
                 pubkey_part(r.peer.as_str()) == pubkey_part(sender),
             ),
         }
@@ -12525,7 +12525,7 @@ impl Mesh {
                 .ok_or("unknown route")?;
             if !(r.is_active()
                 && r.route.media == MediaKind::Input
-                && node_of(r.route.from.as_str()) == me)
+                && route_sources_on(&r.route, &me))
             {
                 return Err("route isn't an active outbound control link".into());
             }
@@ -12556,7 +12556,7 @@ impl Mesh {
                 .ok_or("unknown route")?;
             if !(r.is_active()
                 && r.route.media == MediaKind::Clipboard
-                && node_of(r.route.from.as_str()) == me)
+                && route_sources_on(&r.route, &me))
             {
                 return Err("route isn't an active outbound clipboard link".into());
             }
@@ -12584,7 +12584,7 @@ impl Mesh {
                 .ok_or("unknown route")?;
             if !(r.is_active()
                 && r.route.media == MediaKind::Clipboard
-                && node_of(r.route.from.as_str()) == me)
+                && route_sources_on(&r.route, &me))
             {
                 return Err("route isn't an active outbound clipboard link".into());
             }
@@ -12753,8 +12753,8 @@ impl Mesh {
                 return;
             }
             (
-                node_of(r.route.to.as_str()) == me,
-                node_of(r.route.from.as_str()) == me,
+                route_sinks_on(&r.route, &me),
+                route_sources_on(&r.route, &me),
             )
         };
 
@@ -13151,6 +13151,14 @@ fn same_node(a: &str, b: &str) -> bool {
     pubkey_part(a) == pubkey_part(b)
 }
 
+fn route_sources_on(route: &Route, node: &str) -> bool {
+    same_node(&node_of(route.from.as_str()), node)
+}
+
+fn route_sinks_on(route: &Route, node: &str) -> bool {
+    same_node(&node_of(route.to.as_str()), node)
+}
+
 /// The RTP video lane to pin a new route to `peer_canon` on: its existing pin
 /// if it already has one, else the **lowest lane in `[0, cap)` not already
 /// taken** by another of that peer's pinned routes. `None` only when the pool
@@ -13306,10 +13314,10 @@ fn is_mapped_drive_route(route: &Route) -> bool {
 /// The peer never supplies a root: it must exactly name a currently mounted
 /// volume this node advertised, and only its recorded mount point is retained.
 fn mapped_drive_root(route: &Route, me: &str) -> Option<std::path::PathBuf> {
-    if !is_mapped_drive_route(route) || node_of(route.from.as_str()) != me {
+    if !is_mapped_drive_route(route) || !route_sources_on(route, me) {
         return None;
     }
-    let prefix = format!("{me}:");
+    let prefix = format!("{}:", node_of(route.from.as_str()));
     let local_cap = route.from.as_str().strip_prefix(&prefix)?;
     allmystuff_inventory::scan()
         .storage
@@ -14918,6 +14926,19 @@ mod tests {
         assert!(!is_mapped_drive_route(&wrong_sink));
         let wrong_media = term_route("host:disk:E:\\", "viewer:storage-in", MediaKind::Generic);
         assert!(!is_mapped_drive_route(&wrong_media));
+    }
+
+    #[test]
+    fn route_endpoint_placement_ignores_display_suffixes() {
+        let route = term_route(
+            "source-A3285:drive-map:abc",
+            "viewer:storage-in",
+            MediaKind::Storage,
+        );
+        assert!(route_sources_on(&route, "source"));
+        assert!(route_sources_on(&route, "source-OTHER"));
+        assert!(route_sinks_on(&route, "viewer-0A307"));
+        assert!(!route_sinks_on(&route, "someone-else"));
     }
 
     #[test]

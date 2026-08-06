@@ -73,6 +73,17 @@ pub fn capabilities_with_screens(
         Flow::Source,
         "screen",
     ));
+    // A remote desktop is rendered by the running AllMyStuff app, not by a
+    // particular monitor from the hardware inventory. Keep this synthetic so
+    // viewing still works when an OS probe cannot enumerate displays (notably
+    // macOS `system_profiler` in some app contexts) or the machine is headless.
+    caps.push(mk(
+        format!("{n}:display-view"),
+        "Remote desktop".into(),
+        MediaKind::Display,
+        Flow::Sink,
+        "remote-desktop",
+    ));
     for s in screens {
         caps.push(mk(
             format!("{n}:screen:{}", s.id),
@@ -314,6 +325,16 @@ mod tests {
         assert_eq!(screen.media, MediaKind::Display);
         assert_eq!(screen.flow, Flow::Source);
         assert_eq!(screen.id.as_str(), "this:screen");
+
+        // Viewing is an app capability, not a side effect of finding a
+        // physical monitor. An empty/headless inventory must still be able to
+        // receive a remote screen in the console webview.
+        let remote_desktop = by_origin("remote-desktop").expect("display viewer");
+        assert_eq!(
+            (remote_desktop.media, remote_desktop.flow),
+            (MediaKind::Display, Flow::Sink)
+        );
+        assert_eq!(remote_desktop.id.as_str(), "this:display-view");
 
         let control = by_origin("control").expect("control");
         assert_eq!(

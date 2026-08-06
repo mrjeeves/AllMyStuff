@@ -112,12 +112,22 @@ impl DriveMounts {
             }
         });
         let url = format!("http://localhost:{port}/");
-        if let Err(error) = mount_native(&mount, &url).await {
-            server_task.abort();
-            return Err(error);
-        }
+        // Seed Explorer's network-drive label BEFORE `net use` publishes the
+        // mount. On a reconnect Explorer enumerates the new loopback UNC as
+        // soon as the mapping appears and caches its generated
+        // "DavWWWRoot (\\localhost@port)" name; writing `_LabelFromReg`
+        // afterwards leaves the registry correct but the visible name stale.
+        // Creating the MountPoints2 value first makes the very first
+        // enumeration read the user's chosen label.
         if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
+        }
+        if let Err(error) = mount_native(&mount, &url).await {
+            server_task.abort();
+            // `label_native` may have written only part of its registry state
+            // before failing; cleanup is deliberately unconditional.
+            let _ = clear_native_label(&mount, Some(port)).await;
+            return Err(error);
         }
         let info = NativeDriveInfo {
             route: route.clone(),

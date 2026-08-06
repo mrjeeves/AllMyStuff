@@ -6971,6 +6971,9 @@ class AppStore {
         if (ids[0] !== msg.into) return;
 
         let target = this.rooms.find((room) => room.id === msg.into);
+        // Never let a peer repurpose an unrelated room whose id it happens to
+        // know. A pre-existing target must already be this exact DM pair.
+        if (target && !this.isDirectRoomWith(target, sender)) return;
         if (!target) {
           const owner = roomHostFromId(msg.into);
           if (!owner || (!this.isMe(owner) && !sameMachine(owner, sender))) return;

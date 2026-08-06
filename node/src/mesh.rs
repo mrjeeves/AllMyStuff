@@ -10950,13 +10950,20 @@ impl Mesh {
         route_id: &str,
         event: FileEvent,
     ) -> Result<Vec<FileEvent>, String> {
+        self.drive_file_request_timeout(route_id, event, Duration::from_secs(30))
+            .await
+    }
+
+    pub(crate) async fn drive_file_request_timeout(
+        self: &Arc<Self>,
+        route_id: &str,
+        event: FileEvent,
+        timeout: Duration,
+    ) -> Result<Vec<FileEvent>, String> {
         let req = event.req();
         let mut replies = self.files.begin_rpc(route_id, req);
-        if let Err(error) = self.file_send(route_id.to_string(), event).await {
-            self.files.cancel_rpc(route_id, req);
-            return Err(error);
-        }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let result = tokio::time::timeout(timeout, async {
+            self.file_send(route_id.to_string(), event).await?;
             let mut events = Vec::new();
             while let Some(event) = replies.recv().await {
                 let terminal = matches!(
@@ -10972,13 +10979,14 @@ impl Mesh {
                     break;
                 }
             }
-            events
+            Ok::<_, String>(events)
         })
         .await;
         self.files.cancel_rpc(route_id, req);
         match result {
-            Ok(events) if !events.is_empty() => Ok(events),
-            Ok(_) => Err("mapped drive disconnected before the request completed".into()),
+            Ok(Ok(events)) if !events.is_empty() => Ok(events),
+            Ok(Ok(_)) => Err("mapped drive disconnected before the request completed".into()),
+            Ok(Err(error)) => Err(error),
             Err(_) => Err("mapped drive request timed out".into()),
         }
     }

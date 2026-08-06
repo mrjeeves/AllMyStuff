@@ -72,6 +72,7 @@ impl DriveMounts {
             return Ok(existing.info.clone());
         }
         let mount = choose_mount(&requested_mount, &self.list()).await?;
+        wait_for_route(&mesh, &route).await?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|error| format!("couldn't start the local drive bridge: {error}"))?;
@@ -111,6 +112,9 @@ impl DriveMounts {
             server_task.abort();
             return Err(error);
         }
+        if let Err(error) = label_native(&mount, &label).await {
+            tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
+        }
         let info = NativeDriveInfo {
             route: route.clone(),
             label,
@@ -140,6 +144,12 @@ impl DriveMounts {
                     active.info.route
                 );
             }
+            if let Err(error) = clear_native_label(&active.info.mount).await {
+                tracing::warn!(
+                    "couldn't clear native drive label for {}: {error}",
+                    active.info.mount
+                );
+            }
         });
     }
 }
@@ -147,6 +157,7 @@ impl DriveMounts {
 async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, String> {
     #[cfg(windows)]
     {
+        let remembered = remembered_network_mounts().await?;
         let requested = requested.trim().trim_end_matches(['\\', '/']);
         if !requested.is_empty() {
             let mut chars = requested.chars();
@@ -160,14 +171,14 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
                 return Err("drive letter must look like X:".into());
             }
             let mount = format!("{letter}:");
-            if !mount_available(&mount, active).await {
+            if !mount_available(&mount, active, &remembered) {
                 return Err(format!("{mount} is already in use"));
             }
             return Ok(mount);
         }
         for letter in ('D'..='Z').rev() {
             let mount = format!("{letter}:");
-            if mount_available(&mount, active).await {
+            if mount_available(&mount, active, &remembered) {
                 return Ok(mount);
             }
         }
@@ -181,26 +192,71 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
 }
 
 #[cfg(windows)]
-async fn mount_available(mount: &str, active: &[NativeDriveInfo]) -> bool {
+fn mount_available(
+    mount: &str,
+    active: &[NativeDriveInfo],
+    remembered: &std::collections::HashSet<String>,
+) -> bool {
     if std::path::Path::new(&format!("{mount}\\")).exists()
         || active
             .iter()
             .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
+        || remembered.contains(&mount.to_ascii_uppercase())
     {
         return false;
     }
+    true
+}
 
-    // `Path::exists` misses disconnected persistent network mappings. Windows
-    // still reserves their letters, though, and `net use` then waits before
-    // failing with system error 1202. Query the requested local name itself:
-    // success means Windows knows that mapping, connected or not; 2250 means
-    // the letter is genuinely unassigned and safe for our loopback WebDAV.
-    tokio::process::Command::new("net.exe")
-        .args(["use", mount])
+#[cfg(windows)]
+async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>, String> {
+    // One snapshot is both faster and more reliable than `net use X:` per
+    // candidate: querying a disconnected remembered letter can make Windows
+    // attempt a reconnect before it answers. The listing includes connected,
+    // disconnected, and reconnecting entries; drive-letter tokens themselves
+    // are stable even when the surrounding output is localized.
+    let output = tokio::process::Command::new("net.exe")
+        .arg("use")
         .output()
         .await
-        .map(|output| !output.status.success())
-        .unwrap_or(false)
+        .map_err(|error| format!("couldn't inspect Windows drive mappings: {error}"))?;
+    if !output.status.success() {
+        return Err("Windows couldn't list its existing drive mappings".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter(|token| {
+            token.len() == 2
+                && token.as_bytes()[0].is_ascii_alphabetic()
+                && token.as_bytes()[1] == b':'
+        })
+        .map(str::to_ascii_uppercase)
+        .collect())
+}
+
+async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
+    // Accept and Storage media use separate mesh deliveries. The local route
+    // is active before the source necessarily processes its Accept; letting
+    // Windows issue the first DAV request in that gap makes the source drop it
+    // and the redirector sit on a 30-second retry. Prove the scoped file plane
+    // answers first, using the same Stat request Windows is about to make.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let req = mesh.next_file_request_id();
+        let probe = FileEvent::Stat {
+            req,
+            path: String::new(),
+        };
+        if mesh
+            .drive_file_request_timeout(route, probe, Duration::from_secs(1))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("the source accepted the drive but its file connection never became ready".into())
 }
 
 #[cfg(windows)]
@@ -245,6 +301,59 @@ async fn unmount_native(mount: &str) -> Result<(), String> {
 #[cfg(not(windows))]
 async fn unmount_native(_mount: &str) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(windows)]
+async fn label_native(mount: &str, label: &str) -> Result<(), String> {
+    let letter = mount.trim_end_matches(':');
+    let key = format!(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+    );
+    let output = tokio::process::Command::new("reg.exe")
+        .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't launch the Explorer label update: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    refresh_explorer_drive_labels().await;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn label_native(_mount: &str, _label: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn clear_native_label(mount: &str) -> Result<(), String> {
+    let letter = mount.trim_end_matches(':');
+    let key = format!(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+    );
+    // A missing key is already the desired state, so deletion is best-effort.
+    let _ = tokio::process::Command::new("reg.exe")
+        .args(["delete", &key, "/f"])
+        .output()
+        .await;
+    refresh_explorer_drive_labels().await;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn clear_native_label(_mount: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn refresh_explorer_drive_labels() {
+    // Ask Explorer to re-read DriveIcons now; otherwise an already-open This
+    // PC window can retain the transport name until its next manual refresh.
+    let _ = tokio::process::Command::new("ie4uinit.exe")
+        .arg("-show")
+        .output()
+        .await;
 }
 
 #[derive(Clone)]

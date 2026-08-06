@@ -12,8 +12,8 @@
 //! immediately, mid-session, exactly like AllMyStuff re-checks authorization
 //! per frame.
 //!
-//! Two roles share this one struct, both living on the one shared support
-//! area (`cecsupport-clients` — see [`help_network_config`]):
+//! Two roles share this one struct. Customers announce in the public support
+//! directory while actual transports use customer-specific session rooms:
 //!  * a **customer** (the standalone CEC Support client) fills
 //!    [`CecInner::consent`] + [`CecInner::pending`];
 //!  * a **technician** (this AllMyStuff install) fills `agent_name` +
@@ -101,14 +101,13 @@ impl PendingRequest {
 /// from CEC state ([`Cec::dialed_list`]), it is not a graph grouping.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialedCustomer {
-    /// The customer's device id — the directory key (canonical form) and
-    /// the address every dial targets on the shared support area mesh.
+    /// The customer's device id — the directory key (canonical form) and the
+    /// address every deliberate session-room dial targets.
     pub node: String,
     /// The customer's support number — a display/verification label derived
     /// from their device key, kept so the technician's card and the
-    /// customer's app spell the same digits. It is NOT a room name: since
-    /// the per-number Silent rooms were removed, sessions ride the one
-    /// `cecsupport-clients` area mesh.
+    /// customer's app spell the same digits. It also deterministically names
+    /// the isolated session room, without exposing a separate user concept.
     pub number: String,
     /// Best-known label (the machine name, once presence lands).
     pub label: String,
@@ -145,11 +144,9 @@ impl DialedCustomer {
 /// re-confirmed live (see the `cec_dialed` reconcile), never trusted from a
 /// prior run. A missing or corrupt file loads empty; it never bricks the node.
 ///
-/// Migration: directories written before the shared-area model were
-/// number-keyed and could hold nodeless "attempt" rows (a dial whose
-/// per-number-room discovery never completed). A nodeless row is
-/// meaningless now — dials target a device id on the area mesh — so those
-/// rows are dropped on load; rows with a node id re-key by it losslessly.
+/// Migration: older directories could be number-keyed and hold nodeless
+/// "attempt" rows. A nodeless row cannot identify a customer, so it is dropped
+/// on load; rows with a node id re-key by it losslessly.
 /// (Old rows also carried a `network_id` room field; serde ignores it.)
 fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
     let Some(path) = path else {
@@ -225,8 +222,8 @@ struct CecInner {
     /// `cec_dial`.
     role: Role,
     /// This node's own support number (customer) — derived once the local id is
-    /// known. Empty until then. A display/verification label only: every CEC
-    /// node, both roles, lives on the one `cecsupport-clients` area mesh.
+    /// known. Empty until then. It is the customer's display/verification label
+    /// and the stable input used to derive their isolated session-room id.
     number: String,
     /// The technician's **Agent Name** — the name a customer sees in the prompt.
     /// Persisted GUI-side; mirrored here so an outbound connect-request carries
@@ -462,8 +459,8 @@ impl Cec {
 
     /// The `cec_status` result: `{ number, network_id, role, asking_help }`.
     /// When `me` is known and this node has no number yet, derive its own from
-    /// it so a customer can read its code straight away. `network_id` is
-    /// always the shared support area — the only mesh CEC uses.
+    /// it so a customer can read its code straight away. `network_id` names
+    /// the public directory for compatibility with existing clients.
     pub fn status(&self, me: Option<&str>) -> Value {
         let mut inner = self.inner.lock();
         if inner.number.is_empty() {
@@ -990,6 +987,28 @@ impl Cec {
         })
     }
 
+    /// Customer-side technicians whose approved support sessions are active.
+    /// This is the authority window for attached-KVM delegation: the KVM is
+    /// part of the support console from session start, before the technician
+    /// happens to turn on (or send the first event over) its input route.
+    pub fn active_session_technicians(&self) -> Vec<String> {
+        let inner = self.inner.lock();
+        let mut peers: Vec<String> = inner
+            .session_tech
+            .iter()
+            .filter(|(session, _)| {
+                inner
+                    .sessions
+                    .get(*session)
+                    .is_some_and(|state| state == "active")
+            })
+            .map(|(_, peer)| peer.clone())
+            .collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
     /// Admit one customer-announced KVM through the CEC presence filter for a
     /// short renewable lease. Returns false for malformed or implausibly long
     /// leases; callers must never allow a wire value to mint standing access.
@@ -1258,23 +1277,19 @@ pub fn grouped_number(number: &str) -> String {
 /// Build the daemon config for the **standing support area** — the one
 /// well-known mesh every CEC node lives on
 /// ([`HELP_NETWORK_ID`](allmystuff_cec_protocol::HELP_NETWORK_ID)):
-/// `cecsupport-clients`, used by the CEC Support app (customers, standing
-/// membership from bring-up) and the CEC tab in AllMyStuff (technicians).
-/// A mesh is just a signaling namespace: the area carries presence and the
-/// session's *signaling*; the number is a display label, never a room.
+/// `cecsupport-clients`, used by announcing customers and listen-only
+/// technician watchers. It carries discovery only; actual support transports
+/// live in [`session_network_config`] rooms.
 ///
 /// **Silent.** MyOwnMesh is a signaling system for direct WebRTC
 /// peer-to-peer connections, and the area uses exactly that: residents are
 /// visible in the signaling room (a technician's pinned redial finds a
 /// rebooted customer; a phoned-in number resolves against the member list)
-/// but the engine never dials anyone on its own — no auto-connect, no
-/// roster gossip, nothing routed through anything. A connection exists only
-/// when a technician deliberately dials one device (`connect_peer`, pinned),
-/// and that session is a direct WebRTC link — the only fallback in the
-/// data path is the venue/default TURN server when NAT rules out a direct
-/// pair, which is WebRTC's own relay, not a mesh hop. `auto_approve` keeps
-/// the *mesh-level* handshake unattended on that deliberate dial; access is
-/// the CEC consent gate's job, checked on every privileged frame.
+/// and mesh admission is disabled — no auto-connect, no roster gossip, and no
+/// unilateral stale pin can create a data link. A deliberate dial happens only
+/// after both sides meet in the customer's session room. That session is a
+/// direct WebRTC link, with the venue/default TURN server as WebRTC's own NAT
+/// fallback; human access remains gated by CEC consent per privileged frame.
 ///
 /// An earlier revision made this area `open` so the daemon's auto-dial
 /// could carry `cec.presence` beacons — which meant every customer
@@ -1290,6 +1305,39 @@ pub fn help_network_config() -> (String, Value) {
         "network_id": network_id,
         "label": "CEC Support",
         "kind": "silent",
+        // This room is a directory, never a data network. Even a stale or
+        // hostile one-sided dial must not become an admitted mesh link.
+        "auto_approve": false,
+        "signaling": { "strategy": "nostr", "mdns": true },
+    });
+    (network_id, config)
+}
+
+/// Technician view of the public customer directory. It receives customer
+/// announces but never publishes the technician's own presence, matching the
+/// asking-room watcher: lurking must be invisible.
+pub fn help_watch_network_config() -> (String, Value) {
+    let (network_id, mut config) = help_network_config();
+    config["signaling"] = json!({
+        "strategy": "nostr",
+        "mdns": false,
+        "listen_only": true,
+    });
+    (network_id, config)
+}
+
+/// Build the customer-specific Silent room that carries an actual support
+/// session. Only the customer and a technician who selected that customer's
+/// Support ID join it; the global area above remains signaling-only.
+pub fn session_network_config(number: &str) -> (String, Value) {
+    let network_id = allmystuff_cec_protocol::network_id_for_number(number);
+    let config = json!({
+        "id": network_id,
+        "network_id": network_id,
+        "label": format!("CEC Support {}", grouped_number(number)),
+        "kind": "silent",
+        // The technician's deliberate dial opens the transport. Human access
+        // is still gated by the CEC consent request on every privileged path.
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
     });
@@ -1303,8 +1351,8 @@ pub fn help_network_config() -> (String, Value) {
 /// membership is the entire signal. A raised hand is this device announcing
 /// in the room; the watching technician's queue is the room's signaling
 /// presence, longest-present first; lowering the hand is leaving. Nothing
-/// ever connects in this room — answering a hand dials the device on the
-/// standing area.
+/// ever connects in this room — answering a hand joins and dials the selected
+/// customer's isolated session room.
 pub fn ask_network_config() -> (String, Value) {
     let network_id = allmystuff_cec_protocol::ASK_NETWORK_ID.to_string();
     let config = json!({
@@ -1312,7 +1360,8 @@ pub fn ask_network_config() -> (String, Value) {
         "network_id": network_id,
         "label": "CEC Support — asking",
         "kind": "silent",
-        "auto_approve": true,
+        // Queue membership is presence only; no peer is ever admitted here.
+        "auto_approve": false,
         "signaling": { "strategy": "nostr", "mdns": true },
     });
     (network_id, config)
@@ -1334,7 +1383,7 @@ pub fn ask_watch_network_config() -> (String, Value) {
         "network_id": network_id,
         "label": "CEC Support — asking",
         "kind": "silent",
-        "auto_approve": true,
+        "auto_approve": false,
         "signaling": { "strategy": "nostr", "mdns": false, "listen_only": true },
     });
     (network_id, config)
@@ -1343,8 +1392,8 @@ pub fn ask_watch_network_config() -> (String, Value) {
 /// The bare digits of a support number — the tolerant-input form of the
 /// dial-by-number fallback (the customer reads their digits over the phone;
 /// the technician types them with or without spacing). Matching happens
-/// against numbers derived from device ids on the area mesh; digits never
-/// name a room anymore.
+/// against numbers derived from device ids in the public directory. The same
+/// digits also derive the private session-room id.
 pub fn number_digits(number: &str) -> String {
     number.chars().filter(|c| c.is_ascii_digit()).collect()
 }
@@ -1365,6 +1414,12 @@ pub fn pubkey_part(id: &str) -> &str {
 pub fn is_cec_network(network: &str) -> bool {
     network == allmystuff_cec_protocol::HELP_NETWORK_ID
         || network == allmystuff_cec_protocol::ASK_NETWORK_ID
+        || network
+            .strip_prefix(allmystuff_cec_protocol::CEC_NETWORK_PREFIX)
+            .is_some_and(|tail| {
+                tail.len() == allmystuff_cec_protocol::SUPPORT_ID_LEN
+                    && tail.chars().all(|c| c.is_ascii_digit())
+            })
 }
 
 #[cfg(test)]
@@ -1373,14 +1428,12 @@ mod tests {
 
     #[test]
     fn area_and_asking_room_are_silent_signaling_only() {
-        // The standing area: Silent (nothing auto-connects; presence is the
-        // only steady-state traffic), unattended mesh handshake on a
-        // deliberate dial, and NO topology shaping — there is nothing to
-        // shape when no connections exist.
+        // The standing area is a Silent discovery-only directory with mesh
+        // admission disabled and no topology to shape.
         let (id, cfg) = help_network_config();
         assert_eq!(id, allmystuff_cec_protocol::HELP_NETWORK_ID);
         assert_eq!(cfg["kind"], "silent");
-        assert_eq!(cfg["auto_approve"], true);
+        assert_eq!(cfg["auto_approve"], false);
         assert!(cfg.get("topology").is_none(), "signaling-only: no topology");
         assert_eq!(cfg["signaling"]["strategy"], "nostr");
 
@@ -1390,18 +1443,34 @@ mod tests {
         assert_eq!(ask_id, allmystuff_cec_protocol::ASK_NETWORK_ID);
         assert_ne!(ask_id, id, "the queue is its own room");
         assert_eq!(ask["kind"], "silent");
+        assert_eq!(ask["auto_approve"], false);
         assert!(ask.get("topology").is_none());
+
+        let (session_id, session) = session_network_config("123 456 789");
+        assert_eq!(session_id, "cec-123456789");
+        assert_eq!(session["kind"], "silent");
+        assert_eq!(session["auto_approve"], true);
+        assert!(is_cec_network(&session_id));
+        assert!(!is_cec_network("cec-kvm-something"));
+
+        let (_, watcher) = help_watch_network_config();
+        assert_eq!(watcher["signaling"]["listen_only"], true);
+        assert_eq!(watcher["signaling"]["mdns"], false);
+        let (_, ask_watcher) = ask_watch_network_config();
+        assert_eq!(ask_watcher["auto_approve"], false);
+        assert_eq!(ask_watcher["signaling"]["listen_only"], true);
     }
 
     const ME: &str = "customerpubkeybase32aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TECH: &str = "techpubkeybase32bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
-    fn status_derives_number_and_reports_the_shared_area() {
+    fn status_derives_number_and_reports_the_public_directory() {
         let cec = Cec::new(None);
         let v = cec.status(Some(ME));
         assert_eq!(v["number"], support_id_from_device(ME));
-        // One mesh for everything — the number is a label, never a room.
+        // Existing clients receive the public-directory id in status; session
+        // room selection happens internally when a technician dials.
         assert_eq!(v["network_id"], allmystuff_cec_protocol::HELP_NETWORK_ID);
         assert_eq!(v["role"], "client");
     }
@@ -1510,6 +1579,23 @@ mod tests {
     }
 
     #[test]
+    fn active_session_technicians_are_canonical_deduped_and_live_only() {
+        let cec = Cec::new(None);
+        cec.set_session("active-a", "active");
+        cec.bind_session("active-a", &format!("{TECH}-AB12C"));
+        cec.set_session("active-b", "active");
+        cec.bind_session("active-b", TECH);
+        cec.set_session("waiting", "requested");
+        cec.bind_session("waiting", TECH_B);
+
+        assert_eq!(cec.active_session_technicians(), vec![TECH.to_string()]);
+
+        cec.set_session("active-a", "ended");
+        cec.set_session("active-b", "ended");
+        assert!(cec.active_session_technicians().is_empty());
+    }
+
+    #[test]
     fn dialed_directory_is_device_keyed() {
         let cec = Cec::new(None);
         let canon = pubkey_part(TECH);
@@ -1579,11 +1665,10 @@ mod tests {
 
     #[test]
     fn legacy_number_keyed_directory_migrates_by_device() {
-        // A directory written by the per-number-room era: one completed dial
-        // (has a node), one nodeless attempt row, both with the old
-        // `network_id` room field. The completed row survives keyed by
-        // device; the nodeless attempt is meaningless without a room world
-        // and is dropped; the room field is ignored.
+        // An older directory: one completed dial (has a node), one nodeless
+        // attempt row, both with an obsolete stored `network_id` field. The
+        // completed row survives keyed by device; the nodeless attempt cannot
+        // identify a customer and is dropped; the room field is ignored.
         let path =
             std::env::temp_dir().join(format!("cec-dialed-migration-{}.json", std::process::id()));
         std::fs::write(

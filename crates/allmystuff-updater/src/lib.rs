@@ -778,7 +778,10 @@ fn artifact_needs_update(kind: ArtifactKind, latest: &str) -> bool {
 /// permitted update; never applies (that happens on next launch).
 pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     let au = load_auto_update();
-    if !au.enabled || env_disabled() {
+    // `force` is an attended check (startup, header Refresh, or Check now).
+    // The preference disables the background ticker, not the user's ability
+    // to discover a release. An explicit environment kill switch still wins.
+    if check_is_disabled(au.enabled, force, env_disabled()) {
         return Ok(CheckOutcome::Disabled);
     }
     if !force && !is_due(au.check_interval_hours) {
@@ -841,6 +844,12 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
 
     stage_release(&release, &latest, &want).await?;
     Ok(CheckOutcome::Staged { version: latest })
+}
+
+/// Automatic-update preference gates only unattended ticks. The environment
+/// switch is an operator kill switch and therefore also gates attended checks.
+fn check_is_disabled(auto_enabled: bool, force: bool, disabled_by_env: bool) -> bool {
+    disabled_by_env || (!auto_enabled && !force)
 }
 
 /// Which halves a release should bring forward: the CLI when it's behind, and
@@ -1703,6 +1712,14 @@ mod tests {
     /// `ALLMYSTUFF_HOME` is process-global; serialize the tests that mutate
     /// it so cargo's parallel runner can't cross their temp dirs.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn attended_checks_ignore_only_the_automatic_update_preference() {
+        assert!(check_is_disabled(false, false, false));
+        assert!(!check_is_disabled(false, true, false));
+        assert!(!check_is_disabled(true, false, false));
+        assert!(check_is_disabled(true, true, true));
+    }
 
     #[test]
     fn install_kind_detection() {

@@ -798,6 +798,7 @@ export type RoomWireMessage = { room: string; name?: string } & (
   | { kind: "close" }
   | { kind: "knock" }
   | { kind: "deny" }
+  | { kind: "merge"; into: string; members: string[]; access?: RoomAccess }
   | { kind: "share_list"; files: SharedFileMeta[] }
   | { kind: "shares"; files: SharedEntry[] }
 );

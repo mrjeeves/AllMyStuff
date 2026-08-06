@@ -165,8 +165,13 @@ test:
 
 # The headless node engine lives in its own workspace (heavy media deps), so
 # its fmt/clippy/test don't ride the root `--workspace` flags — run them here.
+[unix]
 node-check:
     @cd node && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
+[windows]
+node-check:
+    @cd node; cargo fmt --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo clippy --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo test
 
 # Typecheck + build the Svelte front-end (no webview needed).
 [unix]

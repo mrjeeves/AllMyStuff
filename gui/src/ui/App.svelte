@@ -41,6 +41,7 @@
   import TerminalHost from "./TerminalHost.svelte";
   import VideoPopoutHost from "./VideoPopoutHost.svelte";
   import LayersSheet from "./LayersSheet.svelte";
+  import NetworkMenu from "./NetworkMenu.svelte";
   import Toasts from "./Toasts.svelte";
 
   // When this webview is a dedicated console window (`?console=<node>`),
@@ -72,7 +73,12 @@
   function refresh() {
     refreshSpin = true;
     setTimeout(() => (refreshSpin = false), 650);
-    void app.restartNetwork();
+    // Header refresh means "bring me current": reconnect the mesh and perform
+    // a real release-feed check in parallel.
+    void Promise.allSettled([
+      app.restartNetwork(),
+      ...(isMobile() ? [] : [app.checkUpdates()]),
+    ]);
   }
 
   onMount(() => {
@@ -147,6 +153,36 @@
         <div class="tag">everything you own, wired together</div>
       </div>
     </div>
+
+    <!-- Meshes stays a first-class interaction surface in both experiences:
+         switch memberships here or jump into the full Meshes settings pane. -->
+    <span class="net-anchor">
+      <button
+        class="chip net"
+        class:live={app.backendConnected && app.normalNetworks.length > 0}
+        onclick={(e) => {
+          e.stopPropagation();
+          app.netMenuOpen = !app.netMenuOpen;
+        }}
+        title="Your meshes — switch them on or off, or open mesh settings"
+        aria-haspopup="menu"
+        aria-expanded={app.netMenuOpen}
+      >
+        <span class="net-dot"></span>
+        {!app.backendConnected
+          ? "demo mode"
+          : app.normalNetworks.length > 1
+            ? `${app.normalNetworks.length} meshes`
+            : app.activeNormalNetwork
+              ? app.meshLabel(app.activeNormalNetwork)
+              : app.normalDisabledNets.length > 0
+                ? "meshes off"
+                : "no mesh"}
+        {#if app.normalDisabledNets.length > 0}<span class="net-off" title="{app.normalDisabledNets.length} disabled">+{app.normalDisabledNets.length} off</span>{/if}
+        <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
+      </button>
+      {#if app.netMenuOpen}<NetworkMenu />{/if}
+    </span>
 
     <button
       class="experience-toggle"
@@ -286,8 +322,8 @@
     font-size: 0.72rem;
     color: var(--ink-faint);
   }
-  /* One unmistakable two-position control replaces the old fleet/mesh/venue
-     status chips. The selected half sits physically lower, like a pressed
+  /* One unmistakable two-position control replaces the secondary summary
+     chips. Meshes remains beside it as a key interaction surface. The selected half sits physically lower, like a pressed
      rocker, while the inactive half dims hard enough to read at a glance. */
   .experience-toggle {
     margin-left: auto;
@@ -340,6 +376,57 @@
     width: 1px;
     height: 1.2rem;
     background: var(--line-strong);
+  }
+  .net-anchor {
+    position: relative;
+    display: inline-flex;
+  }
+  .chip.net {
+    cursor: pointer;
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: oklch(0.7 0.19 14 / 0.35);
+    transition: border-color 0.12s ease, background 0.12s ease,
+      filter 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
+  }
+  .chip.net.live {
+    background: var(--c-mesh-soft);
+    color: var(--c-mesh-ink);
+    border-color: var(--c-mesh);
+  }
+  .chip.net:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-sm), 0 5px 12px -5px oklch(0 0 0 / 0.45);
+    border-color: currentColor;
+  }
+  .net-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .chip.net.live .net-dot {
+    box-shadow: 0 0 0 3px var(--c-mesh-soft);
+  }
+  .net-off {
+    font-size: 0.64rem;
+    font-weight: 700;
+    color: var(--ink-faint);
+    background: var(--surface);
+    border-radius: var(--r-pill);
+    padding: 0 0.3rem;
+  }
+  .net-chevron {
+    font-size: 0.62rem;
+    line-height: 1;
+    margin-left: 0.05rem;
+    opacity: 0.7;
+    transition: transform 0.12s ease;
+  }
+  .net-chevron.open {
+    transform: rotate(180deg);
   }
   @keyframes mode-flip {
     45% { transform: rotateX(18deg) scale(0.98); }

@@ -1333,7 +1333,7 @@
      terminal, sites, updates, plus the KVM set (Wi-Fi, firmware update, the
      attach link, and the attached machine's power/reset). Stroke uses
      currentColor. -->
-{#snippet cicon(kind: "remote" | "files" | "drives" | "terminal" | "sites" | "kvm" | "update" | "link" | "power" | "reset" | "wifi")}
+{#snippet cicon(kind: "remote" | "files" | "drives" | "terminal" | "sites" | "kvm" | "update" | "link" | "power" | "reset" | "wifi" | "share" | "room")}
   {#if kind === "remote"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
@@ -1371,6 +1371,14 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
       <path d="M4 9.5a12 12 0 0 1 16 0M7 13a7.5 7.5 0 0 1 10 0M10 16.5a3 3 0 0 1 4 0" /><circle cx="12" cy="20" r=".8" fill="currentColor" stroke="none" />
     </svg>
+  {:else if kind === "share"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="18" cy="18" r="2.5" /><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6" />
+    </svg>
+  {:else if kind === "room"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M4 5.5h16v11H9l-5 3.5z" /><circle cx="9" cy="11" r=".7" fill="currentColor" stroke="none" /><circle cx="12" cy="11" r=".7" fill="currentColor" stroke="none" /><circle cx="15" cy="11" r=".7" fill="currentColor" stroke="none" />
+    </svg>
   {:else if kind === "power"}
     <!-- The attached machine's power button, driven through the KVM's GPIO. -->
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1404,6 +1412,13 @@
   {@const driveAllowed = app.isKvm(n)
     ? app.kvmAllowed(n)
     : app.isMe(n.id) || app.isFleetMember(n.id) || app.filesAllowed(n)}
+  {@const externalInteraction =
+    st.app &&
+    !st.self &&
+    !st.mine &&
+    !st.inFleet &&
+    !app.isKvm(n) &&
+    !app.isCecCustomer(n.id)}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="node"
@@ -1586,6 +1601,15 @@
       {#if app.canUpdateAllMyStuff(n)}
         <button class="cbtn update-action" data-tip="Update AllMyStuff" aria-label="Update AllMyStuff on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.updateAllMyStuff(n.id); }}>{@render cicon("update")}<span class="action-label">Update</span></button>
+      {/if}
+      {#if externalInteraction}
+        <button class="cbtn share-action" data-tip="Manage sharing" aria-label="Manage sharing with {displayName(n)}"
+          onclick={(e) => {
+            e.stopPropagation();
+            app.openShareFlow(app.localId, n.id, app.existingShareCaps(app.localId, n.id));
+          }}>{@render cicon("share")}<span class="action-label">Share</span></button>
+        <button class="cbtn room-action" data-tip="Private room" aria-label="Open a private room with {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.openDirectRoom(n.id); }}>{@render cicon("room")}<span class="action-label">Room</span></button>
       {/if}
       {#if app.kvmAllowed(n)}
         <!-- A KVM's extra controls, alongside the generic Remote Control +
@@ -3311,6 +3335,15 @@
     border-color: var(--accent);
     color: var(--accent-ink);
     background: var(--accent-soft);
+  }
+  .cbtn.share-action {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  .cbtn.room-action {
+    border-color: color-mix(in oklch, var(--accent) 55%, var(--line-strong));
+    color: var(--accent-ink);
   }
   .cbtn :global(svg) {
     width: 0.9rem;

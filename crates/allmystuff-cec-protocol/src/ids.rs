@@ -122,12 +122,17 @@ pub fn normalize_input(input: &str) -> String {
         .collect()
 }
 
-// The per-number room derivations (`network_id_for_number` /
-// `network_id_for_device`) lived here until the shared support area
-// (`HELP_NETWORK_ID`) took over sessions entirely: a number is a display /
-// verification label now, never a room. `CEC_NETWORK_PREFIX` survives in
-// `lib.rs` solely so upgrading nodes can recognise (and purge) the legacy
-// `cec-<digits>` rooms older builds persisted.
+/// Derive the private support-session room from a Support ID. The shared
+/// support area is discovery-only; actual data sessions ride this room so a
+/// technician can connect only to the customer whose number they were given.
+pub fn network_id_for_number(number: &str) -> String {
+    format!("{}{}", crate::CEC_NETWORK_PREFIX, normalize_input(number))
+}
+
+/// The private support-session room belonging to `device_id`.
+pub fn network_id_for_device(device_id: &str) -> String {
+    network_id_for_number(&support_id_from_device(device_id))
+}
 
 #[cfg(test)]
 mod tests {
@@ -164,6 +169,10 @@ mod tests {
         assert_eq!(
             support_id_from_device(bare),
             support_id_from_device(&suffixed)
+        );
+        assert_eq!(
+            network_id_for_device(bare),
+            network_id_for_device(&suffixed)
         );
         // But a dash tail that isn't a 5-char display suffix is part of the
         // id and must NOT be stripped.
@@ -207,10 +216,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_room_prefix_stays_frozen() {
-        // Upgrading nodes purge the retired per-number rooms by matching
-        // `CEC_NETWORK_PREFIX` + 9 digits — the prefix must never drift or
-        // the sweep misses what old builds persisted.
+    fn session_room_prefix_stays_frozen() {
+        // Session rooms match `CEC_NETWORK_PREFIX` + 9 digits; the prefix must
+        // never drift or two builds will choose different rooms for one customer.
         assert_eq!(crate::CEC_NETWORK_PREFIX, "cec-");
+        assert_eq!(network_id_for_number("123 456 789"), "cec-123456789");
     }
 }

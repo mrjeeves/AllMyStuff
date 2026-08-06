@@ -2018,6 +2018,17 @@ impl Mesh {
         // (The inventory watcher lives in `start` — engine-lifetime, not
         // per-connect.)
 
+        // The standing support area is a public directory, never a data mesh.
+        // Enforce that at every node startup, even when no CEC GUI command has
+        // run yet: persisted old pins otherwise reconnect before the app opens.
+        if networks
+            .iter()
+            .any(|network| network == allmystuff_cec_protocol::HELP_NETWORK_ID)
+        {
+            self.cec_prepare_directory_area().await;
+            self.cec_restore_dialed_session_rooms().await;
+        }
+
         // CEC hygiene: the daemon persists CEC rooms and auto-rejoins them,
         // so a crash mid-ask (or an exit with the queue view armed) leaves
         // this device resident in the asking room — reading as a raised
@@ -2207,11 +2218,11 @@ impl Mesh {
                     mesh.sink.emit("cec://viewing", cec_viewing_value(&viewing));
                     last_viewing = Some(viewing.clone());
                 }
-                // A customer computer with an attached KVM lends that
-                // appliance to the technician only while an input/control
-                // route is genuinely live. Both halves are short leases:
-                // discovery on the technician and authority on the KVM.
-                mesh.refresh_kvm_support(&viewing).await;
+                // An approved support session includes the customer's attached
+                // KVM from the start. Both halves stay short leases: discovery
+                // on the technician and authority on the KVM disappear shortly
+                // after the support session ends.
+                mesh.refresh_kvm_support().await;
                 for kvm in mesh.cec.prune_support_kvms() {
                     mesh.drop_transient_support_kvm(&kvm).await;
                 }
@@ -4435,19 +4446,13 @@ impl Mesh {
     /// passthrough. The customer tells its technician which KVM to expect, then
     /// tells that KVM which technician may drive it. The appliance independently
     /// verifies that this sender is its recorded attached computer.
-    async fn refresh_kvm_support(
-        &self,
-        viewing: &std::collections::BTreeMap<String, (bool, bool)>,
-    ) {
+    async fn refresh_kvm_support(&self) {
         const LEASE_SECS: u64 = 8;
         let kvms = self.locally_attached_kvms();
         if kvms.is_empty() {
             return;
         }
-        for (technician, (_, controlling)) in viewing {
-            if !*controlling {
-                continue;
-            }
+        for technician in self.cec.active_session_technicians() {
             for kvm in &kvms {
                 // Discovery goes first so the KVM's immediate targeted greet
                 // cannot race the technician's strict CEC presence filter.
@@ -4455,11 +4460,11 @@ impl Mesh {
                     kvm: NodeId::from(kvm.clone()),
                     expires_in: LEASE_SECS,
                 });
-                if let Err(error) = self.send_control(technician, &available).await {
+                if let Err(error) = self.send_control(&technician, &available).await {
                     tracing::debug!(
                         "couldn't announce support KVM {} to technician {}: {error}",
                         short_id(kvm),
-                        short_id(technician)
+                        short_id(&technician)
                     );
                     continue;
                 }
@@ -4470,7 +4475,7 @@ impl Mesh {
                 if let Err(error) = self.send_control(kvm, &grant).await {
                     tracing::debug!(
                         "couldn't delegate technician {} to attached KVM {}: {error}",
-                        short_id(technician),
+                        short_id(&technician),
                         short_id(kvm)
                     );
                 }
@@ -5131,17 +5136,15 @@ impl Mesh {
 
     // ---- CEC Support (technician + customer) --------------------------
     //
-    // CEC Support rides this exact engine: every CEC node — customer and
-    // technician — lives on the one shared **support area**
-    // (`cecsupport-clients`), a **Silent** mesh used for exactly what
-    // MyOwnMesh is: signaling for direct WebRTC peer-to-peer connections.
-    // Residents are present in the signaling room and connected to nobody;
-    // raising a hand is joining the sibling asking room
-    // (`cecsupport-asking`), whose membership IS the technicians' queue. A
-    // technician answers a raised hand (or a phoned-in number) by dialing
-    // that customer's device on the area with `connect_peer` — a direct
-    // session, with the venue/default TURN server as WebRTC's own NAT
-    // fallback, never a mesh relay. From then on that customer is an
+    // CEC Support rides this exact engine, but its public Silent rooms are
+    // signaling directories, never data meshes. Customers announce in
+    // `cecsupport-clients`; technicians lurk listen-only. Raising a hand is
+    // joining `cecsupport-asking`, whose presence is the technicians' queue.
+    // The app suppresses those public sightings outside the support workflow.
+    // A technician answers a raised hand (or a phoned-in number) by joining
+    // the selected customer's `cec-<Support ID>` room and deliberately dialing
+    // them there — a direct session, with TURN as WebRTC's NAT fallback, never
+    // a mesh hop. From then on that customer is an
     // ordinary AllMyStuff graph peer with the normal screen/control
     // features. The only substitution is trust — a CEC route is authorized
     // by the customer's live consent grant ([`crate::cec`]) rather than
@@ -5151,7 +5154,7 @@ impl Mesh {
     // verbatim.
 
     /// `cec_status`: this node's CEC snapshot — its own support number (a
-    /// display label), the shared support area, its role, and whether the
+    /// display label), the public support directory, its role, and whether the
     /// technician's help-queue view is armed.
     pub async fn cec_status(&self) -> Result<Value, String> {
         let me = self.resolve_local_id().await;
@@ -5168,13 +5171,11 @@ impl Mesh {
         Ok(status)
     }
 
-    /// `cec_online` (customer): take up residence on the shared support area
-    /// (`cecsupport-clients`) — the CEC Support app calls this at bring-up and
-    /// the membership is standing. This replaced per-number hosting: there is
-    /// no number-derived room to advertise on anymore; the customer simply
-    /// lives on the **Silent** area — present in the signaling room,
-    /// connected to nobody — where technicians can see and deliberately dial
-    /// them. Joining raises no hand — that's `cec_ask_help`'s job (membership
+    /// `cec_online` (customer): announce in the public `cecsupport-clients`
+    /// directory and host this customer's isolated session room. The public
+    /// membership is standing and admission-disabled: technicians can discover
+    /// the customer but cannot make it a data mesh. Joining raises no hand —
+    /// that's `cec_ask_help`'s job (membership
     /// in the sibling asking room). Returns `{ number }` for the app's
     /// display: the digits a customer reads over the phone, derived from the
     /// device key.
@@ -5186,71 +5187,95 @@ impl Mesh {
         let number = self.cec.own_number(Some(&me));
         let (network_id, config) = crate::cec::help_network_config();
         self.cec_join_silent(&network_id, config).await?;
-        self.cec_migrate_area_to_silent().await;
-        self.cec_sweep_area_roster().await;
-        self.cec_purge_legacy_rooms().await;
+        self.cec_prepare_directory_area().await;
+        // The global area above is discovery-only. Host the actual support
+        // transport in this customer's own room so unrelated CEC nodes can
+        // never become data peers.
+        let (session_network, session_config) = crate::cec::session_network_config(&number);
+        self.cec_join_silent(&session_network, session_config)
+            .await?;
+        self.cec_restore_dialed_session_rooms().await;
         self.cec_sweep_stale_asking_room().await;
-        tracing::info!("CEC Support: on the support area {network_id} as number {number}");
+        tracing::info!(
+            "CEC Support: discoverable on {network_id}; hosting isolated session room {session_network} as number {number}"
+        );
         Ok(json!({ "number": number }))
     }
 
-    /// One-time sweep for installs upgrading from the per-number model:
-    /// remove every `cec-<9 digits>` Silent room the daemon still carries —
-    /// a customer's own number room, and every number room a technician's
-    /// dials accumulated. Exactly prefix + digits, so the NanoKVM claim
-    /// meshes (`cec-kvm-…`) can never match. Purge is deliberate: those
-    /// rooms' rosters are meaningless now and a re-add would mint fresh
-    /// state anyway.
-    async fn cec_purge_legacy_rooms(self: &Arc<Self>) {
-        let stale: Vec<String> = {
-            let st = self.state.lock();
-            st.networks
-                .iter()
-                .filter(|n| {
-                    n.strip_prefix(allmystuff_cec_protocol::CEC_NETWORK_PREFIX)
-                        .is_some_and(|rest| {
-                            rest.len() == 9 && rest.chars().all(|c| c.is_ascii_digit())
-                        })
-                })
-                .cloned()
-                .collect()
-        };
-        if stale.is_empty() {
-            return;
-        }
-        tracing::info!(
-            "CEC Support: removing {} legacy per-number room(s) — sessions ride the shared area now",
-            stale.len()
-        );
-        for network in stale {
+    /// Rejoin and re-pin only the customers in this technician's durable CEC
+    /// directory. These isolated rooms replace the old pins on the global
+    /// support area without losing wake/reboot reconnect behavior.
+    async fn cec_restore_dialed_session_rooms(self: &Arc<Self>) {
+        for record in self.cec.dialed_records() {
+            let canonical = crate::cec::pubkey_part(&record.node).to_string();
+            let (network, config) = crate::cec::session_network_config(&record.number);
+            if let Err(e) = self.cec_join_silent(&network, config).await {
+                tracing::warn!(
+                    "CEC Support: couldn't restore session room {network} for {}: {e}",
+                    short_id(&canonical)
+                );
+                continue;
+            }
             let _ = self
                 .client
-                .request(&Request::NetworkRemove {
+                .request(&Request::NetworkConnectPeer {
                     network,
-                    purge: true,
+                    peer: canonical,
+                    pin: true,
+                    wait_ms: 0,
                 })
                 .await;
         }
-        self.sync_networks().await;
     }
 
-    /// One-time (per install) migration of the support area back to
-    /// **Silent**. A stretch of builds ran the area `open` + auto-approve so
-    /// the daemon's auto-dial could carry help beacons — which connected
-    /// every customer to every co-present stranger and filled their graphs
-    /// (and gossiped rosters) with the whole area. The network *kind* is
-    /// governed state bootstrapped at first attach, so pushing a `silent`
-    /// config over a joined room can't flip it — the room has to be
-    /// re-created. Purge is deliberate: it also deletes the room's leaked
-    /// roster (a membership list of strangers gossiped in while it was open)
-    /// and its open-genesis governance log. No valuable state lives on the
-    /// area — dialed directories, grants, and chats are CEC files, not mesh
-    /// state — so the re-create costs a moment of presence, nothing more.
-    async fn cec_migrate_area_to_silent(self: &Arc<Self>) {
+    /// Enforce the global support area's only valid shape: signaling-only,
+    /// approval-gated, with no pins, roster, or live transports. Older builds
+    /// pinned support sessions here, so merely changing the config would leave
+    /// those authenticated WebRTC links alive. A dirty area is purged and
+    /// recreated; actual sessions are restored in per-customer rooms instead.
+    async fn cec_prepare_directory_area(self: &Arc<Self>) {
         let (area, config) = crate::cec::help_network_config();
-        let kind = match self
+
+        let config_dirty = match self.client.request(&Request::ConfigShow).await {
+            Ok(r) if r.ok => r
+                .data
+                .as_ref()
+                .and_then(|d| d.pointer("/config/networks"))
+                .and_then(Value::as_array)
+                .and_then(|nets| {
+                    nets.iter().find(|n| {
+                        n.get("id").and_then(Value::as_str) == Some(area.as_str())
+                            || n.get("network_id").and_then(Value::as_str) == Some(area.as_str())
+                    })
+                })
+                .is_some_and(|cfg| {
+                    cfg.get("auto_approve").and_then(Value::as_bool) != Some(false)
+                        || cfg
+                            .get("pinned_peers")
+                            .and_then(Value::as_array)
+                            .is_some_and(|pins| !pins.is_empty())
+                }),
+            _ => false,
+        };
+        let kind_dirty = match self
             .client
             .request(&Request::GovernanceState {
+                network: area.clone(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => {
+                r.data
+                    .as_ref()
+                    .and_then(|d| d.pointer("/state/kind"))
+                    .and_then(Value::as_str)
+                    != Some("silent")
+            }
+            _ => false,
+        };
+        let roster_dirty = match self
+            .client
+            .request(&Request::RosterList {
                 network: area.clone(),
             })
             .await
@@ -5258,19 +5283,43 @@ impl Mesh {
             Ok(r) if r.ok => r
                 .data
                 .as_ref()
-                .and_then(|d| d.pointer("/state/kind"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            // Can't read the governed kind (older daemon mid-upgrade, or the
-            // room isn't actually joined) — don't churn the room on a guess.
-            _ => None,
+                .and_then(|d| d.get("roster"))
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty()),
+            _ => false,
         };
-        if kind.as_deref() != Some("open") {
+        let transport_dirty = match self
+            .client
+            .request(&Request::PeersList {
+                network: area.clone(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r
+                .data
+                .as_ref()
+                .and_then(|d| d.get("peers"))
+                .and_then(Value::as_array)
+                .is_some_and(|peers| {
+                    peers.iter().any(|peer| {
+                        !matches!(
+                            peer.get("status").and_then(Value::as_str),
+                            Some("sighted" | "offline") | None
+                        )
+                    })
+                }),
+            _ => false,
+        };
+
+        if !(config_dirty || kind_dirty || roster_dirty || transport_dirty) {
             return;
         }
-        tracing::info!(
-            "CEC Support: support area is governed open (the beacon-era shape) — \
-             re-creating it silent and purging its leaked roster"
+        tracing::warn!(
+            config_dirty,
+            kind_dirty,
+            roster_dirty,
+            transport_dirty,
+            "CEC Support: purging data links and legacy state from the discovery-only area"
         );
         let _ = self
             .client
@@ -5280,127 +5329,9 @@ impl Mesh {
             })
             .await;
         if let Err(e) = self.cec_join_silent(&area, config).await {
-            tracing::warn!("CEC Support: re-join of the silent area failed: {e}");
-        }
-        // The purge deleted the area's network config — including the pinned
-        // standing dials a technician holds toward every serviced customer
-        // (pins persist inside the network config). Re-arm them from the
-        // durable dialed directory so unattended reconnects survive the
-        // migration: each pin is a fire-and-forget reconnect intent the
-        // engine parks until that customer next announces. A customer node
-        // has no dialed records, so this is a no-op for them.
-        for record in self.cec.dialed_records() {
-            let canonical = crate::cec::pubkey_part(&record.node).to_string();
-            let _ = self
-                .client
-                .request(&Request::NetworkConnectPeer {
-                    network: area.clone(),
-                    peer: canonical,
-                    pin: true,
-                    wait_ms: 0,
-                })
-                .await;
+            tracing::warn!("CEC Support: re-join of the directory area failed: {e}");
         }
         self.sync_networks().await;
-    }
-
-    /// Drop every area-roster entry this node has no deliberate CEC
-    /// relationship with. The open era auto-approved (and gossiped in)
-    /// every co-present stranger, and the migration's purge only heals a
-    /// room whose governed kind still reads `open` — a daemon that
-    /// restarted onto the silent config before the app's first post-update
-    /// run keeps its stranger roster. This sweep is the idempotent
-    /// belt-and-suspenders: legitimate entries (dialed customers, granted
-    /// or pending technicians) stay, strangers go.
-    async fn cec_sweep_area_roster(self: &Arc<Self>) {
-        let area = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
-        let data = match self
-            .client
-            .request(&Request::RosterList {
-                network: area.clone(),
-            })
-            .await
-        {
-            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
-            _ => return,
-        };
-        let Some(entries) = data.get("roster").and_then(|v| v.as_array()) else {
-            return;
-        };
-        let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
-        let strangers: Vec<String> = entries
-            .iter()
-            .filter_map(|e| e.get("device_id").and_then(|v| v.as_str()))
-            .map(|id| pubkey_part(id).to_string())
-            .filter(|id| me.as_deref() != Some(id.as_str()))
-            .filter(|id| !self.cec.relationship_with(id))
-            .collect();
-        if strangers.is_empty() {
-            return;
-        }
-        tracing::info!(
-            "CEC Support: dropping {} open-era stranger(s) from the area roster",
-            strangers.len()
-        );
-        for device_id in &strangers {
-            let _ = self
-                .client
-                .request(&Request::RosterRemove {
-                    network: area.clone(),
-                    device_id: device_id.clone(),
-                })
-                .await;
-        }
-        // RosterRemove fixes the daemon, but it cannot retract a profile the
-        // app session already accepted during the Open→Silent startup window.
-        // Purge that residue too. Keep peers with durable non-CEC standing
-        // (fleet ownership or an explicit share), and keep a peer whose
-        // recorded provenance is another network; those are real AllMyStuff
-        // nodes that merely happen to be co-resident in Support as well.
-        let protected: std::collections::HashSet<String> = strangers
-            .iter()
-            .filter(|peer| self.peer_has_durable_non_cec_standing(peer))
-            .cloned()
-            .collect();
-        let (effects, dropped) = {
-            let mut st = self.state.lock();
-            let purgeable: std::collections::HashSet<String> = strangers
-                .into_iter()
-                .filter(|peer| !protected.contains(peer))
-                .filter(|peer| {
-                    st.peer_networks
-                        .get(peer)
-                        .is_none_or(|network| crate::cec::is_cec_network(network))
-                })
-                .collect();
-            for peer in &purgeable {
-                st.peer_networks.remove(peer);
-                st.peer_features.remove(peer);
-                st.peer_links.remove(peer);
-                st.peer_boots.remove(peer);
-            }
-            let mut effects = Vec::new();
-            let mut dropped = 0usize;
-            if let Some(session) = st.session.as_mut() {
-                let gone: Vec<NodeId> = session
-                    .peers()
-                    .filter(|profile| purgeable.contains(pubkey_part(profile.node.as_str())))
-                    .map(|profile| profile.node.clone())
-                    .collect();
-                for peer in gone {
-                    effects.extend(session.drop_peer(&peer));
-                    dropped += 1;
-                }
-            }
-            (effects, dropped)
-        };
-        if dropped > 0 {
-            tracing::info!(
-                "CEC Support: cleared {dropped} CEC-only stranger profile(s) from the AllMyStuff session"
-            );
-            self.process_effects(effects).await;
-            self.emit_snapshot();
-        }
     }
 
     /// Whether a peer has a reason to stay in the AllMyStuff catalog even if
@@ -5455,7 +5386,7 @@ impl Mesh {
     /// the entire "I need help" signal a watching technician sees (their
     /// queue is the room's member list, and the dialable number derives from
     /// this device's announced id). The technician answers by dialing this
-    /// device on the standing area. Presence carries want, never access: a
+    /// device in its isolated session room. Presence carries want, never access: a
     /// session still takes the full consent handshake.
     pub async fn cec_ask_help(self: &Arc<Self>, on: bool) -> Result<Value, String> {
         let me = self
@@ -5490,8 +5421,8 @@ impl Mesh {
     /// broadcasts a signaling Leave; a crash instead ages out with the
     /// room's presence). Shared by the explicit cancel and the automatic
     /// clear when a session gets approved — help arrived, stop asking for
-    /// it. The standing area is untouched: that's where this node lives, and
-    /// where the approved session is riding. A technician whose own hand
+    /// it. The standing directory and isolated session room are untouched. A
+    /// technician whose own hand
     /// was up while their queue view is armed doesn't leave — they drop
     /// back to the listen-only watch join instead.
     async fn cec_stop_asking_help(self: &Arc<Self>) {
@@ -5518,24 +5449,22 @@ impl Mesh {
     }
 
     /// `cec_help_watch { on }` (technician): arm or disarm the help-queue
-    /// view. Arming joins the standing area (idempotent — a technician with
-    /// dialed customers is already living there) **and the asking room**,
-    /// whose signaling presence is the queue itself; disarming leaves the
-    /// asking room and clears the view. The standing area is never left:
-    /// dialed customers' sessions ride it, and "stop watching the queue"
-    /// must never mean "hang up on everyone".
+    /// view. Arming joins both public rooms listen-only; disarming leaves the
+    /// asking-room view and clears the queue. Existing customer sessions remain
+    /// in their isolated rooms, so stopping the queue never hangs them up.
     pub async fn cec_help_watch(self: &Arc<Self>, on: bool) -> Result<Value, String> {
         if on {
-            let (network_id, config) = crate::cec::help_network_config();
+            let (network_id, config) = crate::cec::help_watch_network_config();
             self.cec_join_silent(&network_id, config).await?;
-            self.cec_migrate_area_to_silent().await;
-            self.cec_sweep_area_roster().await;
-            // Listen-only: the queue is read by presence, never joined as a
+            self.cec_prepare_directory_area().await;
+            let (_, watcher_config) = crate::cec::help_watch_network_config();
+            self.cec_join_silent(&network_id, watcher_config).await?;
+            self.cec_restore_dialed_session_rooms().await;
+            // Listen-only: the queue is read by presence without announcing
             // presence — a watching technician must not read as a raised
             // hand in other technicians' queues.
             let (ask_room, ask_config) = crate::cec::ask_watch_network_config();
             self.cec_join_silent(&ask_room, ask_config).await?;
-            self.cec_purge_legacy_rooms().await;
             self.cec.set_watching_help(true);
             // Seed the queue from the room's current members — hands raised
             // before this technician started watching must not wait for
@@ -5592,11 +5521,7 @@ impl Mesh {
             .iter()
             .filter_map(|p| p.get("device_id").and_then(|v| v.as_str()))
             .map(|id| pubkey_part(id).to_string())
-            // A watching technician is co-present in the asking room but is
-            // not asking; keep ourselves (and nothing else we can tell
-            // apart — other watching technicians do appear as waiting rows
-            // until they disarm; the queue card's number makes that
-            // harmless) out of our own queue.
+            // Defensive self-filter for older daemons that ignore listen_only.
             .filter(|id| me.as_deref() != Some(id.as_str()))
             .collect();
         if self.cec.help_sync_presence(&present) {
@@ -5610,8 +5535,8 @@ impl Mesh {
     /// crowded to spot them (or they just prefer saying a number). Resolves
     /// the digits to a device id **on the support area** — a raised hand
     /// first (the beacon's authenticated sender), else any area member whose
-    /// key-derived number matches — then dials that device like any answered
-    /// hand. Numbers never name a room anymore. Returns `{ node }`.
+    /// key-derived number matches — then joins that customer's private room and
+    /// dials it like any answered hand. Returns `{ node }`.
     pub async fn cec_dial(
         self: &Arc<Self>,
         number: String,
@@ -5624,9 +5549,11 @@ impl Mesh {
             ));
         }
         // The area is where customers are — be on it before looking.
-        let (area, config) = crate::cec::help_network_config();
+        let (area, config) = crate::cec::help_watch_network_config();
         self.cec_join_silent(&area, config).await?;
-        self.cec_purge_legacy_rooms().await;
+        self.cec_prepare_directory_area().await;
+        let (_, watcher_config) = crate::cec::help_watch_network_config();
+        self.cec_join_silent(&area, watcher_config).await?;
         let node = match self.cec.help_seeker_by_number(&digits) {
             Some(node) => node,
             None => self
@@ -5662,8 +5589,8 @@ impl Mesh {
         })
     }
 
-    /// `cec_dial_node` (technician): open a support session with `node` on
-    /// the shared area — the headline path, fed straight from a raised
+    /// `cec_dial_node` (technician): open a support session with `node` in the
+    /// customer's isolated room — the headline path, fed straight from a raised
     /// hand's beacon (its authenticated device id), and the tail of the
     /// dial-by-number fallback. Pins the connection (a support session is a
     /// standing dial), records the customer in the device-keyed directory,
@@ -5683,11 +5610,11 @@ impl Mesh {
             agent_name
         };
         self.cec.note_technician();
-        let (network_id, config) = crate::cec::help_network_config();
-        self.cec_join_silent(&network_id, config).await?;
         let customer = node;
         let canonical = crate::cec::pubkey_part(&customer).to_string();
         let number = allmystuff_cec_protocol::support_id_from_device(&customer);
+        let (network_id, config) = crate::cec::session_network_config(&number);
+        self.cec_join_silent(&network_id, config).await?;
         // The row is directory-worthy from the moment of the dial — emitted
         // immediately so the CEC tab shows it right away; the post-connect
         // refresh below fills in the live ident.
@@ -5726,8 +5653,8 @@ impl Mesh {
             self.cec
                 .record_dialed(customer.clone(), number.clone(), label, hostname, true);
         tracing::info!(
-            "CEC Support: dialed customer {} on the support area",
-            short_id(&customer)
+            "CEC Support: dialed customer {} in isolated room {network_id}",
+            short_id(&customer),
         );
 
         // The connect handshake — the customer's node raises the 3-choice
@@ -5823,6 +5750,10 @@ impl Mesh {
         // Bind the session to this technician so the consent sweep can end
         // exactly their sessions when the grant later lapses.
         self.cec.bind_session(&session_id, &tech);
+        // Prime attached-KVM discovery and authority now, rather than making
+        // the newly approved console wait for the next two-second renewal
+        // sweep before its KVM screen can be selected.
+        self.refresh_kvm_support().await;
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
             self.cec_send_decision(
@@ -5997,13 +5928,13 @@ impl Mesh {
         // shows which stored machines are reachable right now (and can be
         // reconnected — an expired grant just re-prompts the customer).
         let records = self.cec.dialed_records();
-        let area = allmystuff_cec_protocol::HELP_NETWORK_ID;
-        // The tab polls this, so fetch the peer set ONCE and reconcile the whole
-        // directory against it — not a round-trip per serviced machine.
-        let reachable = self.cec_reachable_set(area).await;
+        // Each stored customer has a distinct session room, so reconcile
+        // reachability against that room's peer set.
         let mut out = Vec::with_capacity(records.len());
         for r in records {
             let canonical = crate::cec::pubkey_part(&r.node).to_string();
+            let network = allmystuff_cec_protocol::network_id_for_number(&r.number);
+            let reachable = self.cec_reachable_set(&network).await;
             let online = reachable.contains(&canonical);
             if online != r.online {
                 self.cec.set_customer_online(&canonical, online);
@@ -6036,11 +5967,29 @@ impl Mesh {
 
     /// CEC-specific cleanup layered onto [`Self::forget_node`] — a no-op for an
     /// ordinary (non-CEC) peer. Revokes any grant for `node` (customer side)
-    /// and drops the dialed record (technician side). Nothing network-level:
-    /// sessions ride the shared area, which is never torn down for one
-    /// forgotten peer (the pinned dial died with `teardown_and_drop_peer`).
+    /// and drops the dialed record (technician side), including the customer's
+    /// isolated room so its durable pin cannot reconnect later.
     async fn cec_forget_cleanup(self: &Arc<Self>, node: &str, canonical: &str) {
+        let dialed_room = self
+            .cec
+            .dialed_records()
+            .into_iter()
+            .find(|record| pubkey_part(&record.node) == canonical)
+            .map(|record| allmystuff_cec_protocol::network_id_for_number(&record.number));
         let _ = self.cec.forget_dialed(canonical);
+        // On the technician side the room belongs to exactly this customer.
+        // Leaving it is also the only daemon-0.3.3 way to remove its persisted
+        // standing dial, so "Forget" really stops reconnecting.
+        if let Some(network) = dialed_room {
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove {
+                    network,
+                    purge: true,
+                })
+                .await;
+            self.sync_networks().await;
+        }
         // Customer side: forgetting a technician is also a revoke.
         let _ = self.cec.revoke(node);
         self.cec_emit_grants();
@@ -6075,7 +6024,7 @@ impl Mesh {
                 // heals in place. The network *kind* is NOT healable this
                 // way: it's governed state bootstrapped at first attach, so
                 // an area still governed `open` (the beacon-era shape) is
-                // re-created by [`Mesh::cec_migrate_area_to_silent`], not
+                // purged and re-created by `cec_prepare_directory_area`, not
                 // updated. A failed update degrades to the old behavior
                 // rather than failing the join.
                 let _ = self
@@ -6404,6 +6353,10 @@ impl Mesh {
                                 // technician so the consent sweep can end it
                                 // when the standing grant later lapses.
                                 self.cec.bind_session(&session_id, &from);
+                                // A standing approval is already active, so
+                                // make the attached KVM available before the
+                                // approval response reaches the technician.
+                                self.refresh_kvm_support().await;
                                 if let Some(rec) =
                                     self.cec.touch_dialed(crate::cec::pubkey_part(&from))
                                 {
@@ -8615,6 +8568,12 @@ impl Mesh {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 if nid.is_empty() {
+                    return false;
+                }
+                // CEC owns its admission policy. The public area and queue are
+                // signaling-only; selected customer rooms opt into admission
+                // explicitly. Never auto-open any of them here.
+                if crate::cec::is_cec_network(nid) {
                     return false;
                 }
                 // Never auto-open the fleet's closed mesh — its members are the

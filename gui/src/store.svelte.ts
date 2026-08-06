@@ -504,6 +504,13 @@ export interface Toast {
   id: number;
   kind: "ok" | "info" | "warn";
   text: string;
+  persistent?: boolean;
+  tag?: "update";
+  actions?: Array<{
+    label: string;
+    action: "apply_update" | "relaunch_update" | "open_updates";
+    primary?: boolean;
+  }>;
 }
 
 /** A connection the user started but that needs a permission grant first.
@@ -1075,14 +1082,14 @@ class AppStore {
     return net?.network_id === LOCAL_CLAIM_NETWORK_ID;
   }
 
-  /** Whether a mesh in the list is the **CEC Support area** — the one shared
-   *  mesh every CEC session rides. It's node-managed (joined at bring-up, or on
-   *  a technician's first dial) and driven from the CEC tab, so the Meshes list
-   *  filters it out to keep client support separate from your own meshes. */
+  /** Whether a mesh is managed by CEC Support: its public discovery/asking
+   *  directories or a private `cec-<Support ID>` session room. These are
+   *  lifecycle-owned by the support workflow, never user meshes. */
   isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
     return (
       net?.network_id === CEC_AREA_NETWORK_ID ||
-      net?.network_id === CEC_ASK_NETWORK_ID
+      net?.network_id === CEC_ASK_NETWORK_ID ||
+      /^cec-\d{9}$/.test(net?.network_id ?? "")
     );
   }
 
@@ -1090,6 +1097,11 @@ class AppStore {
    *  shows. Client support lives in the (secret) CEC tab instead. */
   normalNetworks = $derived.by(() =>
     this.networks.filter((n) => !this.isManagedCecMesh(n)),
+  );
+
+  /** Parked user meshes, excluding CEC's private/public workflow rooms. */
+  normalDisabledNets = $derived.by(() =>
+    this.disabledNets.filter((n) => !this.isManagedCecMesh(n)),
   );
 
   /** The fleet owner's display name, read from the signed roster (the member
@@ -1396,12 +1408,16 @@ class AppStore {
   consoleSessionRoutes = $derived.by(() => {
     const remote = this.consoleNodeId;
     if (!remote) return [] as Route[];
+    const customer = this.machineByAnyId(remote);
+    const kvm = customer && this.isCecCustomer(customer.id) ? this.kvmAttachedTo(customer.id) : null;
+    const remoteEnds = [remote, ...(kvm ? [kvm.id] : [])];
     return this.catalog.routes.filter((r) => {
       const f = this.capability(r.from);
       const t = this.capability(r.to);
       if (!f || !t) return false;
       const ends = [f.node, t.node];
-      return ends.includes(remote) && ends.includes(this.localId);
+      return ends.some((end) => remoteEnds.some((peer) => sameMachine(end, peer))) &&
+        ends.some((end) => this.isMe(end));
     });
   });
 
@@ -1415,6 +1431,13 @@ class AppStore {
     const nets = Array.isArray(this.networks) ? this.networks : [];
     return nets.find((n) => n.config_id === this.sessionNetwork) ?? nets[0] ?? null;
   });
+  /** Header-facing active mesh. CEC's managed rooms must never replace the
+   *  user's Meshes pill label merely because one became the session primary. */
+  activeNormalNetwork = $derived.by(() =>
+    this.normalNetworks.find((n) => n.config_id === this.sessionNetwork) ??
+    this.normalNetworks[0] ??
+    null,
+  );
   /** Devices waiting to be let onto the roster network. */
   pendingPeers = $derived(
     (Array.isArray(this.livePeers) ? this.livePeers : []).filter(
@@ -1525,6 +1548,11 @@ class AppStore {
       this.seedDemoNetworks();
       this.seedDemoRoom();
     }
+    // Update discovery starts before mesh hydration and hardware scans. Those
+    // can take seconds on a cold Windows launch; version checking must not wait
+    // behind them or depend on the later background ticker.
+    await onUpdateChecked((o) => this.applyUpdateChecked(o));
+    if (isTauri() && !isMobile()) void this.checkUpdates();
     // The rooms plane goes live *before* the first data pull. A room window
     // joins the instant its identity lands (set by `hydrateFromBackend`,
     // just below), and a `join` broadcast before onRoom is listening drops
@@ -1604,16 +1632,9 @@ class AppStore {
     await this.loadOwnedFleet();
     await this.loadSites();
     await onNodeSites((e) => this.applyNodeSites(e));
-    // The background ticker's verdict. Registered here (not in the Updates
-    // pane) so a release found while the user is anywhere in the app still
-    // surfaces — the pane only mounts when you go looking for it, which is
-    // exactly the trap that made auto-update feel like it never ran.
-    await onUpdateChecked((o) => this.applyUpdateChecked(o));
+    // The listener and forced launch check were started before hydration; now
+    // read the resulting staged/install state for Settings and node cards.
     await this.loadUpdateStatus();
-    // Do one real feed check while the main window starts. The updater still
-    // applies its own due/policy rules; this closes the gap where no timer had
-    // run yet and the app only displayed yesterday's persisted status.
-    void this.checkUpdates();
     // Card-level update affordances need the channel version even when the
     // details drawer never mounts (Normal mode's default).
     void this.loadLatestRelease();
@@ -3069,12 +3090,27 @@ class AppStore {
    *  — ordered so the screen leads and the default sits near the front. This
    *  is the console's "video inputs" tab bar. */
   consoleVideoInputs(nodeId: string): Capability[] {
-    return this.capsOf(nodeId)
+    const inputs = this.capsOf(nodeId)
       .filter((c) => (c.media === "display" || c.media === "video") && canSource(c.flow))
-      .sort((a, b) => {
-        const rank = (c: Capability) => (c.origin === "screen" ? 0 : c.default ? 1 : 2);
-        return rank(a) - rank(b) || a.id.localeCompare(b.id);
-      });
+      .map((c) => ({ ...c }));
+    const customer = this.machineByAnyId(nodeId);
+    if (customer && this.isCecCustomer(customer.id)) {
+      const kvm = this.kvmAttachedTo(customer.id);
+      if (kvm && this.kvmPassthroughDoors(kvm, customer)) {
+        for (const cap of this.capsOf(kvm.id)) {
+          if ((cap.media === "display" || cap.media === "video") && canSource(cap.flow)) {
+            inputs.push({ ...cap, label: `${kvm.label} KVM` });
+          }
+        }
+      }
+    }
+    return inputs.sort((a, b) => {
+      const aKvm = this.isKvm(this.machineByAnyId(a.node));
+      const bKvm = this.isKvm(this.machineByAnyId(b.node));
+      const rank = (c: Capability, kvm: boolean) =>
+        kvm ? 1 : c.origin === "screen" ? 0 : c.default ? 2 : 3;
+      return rank(a, aKvm) - rank(b, bKvm) || a.id.localeCompare(b.id);
+    });
   }
 
   /** Whether a machine's cameras actually *stream* when selected: its
@@ -3331,8 +3367,10 @@ class AppStore {
 
   /** Switch which remote source the console is showing. */
   setConsoleInput(capId: string) {
+    if (this.consoleInput === capId) return;
     this.consoleInput = capId;
     void this.applyConsoleVideo();
+    if (this.consoleControl) this.rewireConsoleControl();
   }
 
   /** Bumped per video (re)wire; an apply that awaited a teardown checks it
@@ -3525,8 +3563,7 @@ class AppStore {
    *  (the backend honours the share grant, so a shared "Control" actually
    *  drives the machine rather than lighting an inert route). */
   toggleConsoleControl() {
-    const remote = this.consoleNodeId;
-    if (!remote) return;
+    if (!this.consoleNodeId) return;
     if (this.consoleControl) {
       if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
       this.consoleControlRouteId = null;
@@ -3536,16 +3573,43 @@ class AppStore {
       return;
     }
     this.consoleUserOff.delete("control");
+    this.consoleControl = true;
+    if (!this.rewireConsoleControl()) {
+      this.consoleControl = false;
+      this.toast("warn", "No control path to that machine");
+    }
+  }
+
+  /** Route input to the machine behind the selected picture. The customer's
+   *  own screen/cameras use its software input sink; its attached KVM screen
+   *  uses the KVM HID sink under the same renewable support delegation. */
+  private consoleControlTarget(): MeshNode | null {
+    const customer = this.consoleNode;
+    if (!customer) return null;
+    const source = this.consoleInput ? this.capability(this.consoleInput) : null;
+    const sourceNode = source ? this.machineByAnyId(source.node) : undefined;
+    if (sourceNode && this.kvmPassthroughDoors(sourceNode, customer)) return sourceNode;
+    return customer;
+  }
+
+  /** Re-home an enabled keyboard/mouse route when the selected picture moves
+   *  between the customer computer and its attached KVM. */
+  private rewireConsoleControl(): boolean {
+    if (this.consoleControlRouteId) void this.disconnect(this.consoleControlRouteId);
+    this.consoleControlRouteId = null;
+    this.consoleControlLive = null;
+    if (!this.consoleControl) return false;
+    const remote = this.consoleControlTarget();
+    if (!remote) return false;
     const mySrc = matchEndpoint(this.catalog, this.localId, "input", "provide");
-    const remoteSink = matchEndpoint(this.catalog, remote, "input", "consume");
+    const remoteSink = matchEndpoint(this.catalog, remote.id, "input", "consume");
     const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
     if (leg) {
       this.consoleControlRouteId = leg.created ? leg.id : null;
       this.consoleControlLive = leg.id;
-      this.consoleControl = true;
-    } else {
-      this.toast("warn", "No control path to that machine");
+      return true;
     }
+    return false;
   }
 
   /** Clipboard passthrough: with it on, a paste in the console first pushes
@@ -3686,7 +3750,15 @@ class AppStore {
       const cap = this.capability(capId);
       return !!cap && !this.isMe(cap.node) && this.isCecCustomer(cap.node);
     });
-    if (cecLeg) {
+    // An attached KVM is a short-lived extension of the approved customer
+    // session, not a device claimed/shared into the technician's fleet. Offer
+    // its screen/input directly and let the KVM enforce the customer's lease.
+    const supportKvmLeg = [from, to].some((capId) => {
+      const cap = this.capability(capId);
+      const kvm = cap ? this.machineByAnyId(cap.node) : undefined;
+      return !!kvm && !!this.consoleNode && this.kvmPassthroughDoors(kvm, this.consoleNode);
+    });
+    if (cecLeg || supportKvmLeg) {
       if (!this.capability(from) || !this.capability(to)) return null;
       const id = `route:${from}→${to}`;
       const existedBefore = this.catalog.routes.some((r) => r.id === id);
@@ -5978,6 +6050,94 @@ class AppStore {
     return room.access ?? "invite";
   }
 
+  /** Whether `room` is exactly a private two-device room between this
+   *  machine and `peer` — no third member can ever be folded into a DM. */
+  private isDirectRoomWith(room: VirtualRoom, peer: string): boolean {
+    const members = [...new Set(room.members.map(canonicalNodeId))];
+    return (
+      members.length === 2 &&
+      members.some((m) => this.isMe(m)) &&
+      members.some((m) => sameMachine(m, peer))
+    );
+  }
+
+  /** Drop a duplicate DM locally without sending `close`: either participant
+   *  may discover the duplicate, while Close remains the host's authority. */
+  private removeMergedRoom(roomId: string) {
+    if (this.isJoined(roomId)) this.unjoinRoom(roomId);
+    else this.clearRoomShares(roomId);
+    this.rooms = this.rooms.filter((r) => r.id !== roomId);
+    const { [roomId]: _chat, ...chat } = this.roomChat;
+    const { [roomId]: _unread, ...unread } = this.roomUnread;
+    const { [roomId]: _presence, ...presence } = this.roomPresence;
+    const { [roomId]: _knocks, ...knocks } = this.roomKnocks;
+    this.roomChat = chat;
+    this.roomUnread = unread;
+    this.roomPresence = presence;
+    this.roomKnocks = knocks;
+  }
+
+  /** Open the DM-like room for one external machine. Concurrent creation can
+   *  leave each side hosting a copy; choose the same lowest room id on both
+   *  ends, remove every duplicate locally, and send a merge statement so the
+   *  peer repairs its own saved list too. */
+  openDirectRoom(peerId: string) {
+    const node = this.machineByAnyId(peerId);
+    if (!node || !isAppNode(node) || this.isKvm(node) || this.isMe(node.id)) return;
+    if (this.isCecCustomer(node.id)) {
+      this.toast("warn", "CEC Support sessions stay separate from your personal rooms");
+      return;
+    }
+    if (!this.roomsSupported(node)) {
+      this.toast("warn", `${node.label} needs a newer AllMyStuff before it can use Rooms`);
+      return;
+    }
+
+    const me = canonicalNodeId(this.localId);
+    const peer = canonicalNodeId(node.id);
+    let direct = this.rooms.filter((room) => this.isDirectRoomWith(room, peer));
+    if (direct.length === 0) {
+      const mine = this.node(this.localId)?.label?.trim() || "This device";
+      const theirs = node.label.trim() || node.hostname?.trim() || shortId(peer);
+      const room: VirtualRoom = {
+        id: newRoomId(me),
+        name: [mine, theirs].sort((a, b) => a.localeCompare(b)).join(" + "),
+        members: [me, peer],
+        owner: me,
+        access: "invite",
+      };
+      this.rooms.push(room);
+      this.saveRooms();
+      this.broadcastRoom(room, this.inviteMessage(room));
+      direct = [room];
+    }
+
+    direct.sort((a, b) => a.id.localeCompare(b.id));
+    const keep = direct[0];
+    const duplicates = direct.slice(1);
+    if (duplicates.length > 0) {
+      for (const duplicate of duplicates) this.removeMergedRoom(duplicate.id);
+      this.saveRooms();
+      if (this.backendConnected) {
+        for (const duplicate of duplicates) {
+          void roomSend([peer], {
+            room: duplicate.id,
+            name: keep.name,
+            kind: "merge",
+            into: keep.id,
+            members: keep.members,
+            access: this.roomAccess(keep),
+          });
+        }
+      }
+      // If we host the winner, re-state it too; this heals an invite the peer
+      // missed while asleep before the merge arrived.
+      if (this.isRoomHost(keep)) this.broadcastRoom(keep, this.inviteMessage(keep));
+      this.toast("info", `Merged ${duplicates.length + 1} private rooms with ${node.label}`);
+    }
+    this.joinRoom(keep.id);
+  }
+
   /** Make a room — you're its **host**: the id is minted under this
    *  device, the roster and name answer to it, and closing it ends the
    *  room for everyone. A room of just this node is fine; invite
@@ -6846,6 +7006,51 @@ class AppStore {
         if (host && !sameMachine(host, sender)) return;
         this.pendingKnocks = this.pendingKnocks.filter((id) => id !== msg.room);
         this.toast("warn", `The host declined your ask to join${existing ? ` “${existing.name}”` : ""}`);
+        break;
+      }
+      case "merge": {
+        // A DM merge is deliberately symmetric: either authenticated member
+        // may converge duplicates, but only for the exact two-device pair and
+        // only onto the deterministic lowest id. It cannot rewrite a group.
+        const members = [...new Set(msg.members.map(canonicalNodeId))];
+        const validPair =
+          members.length === 2 &&
+          members.some((m) => this.isMe(m)) &&
+          members.some((m) => sameMachine(m, sender));
+        if (!validPair || msg.into === msg.room) return;
+        const candidates = this.rooms.filter((room) => this.isDirectRoomWith(room, sender));
+        const sourceKnown = candidates.some((room) => room.id === msg.room);
+        const targetKnown = candidates.some((room) => room.id === msg.into);
+        if (!sourceKnown && !targetKnown) return;
+        const ids = [...new Set([...candidates.map((room) => room.id), msg.into])].sort();
+        if (ids[0] !== msg.into) return;
+
+        let target = this.rooms.find((room) => room.id === msg.into);
+        // Never let a peer repurpose an unrelated room whose id it happens to
+        // know. A pre-existing target must already be this exact DM pair.
+        if (target && !this.isDirectRoomWith(target, sender)) return;
+        if (!target) {
+          const owner = roomHostFromId(msg.into);
+          if (!owner || (!this.isMe(owner) && !sameMachine(owner, sender))) return;
+          target = {
+            id: msg.into,
+            name: msg.name?.trim() || "Private room",
+            members,
+            owner,
+            access: msg.access,
+          };
+          this.rooms.push(target);
+        }
+        for (const room of [...this.rooms]) {
+          if (room.id !== target.id && this.isDirectRoomWith(room, sender)) {
+            this.removeMergedRoom(room.id);
+          }
+        }
+        target.name = msg.name?.trim() || target.name;
+        target.members = members;
+        target.access = msg.access ?? target.access;
+        this.saveRooms();
+        if (this.isRoomHost(target)) this.broadcastRoom(target, this.inviteMessage(target));
         break;
       }
     }
@@ -8553,28 +8758,39 @@ class AppStore {
   private applyUpdateChecked(o: CheckOutcome) {
     this.updateOutcome = o;
     void this.loadUpdateStatus();
-    switch (o.outcome) {
-      case "staged":
-        this.toast(
-          "info",
-          `Update ${o.version} is ready — relaunch to run it (Settings → Updates)`,
-        );
-        break;
-      case "manual_update_available":
-        this.toast(
-          "info",
-          `${o.latest} is available — update the way you installed AllMyStuff`,
-        );
-        break;
-      case "policy_blocked":
-        this.toast(
-          "info",
-          `${o.latest} is available — approve it in Settings → Updates`,
-        );
-        break;
-      default:
-        break;
+    this.showUpdateNotice(o);
+  }
+
+  /** Keep an available update visible until the user acts or dismisses it. */
+  private showUpdateNotice(o: CheckOutcome): boolean {
+    if (o.outcome === "staged") {
+      this.toast("info", `AllMyStuff ${o.version} is downloaded and ready.`, {
+        persistent: true,
+        tag: "update",
+        actions: [
+          { label: "Apply", action: "apply_update" },
+          { label: "Restart & update", action: "relaunch_update", primary: true },
+        ],
+      });
+      return true;
     }
+    if (o.outcome === "manual_update_available") {
+      this.toast("info", `${o.latest} is available. Update it the way AllMyStuff was installed.`, {
+        persistent: true,
+        tag: "update",
+        actions: [{ label: "Update details", action: "open_updates", primary: true }],
+      });
+      return true;
+    }
+    if (o.outcome === "policy_blocked") {
+      this.toast("info", `${o.latest} is available and waiting for your approval.`, {
+        persistent: true,
+        tag: "update",
+        actions: [{ label: "Review update", action: "open_updates", primary: true }],
+      });
+      return true;
+    }
+    return false;
   }
 
   /** Check the release feed now and stage anything permitted. */
@@ -8586,10 +8802,11 @@ class AppStore {
     this.updateBusy = true;
     this.updateOutcome = null;
     try {
-      this.updateOutcome = await updateCheck();
+      const outcome = await updateCheck();
+      if (outcome) this.applyUpdateChecked(outcome);
       this.updateInfo = (await updateStatus()) ?? this.updateInfo;
-      // No toast — the Updates pane reads updateOutcome and shows the result
-      // inline (staged/ready blocks, or the "check result" line) right there.
+      // Routine outcomes stay in the Updates pane; an available release gets
+      // the persistent inline-action notice in applyUpdateChecked.
     } catch (e) {
       this.toast("warn", `Update check failed: ${errMsg(e)}`);
     } finally {
@@ -9267,12 +9484,48 @@ class AppStore {
   }
 
   // ---- toasts ------------------------------------------------------
-  toast(kind: Toast["kind"], text: string) {
+  toast(
+    kind: Toast["kind"],
+    text: string,
+    options: Pick<Toast, "persistent" | "tag" | "actions"> = {},
+  ) {
+    if (options.tag) this.toasts = this.toasts.filter((toast) => toast.tag !== options.tag);
     const id = ++seq;
-    this.toasts.push({ id, kind, text });
+    this.toasts.push({ id, kind, text, ...options });
+    if (options.persistent) return;
     setTimeout(() => {
       this.toasts = this.toasts.filter((t) => t.id !== id);
     }, 3200);
+  }
+
+  dismissToast(id: number) {
+    this.toasts = this.toasts.filter((toast) => toast.id !== id);
+  }
+
+  async runToastAction(
+    id: number,
+    action: "apply_update" | "relaunch_update" | "open_updates",
+  ) {
+    if (action === "open_updates") {
+      this.openSettings("updates");
+      this.dismissToast(id);
+      return;
+    }
+    if (action === "apply_update") {
+      await this.applyUpdate();
+      if (this.updateApplied) {
+        this.dismissToast(id);
+        this.toast("info", `AllMyStuff ${this.updateApplied} is applied and ready to restart.`, {
+          persistent: true,
+          tag: "update",
+          actions: [
+            { label: "Restart now", action: "relaunch_update", primary: true },
+          ],
+        });
+      }
+      return;
+    }
+    await this.relaunchUpdate();
   }
 }
 

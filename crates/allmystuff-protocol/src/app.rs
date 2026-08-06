@@ -568,6 +568,17 @@ pub enum RoomEvent {
     Knock,
     /// The host's "no" to a knock, so the asker isn't left waiting.
     Deny,
+    /// Converge duplicate two-person rooms onto `into`. Either participant may
+    /// send this, but receivers accept it only when both the old and replacement
+    /// rosters are exactly that authenticated pair and `into` is the
+    /// deterministic lowest room id. Carrying the replacement roster lets an
+    /// offline peer repair a missed invite and still converge on reconnect.
+    Merge {
+        into: String,
+        members: Vec<NodeId>,
+        #[serde(default)]
+        access: RoomAccess,
+    },
     /// A member tells the **host** the files it's currently offering into
     /// the room's Shared Files area — replacement semantics (the member's
     /// full current list each time). The host aggregates every member's
@@ -1914,6 +1925,24 @@ mod tests {
             let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
             assert_eq!(m, back);
         }
+    }
+
+    #[test]
+    fn room_merge_round_trips_the_canonical_room() {
+        let m = RoomMessage {
+            room: "room:b:duplicate".into(),
+            name: "Alex + Casey".into(),
+            event: RoomEvent::Merge {
+                into: "room:a:canonical".into(),
+                members: vec!["a".into(), "b".into()],
+                access: RoomAccess::Invite,
+            },
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "merge");
+        assert_eq!(j["into"], "room:a:canonical");
+        let back: RoomMessage = serde_json::from_value(j).unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]

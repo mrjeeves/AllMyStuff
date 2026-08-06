@@ -4,6 +4,7 @@
   import { isMobile } from "../tauri";
   import { displayName, mediaColor, humanBytes, isAppNode, MEDIA, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
+  import DrivePanel from "./DrivePanel.svelte";
 
   // Phone/tablet shell: a finger drag only ever pans/scrolls the view — it
   // never marquees and never starts the drag-to-share gesture. Taps still
@@ -166,36 +167,11 @@
     buildFleetGroups(fleetKeyOf, (g) => (g.key === "mine" ? 0 : g.key === "unknown" ? 2 : 1)),
   );
 
-  // ---- mesh sub-groups ----------------------------------------------------
-  //
-  // Within one fleet, the grid and the list seat devices by the mesh(es)
-  // they're on. A device can be on several meshes at once, so the sub-group
-  // key is the *combination*: devices sharing the same set sit together under
-  // one label ("Home + Work") rather than any device being drawn twice — a
-  // card exists once, keyed by its node id, and every view keeps that
-  // invariant. A fleet whose devices all share one identical mesh set gets no
-  // sub-bands at all (the header would only repeat itself), and devices whose
-  // meshes we don't know yet (an older peer, or presence still landing) gather
-  // at the end under "Mesh unknown" instead of polluting a real mesh's band.
-
+  // Both modes organize devices by fleet only. Mesh membership remains useful
+  // networking detail, but never creates another visual hierarchy.
   type MeshSub = { key: string; label: string; nodes: MeshNode[] };
-  const NO_MESH_KEY = "~none";
-
-  function meshSubsOf(nodes: MeshNode[]): MeshSub[] {
-    const subs = new Map<string, MeshSub>();
-    for (const n of nodes) {
-      const meshes = [...new Set(n.networks ?? [])].sort((a, b) => a.localeCompare(b));
-      const key = meshes.length ? meshes.join(" ") : NO_MESH_KEY;
-      const label = meshes.length ? meshes.join(" + ") : "Mesh unknown";
-      const s = subs.get(key) ?? { key, label, nodes: [] };
-      s.nodes.push(n);
-      subs.set(key, s);
-    }
-    // Insertion preserved the group's own node order (this-device first, then
-    // alphabetical), so only the sub-bands themselves need sorting.
-    return [...subs.values()].sort((a, b) =>
-      a.key === NO_MESH_KEY ? 1 : b.key === NO_MESH_KEY ? -1 : a.label.localeCompare(b.label),
-    );
+  function displaySubsOf(nodes: MeshNode[]): MeshSub[] {
+    return [{ key: "fleet", label: "", nodes }];
   }
 
   // ---- views ------------------------------------------------------------
@@ -282,7 +258,7 @@
         const useCols = Math.min(cols, Math.max(1, g.nodes.length));
         const w = useCols * cellW + 2 * SECTION_PAD;
         const x0 = Math.max(GRID_MARGIN, (width - w) / 2);
-        const subs = meshSubsOf(g.nodes);
+        const subs = displaySubsOf(g.nodes);
         const showSubs = subs.length > 1;
         let innerY = y + SECTION_HEAD;
         for (const sub of subs) {
@@ -476,6 +452,24 @@
       const b = posOf.get(target.id);
       if (!a || !b || a === b) continue;
       out.push({ id: `kvm-tether:${n.id}`, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+    }
+    return out;
+  });
+
+  // Virtual media is a real source-to-KVM relationship: the selected disk or
+  // image is streamed by the source node and exposed by the KVM's USB gadget.
+  // Keep that distinct from both ordinary app routes and the physical tether.
+  const kvmMediaTethers = $derived.by((): Tether[] => {
+    const out: Tether[] = [];
+    for (const kvm of graphNodes) {
+      const media = kvm.kvm?.virtualMedia;
+      if (!media) continue;
+      const source = app.machineByAnyId(media.source);
+      if (!source) continue;
+      const a = posOf.get(source.id);
+      const b = posOf.get(kvm.id);
+      if (!a || !b || a === b) continue;
+      out.push({ id: `kvm-media:${kvm.id}:${media.source}`, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
     }
     return out;
   });
@@ -1152,6 +1146,7 @@
   let nodeMenu = $state<{ id: string; left: number; top: number } | null>(null);
   let kvmPowerMenu = $state<{ kvmId: string; left: number; top: number } | null>(null);
   let fleetMenu = $state<{ id: string; left: number; top: number } | null>(null);
+  let driveMenu = $state<{ anchorId: string; target: string; left: number; top: number } | null>(null);
   const MENU_W = 216;
   // Per-item height + container padding for the flip math below — the menu's
   // real height depends on which items this node offers.
@@ -1199,6 +1194,7 @@
     const items =
       1 +
       (normalMode && cons?.terminal ? 1 : 0) +
+      (normalMode && mn && app.kvmAllowed(mn) ? 2 : 0) +
       (app.canRestartApp(mn) ? 1 : 0) +
       (!app.isKvm(mn) && app.canRestartDevice(mn) ? 1 : 0) +
       (mn && mn.kind !== "this" && !app.isMe(nodeId) ? 1 : 0); // Forget this node
@@ -1208,6 +1204,7 @@
   function openNodeMenu(e: MouseEvent, nodeId: string) {
     e.stopPropagation();
     fleetMenu = null;
+    driveMenu = null;
     fleetEvictArmed = null;
     restartDeviceArmed = null;
     forgetNodeArmed = null;
@@ -1251,6 +1248,7 @@
   function openFleetMenu(e: MouseEvent, nodeId: string) {
     e.stopPropagation();
     nodeMenu = null;
+    driveMenu = null;
     kvmPowerMenu = null;
     restartDeviceArmed = null;
     forgetNodeArmed = null;
@@ -1270,16 +1268,44 @@
     fleetMenu = { id: nodeId, left, top };
   }
 
+  function openDriveMenu(e: MouseEvent, nodeId: string, target = nodeId) {
+    e.stopPropagation();
+    nodeMenu = null;
+    fleetMenu = null;
+    kvmPowerMenu = null;
+    if (driveMenu?.anchorId === nodeId) {
+      driveMenu = null;
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const menuW = 346;
+    const menuH = 430;
+    const left = rect.left + menuW + 8 > window.innerWidth
+      ? Math.max(8, rect.right - menuW)
+      : Math.min(rect.left, window.innerWidth - menuW - 8);
+    const top = rect.bottom + menuH + 8 > window.innerHeight
+      ? Math.max(8, rect.top - menuH - 6)
+      : rect.bottom + 6;
+    driveMenu = { anchorId: nodeId, target, left, top };
+  }
+
+  function openNodeDriveMenu(e: MouseEvent, node: MeshNode) {
+    // A KVM's Drives surface is virtual media on the KVM itself. It must not
+    // silently become a drive map to the computer attached behind the KVM.
+    openDriveMenu(e, node.id, node.id);
+  }
+
   // Close the menu on any outside pointer-down (the gear + the menu are exempt
   // so they can toggle / be clicked), and on Escape.
   $effect(() => {
-    if (!nodeMenu && !kvmPowerMenu && !fleetMenu) return;
+    if (!nodeMenu && !kvmPowerMenu && !fleetMenu && !driveMenu) return;
     function onDown(e: PointerEvent) {
       const t = e.target as Element | null;
-      if (!t?.closest?.(".node-menu, .node-gear, .kvm-power-trigger, .fleet-trigger")) {
+      if (!t?.closest?.(".node-menu, .node-gear, .kvm-power-trigger, .fleet-trigger, .drive-trigger, .drive-menu")) {
         nodeMenu = null;
         kvmPowerMenu = null;
         fleetMenu = null;
+        driveMenu = null;
         fleetEvictArmed = null;
       }
     }
@@ -1288,6 +1314,7 @@
         nodeMenu = null;
         kvmPowerMenu = null;
         fleetMenu = null;
+        driveMenu = null;
         fleetEvictArmed = null;
       }
     }
@@ -1304,7 +1331,7 @@
      terminal, sites, updates, plus the KVM set (Wi-Fi, firmware update, the
      attach link, and the attached machine's power/reset). Stroke uses
      currentColor. -->
-{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "update" | "link" | "power" | "reset" | "wifi")}
+{#snippet cicon(kind: "remote" | "files" | "drives" | "terminal" | "sites" | "kvm" | "update" | "link" | "power" | "reset" | "wifi")}
   {#if kind === "remote"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
@@ -1312,6 +1339,10 @@
   {:else if kind === "files"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2.2H19a1.5 1.5 0 0 1 1.5 1.5V18a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 18Z" />
+    </svg>
+  {:else if kind === "drives"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 5.5h14l2 5.5H3z" /><rect x="3" y="11" width="18" height="7.5" rx="2" /><circle cx="17.5" cy="14.8" r=".8" fill="currentColor" stroke="none" />
     </svg>
   {:else if kind === "terminal"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1367,6 +1398,10 @@
        advert, so claiming or fleet changes reflect immediately. -->
   {@const st = app.standingOf(n)}
   {@const cons = app.consoleAccess(n)}
+  {@const kvmDestination = app.isKvm(n) ? app.kvmTargetNode(n) : undefined}
+  {@const driveAllowed = app.isKvm(n)
+    ? app.kvmAllowed(n)
+    : app.isMe(n.id) || app.isFleetMember(n.id) || app.filesAllowed(n)}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="node"
@@ -1533,6 +1568,11 @@
         <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}<span class="action-label">Files</span></button>
       {/if}
+      {#if isAppNode(n) && driveAllowed}
+        <button class="cbtn drive-trigger" data-tip={app.isKvm(n) ? "Install media via KVM" : "Mapped drives"} aria-label={app.isKvm(n) ? `Present install media to ${kvmDestination ? displayName(kvmDestination) : "the attached computer"} through ${displayName(n)}` : `Map drives with ${displayName(n)}`}
+          aria-haspopup="menu" aria-expanded={driveMenu?.anchorId === n.id}
+          onclick={(e) => openNodeDriveMenu(e, n)}>{@render cicon("drives")}<span class="action-label">Drives</span></button>
+      {/if}
       {#if cons.terminal && !normalMode}
         <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}<span class="action-label">Terminal</span></button>
@@ -1552,17 +1592,21 @@
              target picker out under the card. Its web UI opens from the
              Sites globe (which routes through openKVM), so there's no
              separate "Open KVM" button. -->
-        <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}<span class="action-label">Wi-Fi</span></button>
+        {#if !normalMode}
+          <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
+            onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}<span class="action-label">Wi-Fi</span></button>
+        {/if}
         <button class="cbtn"
           disabled={app.isKvmUpdating(n.id)}
           data-tip="Update this KVM"
           aria-label="Update {displayName(n)} (the KVM itself)"
           onclick={(e) => { e.stopPropagation(); void app.updateKvm(n.id); }}>{@render cicon("update")}<span class="action-label">{app.isKvmUpdating(n.id) ? "Updating…" : "Update"}</span></button>
-        <button class="cbtn" class:active={app.kvmRevealed === n.id}
-          data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
-          aria-expanded={app.kvmRevealed === n.id}
-          onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}<span class="action-label">Attach</span></button>
+        {#if !normalMode}
+          <button class="cbtn" class:active={app.kvmRevealed === n.id}
+            data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
+            aria-expanded={app.kvmRevealed === n.id}
+            onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}<span class="action-label">Attach</span></button>
+        {/if}
       {/if}
       {#if !app.isKvm(n)}
         {@const kvmHere = app.kvmAttachedTo(n.id)}
@@ -1709,7 +1753,7 @@
       <!-- edge layer -->
       <svg class="edges" width={stageW} height={stageH} aria-hidden="true">
         <g transform={layerTransformSvg}>
-          {#each kvmTethers as tth (tth.id)}
+      {#each kvmTethers as tth (tth.id)}
         <!-- The physical KVM↔machine wiring: a quiet dashed tether under the
              live media wires, with a plug dot at the KVM end. -->
         <path
@@ -1718,6 +1762,14 @@
           fill="none"
         />
         <circle class="wire-kvm-plug" cx={tth.x1} cy={tth.y1} r="3.5" />
+      {/each}
+      {#each kvmMediaTethers as tth (tth.id)}
+        <path
+          class="wire-kvm-media"
+          d="M {tth.x1} {tth.y1} L {tth.x2} {tth.y2}"
+          fill="none"
+        />
+        <circle class="wire-kvm-media-source" cx={tth.x1} cy={tth.y1} r="4" />
       {/each}
       {#each edges as e (e.id)}
         <path
@@ -1820,7 +1872,7 @@
           </div>
         {:else}
           {#each filteredListGroups as g (g.key)}
-            {@const subs = meshSubsOf(g.nodes)}
+            {@const subs = displaySubsOf(g.nodes)}
             <section
               class="list-group"
               class:mine={g.key === "mine"}
@@ -1942,6 +1994,17 @@
     </div>
   {/if}
 </div>
+
+{#if driveMenu}
+  <div
+    class="node-menu drive-menu"
+    role="menu"
+    aria-label="Mapped drives"
+    style="left: {driveMenu.left}px; top: {driveMenu.top}px;"
+  >
+    <DrivePanel target={driveMenu.target} />
+  </div>
+{/if}
 
 <!-- Fleet actions live on the badge itself. Like the gear menu, this is a
      viewport-fixed sibling of the transformed graph so it never scales,
@@ -2136,6 +2199,30 @@
           <span class="nm-label">Open Terminal</span>
           <span class="nm-sub">open a shell on this machine</span>
         </span>
+      </button>
+    {/if}
+    {#if normalMode && mn && app.kvmAllowed(mn)}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          nodeMenu = null;
+          void app.openKvmWifi(menuId);
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">⌁</span>
+        <span class="nm-text"><span class="nm-label">Wi-Fi</span><span class="nm-sub">configure this KVM's network</span></span>
+      </button>
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          nodeMenu = null;
+          toggleKvmAttach(menuId);
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">🔗</span>
+        <span class="nm-text"><span class="nm-label">Attach</span><span class="nm-sub">choose the machine behind this KVM</span></span>
       </button>
     {/if}
     {#if app.canRestartApp(mn)}
@@ -2381,6 +2468,19 @@
     stroke: var(--ink-faint);
     stroke-width: 1.6;
     opacity: 0.8;
+  }
+  .wire-kvm-media {
+    stroke: #45d9c5;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-dasharray: 2 11;
+    opacity: 0.9;
+    animation: flow 1.1s linear infinite;
+  }
+  .wire-kvm-media-source {
+    fill: #45d9c5;
+    stroke: var(--surface);
+    stroke-width: 2;
   }
   @keyframes flow {
     to {
@@ -2963,6 +3063,12 @@
     animation: nmenu 0.12s ease;
     max-height: calc(100vh - 16px);
     overflow-y: auto;
+  }
+  .node-menu.drive-menu {
+    width: min(346px, calc(100vw - 16px));
+    padding: 0.3rem;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
   }
   @keyframes nmenu {
     from {

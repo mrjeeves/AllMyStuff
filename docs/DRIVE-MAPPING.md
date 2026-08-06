@@ -1,91 +1,144 @@
-# Mesh-native drive mapping
+# Native drive mapping over the mesh
 
-## Assumptions and requirements
+## Decision
 
-- A user can map one currently mounted volume to another AllMyStuff machine or
-  a connected CECSupport machine without a KVM.
-- The mapping is read/write and lasts until its route is disconnected.
-- Mapping a volume must not imply permission to browse the source machine's
-  home directory or its other drives.
-- The first implementation is app-native: the receiver opens the mapped drive
-  in AllMyStuff or CECSupport. It does not install an OS filesystem driver or
-  claim a Windows drive letter.
+AllMyStuff maps an explicitly selected folder as a real operating-system
+drive. On Windows the receiver sees an ordinary drive letter in Explorer and
+every native application; it is not an AllMyStuff-only file browser.
+
+The first native adapter is Windows WebDAV. A loopback-only WebDAV server runs
+on the receiving node, translates filesystem operations into the existing
+mesh file protocol, and is mounted with Windows `net use`. The WebDAV server
+is never exposed to the LAN and the file bytes still travel only on the live
+AllMyStuff route (direct, STUN, or TURN).
+
+## User contract
+
+- From another machine's card or remote-control console, **Drives → Map new
+  Drive** opens the local OS folder picker. The user may choose a whole drive
+  or one folder.
+- From **This Device → Drives**, the user first chooses an online fleet,
+  shared, or support machine with Files access, browses that machine's real
+  file session, and chooses the remote folder to mount here. A local native
+  picker cannot browse a remote filesystem, so this distinction is explicit.
+- A KVM's Drives button is its virtual-media surface. The user chooses an ISO,
+  IMG, or whole removable USB disk from an eligible source machine; the KVM
+  presents it to its attached computer as BIOS/UEFI-visible USB storage.
+- The attached computer is the destination and is therefore excluded from the
+  source list. This prevents a circular source that disappears when that
+  computer reboots into an installer or firmware utility.
+- The drive-letter field defaults to **Auto — next available**. A user may
+  enter a particular `X:` instead. Enter, click-away, or Map Drive completes
+  the form.
+- Unmap tears down both the Windows drive and its mesh route.
 
 ## Architecture
 
-Inventory already produces a stable capability for each real volume. The
-bridge adds one synthetic `Storage/Sink` capability per machine,
-`<node>:storage-in`. A mapping is therefore an ordinary graph route:
-
 ```text
-source:disk:<mount>  -- Storage route -->  receiver:storage-in
-        |                                      |
-        | FileEvent request/response frames    | mapped-drive browser
-        +--------------------------------------+
+source machine                                      receiving machine
+┌─────────────────────────────┐                    ┌─────────────────────────┐
+│ selected local folder       │                    │ Windows Explorer / apps │
+│ route-id → canonical root   │                    │           │ X:\         │
+│             │               │                    │   net use + WebClient   │
+│ scoped FileEvent host       │◄══ mesh route ═══►│ 127.0.0.1 WebDAV       │
+└─────────────────────────────┘  direct/STUN/TURN  │ RemoteDavFs adapter     │
+                                                   └─────────────────────────┘
 ```
 
-The existing file plane carries list, read, write, mkdir, rename, delete, and
-download traffic. Whole-machine Files continues to use a generic `:files`
-route and its owner/fleet/share/CEC control gate. A mapped Storage route is a
-separate explicit lease scoped to the source capability's volume.
+One mapping is a unique `Storage` route:
 
-## Contract and lifecycle
+```text
+<source>:drive-map:<nonce> → <receiver>:storage-in
+```
 
-1. The source UI selects a local `origin=storage` capability and the target's
-   `origin=storage-in` capability.
-2. Normal route offer/accept establishes the Storage route over the mesh and
-   therefore works over direct, STUN, or TURN paths.
-3. On the source, route activation resolves the capability against a fresh
-   inventory scan and binds the route id to that recorded mount point.
-4. On the receiver, activation creates the file-response queue. The browser
-   sends the existing `FileEvent` messages on the Storage route.
-5. Disconnect/unmap removes the route, cancels in-flight reads, clears the
-   response queue, and forgets the bound root.
+The route offer carries only a friendly label and requested receiver mount.
+The absolute source path never crosses signaling. Before offering, the source
+canonicalizes the chosen path and binds it locally to the unique route id.
+Multiple folders between the same pair therefore remain independent.
 
-CECSupport drives the same node-control commands. Either side may be the source;
-an incoming drive is openable in its Drive mapping card, while an outgoing one
-is shown with an Unmap action.
+The native adapter adds metadata and random-access read/write operations to
+`FileEvent`. Replies for OS filesystem calls use a dedicated per-request
+waiter instead of the GUI Files queue. Existing whole-machine Files sessions,
+room shared-file downloads, and their permissions remain separate.
 
-## Security
+## Lifecycle
 
-- The root comes only from local inventory; a peer cannot name an arbitrary
-  host path.
-- Viewer paths are virtual `/` paths. Parent traversal and platform prefixes
-  are rejected.
-- The nearest existing ancestor and existing targets are canonicalized, which
-  prevents symlinks from escaping the mapped root.
-- The virtual root cannot itself be renamed or deleted.
-- A peer cannot fabricate an inbound mapping that sources this machine: mapped
-  Storage offers are classified as the Files drive plane and pass the normal
-  privileged-offer gate. A locally initiated mapping is the explicit grant.
-- KVM nodes are excluded as destinations in the UI.
+1. Source selects and canonicalizes a folder, binds it to a fresh route id,
+   and offers the Storage route with `DriveRouteOffer` metadata.
+2. The receiver accepts under the normal Files authorization gate.
+3. On activation, the receiver binds an ephemeral listener to
+   `127.0.0.1:0`, builds `RemoteDavFs`, chooses the next free letter (Z down to
+   D when Auto), and runs `net use <letter> http://localhost:<port>/
+   /persistent:no`.
+4. Explorer WebDAV requests become scoped FileEvents over the active route.
+5. Route teardown aborts the listener, cancels in-flight RPCs, runs `net use
+   <letter> /delete /y`, and forgets the source root.
+6. If native mounting fails, the receiver tears the route down instead of
+   showing a live connection line for a drive Windows cannot use.
 
-## Failure modes
+## KVM install and firmware media
 
-- If the drive is unplugged, operations return that the mapped drive is
-  unavailable; Unmap remains available from the live route.
-- If the receiver is on an older build without `storage-in`, the source asks
-  the user to update it instead of routing onto a physical target disk.
-- A dropped mesh/TURN path follows normal route teardown and reconnect rules;
-  file reads are bounded and cancellable, so a broken receiver cannot grow
-  source memory without limit.
+KVM media is deliberately not the desktop WebDAV mapping described above.
+BIOS/UEFI cannot see a drive mounted by an operating-system agent. Instead:
 
-## Alternatives considered
+1. The source opens an ISO/IMG, or reads a selected removable USB disk as a raw
+   physical disk so its partition table and boot sectors are preserved.
+2. The source streams those bytes directly through the KVM's authenticated
+   mesh site tunnel. Large media never bounces through the controller webview.
+3. NanoKVM or NanoKVM-Pro stages the image under `/data`, configures its Linux
+   USB mass-storage gadget read-only, and presents it to the attached computer.
+4. The KVM advertises the active source, label, and staged file in presence.
+   AllMyStuff draws source to KVM as a live media connection while retaining
+   the separate KVM to attached-computer physical tether.
+5. Eject clears the gadget backing and presence metadata.
 
-- Reusing whole-machine Files was rejected because it grants materially more
-  access than mapping a plugged-in volume.
-- A bespoke transfer channel was rejected because the tested file protocol
-  already supplies streaming, backpressure, uploads, and downloads.
-- OS drive letters/FUSE/WinFSP/WebDAV were deferred: each adds platform
-  services or drivers and a second local filesystem server. The mesh contract
-  deliberately stays independent so such an adapter can be added later.
+The source may be a fleet machine, an explicit Files share, or a currently
+authorized support technician. It may never be the KVM's attached destination
+computer. That invariant is enforced in both the picker and the node backend.
 
-## Testing and implementation steps
+## Authorization and security
 
-- Unit-test scoped listing/reading and traversal refusal in `node/files.rs`.
-- Unit-test the dedicated route shape and privileged-plane classification.
-- Run graph/bridge tests, node check, both Svelte checks/builds, and the
-  CECSupport Tauri check.
-- Validate end-to-end with two current nodes: map a removable volume in both
-  directions, force TURN, upload/download/rename/delete, unplug it mid-session,
-  and confirm Unmap tears down access immediately.
+- A locally initiated outbound map is explicit user intent. An inbound map
+  request is accepted only when the requester passes the source's Files gate:
+  fleet/owner, an explicit Files share, or active CECSupport consent.
+- The source canonicalizes the root itself; a receiver never binds its own
+  claim about a source path.
+- All viewer paths are virtual paths below the bound root. Parent traversal,
+  prefixes, and symlink escapes are rejected. The virtual root cannot be
+  renamed or deleted.
+- WebDAV binds only to loopback. There is no new remotely reachable HTTP
+  service and no separate credential to leak.
+- Native operating-system drive mapping never depends on a KVM and never
+  creates a Files share *to* a KVM. KVM virtual media is a separate,
+  purpose-built path that terminates at the KVM's USB gadget.
+
+## Compatibility and tradeoffs
+
+- Windows is first-class now because it supplies a native WebDAV redirector;
+  no WinFsp/Dokan driver installation is required. macOS and Linux builds
+  compile but return a clear unsupported result until their mount adapters
+  (`mount_webdav`, GVfs, or an equivalent) are implemented.
+- WebDAV favors zero-install interoperability over perfect POSIX semantics.
+  Windows applications get ordinary read/write/seek/rename/delete behavior;
+  filesystem features WebDAV cannot represent (hard links, alternate streams,
+  POSIX ownership) are outside this contract.
+- Remote-source selection uses the already-authorized mesh Files session.
+  Pretending a native dialog on this PC could browse another PC was rejected;
+  so was temporarily exposing an entire remote disk merely to feed a picker.
+- The receiver chooses Auto at activation because only it knows which drive
+  letters are actually free. The route metadata may continue to say Auto on
+  the source; the receiver's OS remains authoritative.
+
+## Verification
+
+- Unit-test scoped paths, symlink/parent escape rejection, metadata, ranged
+  reads, and ranged writes.
+- Test offer metadata round-tripping and multiple unique folder routes.
+- On Windows, map a folder both directions, verify the letter appears in
+  Explorer, read/write/seek/rename/delete with native programs, and confirm
+  Unmap removes it.
+- Repeat over forced TURN and while disconnecting mid-read.
+- Verify fleet, Files-share, and CECSupport-consent admission separately.
+- Verify ISO boot, raw USB installer boot, and firmware/BIOS media on both
+  NanoKVM and NanoKVM-Pro; confirm the attached computer never appears as an
+  eligible source and that Eject removes the presence relationship.

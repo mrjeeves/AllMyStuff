@@ -148,6 +148,73 @@ async fn disconnect_route(state: State<'_, AppState>, route_id: String) -> Resul
     Ok(())
 }
 
+#[tauri::command]
+async fn drive_map(
+    state: State<'_, AppState>,
+    target: String,
+    root: String,
+    label: String,
+    mount: String,
+) -> Result<String, String> {
+    let value = state
+        .node
+        .request(
+            "drive_map",
+            json!({ "target": target, "root": root, "label": label, "mount": mount }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn drive_map_from(
+    state: State<'_, AppState>,
+    source: String,
+    root: String,
+    label: String,
+    mount: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "drive_map_from",
+            json!({ "source": source, "root": root, "label": label, "mount": mount }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn kvm_media_stage(
+    state: State<'_, AppState>,
+    source: String,
+    kvm: String,
+    path: String,
+    label: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "kvm_media_stage",
+            json!({ "source": source, "kvm": kvm, "path": path, "label": label }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn kvm_media_unmount(state: State<'_, AppState>, kvm: String) -> Result<(), String> {
+    state
+        .node
+        .request("kvm_media_unmount", json!({ "kvm": kvm }))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Mirror one frontend diagnostic line into the GUI's `tracing` log. The
 /// call plane decides who to wire entirely in the webview (online/claimed
 /// gates, sink lookup, presence) — decisions the Rust side never sees — so
@@ -2634,6 +2701,10 @@ fn main() {
             scan_self,
             scan_full,
             connect_route,
+            drive_map,
+            drive_map_from,
+            kvm_media_stage,
+            kvm_media_unmount,
             disconnect_route,
             client_log,
             claim_node,

@@ -28,10 +28,11 @@ use crate::UiSink;
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
-    claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage, KvmControl,
-    NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request, RoomMessage, RouteControl,
-    ShareControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL,
-    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
+    DriveRouteOffer, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
+    RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
+    LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -43,6 +44,7 @@ use allmystuff_session::{
 use crate::audio::{AudioBridge, CaptureSource};
 use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
+use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
@@ -115,6 +117,11 @@ pub struct Mesh {
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
     files: FilesPlane,
+    /// OS-native drive letters/mounts backed by active Storage routes.
+    drive_mounts: DriveMounts,
+    /// Explicit inbound pull requests. A drive pushed at us is fleet-only;
+    /// this token is what lets a Files share/support source answer a pull.
+    drive_pull_tokens: Mutex<HashMap<String, (String, Instant)>>,
     /// Sequence for outbound file frames (requests viewer-side, response
     /// streams host-side — one stream per app run, like `term_seq`).
     file_seq: AtomicU64,
@@ -1019,6 +1026,8 @@ impl Mesh {
             term_rx_seq: Mutex::new(HashMap::new()),
             term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
+            drive_mounts: DriveMounts::new(),
+            drive_pull_tokens: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
             site_seq: AtomicU64::new(0),
@@ -2938,7 +2947,7 @@ impl Mesh {
                     // StartMedia in one step), and a shell — or this disk —
                     // is owner/fleet-only, the same rule as input injection,
                     // enforced before any reply exists.
-                    if let ControlMessage::Route(RouteControl::Offer { route, .. }) = &msg {
+                    if let ControlMessage::Route(RouteControl::Offer { route, drive, .. }) = &msg {
                         // Log every inbound offer at the point it's received, so
                         // a host's node log shows whether an offer even arrived
                         // (vs. an offerer stuck "awaiting accept" because nothing
@@ -2955,8 +2964,35 @@ impl Mesh {
                         // Authorized for this exact plane: owner/fleet, or a
                         // share grant the owner extended for it. Non-privileged
                         // routes (`None` plane) are never refused here.
-                        let authorized = route_drive_plane(route)
-                            .is_none_or(|plane| self.sender_may_drive(&from, plane));
+                        let explicit_drive_pull = if is_mapped_drive_route(route) {
+                            drive
+                                .as_ref()
+                                .and_then(|offer| offer.request.as_ref())
+                                .is_some_and(|request| {
+                                    let mut pulls = self.drive_pull_tokens.lock();
+                                    let matches =
+                                        pulls.get(request).is_some_and(|(source, made)| {
+                                            same_node(source, &from)
+                                                && made.elapsed() < Duration::from_secs(120)
+                                        });
+                                    if matches {
+                                        pulls.remove(request);
+                                    }
+                                    matches
+                                })
+                        } else {
+                            false
+                        };
+                        // Drive pushes TO this machine are fleet-only. A
+                        // receiver-minted pull token is the explicit exception:
+                        // it lets this user pull FROM a Files share/support
+                        // source without turning that share into push access.
+                        let authorized = if is_mapped_drive_route(route) {
+                            explicit_drive_pull || self.sender_may_control(&from)
+                        } else {
+                            route_drive_plane(route)
+                                .is_none_or(|plane| self.sender_may_drive(&from, plane))
+                        };
                         // CEC screen gate: a customer only lets a dialed
                         // technician view its screen while a live consent grant
                         // covers it — the screen twin of the per-plane
@@ -4074,6 +4110,236 @@ impl Mesh {
         self.connect_term(from, to, media, video, None).await
     }
 
+    /// Share one explicitly selected local folder as a real native drive on
+    /// another machine. The absolute source path stays local and is bound to
+    /// the unique route id before the offer leaves this process.
+    pub async fn drive_map(
+        self: &Arc<Self>,
+        target: String,
+        root: String,
+        label: String,
+        mount: String,
+    ) -> Result<String, String> {
+        self.drive_map_requested(target, root, label, mount, None)
+            .await
+    }
+
+    async fn drive_map_requested(
+        self: &Arc<Self>,
+        target: String,
+        root: String,
+        label: String,
+        mount: String,
+        request: Option<String>,
+    ) -> Result<String, String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let target = pubkey_part(&node_of(&target)).to_string();
+        if target.is_empty() || same_node(&target, &me) {
+            return Err("choose another machine for this drive".into());
+        }
+        if request.is_none() && !self.sender_may_control(&target) {
+            return Err("mapping a drive to another device is fleet-only".into());
+        }
+        let root = std::path::PathBuf::from(root)
+            .canonicalize()
+            .map_err(|error| format!("couldn't open that folder: {error}"))?;
+        if !root.is_dir() {
+            return Err("choose a drive or folder".into());
+        }
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a drive route: {error}"))?;
+        let nonce = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let from = format!("{me}:drive-map:{nonce}");
+        let to = format!("{target}:storage-in");
+        let route = Route {
+            id: format!("route:{from}→{to}"),
+            from: from.into(),
+            to: to.into(),
+            media: MediaKind::Storage,
+        };
+        self.files.map_root(&route.id, root.clone());
+        let drive = DriveRouteOffer {
+            label: if label.trim().is_empty() {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Remote drive".into())
+            } else {
+                label.trim().to_string()
+            },
+            mount: mount.trim().to_string(),
+            request,
+        };
+        let message = {
+            let mut state = self.state.lock();
+            let session = state.session.as_mut().ok_or("mesh not ready")?;
+            session.offer_with_drive(
+                route.clone(),
+                target.as_str(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(drive),
+            )
+        };
+        if let Err(error) = self.send_control(&target, &message).await {
+            self.files.stop(&route.id);
+            if let Some(session) = self.state.lock().session.as_mut() {
+                let _ = session.teardown(&route.id);
+            }
+            return Err(error);
+        }
+        tracing::info!(
+            "drive {} offered to {} from {}",
+            route.id,
+            short_id(&target),
+            root.display()
+        );
+        self.emit_snapshot();
+        Ok(route.id)
+    }
+
+    pub fn native_drives(&self) -> Vec<crate::drive_mount::NativeDriveInfo> {
+        self.drive_mounts.list()
+    }
+
+    fn kvm_attached_to(&self, kvm: &str) -> Option<String> {
+        self.state
+            .lock()
+            .session
+            .as_ref()?
+            .peers()
+            .find(|profile| same_node(profile.node.as_str(), kvm))?
+            .kvm
+            .as_ref()?
+            .attached_to
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    /// Stage local install/firmware media on a KVM's USB mass-storage gadget.
+    pub async fn kvm_media_stage(
+        self: &Arc<Self>,
+        kvm: String,
+        path: String,
+        label: String,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let kvm = pubkey_part(&node_of(&kvm)).to_string();
+        if kvm.is_empty() || same_node(&kvm, &me) {
+            return Err("choose a KVM for virtual media".into());
+        }
+        if self
+            .kvm_attached_to(&kvm)
+            .is_some_and(|attached| same_node(&attached, &me))
+        {
+            return Err(
+                "the KVM's attached computer cannot also source its virtual media; choose another fleet/shared/technician machine"
+                    .into(),
+            );
+        }
+        let port = self.site_map(kvm.clone(), 80).await?;
+        crate::kvm_media::stage(port, &me, &path, &label).await?;
+        // Mount metadata is now part of KVM presence. Ask for a fresh advert
+        // so every graph learns the source→KVM relationship immediately.
+        let _ = self
+            .send_control(&kvm, &ControlMessage::ProfileRequest)
+            .await;
+        Ok(())
+    }
+
+    /// Ask another Files-authorized machine to source the media. The source
+    /// performs the upload itself, so large images never bounce through this
+    /// controller or its webview.
+    pub async fn kvm_media_stage_from(
+        self: &Arc<Self>,
+        source: String,
+        kvm: String,
+        path: String,
+        label: String,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let source = pubkey_part(&node_of(&source)).to_string();
+        if source.is_empty() || same_node(&source, &me) {
+            return self.kvm_media_stage(kvm, path, label).await;
+        }
+        if self
+            .kvm_attached_to(&kvm)
+            .is_some_and(|attached| same_node(&attached, &source))
+        {
+            return Err("the KVM's attached computer cannot source its virtual media".into());
+        }
+        self.send_control(
+            &source,
+            &ControlMessage::App(AppControl::StageKvmMedia { kvm, path, label }),
+        )
+        .await
+    }
+
+    pub async fn kvm_media_unmount(self: &Arc<Self>, kvm: String) -> Result<(), String> {
+        let kvm = pubkey_part(&node_of(&kvm)).to_string();
+        if kvm.is_empty() {
+            return Err("choose a KVM".into());
+        }
+        let port = self.site_map(kvm.clone(), 80).await?;
+        crate::kvm_media::unmount(port).await?;
+        let _ = self
+            .send_control(&kvm, &ControlMessage::ProfileRequest)
+            .await;
+        Ok(())
+    }
+
+    /// Ask another authorized machine to expose `root` back to us. This is
+    /// the inbound-map twin of `drive_map`; the source re-checks Files access
+    /// and canonicalizes the path on its own filesystem before offering.
+    pub async fn drive_map_from(
+        self: &Arc<Self>,
+        source: String,
+        root: String,
+        label: String,
+        mount: String,
+    ) -> Result<(), String> {
+        let source = pubkey_part(&node_of(&source)).to_string();
+        if source.is_empty()
+            || self
+                .local_node_id()
+                .is_some_and(|me| same_node(&source, &me))
+        {
+            return Err("choose another machine as the drive source".into());
+        }
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a drive request: {error}"))?;
+        let request = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.drive_pull_tokens
+            .lock()
+            .retain(|_, (_, made)| made.elapsed() < Duration::from_secs(120));
+        self.drive_pull_tokens
+            .lock()
+            .insert(request.clone(), (source.clone(), Instant::now()));
+        let sent = self
+            .send_control(
+                &source,
+                &ControlMessage::App(AppControl::MapDrive {
+                    root,
+                    label,
+                    mount,
+                    request: request.clone(),
+                }),
+            )
+            .await;
+        if sent.is_err() {
+            self.drive_pull_tokens.lock().remove(&request);
+        }
+        sent
+    }
+
     /// [`connect`](Self::connect) with an optional terminal **session** to
     /// attach to (the multi-attach entry point): `Some(id)` makes the
     /// terminal Offer name that already-running host shell to join, `None`
@@ -4359,6 +4625,7 @@ impl Mesh {
         self.release_audio_lanes(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
+        self.drive_mounts.stop(&route_id);
         // The unmapping (client) side gets no local StopMedia effect — only
         // the wire Teardown goes out — so close the listener + connections
         // here, or they'd leak (the port stays bound, the accept loop runs).
@@ -6077,6 +6344,7 @@ impl Mesh {
                     self.term_rx_seq.lock().remove(&id);
                     self.term_in_seq.lock().remove(&id);
                     self.files.stop(&id);
+                    self.drive_mounts.stop(&id);
                     // A site route ending closes its local listener (client
                     // side) and every tunneled connection it carried.
                     self.sites.stop_route(&id);
@@ -6094,7 +6362,15 @@ impl Mesh {
     /// rule a terminal/remote-control offer is screened by), so a command
     /// from anyone else is logged and dropped.
     async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
-        if !self.sender_may_control(from.as_str()) {
+        let authorized = if matches!(
+            &message,
+            AppControl::MapDrive { .. } | AppControl::StageKvmMedia { .. }
+        ) {
+            self.sender_may_drive(from.as_str(), DrivePlane::Files)
+        } else {
+            self.sender_may_control(from.as_str())
+        };
+        if !authorized {
             tracing::warn!(
                 "app-control {:?} from {} ignored: not owner/fleet",
                 message,
@@ -6103,6 +6379,40 @@ impl Mesh {
             return;
         }
         match message {
+            AppControl::MapDrive {
+                root,
+                label,
+                mount,
+                request,
+            } => {
+                tracing::info!(
+                    "native drive requested by {} from {}",
+                    short_id(from.as_str()),
+                    root
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    if let Err(error) = mesh
+                        .drive_map_requested(from.to_string(), root, label, mount, Some(request))
+                        .await
+                    {
+                        tracing::warn!("native drive request failed: {error}");
+                    }
+                });
+            }
+            AppControl::StageKvmMedia { kvm, path, label } => {
+                tracing::info!(
+                    "KVM virtual media requested by {} from {}",
+                    short_id(from.as_str()),
+                    path
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    if let Err(error) = mesh.kvm_media_stage(kvm, path, label).await {
+                        tracing::warn!("KVM virtual media request failed: {error}");
+                    }
+                });
+            }
             AppControl::Upgrade => {
                 tracing::info!(
                     "upgrade requested by {} — running self-update",
@@ -9015,7 +9325,11 @@ impl Mesh {
             }
             MediaKind::Storage if is_mapped_drive_route(route) => {
                 if from_node == me && to_node != me {
-                    match mapped_drive_root(route, &me) {
+                    match self
+                        .files
+                        .mapped_root(&route.id)
+                        .or_else(|| mapped_drive_root(route, &me))
+                    {
                         Some(root) => {
                             self.files.map_root(&route.id, root.clone());
                             tracing::info!(
@@ -9039,11 +9353,41 @@ impl Mesh {
                     }
                 } else if to_node == me && from_node != me {
                     self.files.ensure_queue(&route.id);
-                    tracing::info!(
-                        "route {} active — drive mapped from {}",
-                        route.id,
-                        short_id(&from_node)
-                    );
+                    let drive = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.route(&route.id))
+                        .and_then(|live| live.drive.clone())
+                        .unwrap_or(DriveRouteOffer {
+                            label: "Remote drive".into(),
+                            mount: String::new(),
+                            request: None,
+                        });
+                    let mesh = self.clone();
+                    let mounts = self.drive_mounts.clone();
+                    let route_id = route.id.clone();
+                    crate::spawn(async move {
+                        match mounts
+                            .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
+                            .await
+                        {
+                            Ok(info) => tracing::info!(
+                                "route {} active — native drive {} mounted from {}",
+                                route_id,
+                                info.mount,
+                                short_id(&from_node)
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "route {} native drive mount failed: {error}",
+                                    route_id
+                                );
+                                let _ = mesh.disconnect(route_id).await;
+                            }
+                        }
+                    });
                 }
             }
             MediaKind::Generic if is_shared_route(route) => {
@@ -10293,8 +10637,17 @@ impl Mesh {
                         self.send_file_event(frame.route.clone(), from.to_string(), reply);
                     }
                 }
+                FileEvent::WriteRange { .. } => {
+                    if let Some(reply) =
+                        crate::files::write_range_in_root(&frame.event, root.as_deref())
+                    {
+                        self.send_file_event(frame.route.clone(), from.to_string(), reply);
+                    }
+                }
                 FileEvent::List { .. }
                 | FileEvent::Read { .. }
+                | FileEvent::Stat { .. }
+                | FileEvent::ReadRange { .. }
                 | FileEvent::Mkdir { .. }
                 | FileEvent::Rename { .. }
                 | FileEvent::Delete { .. } => {
@@ -10305,6 +10658,9 @@ impl Mesh {
                 _ => {}
             }
         } else if views_here {
+            if self.files.deliver_rpc(&frame.route, &frame.event) {
+                return;
+            }
             // A chunk of a registered download streams to disk, not to
             // the window; everything else is queued for the window.
             if let FileEvent::Chunk { req, .. } = &frame.event {
@@ -10393,8 +10749,11 @@ impl Mesh {
         match event {
             FileEvent::List { .. }
             | FileEvent::Read { .. }
+            | FileEvent::Stat { .. }
+            | FileEvent::ReadRange { .. }
             | FileEvent::Fetch { .. }
             | FileEvent::Write { .. }
+            | FileEvent::WriteRange { .. }
             | FileEvent::Mkdir { .. }
             | FileEvent::Rename { .. }
             | FileEvent::Delete { .. } => {}
@@ -10422,6 +10781,51 @@ impl Mesh {
         let frame = FileFrame::new(&route_id, seq, event);
         let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
         self.send_media_value(&peer, payload).await
+    }
+
+    /// Issue one files-plane request for a native filesystem adapter and
+    /// collect its complete reply (one event for metadata/mutations, a
+    /// sequence for ranged reads).
+    pub(crate) async fn drive_file_request(
+        self: &Arc<Self>,
+        route_id: &str,
+        event: FileEvent,
+    ) -> Result<Vec<FileEvent>, String> {
+        let req = event.req();
+        let mut replies = self.files.begin_rpc(route_id, req);
+        if let Err(error) = self.file_send(route_id.to_string(), event).await {
+            self.files.cancel_rpc(route_id, req);
+            return Err(error);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut events = Vec::new();
+            while let Some(event) = replies.recv().await {
+                let terminal = matches!(
+                    event,
+                    FileEvent::Entries { .. }
+                        | FileEvent::Metadata { .. }
+                        | FileEvent::Ok { .. }
+                        | FileEvent::Err { .. }
+                        | FileEvent::Chunk { eof: true, .. }
+                );
+                events.push(event);
+                if terminal {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        self.files.cancel_rpc(route_id, req);
+        match result {
+            Ok(events) if !events.is_empty() => Ok(events),
+            Ok(_) => Err("mapped drive disconnected before the request completed".into()),
+            Err(_) => Err("mapped drive request timed out".into()),
+        }
+    }
+
+    pub(crate) fn next_file_request_id(&self) -> u64 {
+        self.file_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     // ---- sites (the reverse proxy) --------------------------------------

@@ -81,6 +81,11 @@ import {
   kvmMeshAdd,
   kvmMeshRemove,
   linkStatus,
+  mapNativeDrive,
+  mapNativeDriveFrom,
+  pickKvmMediaImage,
+  stageKvmMedia as stageKvmMediaNative,
+  unmountKvmMedia as unmountKvmMediaNative,
   onClockSkew,
   onControlRefused,
   onDeviceRestart,
@@ -89,6 +94,7 @@ import {
   onMeshEvent,
   openFilesWindow,
   pickFilesToShare,
+  pickDriveFolder,
   roomShareFiles,
   roomSetSharePeers,
   roomUnshare,
@@ -285,7 +291,6 @@ export type SettingsTab =
   | "devices"
   | "fleet"
   | "sharing"
-  | "drives"
   | "always_on"
   | "updates"
   // The secret CEC Support tab — shown only when a technician reveals it with
@@ -862,9 +867,6 @@ class AppStore {
   /** The remote machine the in-page files popover is open on (web preview
    *  only — the desktop opens a dedicated window per machine). */
   filesNodeId = $state<string | null>(null);
-  /** An already-active Storage route opened as a volume-scoped file browser.
-   *  Closing the browser leaves the mapping in place; Unmap owns teardown. */
-  mappedFiles = $state<{ host: string; route: string; label: string } | null>(null);
   /** Per-app-run counter so each files session mints a unique viewer-side
    *  endpoint (`{me}:files-view:…`) — unique endpoint, unique route id. */
   private filesViewSeq = 0;
@@ -2360,6 +2362,13 @@ class AppStore {
             web: p.kvm.web || undefined,
             joiningMesh: p.kvm.joining_mesh || undefined,
             meshes: p.kvm.meshes?.length ? p.kvm.meshes : undefined,
+            virtualMedia: p.kvm.virtual_media
+              ? {
+                  source: p.kvm.virtual_media.source,
+                  label: p.kvm.virtual_media.label,
+                  file: p.kvm.virtual_media.file,
+                }
+              : undefined,
           }
         : undefined;
       // The AllMyStuff version it's running — let it tell when the machine
@@ -2445,7 +2454,10 @@ class AppStore {
       const id = lr.route.id;
       const exists = this.catalog.routes.some((r) => r.id === id);
       if (active && !exists) {
-        this.catalog.routes.push({ ...lr.route });
+        this.catalog.routes.push({ ...lr.route, drive: lr.drive ?? null });
+      } else if (active && exists) {
+        const route = this.catalog.routes.find((route) => route.id === id);
+        if (route) route.drive = lr.drive ?? route.drive ?? null;
       } else if (!active && exists) {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
       }
@@ -4040,14 +4052,6 @@ class AppStore {
    *  windows close themselves, tearing their route down first. */
   closeFiles() {
     this.filesNodeId = null;
-    this.mappedFiles = null;
-  }
-
-  /** Physical volumes on this machine that can be explicitly mapped. */
-  get localDrives(): Capability[] {
-    return this.catalog.capabilities.filter(
-      (c) => this.isMe(c.node) && c.media === "storage" && c.origin === "storage",
-    );
   }
 
   /** App machines that can receive a mapped drive. KVMs stay excluded: they
@@ -4058,12 +4062,22 @@ class AppStore {
     );
   }
 
+  /** Remote machines whose filesystem this user is authorized to browse and
+   * therefore choose as the source of an inbound native mapping. */
+  get driveSources(): MeshNode[] {
+    return this.catalog.nodes.filter(
+      (node) => !this.isMe(node.id) && node.online && !this.isKvm(node) && this.filesAllowed(node),
+    );
+  }
+
   get driveMappings(): Array<{
     route: Route;
     direction: "in" | "out";
     drive: string;
     machine: string;
     host: string;
+    target: string;
+    mount: string;
   }> {
     const out = [] as Array<{
       route: Route;
@@ -4071,6 +4085,8 @@ class AppStore {
       drive: string;
       machine: string;
       host: string;
+      target: string;
+      mount: string;
     }>;
     for (const route of this.catalog.routes) {
       if (route.media !== "storage" || !route.to.endsWith(":storage-in")) continue;
@@ -4078,7 +4094,8 @@ class AppStore {
       const to = this.capability(route.to);
       const fromNode = from?.node ?? this.capNodeOf(route.from);
       const toNode = to?.node ?? this.capNodeOf(route.to);
-      const driveLabel = from?.label ?? route.from.split(":disk:").at(-1) ?? "Mapped drive";
+      const driveLabel = route.drive?.label ?? from?.label ?? "Mapped drive";
+      const mount = route.drive?.mount || "Auto";
       if (this.isMe(toNode)) {
         out.push({
           route,
@@ -4086,6 +4103,8 @@ class AppStore {
           drive: driveLabel,
           machine: this.node(fromNode)?.label ?? fromNode,
           host: fromNode,
+          target: toNode,
+          mount,
         });
       } else if (this.isMe(fromNode)) {
         out.push({
@@ -4094,40 +4113,112 @@ class AppStore {
           drive: driveLabel,
           machine: this.node(toNode)?.label ?? toNode,
           host: fromNode,
+          target: toNode,
+          mount,
         });
       }
     }
     return out;
   }
 
-  mapDrive(capabilityId: string, targetNodeId: string) {
-    const drive = this.capability(capabilityId);
-    if (!drive || !this.isMe(drive.node) || drive.media !== "storage" || drive.origin !== "storage") {
-      this.toast("warn", "Pick a drive attached to this machine");
-      return;
-    }
-    if (!this.driveTargets.some((n) => sameMachine(n.id, targetNodeId))) {
-      this.toast("warn", "That machine can't receive a mapped drive");
-      return;
-    }
-    const sink = matchEndpoint(this.catalog, targetNodeId, "storage", "consume");
-    if (!sink || sink.origin !== "storage-in") {
-      this.toast("warn", "Update that machine before mapping a drive to it");
-      return;
-    }
-    const leg = this.ownedConnect(capabilityId, sink.id);
-    if (!leg) this.toast("warn", "The drive mapping couldn't be started");
+  pickDriveSource(): Promise<string | null> {
+    return pickDriveFolder();
   }
 
-  openMappedDrive(routeId: string) {
-    const mapping = this.driveMappings.find((m) => m.route.id === routeId && m.direction === "in");
-    if (!mapping) return;
-    this.settingsOpen = false;
-    this.mappedFiles = { host: mapping.host, route: mapping.route.id, label: mapping.drive };
+  pickKvmMediaImage(): Promise<string | null> {
+    return pickKvmMediaImage();
+  }
+
+  /** Eligible virtual-media sources for a KVM. Its attached computer is
+   * deliberately excluded: that circular source disappears during the very
+   * reboot into BIOS/Setup for which virtual media exists. */
+  kvmMediaSources(kvmId: string): MeshNode[] {
+    const kvm = this.machineByAnyId(kvmId);
+    const attached = kvm?.kvm?.attachedTo;
+    return this.catalog.nodes.filter(
+      (node) =>
+        node.online &&
+        isAppNode(node) &&
+        !this.isKvm(node) &&
+        (!attached || !sameMachine(node.id, attached)) &&
+        (this.isMe(node.id) || this.filesAllowed(node)),
+    );
+  }
+
+  async stageKvmMedia(kvm: string, source: string, path: string, label: string): Promise<boolean> {
+    const kvmNode = this.machineByAnyId(kvm);
+    const sourceNode = this.machineByAnyId(source);
+    if (!this.isKvm(kvmNode) || !sourceNode) return false;
+    if (kvmNode!.kvm?.attachedTo && sameMachine(kvmNode!.kvm!.attachedTo!, sourceNode.id)) {
+      this.toast("warn", "The attached computer can't source this KVM's virtual media");
+      return false;
+    }
+    try {
+      await stageKvmMediaNative(sourceNode.id, kvmNode!.id, path, label);
+      this.toast("ok", `${label || "Virtual media"} is being staged on ${kvmNode!.label}`);
+      return true;
+    } catch (error) {
+      this.toast("warn", errMsg(error));
+      return false;
+    }
+  }
+
+  async unmountKvmMedia(kvm: string): Promise<void> {
+    const node = this.machineByAnyId(kvm);
+    if (!this.isKvm(node)) return;
+    try {
+      await unmountKvmMediaNative(node!.id);
+      this.toast("ok", `Virtual media ejected from ${node!.label}`);
+    } catch (error) {
+      this.toast("warn", errMsg(error));
+    }
+  }
+
+  async mapFolderToNode(
+    targetNodeId: string,
+    root: string,
+    label: string,
+    mount = "",
+  ): Promise<boolean> {
+    if (!this.driveTargets.some((node) => sameMachine(node.id, targetNodeId))) {
+      this.toast("warn", "That machine can't receive a mapped drive");
+      return false;
+    }
+    try {
+      const route = await mapNativeDrive(targetNodeId, root, label, mount);
+      if (!route) {
+        this.toast("warn", "Native drive mapping requires the desktop app");
+        return false;
+      }
+      this.toast("ok", `${label || "Drive"} is being mapped`);
+      return true;
+    } catch (error) {
+      this.toast("warn", String(error));
+      return false;
+    }
+  }
+
+  async mapFolderFromNode(
+    sourceNodeId: string,
+    root: string,
+    label: string,
+    mount = "",
+  ): Promise<boolean> {
+    if (!this.driveSources.some((node) => sameMachine(node.id, sourceNodeId))) {
+      this.toast("warn", "That machine hasn't shared Files access with you");
+      return false;
+    }
+    try {
+      await mapNativeDriveFrom(sourceNodeId, root, label, mount);
+      this.toast("ok", `${label || "Drive"} is being mapped to this device`);
+      return true;
+    } catch (error) {
+      this.toast("warn", String(error));
+      return false;
+    }
   }
 
   unmapDrive(routeId: string) {
-    if (this.mappedFiles?.route === routeId) this.mappedFiles = null;
     void this.disconnect(routeId);
   }
 

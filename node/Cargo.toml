@@ -117,6 +117,12 @@ serde_json = "1"
 anyhow = "1"
 dirs = "5"
 parking_lot = "0.12"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+futures-util = "0.3"
+dav-server = { version = "0.11", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # SIMD-accelerated byte scanning for the pacer's Annex-B start-code walk
 # (already in the tree transitively — this only makes it a direct dep).

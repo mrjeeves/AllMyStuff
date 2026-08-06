@@ -681,6 +681,24 @@ pub enum SiteControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControl {
+    /// Ask this machine to expose one user-selected folder as a native drive
+    /// on the authenticated requester. The source validates/canonicalizes the
+    /// path locally and accepts this only under the Files authorization gate
+    /// (fleet, an explicit Files share, or active support consent).
+    MapDrive {
+        root: String,
+        label: String,
+        #[serde(default)]
+        mount: String,
+        request: String,
+    },
+    /// Ask this authorized source machine to stage one local ISO/image (or a
+    /// whole removable disk) on a KVM as BIOS-visible USB virtual media.
+    StageKvmMedia {
+        kvm: String,
+        path: String,
+        label: String,
+    },
     /// "Update yourself and restart." Sent to a fleet machine running an
     /// AllMyStuff older than the channel's latest release. The receiver runs
     /// its self-updater and, if a newer build was applied, relaunches — its
@@ -748,6 +766,16 @@ pub struct KvmAdvert {
     /// firmware, or genuinely none known yet) serializes *without* the key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub meshes: Vec<String>,
+    /// BIOS-visible USB media currently staged and mounted by this KVM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_media: Option<KvmVirtualMediaAdvert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvmVirtualMediaAdvert {
+    pub source: NodeId,
+    pub label: String,
+    pub file: String,
 }
 
 /// Curating a KVM appliance — its attachment binding and its mesh membership.
@@ -818,6 +846,23 @@ pub struct TerminalSessionInfo {
     pub attachers: usize,
 }
 
+/// Receiver-side OS mount requested for a Storage route. The selected source
+/// path never crosses the mesh: it is bound locally to the route before the
+/// offer is sent. Only the friendly label and the receiver's requested drive
+/// letter/mount point travel with the offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveRouteOffer {
+    pub label: String,
+    /// Windows: `X:`. Other desktop platforms may use an absolute mount point.
+    /// Empty means pick the next available native target on the receiver.
+    #[serde(default)]
+    pub mount: String,
+    /// Opaque receiver-minted token for a pull the receiver explicitly
+    /// requested. Absent means an unsolicited push, which is fleet-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
 /// other side accepts to start media flowing, or rejects with a reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -857,6 +902,10 @@ pub enum RouteControl {
         /// shape it always did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        /// Native drive mapping metadata for a Storage route. Absent for every
+        /// other route and for peers predating native mapped drives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drive: Option<DriveRouteOffer>,
     },
     /// "Go ahead" — media may start. For a terminal route the host echoes
     /// the **resolved** session id it attached this route to (the minted
@@ -1515,6 +1564,7 @@ mod tests {
                 video: vec!["h264".into()],
                 audio: Vec::new(),
                 session: None,
+                drive: None,
             },
             _ => unreachable!(),
         };
@@ -1543,6 +1593,7 @@ mod tests {
                 video: Vec::new(),
                 audio: vec!["opus".into()],
                 session: None,
+                drive: None,
             },
             _ => unreachable!(),
         };
@@ -1575,6 +1626,7 @@ mod tests {
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: Some("term-3".into()),
+                drive: None,
             },
             _ => unreachable!(),
         };

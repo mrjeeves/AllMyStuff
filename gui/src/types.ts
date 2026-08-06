@@ -202,7 +202,13 @@ export interface MeshNode {
    *  it shows on its screen); `meshes` is every mesh it's currently joined
    *  to, fleet included — the list a fleet owner curates from the drawer.
    *  Absent on an ordinary node or an older peer. */
-  kvm?: { attachedTo?: string; web?: string; joiningMesh?: string; meshes?: string[] };
+  kvm?: {
+    attachedTo?: string;
+    web?: string;
+    joiningMesh?: string;
+    meshes?: string[];
+    virtualMedia?: { source: string; label: string; file: string };
+  };
   /** The AllMyStuff version this node is running, from its presence advert
    *  (e.g. "0.1.11"). Absent from an older peer (or the in-browser demo) —
    *  the upgrade affordance only appears once we know both this and the
@@ -369,6 +375,8 @@ export interface Route {
   from: string;
   to: string;
   media: MediaKind;
+  /** Native receiver mount metadata for explicit Storage mappings. */
+  drive?: { label: string; mount: string } | null;
 }
 
 export interface Catalog {
@@ -654,20 +662,33 @@ export interface FileEntry {
   symlink?: boolean;
 }
 
+export interface FileVolume {
+  name: string;
+  path: string;
+  size: number;
+  removable: boolean;
+}
+
 /** One event of a files route — the request/response conversation between
  *  the file-manager viewer and the host whose disk it browses. Tagged
  *  exactly like the Rust `FileEvent` (serde `kind`, snake_case); `data`
  *  is base64 (the wire is JSON). Every event carries the viewer-minted
  *  request id (`req`) it belongs to. */
 export type FileEvent =
+  | { kind: "volumes"; req: number }
   | { kind: "list"; req: number; path: string }
   | { kind: "read"; req: number; path: string }
+  | { kind: "stat"; req: number; path: string }
+  | { kind: "read_range"; req: number; path: string; offset: number; len: number }
   | { kind: "fetch"; req: number; token: string }
   | { kind: "write"; req: number; path: string; data: string; append?: boolean; eof?: boolean }
+  | { kind: "write_range"; req: number; path: string; offset: number; data: string; truncate?: boolean }
   | { kind: "mkdir"; req: number; path: string }
   | { kind: "rename"; req: number; from: string; to: string }
   | { kind: "delete"; req: number; path: string }
   | { kind: "entries"; req: number; path: string; home: string; entries: FileEntry[] }
+  | { kind: "volume_list"; req: number; volumes: FileVolume[] }
+  | { kind: "metadata"; req: number; entry: FileEntry }
   | { kind: "chunk"; req: number; data: string; total: number; eof?: boolean }
   | { kind: "ok"; req: number }
   | { kind: "err"; req: number; reason: string };

@@ -240,6 +240,15 @@ pub struct FileEntry {
     pub symlink: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileVolume {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub removable: bool,
+}
+
 /// What happened on the files route. The viewer asks (`List`, `Read`,
 /// `Write`, `Mkdir`, `Rename`, `Delete`); the host answers (`Entries`,
 /// `Chunk`, `Ok`, `Err`). Paths are the host's own (absolute once the
@@ -248,11 +257,35 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FileEvent {
+    /// List mounted filesystem roots. Used by the KVM virtual-media picker so
+    /// a remote removable disk is reachable without guessing its drive letter.
+    Volumes {
+        req: u64,
+    },
     /// List a directory. Answered with `Entries` or `Err`.
-    List { req: u64, path: String },
+    List {
+        req: u64,
+        path: String,
+    },
     /// Read a whole file. Answered with a stream of `Chunk`s (the last
     /// has `eof: true`) or `Err`.
-    Read { req: u64, path: String },
+    Read {
+        req: u64,
+        path: String,
+    },
+    /// Read file metadata without transferring its contents.
+    Stat {
+        req: u64,
+        path: String,
+    },
+    /// Read at most `len` bytes beginning at `offset`. Native filesystem
+    /// bridges use this for random-access reads.
+    ReadRange {
+        req: u64,
+        path: String,
+        offset: u64,
+        len: u64,
+    },
     /// Fetch a file offered into a room's **Shared Files** area, named by
     /// the opaque `token` the uploader minted (never a path — a `:shared`
     /// route can't browse the disk, only pull what was explicitly shared).
@@ -260,7 +293,10 @@ pub enum FileEvent {
     /// member the file was shared with, and answers with the same `Chunk`
     /// stream a `Read` would — or `Err` when the token is unknown or not
     /// shared with this peer.
-    Fetch { req: u64, token: String },
+    Fetch {
+        req: u64,
+        token: String,
+    },
     /// Write one piece of a file. The first piece (`append: false`)
     /// creates/truncates; later pieces append. The host answers `Ok` once
     /// the piece with `eof: true` is on disk (or `Err` at any point).
@@ -274,12 +310,33 @@ pub enum FileEvent {
         #[serde(default)]
         eof: bool,
     },
+    /// Write one random-access range. `truncate` sets the file length to
+    /// `offset` before the bytes are written (used by create/truncate).
+    WriteRange {
+        req: u64,
+        path: String,
+        offset: u64,
+        #[serde(with = "bytes_b64")]
+        data: Vec<u8>,
+        #[serde(default)]
+        truncate: bool,
+    },
     /// Create a directory (parents included). Answered with `Ok`/`Err`.
-    Mkdir { req: u64, path: String },
+    Mkdir {
+        req: u64,
+        path: String,
+    },
     /// Rename/move within the host. Answered with `Ok`/`Err`.
-    Rename { req: u64, from: String, to: String },
+    Rename {
+        req: u64,
+        from: String,
+        to: String,
+    },
     /// Delete a file or directory (recursively). Answered with `Ok`/`Err`.
-    Delete { req: u64, path: String },
+    Delete {
+        req: u64,
+        path: String,
+    },
     /// A directory listing. `home` is the host's home directory — sent on
     /// every listing so the viewer can mark it and start there.
     Entries {
@@ -287,6 +344,15 @@ pub enum FileEvent {
         path: String,
         home: String,
         entries: Vec<FileEntry>,
+    },
+    VolumeList {
+        req: u64,
+        volumes: Vec<FileVolume>,
+    },
+    /// Metadata returned by `Stat`.
+    Metadata {
+        req: u64,
+        entry: FileEntry,
     },
     /// One piece of a `Read`. `total` is the file's full size (so the
     /// viewer can show progress); `eof` marks the last piece.
@@ -299,9 +365,14 @@ pub enum FileEvent {
         eof: bool,
     },
     /// The request succeeded (`Write`/`Mkdir`/`Rename`/`Delete`).
-    Ok { req: u64 },
+    Ok {
+        req: u64,
+    },
     /// The request failed, with the host's reason.
-    Err { req: u64, reason: String },
+    Err {
+        req: u64,
+        reason: String,
+    },
     /// A files-plane event a newer build introduced. Ignored rather than
     /// failing the whole frame.
     #[serde(other)]
@@ -314,14 +385,20 @@ impl FileEvent {
     /// it reads as `0` — it is dropped before this is consulted anyway.
     pub fn req(&self) -> u64 {
         match self {
-            FileEvent::List { req, .. }
+            FileEvent::Volumes { req }
+            | FileEvent::List { req, .. }
             | FileEvent::Read { req, .. }
+            | FileEvent::Stat { req, .. }
+            | FileEvent::ReadRange { req, .. }
             | FileEvent::Fetch { req, .. }
             | FileEvent::Write { req, .. }
+            | FileEvent::WriteRange { req, .. }
             | FileEvent::Mkdir { req, .. }
             | FileEvent::Rename { req, .. }
             | FileEvent::Delete { req, .. }
             | FileEvent::Entries { req, .. }
+            | FileEvent::VolumeList { req, .. }
+            | FileEvent::Metadata { req, .. }
             | FileEvent::Chunk { req, .. }
             | FileEvent::Ok { req }
             | FileEvent::Err { req, .. } => *req,

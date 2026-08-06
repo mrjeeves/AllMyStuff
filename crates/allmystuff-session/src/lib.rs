@@ -26,16 +26,17 @@ use std::collections::HashMap;
 
 use allmystuff_graph::{NodeId, Route};
 use allmystuff_protocol::{
-    AppControl, ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
+    AppControl, ControlMessage, DriveRouteOffer, NodeProfile, OwnershipControl, RouteControl,
+    ShareControl,
 };
 
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
     ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, FileEntry, FileEvent,
-    FileFrame, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent, TermFrame,
-    VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
-    SITE_CHUNK_BYTES,
+    FileFrame, FileVolume, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent,
+    TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState,
+    CLIPBOARD_CHUNK_BYTES, SITE_CHUNK_BYTES,
 };
 
 /// Which side of a route we are.
@@ -93,6 +94,9 @@ pub struct LiveRoute {
     /// N" and to re-attach. Skipped on the wire when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term_session: Option<String>,
+    /// Receiver-side native mount request for a mapped Storage route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive: Option<DriveRouteOffer>,
 }
 
 impl LiveRoute {
@@ -269,6 +273,19 @@ impl Session {
         audio: Vec<String>,
         session: Option<String>,
     ) -> ControlMessage {
+        self.offer_with_drive(route, peer, video, audio, session, None)
+    }
+
+    /// Offer a route carrying an optional native-drive mount request.
+    pub fn offer_with_drive(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        session: Option<String>,
+        drive: Option<DriveRouteOffer>,
+    ) -> ControlMessage {
         let peer = peer.into();
         self.routes.insert(
             route.id.clone(),
@@ -280,6 +297,7 @@ impl Session {
                 video: video.clone(),
                 audio: audio.clone(),
                 term_session: session.clone(),
+                drive: drive.clone(),
             },
         );
         ControlMessage::Route(RouteControl::Offer {
@@ -287,6 +305,7 @@ impl Session {
             video,
             audio,
             session,
+            drive,
         })
     }
 
@@ -381,6 +400,7 @@ impl Session {
                 video,
                 audio,
                 session,
+                drive,
             } => {
                 // A duplicate Offer for a route we have already accepted and
                 // started. The daemon redelivers the same Offer once per
@@ -426,6 +446,7 @@ impl Session {
                         // real id once it opens the shell, via
                         // [`set_term_session`](Self::set_term_session).
                         term_session: session,
+                        drive,
                     },
                 );
                 if accept {
@@ -751,6 +772,7 @@ mod tests {
                 route: route("t1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: Some("term-2".into()),
             }),
         );
@@ -775,6 +797,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -804,6 +827,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -815,6 +839,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 // A re-offer might still carry the viewer's original ask;
                 // honouring it must not clobber the resolved id below.
                 session: Some("term-1".into()),
@@ -848,6 +873,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -884,6 +910,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -906,6 +933,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -925,6 +953,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -991,6 +1020,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );
@@ -1054,6 +1084,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                drive: None,
                 session: None,
             }),
         );

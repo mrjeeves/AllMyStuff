@@ -71,6 +71,7 @@ pub mod daemon_spawn;
 /// Local-only development diagnostics shared by the GUI setting and node
 /// startup. This never travels over the mesh or signaling layer.
 pub mod diagnostics;
+pub mod drive_mount;
 pub mod files;
 /// The GPU frame lane — D3D11 VideoProcessor colour conversion + a DXGI
 /// device-manager encoder feed, keeping frames on the GPU end to end.
@@ -89,6 +90,7 @@ pub mod input_inject;
 #[cfg(not(feature = "host"))]
 #[path = "stubs/input_inject.rs"]
 pub mod input_inject;
+pub mod kvm_media;
 /// The Experimental ("Labs") tier gate — one runtime choke point the Mode
 /// dropdown's Experimental toggle flips, so every future field-trial
 /// feature reads `labs::on(Feature::X)` and needs no new GUI control.

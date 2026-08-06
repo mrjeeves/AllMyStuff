@@ -19,7 +19,7 @@
 //! ops run as this user with this user's permissions.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,6 +53,9 @@ pub struct FilesPlane {
     /// bound to the host's real mount root when the route activates; requests
     /// never trust a peer-supplied filesystem path as that root.
     roots: Mutex<HashMap<String, PathBuf>>,
+    /// Native filesystem bridges consume request replies directly instead
+    /// of routing them through a GUI byte queue.
+    waiters: Mutex<HashMap<(String, u64), tokio::sync::mpsc::UnboundedSender<FileEvent>>>,
 }
 
 impl Default for FilesPlane {
@@ -67,6 +70,7 @@ impl FilesPlane {
             queues: ByteQueues::new(MAX_QUEUED_BYTES),
             cancels: Mutex::new(HashMap::new()),
             roots: Mutex::new(HashMap::new()),
+            waiters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -125,6 +129,9 @@ impl FilesPlane {
         }
         self.queues.remove(route_id);
         self.roots.lock().remove(route_id);
+        self.waiters
+            .lock()
+            .retain(|(route, _), _| route != route_id);
     }
 
     pub fn map_root(&self, route_id: &str, root: PathBuf) {
@@ -162,6 +169,49 @@ impl FilesPlane {
     pub fn enqueue(&self, route_id: &str, bytes: Vec<u8>) -> bool {
         self.queues.enqueue(route_id, bytes)
     }
+
+    pub fn begin_rpc(
+        &self,
+        route_id: &str,
+        req: u64,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<FileEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.waiters.lock().insert((route_id.to_string(), req), tx);
+        rx
+    }
+
+    pub fn cancel_rpc(&self, route_id: &str, req: u64) {
+        self.waiters.lock().remove(&(route_id.to_string(), req));
+    }
+
+    /// Deliver a response to a native bridge waiter. Returns true when the
+    /// event belonged to one, so the GUI queue must not also consume it.
+    pub fn deliver_rpc(&self, route_id: &str, event: &FileEvent) -> bool {
+        let req = event.req();
+        if req == 0 {
+            return false;
+        }
+        let key = (route_id.to_string(), req);
+        let terminal = matches!(
+            event,
+            FileEvent::Entries { .. }
+                | FileEvent::VolumeList { .. }
+                | FileEvent::Metadata { .. }
+                | FileEvent::Ok { .. }
+                | FileEvent::Err { .. }
+                | FileEvent::Chunk { eof: true, .. }
+        );
+        let mut waiters = self.waiters.lock();
+        let Some(waiter) = waiters.get(&key).cloned() else {
+            return false;
+        };
+        if terminal {
+            waiters.remove(&key);
+        }
+        drop(waiters);
+        let _ = waiter.send(event.clone());
+        true
+    }
 }
 
 /// Run one request, sending streamed events through `tx`; the returned
@@ -174,6 +224,26 @@ fn run_op(
     root: Option<&Path>,
 ) -> Option<FileEvent> {
     match event {
+        FileEvent::Volumes { req } => {
+            let inv = allmystuff_inventory::scan();
+            Some(FileEvent::VolumeList {
+                req,
+                volumes: inv
+                    .storage
+                    .into_iter()
+                    .filter_map(|volume| {
+                        volume
+                            .mount_point
+                            .map(|path| allmystuff_session::FileVolume {
+                                name: volume.name,
+                                path,
+                                size: volume.total_bytes,
+                                removable: volume.removable,
+                            })
+                    })
+                    .collect(),
+            })
+        }
         FileEvent::List { req, path } => Some(match list_dir(&path, root) {
             Ok((path, entries)) => FileEvent::Entries {
                 req,
@@ -189,6 +259,19 @@ fn run_op(
         }),
         FileEvent::Read { req, path } => match stream_read(req, &path, tx, cancel, root) {
             Ok(()) => None, // the chunk stream (ending in eof) is the reply
+            Err(reason) => Some(FileEvent::Err { req, reason }),
+        },
+        FileEvent::Stat { req, path } => Some(match stat_path(&path, root) {
+            Ok(entry) => FileEvent::Metadata { req, entry },
+            Err(reason) => FileEvent::Err { req, reason },
+        }),
+        FileEvent::ReadRange {
+            req,
+            path,
+            offset,
+            len,
+        } => match stream_read_range(req, &path, offset, Some(len), tx, cancel, root) {
+            Ok(()) => None,
             Err(reason) => Some(FileEvent::Err { req, reason }),
         },
         FileEvent::Mkdir { req, path } => Some(reply(
@@ -293,6 +376,36 @@ pub fn write_piece_in_root(event: &FileEvent, root: Option<&Path>) -> Option<Fil
             reason: e.to_string(),
         }),
     }
+}
+
+/// Apply one random-access write used by the native filesystem bridge.
+pub fn write_range_in_root(event: &FileEvent, root: Option<&Path>) -> Option<FileEvent> {
+    let FileEvent::WriteRange {
+        req,
+        path,
+        offset,
+        data,
+        truncate,
+    } = event
+    else {
+        return None;
+    };
+    let p = match resolve_for(path, root) {
+        Ok(p) => p,
+        Err(reason) => return Some(FileEvent::Err { req: *req, reason }),
+    };
+    let r = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        let mut file = options.open(&p)?;
+        if *truncate {
+            file.set_len(*offset)?;
+        }
+        file.seek(std::io::SeekFrom::Start(*offset))?;
+        file.write_all(data)?;
+        file.flush()
+    })();
+    Some(reply(*req, r.map_err(|e| e.to_string())))
 }
 
 /// Resolve a viewer path to a host path: `""`/`"~"` (and `~/…`) mean this
@@ -438,12 +551,50 @@ fn list_dir(path: &str, root: Option<&Path>) -> Result<(String, Vec<FileEntry>),
     Ok((shown, entries))
 }
 
+fn stat_path(path: &str, root: Option<&Path>) -> Result<FileEntry, String> {
+    let p = resolve_for(path, root)?;
+    let symlink_meta = std::fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+    let symlink = symlink_meta.is_symlink();
+    let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+    let dir = meta.is_dir();
+    let name = if root.is_some() && scoped_is_root(path) {
+        String::new()
+    } else {
+        p.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    Ok(FileEntry {
+        name,
+        dir,
+        size: if dir { 0 } else { meta.len() },
+        modified: meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        symlink,
+    })
+}
+
 /// Stream one file as `Chunk` events (the last marked `eof`), checking
 /// the route's cancel flag between pieces. `blocking_send` is the flow
 /// control: a slow mesh send fills the channel and parks the read here.
 fn stream_read(
     req: u64,
     path: &str,
+    tx: &tokio::sync::mpsc::Sender<FileEvent>,
+    cancel: &AtomicBool,
+    root: Option<&Path>,
+) -> Result<(), String> {
+    stream_read_range(req, path, 0, None, tx, cancel, root)
+}
+
+fn stream_read_range(
+    req: u64,
+    path: &str,
+    offset: u64,
+    len: Option<u64>,
     tx: &tokio::sync::mpsc::Sender<FileEvent>,
     cancel: &AtomicBool,
     root: Option<&Path>,
@@ -455,14 +606,23 @@ fn stream_read(
     }
     let total = meta.len();
     let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+    f.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut sent: u64 = 0;
+    let wanted = len.unwrap_or_else(|| total.saturating_sub(offset));
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
-        let eof = n == 0 || sent + n as u64 >= total;
+        let remaining = wanted.saturating_sub(sent);
+        let take = remaining.min(buf.len() as u64) as usize;
+        let n = if take == 0 {
+            0
+        } else {
+            f.read(&mut buf[..take]).map_err(|e| e.to_string())?
+        };
+        let eof = n == 0 || sent + n as u64 >= wanted || offset + sent + n as u64 >= total;
         let chunk = FileEvent::Chunk {
             req,
             data: buf[..n].to_vec(),

@@ -2139,7 +2139,7 @@ impl Mesh {
                 // Snapshot every live route (peer, id, is-screen, drive-plane)
                 // under the state lock, then drop it before touching the CEC
                 // store or tearing anything down (`disconnect` re-locks state).
-                let routes: Vec<(String, String, bool, Option<DrivePlane>)> = {
+                let routes: Vec<(String, Route, Option<DrivePlane>)> = {
                     let st = mesh.state.lock();
                     match st.session.as_ref() {
                         Some(session) => session
@@ -2147,8 +2147,7 @@ impl Mesh {
                             .map(|r| {
                                 (
                                     r.peer.as_str().to_string(),
-                                    r.route.id.clone(),
-                                    matches!(r.route.media, MediaKind::Display | MediaKind::Video),
+                                    r.route.clone(),
                                     route_drive_plane(&r.route),
                                 )
                             })
@@ -2169,16 +2168,21 @@ impl Mesh {
                 // is tearing down for lapsed consent doesn't count.
                 let mut viewing: std::collections::BTreeMap<String, (bool, bool)> =
                     std::collections::BTreeMap::new();
-                for (peer, route_id, is_screen, plane) in routes {
+                for (peer, route, plane) in routes {
                     // Only CEC technicians are consent-gated; an owner/fleet or
                     // ordinary peer's routes are none of this sweep's business.
                     if !mesh.cec.knows_technician(&peer) {
                         continue;
                     }
-                    let screen_lapsed = is_screen && mesh.cec_screen_offer_denied(&peer);
+                    let is_screen = matches!(route.media, MediaKind::Display | MediaKind::Video);
+                    let screen_lapsed = is_screen
+                        && cec_screen_consent_blocks(
+                            mesh.sender_may_source_media(&peer, &route),
+                            mesh.cec_screen_offer_denied(&peer),
+                        );
                     let drive_lapsed = plane.is_some_and(|pl| !mesh.sender_may_drive(&peer, pl));
                     if screen_lapsed || drive_lapsed {
-                        stale_routes.push(route_id);
+                        stale_routes.push(route.id.clone());
                         lapsed_techs.insert(crate::cec::pubkey_part(&peer).to_string());
                         continue;
                     }
@@ -3184,7 +3188,10 @@ impl Mesh {
                         // here).
                         if hosts_here
                             && matches!(route.media, MediaKind::Display | MediaKind::Video)
-                            && self.cec_screen_offer_denied(&from)
+                            && cec_screen_consent_blocks(
+                                self.sender_may_source_media(&from, route),
+                                self.cec_screen_offer_denied(&from),
+                            )
                         {
                             tracing::warn!(
                                 "CEC screen offer {} from {} refused: no live consent grant",
@@ -13928,6 +13935,16 @@ fn fleet_departure(advertised_owner: Option<&str>, me: Option<&str>) -> bool {
     }
 }
 
+/// Whether CEC consent should block a screen offer after the ordinary
+/// AllMyStuff authority has been evaluated. A peer can be both a known CEC
+/// technician and an owner/fleet member (for example, the same laptop runs
+/// CECSupport and AllMyStuff). CEC is an additional authorization path; it
+/// must never narrow owner/fleet or explicit-share access merely because that
+/// identity also appears in the support directory.
+fn cec_screen_consent_blocks(media_authorized: bool, cec_consent_denied: bool) -> bool {
+    cec_consent_denied && !media_authorized
+}
+
 /// Why an inbound terminal/files/site offer must be refused, if it must: it
 /// asks *this* machine to host a shell (or hand over its disk, or proxy a
 /// service) and the offerer is neither owner/fleet nor holds a share grant for
@@ -15468,6 +15485,19 @@ mod tests {
         // owner/fleet rule) is what keeps it to explicitly-shared files.
         let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
         assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    #[test]
+    fn cec_identity_never_narrows_ordinary_screen_authority() {
+        // A known technician without live CEC consent is blocked only when
+        // CEC is the sole possible authority.
+        assert!(cec_screen_consent_blocks(false, true));
+        // Owner/fleet or an explicit AllMyStuff share wins even if this same
+        // identity is also remembered as a CEC technician.
+        assert!(!cec_screen_consent_blocks(true, true));
+        // With live CEC consent there is no CEC denial in either case.
+        assert!(!cec_screen_consent_blocks(false, false));
+        assert!(!cec_screen_consent_blocks(true, false));
     }
 
     #[test]

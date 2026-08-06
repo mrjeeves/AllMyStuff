@@ -58,14 +58,19 @@ export function capabilityForDisplay(cat: Catalog, id: string): Capability | und
       flow: "sink",
       origin: "terminal-view",
     };
-  // The phone shell's minted display sink (its scan can't enumerate the
-  // panel; the store synthesizes `<node>:display-view` — see
-  // `hydrateFromBackend`). It IS a real catalog capability on the phone
-  // itself; this stand-in is for every *other* machine, whose view of the
-  // phone only carries the scan-advertised endpoints — so the machine being
-  // watched still draws/labels the console's video route.
+  // The app-level remote-desktop sink. New nodes advertise it directly and
+  // the store synthesizes it when an older local service does not; this
+  // stand-in also keeps a live route legible if its endpoint arrived without
+  // the corresponding catalog frame.
   if (tail === "display-view")
-    return { id, node, label: "Screen view", media: "display", flow: "sink", origin: "viewer" };
+    return {
+      id,
+      node,
+      label: "Remote desktop",
+      media: "display",
+      flow: "sink",
+      origin: "remote-desktop",
+    };
   if (tail === "files")
     return { id, node, label: "Files", media: "generic", flow: "source", origin: "files" };
   if (tail.startsWith("files-view"))
@@ -233,7 +238,15 @@ function validateRoute(cat: Catalog, from: string, to: string): ConnectResult {
   return { ok: true, route: { id: routeId(from, to), from, to, media } };
 }
 
-const MACHINE_ORIGINS = new Set(["screen", "control", "controller", "system", "viewer", "storage-in"]);
+const MACHINE_ORIGINS = new Set([
+  "screen",
+  "remote-desktop",
+  "control",
+  "controller",
+  "system",
+  "viewer",
+  "storage-in",
+]);
 
 /** Sort key (lower = preferred), mirroring the Rust `endpoint_rank`: a
  *  synthetic machine endpoint first, then the category's current default

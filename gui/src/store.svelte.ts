@@ -2285,24 +2285,21 @@ class AppStore {
       ...scan.capabilities,
       ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
-    // The phone/tablet shell: a mobile OS offers no display enumeration, so
-    // the scan reports no display *sink* — and with no local sink endpoint the
-    // console's video leg has nowhere to land and silently never wires (audio,
-    // control and clipboard all ride synthetic machine capabilities and come
-    // up fine, which is exactly the "session with no picture" a phone console
-    // showed). The webview itself is where inbound screen video renders, so
-    // "can show a screen" is a property of the running app — the same
-    // rationale as the backend's own synthetic `video-in` camera sink. Mint
-    // the sink the scan couldn't see; a desktop scan reports its real
-    // monitors and never takes this branch.
-    if (isMobile() && !matchEndpoint(this.catalog, newId, "display", "consume")) {
+    // The webview is where an inbound remote desktop renders, so viewing a
+    // screen is a capability of the running app rather than a side effect of
+    // the hardware scanner finding a physical monitor. New node builds expose
+    // this synthetic endpoint themselves; keep the GUI fallback for an older
+    // local service, and for any platform scan that omits display inventory.
+    // Without it the console returns before sending a route offer while its
+    // terminal/control legs still work — the one-way, no-picture failure.
+    if (!matchEndpoint(this.catalog, newId, "display", "consume")) {
       this.catalog.capabilities.push({
         id: `${newId}:display-view`,
         node: newId,
-        label: "Screen view",
+        label: "Remote desktop",
         media: "display",
         flow: "sink",
-        origin: "viewer",
+        origin: "remote-desktop",
       });
     }
     // A console window scans too (it needs the local sinks to wire routes).

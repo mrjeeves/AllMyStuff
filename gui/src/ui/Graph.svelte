@@ -1194,8 +1194,10 @@
     const items =
       1 +
       (normalMode && cons?.terminal ? 1 : 0) +
-      (normalMode && mn && app.kvmAllowed(mn) ? 2 : 0) +
-      (app.canRestartApp(mn) ? 1 : 0) +
+      (normalMode && cons?.files ? 1 : 0) +
+      (normalMode && mn && app.isKvm(mn) && cons?.sites ? 1 : 0) +
+      (normalMode && mn && app.kvmAllowed(mn) ? 3 : 0) +
+      (!app.isKvm(mn) && app.canRestartApp(mn) ? 1 : 0) +
       (!app.isKvm(mn) && app.canRestartDevice(mn) ? 1 : 0) +
       (mn && mn.kind !== "this" && !app.isMe(nodeId) ? 1 : 0); // Forget this node
     return MENU_PAD + items * MENU_ITEM_H;
@@ -2271,7 +2273,7 @@
         <span class="nm-text"><span class="nm-label">Attach</span><span class="nm-sub">choose the machine behind this KVM</span></span>
       </button>
     {/if}
-    {#if app.canRestartApp(mn)}
+    {#if !app.isKvm(mn) && app.canRestartApp(mn)}
       <button
         class="nm-item"
         role="menuitem"

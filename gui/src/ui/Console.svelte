@@ -70,7 +70,7 @@
       : { remote: false, files: false, terminal: false, sites: false, audio: false, control: false, clipboard: false },
   );
   const drivesAllowed = $derived(
-    !!node && (kvmSource ? app.kvmAllowed(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
+    !!node && (kvmSource ? app.kvmDoors(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
   );
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);

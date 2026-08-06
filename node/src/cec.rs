@@ -983,7 +983,10 @@ impl Cec {
         let inner = self.inner.lock();
         inner.session_tech.iter().any(|(session, peer)| {
             pubkey_part(peer) == key
-                && inner.sessions.get(session).is_some_and(|state| state == "active")
+                && inner
+                    .sessions
+                    .get(session)
+                    .is_some_and(|state| state == "active")
         })
     }
 

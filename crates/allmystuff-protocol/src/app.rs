@@ -856,13 +856,18 @@ pub struct TerminalSessionInfo {
     pub attachers: usize,
 }
 
-/// Receiver-side OS mount requested for a Storage route. The selected source
-/// path never crosses the mesh: it is bound locally to the route before the
-/// offer is sent. Only the friendly label and the receiver's requested drive
-/// letter/mount point travel with the offer.
+/// Receiver-side OS mount requested for a Storage route. The canonical source
+/// path is included so the receiver can re-request the mapping after either
+/// app restarts. Drive pushes are fleet-only, and pull recipients supplied the
+/// path themselves, so it is never disclosed outside an already-authorized
+/// native-drive relationship.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveRouteOffer {
     pub label: String,
+    /// Canonical path on the source. Absent on older senders; those mappings
+    /// remain live-only and cannot be rebuilt by the receiver after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     /// Windows: `X:`. Other desktop platforms may use an absolute mount point.
     /// Empty means pick the next available native target on the receiver.
     #[serde(default)]

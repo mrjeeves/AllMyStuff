@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -124,8 +124,10 @@ pub struct Mesh {
     drive_pull_tokens: Mutex<HashMap<String, DrivePullRequest>>,
     /// Successful receiver-initiated mappings, keyed by their current route.
     /// The route is one connection incarnation; this is the user's intent and
-    /// survives a source laptop's sleep/restart for the life of this app.
+    /// survives either app restarting and a source laptop sleeping.
     drive_reconnects: Mutex<HashMap<String, DriveReconnect>>,
+    /// Crash-safe backing store for the receiver-owned mapping intents.
+    drive_reconnect_path: Option<PathBuf>,
     /// Old route ids currently being rebuilt, so repeated presence adverts do
     /// not launch duplicate offers for the same native drive.
     drive_reconnect_inflight: Mutex<std::collections::HashSet<String>>,
@@ -425,12 +427,62 @@ struct DrivePullRequest {
     made: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DriveReconnect {
     source: String,
     root: String,
     label: String,
     mount: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedDriveReconnects {
+    #[serde(default)]
+    mappings: Vec<DriveReconnect>,
+}
+
+fn drive_reconnect_store_path() -> Option<PathBuf> {
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".myownmesh").join("allmystuff-drives.json"))
+}
+
+fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconnect> {
+    let persisted: PersistedDriveReconnects = path
+        .as_ref()
+        .map(|path| crate::persist::load_json(path))
+        .unwrap_or_default();
+    persisted
+        .mappings
+        .into_iter()
+        .enumerate()
+        .map(|(index, mapping)| (format!("saved:{index}"), mapping))
+        .collect()
+}
+
+fn persist_drive_reconnects(
+    path: &Option<PathBuf>,
+    mappings: &HashMap<String, DriveReconnect>,
+) -> bool {
+    let Some(path) = path else { return true };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut durable = Vec::new();
+    for mapping in mappings.values() {
+        if !durable.contains(mapping) {
+            durable.push(mapping.clone());
+        }
+    }
+    durable.sort_by(|a, b| {
+        (&a.source, &a.root, &a.mount, &a.label).cmp(&(&b.source, &b.root, &b.mount, &b.label))
+    });
+    let persisted = PersistedDriveReconnects { mappings: durable };
+    match serde_json::to_string_pretty(&persisted) {
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -1049,6 +1101,8 @@ impl Mesh {
         // Audio's 8 buffers are ~160 ms of slack.
         let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
         let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
+        let drive_reconnect_path = drive_reconnect_store_path();
+        let drive_reconnects = load_drive_reconnects(&drive_reconnect_path);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -1068,7 +1122,8 @@ impl Mesh {
             files: FilesPlane::new(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
-            drive_reconnects: Mutex::new(HashMap::new()),
+            drive_reconnects: Mutex::new(drive_reconnects),
+            drive_reconnect_path,
             drive_reconnect_inflight: Mutex::new(std::collections::HashSet::new()),
             kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
@@ -3045,17 +3100,6 @@ impl Mesh {
                             None
                         };
                         let explicit_drive_pull = accepted_drive_pull.is_some();
-                        if let Some(pull) = accepted_drive_pull {
-                            self.drive_reconnects.lock().insert(
-                                route.id.clone(),
-                                DriveReconnect {
-                                    source: pull.source,
-                                    root: pull.root,
-                                    label: pull.label,
-                                    mount: pull.mount,
-                                },
-                            );
-                        }
                         // Drive pushes TO this machine are fleet-only. A
                         // receiver-minted pull token is the explicit exception:
                         // it lets this user pull FROM a Files share/support
@@ -3066,6 +3110,30 @@ impl Mesh {
                             route_drive_plane(route)
                                 .is_none_or(|plane| self.sender_may_drive(&from, plane))
                         };
+                        if authorized && is_mapped_drive_route(route) {
+                            let reconnect = accepted_drive_pull
+                                .map(|pull| DriveReconnect {
+                                    source: pull.source,
+                                    root: pull.root,
+                                    label: pull.label,
+                                    mount: pull.mount,
+                                })
+                                .or_else(|| {
+                                    let offer = drive.as_ref()?;
+                                    Some(DriveReconnect {
+                                        source: pubkey_part(from.as_str()).to_string(),
+                                        root: offer.root.clone()?,
+                                        label: offer.label.clone(),
+                                        mount: offer.mount.clone(),
+                                    })
+                                });
+                            if let Some(reconnect) = reconnect {
+                                self.drive_reconnects
+                                    .lock()
+                                    .insert(route.id.clone(), reconnect);
+                                self.persist_drive_reconnects();
+                            }
+                        }
                         // CEC screen gate: a customer only lets a dialed
                         // technician view its screen while a live consent grant
                         // covers it — the screen twin of the per-plane
@@ -3291,8 +3359,12 @@ impl Mesh {
                                     // source is a real unmap. Peer-restart
                                     // reaps never arrive through this arm, so
                                     // those retain their reconnect intent.
-                                    self.drive_reconnects.lock().remove(route_id);
+                                    let forgot =
+                                        self.drive_reconnects.lock().remove(route_id).is_some();
                                     self.drive_reconnect_inflight.lock().remove(route_id);
+                                    if forgot {
+                                        self.persist_drive_reconnects();
+                                    }
                                 }
                                 self.process_effects(effects).await;
                                 self.emit_snapshot();
@@ -4251,6 +4323,7 @@ impl Mesh {
             } else {
                 label.trim().to_string()
             },
+            root: Some(root.to_string_lossy().into_owned()),
             mount: mount.trim().to_string(),
             request,
         };
@@ -4476,6 +4549,13 @@ impl Mesh {
         Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
     }
 
+    fn persist_drive_reconnects(&self) {
+        let mappings = self.drive_reconnects.lock();
+        if !persist_drive_reconnects(&self.drive_reconnect_path, &mappings) {
+            tracing::error!("couldn't save native drive mappings");
+        }
+    }
+
     /// Rebuild receiver-initiated drive routes whose source has returned with
     /// a fresh app/session incarnation. The Windows drive letter is briefly
     /// unavailable while the old route is reaped, then is claimed again with
@@ -4535,6 +4615,7 @@ impl Mesh {
                     {
                         Ok(()) => {
                             mesh.drive_reconnects.lock().remove(&old_route);
+                            mesh.persist_drive_reconnects();
                             last_error = None;
                             tracing::info!(
                                 "native drive from {} reconnected after the source returned",
@@ -4790,8 +4871,11 @@ impl Mesh {
         // An explicit disconnect means "forget this mapping", not merely
         // "this connection incarnation ended". Automatic peer-restart reaps
         // bypass this command and intentionally retain the reconnect intent.
-        self.drive_reconnects.lock().remove(&route_id);
+        let forgot = self.drive_reconnects.lock().remove(&route_id).is_some();
         self.drive_reconnect_inflight.lock().remove(&route_id);
+        if forgot {
+            self.persist_drive_reconnects();
+        }
         if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
             // Do not infer intent from watcher *presence*: unwatch is a
             // separate fire-and-forget command and can lag. A window that polls
@@ -9720,6 +9804,7 @@ impl Mesh {
                         .and_then(|live| live.drive.clone())
                         .unwrap_or(DriveRouteOffer {
                             label: "Remote drive".into(),
+                            root: None,
                             mount: String::new(),
                             request: None,
                         });
@@ -9740,6 +9825,7 @@ impl Mesh {
                                     // letter/mount point the user already sees.
                                     intent.mount = info.mount.clone();
                                 }
+                                mesh.persist_drive_reconnects();
                                 tracing::info!(
                                     "route {} active — native drive {} mounted from {}",
                                     route_id,
@@ -15435,5 +15521,34 @@ mod tests {
         assert_eq!(audio_capture_source(&mic), CaptureSource::Mic);
         let bare = term_route("me", "them:system-audio", MediaKind::Audio);
         assert_eq!(audio_capture_source(&bare), CaptureSource::Mic);
+    }
+
+    #[test]
+    fn native_drive_mapping_intents_survive_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "amst-drive-intents-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        let path = Some(dir.join("allmystuff-drives.json"));
+        let intent = super::DriveReconnect {
+            source: "source-key".into(),
+            root: "/Volumes/Install Media".into(),
+            label: "Windows installer".into(),
+            mount: "X:".into(),
+        };
+        let mappings = std::collections::HashMap::from([
+            ("route:old".into(), intent.clone()),
+            // Duplicate routes can briefly coexist during a reconnect, but
+            // the durable store records the user's mapping only once.
+            ("route:new".into(), intent.clone()),
+        ]);
+
+        assert!(super::persist_drive_reconnects(&path, &mappings));
+        let loaded = super::load_drive_reconnects(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.values().next(), Some(&intent));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

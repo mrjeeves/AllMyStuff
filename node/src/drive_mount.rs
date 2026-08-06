@@ -71,7 +71,7 @@ impl DriveMounts {
         if let Some(existing) = self.active.lock().get(&route) {
             return Ok(existing.info.clone());
         }
-        let mount = choose_mount(&requested_mount, &self.list())?;
+        let mount = choose_mount(&requested_mount, &self.list()).await?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|error| format!("couldn't start the local drive bridge: {error}"))?;
@@ -144,7 +144,7 @@ impl DriveMounts {
     }
 }
 
-fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, String> {
+async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, String> {
     #[cfg(windows)]
     {
         let requested = requested.trim().trim_end_matches(['\\', '/']);
@@ -160,18 +160,14 @@ fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, S
                 return Err("drive letter must look like X:".into());
             }
             let mount = format!("{letter}:");
-            if std::path::Path::new(&format!("{mount}\\")).exists()
-                || active.iter().any(|entry| entry.mount == mount)
-            {
+            if !mount_available(&mount, active).await {
                 return Err(format!("{mount} is already in use"));
             }
             return Ok(mount);
         }
         for letter in ('D'..='Z').rev() {
             let mount = format!("{letter}:");
-            if !std::path::Path::new(&format!("{mount}\\")).exists()
-                && !active.iter().any(|entry| entry.mount == mount)
-            {
+            if mount_available(&mount, active).await {
                 return Ok(mount);
             }
         }
@@ -182,6 +178,29 @@ fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, S
         let _ = (requested, active);
         Err("native drive mounting is currently available on Windows".into())
     }
+}
+
+#[cfg(windows)]
+async fn mount_available(mount: &str, active: &[NativeDriveInfo]) -> bool {
+    if std::path::Path::new(&format!("{mount}\\")).exists()
+        || active
+            .iter()
+            .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
+    {
+        return false;
+    }
+
+    // `Path::exists` misses disconnected persistent network mappings. Windows
+    // still reserves their letters, though, and `net use` then waits before
+    // failing with system error 1202. Query the requested local name itself:
+    // success means Windows knows that mapping, connected or not; 2250 means
+    // the letter is genuinely unassigned and safe for our loopback WebDAV.
+    tokio::process::Command::new("net.exe")
+        .args(["use", mount])
+        .output()
+        .await
+        .map(|output| !output.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]

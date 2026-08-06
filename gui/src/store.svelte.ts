@@ -856,6 +856,7 @@ class AppStore {
    *  snapshot. A terminal tab watches its own route here to tell
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
+  driveMounts = $state<Record<string, { label: string; mount: string }>>({});
   /** The resolved host-side terminal session id per terminal route id, from
    *  the snapshot (the host echoes it on `Accept` for a shared shell). A
    *  terminal tab reads it to label which shell it's on and to re-query the
@@ -1557,8 +1558,16 @@ class AppStore {
     });
     await onDriveMount((e) => {
       const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
-      if (e.error) this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
-      else this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
+      if (e.error) {
+        delete this.driveMounts[e.route];
+        this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
+      } else {
+        this.driveMounts[e.route] = {
+          label: e.label || "Remote drive",
+          mount: e.mount!,
+        };
+        this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
+      }
     });
     await onKvmMedia((e) => {
       const kvm = this.nodeByCanonical(e.kvm)?.label ?? "the KVM";
@@ -2477,6 +2486,11 @@ class AppStore {
     }
     this.routeStates = states;
     this.routeSessions = sessions;
+    for (const routeId of Object.keys(this.driveMounts)) {
+      if (!states[routeId] || states[routeId].state !== "active") {
+        delete this.driveMounts[routeId];
+      }
+    }
 
     // A console leg the far side REFUSED: the controlled machine rejects the
     // control/clipboard route when our events fail its authorization gate
@@ -4091,6 +4105,7 @@ class AppStore {
     host: string;
     target: string;
     mount: string;
+    status: "connecting" | "mounted" | "shared";
   }> {
     const out = [] as Array<{
       route: Route;
@@ -4100,6 +4115,7 @@ class AppStore {
       host: string;
       target: string;
       mount: string;
+      status: "connecting" | "mounted" | "shared";
     }>;
     for (const route of this.catalog.routes) {
       if (route.media !== "storage" || !route.to.endsWith(":storage-in")) continue;
@@ -4107,27 +4123,30 @@ class AppStore {
       const to = this.capability(route.to);
       const fromNode = from?.node ?? this.capNodeOf(route.from);
       const toNode = to?.node ?? this.capNodeOf(route.to);
-      const driveLabel = route.drive?.label ?? from?.label ?? "Mapped drive";
-      const mount = route.drive?.mount || "Auto";
+      const mounted = this.driveMounts[route.id];
+      const driveLabel = mounted?.label ?? route.drive?.label ?? from?.label ?? "Mapped drive";
+      const mount = mounted?.mount ?? route.drive?.mount ?? "";
       if (this.isMe(toNode)) {
         out.push({
           route,
           direction: "in",
           drive: driveLabel,
-          machine: this.node(fromNode)?.label ?? fromNode,
+          machine: this.machineByAnyId(fromNode)?.label ?? shortId(fromNode),
           host: fromNode,
           target: toNode,
           mount,
+          status: mounted ? "mounted" : "connecting",
         });
       } else if (this.isMe(fromNode)) {
         out.push({
           route,
           direction: "out",
           drive: driveLabel,
-          machine: this.node(toNode)?.label ?? toNode,
+          machine: this.machineByAnyId(toNode)?.label ?? shortId(toNode),
           host: fromNode,
           target: toNode,
           mount,
+          status: "shared",
         });
       }
     }

@@ -84,11 +84,21 @@
     <div class="drive-list">
       {#each mappings as mapping (mapping.route.id)}
         <div class="drive-row">
+          <span class="drive-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 5.5h14l2 5.5H3z" /><rect x="3" y="11" width="18" height="7.5" rx="2" /><circle cx="17.5" cy="14.8" r=".8" fill="currentColor" stroke="none" />
+            </svg>
+          </span>
           <div class="drive-copy">
             <strong>{mapping.drive}</strong>
             <span>
-              {mapping.direction === "out" ? `On ${mapping.machine}` : `From ${mapping.machine}`}
-              · {mapping.mount === "Auto" ? "next available letter" : mapping.mount}
+              {#if mapping.direction === "out"}
+                Available on {mapping.machine}
+              {:else if mapping.status === "mounted"}
+                From {mapping.machine} · Mounted as {mapping.mount}
+              {:else}
+                From {mapping.machine} · Connecting…
+              {/if}
             </span>
           </div>
           <button class="remove" title="Remove mapped drive" onclick={() => app.unmapDrive(mapping.route.id)}>×</button>
@@ -170,8 +180,11 @@
   .drive-panel { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px; color: var(--text, #eef0fa); }
   .drive-list { display: grid; gap: 6px; margin-bottom: 8px; }
   .drive-row { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 10px; background: rgba(255,255,255,.045); }
+  .drive-icon { display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 auto; border: 1px solid rgba(86,210,139,.2); border-radius: 8px; color: #63d99b; background: rgba(86,210,139,.08); font-size: 13px; }
+  .drive-icon svg { width: 16px; height: 16px; }
   .drive-copy { min-width: 0; display: grid; gap: 2px; flex: 1; }
   .drive-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .drive-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .drive-copy span, .empty, .path { color: var(--muted, #9297aa); font-size: 11px; }
   .remove { width: 27px; height: 27px; border: 0; border-radius: 8px; color: #ff9caf; background: rgba(255,83,119,.1); font-size: 18px; cursor: pointer; }
   .empty { padding: 9px 7px 12px; }

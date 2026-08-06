@@ -11,6 +11,8 @@
   let saving = $state(false);
   let formEl = $state<HTMLFormElement | null>(null);
 
+  const targetNode = $derived(app.machineByAnyId(target));
+  const targetLabel = $derived(targetNode?.label || "that computer");
   const mappings = $derived(
     app.driveMappings.filter(
       (mapping) =>
@@ -111,17 +113,17 @@
       {#if app.filesAllowed(app.machineByAnyId(target) ?? undefined)}
         <button onclick={() => { choosingDirection = false; remoteSource = target; }}>
           <span aria-hidden="true">⇣</span>
-          <span><strong>From this device</strong><small>Choose one of its folders to mount here</small></span>
+          <span><strong>Use a folder from {targetLabel}</strong><small>It will appear as a drive on this computer</small></span>
         </button>
       {/if}
       {#if app.isFleetMember(target)}
         <button onclick={() => void chooseLocalForTarget()}>
           <span aria-hidden="true">⇡</span>
-          <span><strong>To this device</strong><small>Choose a local folder · fleet only</small></span>
+          <span><strong>Map a folder onto {targetLabel}</strong><small>Choose a folder from this computer · fleet only</small></span>
         </button>
       {/if}
       {#if !app.filesAllowed(app.machineByAnyId(target) ?? undefined) && !app.isFleetMember(target)}
-        <div class="empty">Drive mapping needs Fleet access to map to this device, or Files access to map from it.</div>
+        <div class="empty">You need Fleet access to map a folder onto {targetLabel}, or Files access to use a folder from it here.</div>
       {/if}
       <button class="source-cancel" onclick={() => (choosingDirection = false)}>Cancel</button>
     </div>

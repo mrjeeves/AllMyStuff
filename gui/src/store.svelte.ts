@@ -4204,7 +4204,8 @@ class AppStore {
         this.toast("warn", "Native drive mapping requires the desktop app");
         return false;
       }
-      this.toast("ok", `${label || "Drive"} is being mapped`);
+      const target = this.machineByAnyId(targetNodeId)?.label || "the other computer";
+      this.toast("ok", `${label || "Drive"} is being mapped onto ${target}`);
       return true;
     } catch (error) {
       this.toast("warn", String(error));
@@ -4224,7 +4225,7 @@ class AppStore {
     }
     try {
       await mapNativeDriveFrom(sourceNodeId, root, label, mount);
-      this.toast("ok", `${label || "Drive"} is being mapped to this device`);
+      this.toast("ok", `${label || "Drive"} is connecting to this computer`);
       return true;
     } catch (error) {
       this.toast("warn", String(error));

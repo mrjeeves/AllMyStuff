@@ -72,7 +72,12 @@
   function refresh() {
     refreshSpin = true;
     setTimeout(() => (refreshSpin = false), 650);
-    void app.restartNetwork();
+    // Header refresh means "bring me current": reconnect the mesh and perform
+    // a real release-feed check in parallel.
+    void Promise.allSettled([
+      app.restartNetwork(),
+      ...(isMobile() ? [] : [app.checkUpdates()]),
+    ]);
   }
 
   onMount(() => {

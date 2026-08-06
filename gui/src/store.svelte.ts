@@ -504,6 +504,13 @@ export interface Toast {
   id: number;
   kind: "ok" | "info" | "warn";
   text: string;
+  persistent?: boolean;
+  tag?: "update";
+  actions?: Array<{
+    label: string;
+    action: "apply_update" | "relaunch_update" | "open_updates";
+    primary?: boolean;
+  }>;
 }
 
 /** A connection the user started but that needs a permission grant first.
@@ -1525,6 +1532,11 @@ class AppStore {
       this.seedDemoNetworks();
       this.seedDemoRoom();
     }
+    // Update discovery starts before mesh hydration and hardware scans. Those
+    // can take seconds on a cold Windows launch; version checking must not wait
+    // behind them or depend on the later background ticker.
+    await onUpdateChecked((o) => this.applyUpdateChecked(o));
+    if (isTauri() && !isMobile()) void this.checkUpdates();
     // The rooms plane goes live *before* the first data pull. A room window
     // joins the instant its identity lands (set by `hydrateFromBackend`,
     // just below), and a `join` broadcast before onRoom is listening drops
@@ -1604,16 +1616,9 @@ class AppStore {
     await this.loadOwnedFleet();
     await this.loadSites();
     await onNodeSites((e) => this.applyNodeSites(e));
-    // The background ticker's verdict. Registered here (not in the Updates
-    // pane) so a release found while the user is anywhere in the app still
-    // surfaces — the pane only mounts when you go looking for it, which is
-    // exactly the trap that made auto-update feel like it never ran.
-    await onUpdateChecked((o) => this.applyUpdateChecked(o));
+    // The listener and forced launch check were started before hydration; now
+    // read the resulting staged/install state for Settings and node cards.
     await this.loadUpdateStatus();
-    // Do one real feed check while the main window starts. The updater still
-    // applies its own due/policy rules; this closes the gap where no timer had
-    // run yet and the app only displayed yesterday's persisted status.
-    void this.checkUpdates();
     // Card-level update affordances need the channel version even when the
     // details drawer never mounts (Normal mode's default).
     void this.loadLatestRelease();
@@ -8553,28 +8558,39 @@ class AppStore {
   private applyUpdateChecked(o: CheckOutcome) {
     this.updateOutcome = o;
     void this.loadUpdateStatus();
-    switch (o.outcome) {
-      case "staged":
-        this.toast(
-          "info",
-          `Update ${o.version} is ready — relaunch to run it (Settings → Updates)`,
-        );
-        break;
-      case "manual_update_available":
-        this.toast(
-          "info",
-          `${o.latest} is available — update the way you installed AllMyStuff`,
-        );
-        break;
-      case "policy_blocked":
-        this.toast(
-          "info",
-          `${o.latest} is available — approve it in Settings → Updates`,
-        );
-        break;
-      default:
-        break;
+    this.showUpdateNotice(o);
+  }
+
+  /** Keep an available update visible until the user acts or dismisses it. */
+  private showUpdateNotice(o: CheckOutcome): boolean {
+    if (o.outcome === "staged") {
+      this.toast("info", `AllMyStuff ${o.version} is downloaded and ready.`, {
+        persistent: true,
+        tag: "update",
+        actions: [
+          { label: "Apply", action: "apply_update" },
+          { label: "Restart & update", action: "relaunch_update", primary: true },
+        ],
+      });
+      return true;
     }
+    if (o.outcome === "manual_update_available") {
+      this.toast("info", `${o.latest} is available. Update it the way AllMyStuff was installed.`, {
+        persistent: true,
+        tag: "update",
+        actions: [{ label: "Update details", action: "open_updates", primary: true }],
+      });
+      return true;
+    }
+    if (o.outcome === "policy_blocked") {
+      this.toast("info", `${o.latest} is available and waiting for your approval.`, {
+        persistent: true,
+        tag: "update",
+        actions: [{ label: "Review update", action: "open_updates", primary: true }],
+      });
+      return true;
+    }
+    return false;
   }
 
   /** Check the release feed now and stage anything permitted. */
@@ -8586,10 +8602,11 @@ class AppStore {
     this.updateBusy = true;
     this.updateOutcome = null;
     try {
-      this.updateOutcome = await updateCheck();
+      const outcome = await updateCheck();
+      if (outcome) this.applyUpdateChecked(outcome);
       this.updateInfo = (await updateStatus()) ?? this.updateInfo;
-      // No toast — the Updates pane reads updateOutcome and shows the result
-      // inline (staged/ready blocks, or the "check result" line) right there.
+      // Routine outcomes stay in the Updates pane; an available release gets
+      // the persistent inline-action notice in applyUpdateChecked.
     } catch (e) {
       this.toast("warn", `Update check failed: ${errMsg(e)}`);
     } finally {
@@ -9267,12 +9284,48 @@ class AppStore {
   }
 
   // ---- toasts ------------------------------------------------------
-  toast(kind: Toast["kind"], text: string) {
+  toast(
+    kind: Toast["kind"],
+    text: string,
+    options: Pick<Toast, "persistent" | "tag" | "actions"> = {},
+  ) {
+    if (options.tag) this.toasts = this.toasts.filter((toast) => toast.tag !== options.tag);
     const id = ++seq;
-    this.toasts.push({ id, kind, text });
+    this.toasts.push({ id, kind, text, ...options });
+    if (options.persistent) return;
     setTimeout(() => {
       this.toasts = this.toasts.filter((t) => t.id !== id);
     }, 3200);
+  }
+
+  dismissToast(id: number) {
+    this.toasts = this.toasts.filter((toast) => toast.id !== id);
+  }
+
+  async runToastAction(
+    id: number,
+    action: "apply_update" | "relaunch_update" | "open_updates",
+  ) {
+    if (action === "open_updates") {
+      this.openSettings("updates");
+      this.dismissToast(id);
+      return;
+    }
+    if (action === "apply_update") {
+      await this.applyUpdate();
+      if (this.updateApplied) {
+        this.dismissToast(id);
+        this.toast("info", `AllMyStuff ${this.updateApplied} is applied and ready to restart.`, {
+          persistent: true,
+          tag: "update",
+          actions: [
+            { label: "Restart now", action: "relaunch_update", primary: true },
+          ],
+        });
+      }
+      return;
+    }
+    await this.relaunchUpdate();
   }
 }
 

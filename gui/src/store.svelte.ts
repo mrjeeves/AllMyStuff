@@ -4800,6 +4800,17 @@ class AppStore {
     return this.kvmAllowed(node) || this.cecStanding(node!.id);
   }
 
+  /** Session doors for a KVM reached *through* the ordinary customer computer
+   *  it controls. Owners/fleet use their normal KVM authority; a support tech
+   *  uses the live CEC standing toward the attached computer, which that
+   *  computer renews as a short appliance-side grant only while control is
+   *  actually active. */
+  kvmPassthroughDoors(kvm: MeshNode | undefined, attached: MeshNode | undefined): boolean {
+    if (!this.isKvm(kvm) || !attached || !kvm!.kvm?.attachedTo) return false;
+    if (!sameMachine(kvm!.kvm!.attachedTo!, attached.id)) return false;
+    return this.kvmAllowed(kvm) || this.cecStanding(attached.id);
+  }
+
   /** The fleet-graph twin of a CEC help/directory row, when the machine that
    *  raised its hand (or was dialed) is a KVM we can also reach on the normal
    *  mesh. The CEC plane's beacon carries no site adverts, but the same

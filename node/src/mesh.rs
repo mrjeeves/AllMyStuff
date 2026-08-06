@@ -2205,7 +2205,15 @@ impl Mesh {
                 // missed frame self-heals on the next change.
                 if last_viewing.as_ref() != Some(&viewing) {
                     mesh.sink.emit("cec://viewing", cec_viewing_value(&viewing));
-                    last_viewing = Some(viewing);
+                    last_viewing = Some(viewing.clone());
+                }
+                // A customer computer with an attached KVM lends that
+                // appliance to the technician only while an input/control
+                // route is genuinely live. Both halves are short leases:
+                // discovery on the technician and authority on the KVM.
+                mesh.refresh_kvm_support(&viewing).await;
+                for kvm in mesh.cec.prune_support_kvms() {
+                    mesh.drop_transient_support_kvm(&kvm).await;
                 }
             }
         });
@@ -2807,6 +2815,29 @@ impl Mesh {
                 short_id(&from)
             );
             return;
+        }
+        // A customer may temporarily introduce its attached KVM, but the
+        // appliance's own authoritative binding must corroborate that exact
+        // customer. This prevents a customer from naming an arbitrary support-
+        // room peer and using the exception to inject it into the tech's graph.
+        if channel == CHANNEL_PRESENCE
+            && crate::cec::is_cec_network(&network)
+            && !self.cec.direct_relationship_with(&from)
+        {
+            if let Some(customer) = self.cec.support_kvm_customer(&from) {
+                let attached = payload
+                    .get("kvm")
+                    .and_then(|kvm| kvm.get("attached_to"))
+                    .and_then(Value::as_str);
+                if attached.is_none_or(|node| !same_node(node, &customer)) {
+                    tracing::warn!(
+                        "ignoring transient KVM presence from {}: attachment does not match customer {}",
+                        short_id(&from),
+                        short_id(&customer)
+                    );
+                    return;
+                }
+            }
         }
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
@@ -4372,6 +4403,118 @@ impl Mesh {
             .attached_to
             .as_ref()
             .map(ToString::to_string)
+    }
+
+    /// KVM appliances whose authoritative binding points at this local node.
+    /// A machine can technically have more than one attached appliance, so the
+    /// support bridge treats this as a set rather than silently picking one.
+    fn locally_attached_kvms(&self) -> Vec<String> {
+        let Some(me) = self.local_node_id() else {
+            return Vec::new();
+        };
+        let st = self.state.lock();
+        st.session
+            .as_ref()
+            .map(|session| {
+                session
+                    .peers()
+                    .filter(|profile| {
+                        profile
+                            .kvm
+                            .as_ref()
+                            .and_then(|kvm| kvm.attached_to.as_ref())
+                            .is_some_and(|attached| same_node(attached.as_str(), &me))
+                    })
+                    .map(|profile| profile.node.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Renew the two short leases behind customer-computer -> attached-KVM
+    /// passthrough. The customer tells its technician which KVM to expect, then
+    /// tells that KVM which technician may drive it. The appliance independently
+    /// verifies that this sender is its recorded attached computer.
+    async fn refresh_kvm_support(
+        &self,
+        viewing: &std::collections::BTreeMap<String, (bool, bool)>,
+    ) {
+        const LEASE_SECS: u64 = 8;
+        let kvms = self.locally_attached_kvms();
+        if kvms.is_empty() {
+            return;
+        }
+        for (technician, (_, controlling)) in viewing {
+            if !*controlling {
+                continue;
+            }
+            for kvm in &kvms {
+                // Discovery goes first so the KVM's immediate targeted greet
+                // cannot race the technician's strict CEC presence filter.
+                let available = ControlMessage::App(AppControl::KvmSupportAvailable {
+                    kvm: NodeId::from(kvm.clone()),
+                    expires_in: LEASE_SECS,
+                });
+                if let Err(error) = self.send_control(technician, &available).await {
+                    tracing::debug!(
+                        "couldn't announce support KVM {} to technician {}: {error}",
+                        short_id(kvm),
+                        short_id(technician)
+                    );
+                    continue;
+                }
+                let grant = ControlMessage::App(AppControl::KvmSupportGrant {
+                    technician: technician.clone(),
+                    expires_in: LEASE_SECS,
+                });
+                if let Err(error) = self.send_control(kvm, &grant).await {
+                    tracing::debug!(
+                        "couldn't delegate technician {} to attached KVM {}: {error}",
+                        short_id(technician),
+                        short_id(kvm)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remove a transient KVM profile after its customer heartbeat lapses. A
+    /// KVM that is also ours/shared or directly dialed remains: those are
+    /// independent relationships and must not be torn down with passthrough.
+    async fn drop_transient_support_kvm(self: &Arc<Self>, kvm: &str) {
+        if self.cec.relationship_with(kvm) || self.peer_has_durable_non_cec_standing(kvm) {
+            return;
+        }
+        let (effects, dropped) = {
+            let mut st = self.state.lock();
+            st.peer_networks.remove(kvm);
+            st.peer_features.remove(kvm);
+            st.peer_links.remove(kvm);
+            st.peer_boots.remove(kvm);
+            let mut effects = Vec::new();
+            let mut dropped = false;
+            if let Some(session) = st.session.as_mut() {
+                let node = {
+                    session
+                        .peers()
+                        .find(|profile| same_node(profile.node.as_str(), kvm))
+                        .map(|profile| profile.node.clone())
+                };
+                if let Some(node) = node {
+                    effects.extend(session.drop_peer(&node));
+                    dropped = true;
+                }
+            }
+            (effects, dropped)
+        };
+        if dropped {
+            tracing::info!(
+                "CEC support KVM {} is no longer delegated — removing its transient graph profile",
+                short_id(kvm)
+            );
+            self.process_effects(effects).await;
+            self.emit_snapshot();
+        }
     }
 
     /// Stage local install/firmware media on a KVM's USB mass-storage gadget.
@@ -6335,6 +6478,10 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
                     self.cec.set_session(&session_id, "active");
+                    // Bind the technician-side session as well. This is the
+                    // proof checked when the approved customer announces the
+                    // KVM physically attached to it.
+                    self.cec.bind_session(&session_id, &from);
                     // The customer just approved — this connection is now in
                     // active use. Stamp its `last_used` (and re-emit the peer so
                     // the CEC tab's time-since refreshes) so the technician's
@@ -6733,6 +6880,35 @@ impl Mesh {
     /// rule a terminal/remote-control offer is screened by), so a command
     /// from anyone else is logged and dropped.
     async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
+        if let AppControl::KvmSupportAvailable { kvm, expires_in } = &message {
+            // This announcement is meaningful only from a customer with whom
+            // we have an active support session. It is not an authority claim:
+            // the KVM separately receives and validates the customer's grant.
+            if !self.cec.has_active_session_with(from.as_str()) {
+                tracing::warn!(
+                    "support-KVM announcement from {} ignored: no active customer session",
+                    short_id(from.as_str())
+                );
+                return;
+            }
+            if !self
+                .cec
+                .note_support_kvm(from.as_str(), kvm.as_str(), *expires_in)
+            {
+                tracing::warn!(
+                    "invalid support-KVM lease from {} ignored",
+                    short_id(from.as_str())
+                );
+            }
+            return;
+        }
+        // The ordinary AllMyStuff node never consumes a KVM grant. It is sent
+        // to the appliance bridge, whose attached-computer check is the
+        // authority boundary. Ignore it here without passing it through the
+        // unrelated owner/fleet app-command gate.
+        if matches!(&message, AppControl::KvmSupportGrant { .. }) {
+            return;
+        }
         if let AppControl::StageKvmMediaResult {
             request,
             complete,
@@ -6922,7 +7098,10 @@ impl Mesh {
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
-            AppControl::StageKvmMediaResult { .. } | AppControl::Unknown => {}
+            AppControl::KvmSupportGrant { .. }
+            | AppControl::KvmSupportAvailable { .. }
+            | AppControl::StageKvmMediaResult { .. }
+            | AppControl::Unknown => {}
         }
     }
 

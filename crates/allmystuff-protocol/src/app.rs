@@ -709,6 +709,20 @@ pub enum AppControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The computer physically attached to a KVM delegates its *current* CEC
+    /// support technician to that appliance for a short, renewable window.
+    /// The KVM accepts this only from its recorded `attached_to` node and
+    /// expires it unless the customer's live control session keeps refreshing
+    /// the heartbeat. This is what lets a technician reach the out-of-band
+    /// power and virtual-media planes without turning support consent into
+    /// unattended KVM access.
+    KvmSupportGrant { technician: String, expires_in: u64 },
+    /// Customer computer -> technician discovery half of
+    /// [`AppControl::KvmSupportGrant`]. It tells the approved technician which
+    /// KVM will shortly greet them on the support network, allowing that one
+    /// targeted presence advert through the otherwise-strict CEC stranger
+    /// filter. It has the same short renewable lifetime as the appliance grant.
+    KvmSupportAvailable { kvm: NodeId, expires_in: u64 },
     /// "Update yourself and restart." Sent to a fleet machine running an
     /// AllMyStuff older than the channel's latest release. The receiver runs
     /// its self-updater and, if a newer build was applied, relaunches — its
@@ -1400,6 +1414,31 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
             result
+        );
+    }
+
+    #[test]
+    fn kvm_support_passthrough_controls_round_trip() {
+        let grant = ControlMessage::App(AppControl::KvmSupportGrant {
+            technician: "tech".into(),
+            expires_in: 8,
+        });
+        let encoded = serde_json::to_string(&grant).unwrap();
+        assert!(encoded.contains("\"kind\":\"kvm_support_grant\""));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            grant
+        );
+
+        let available = ControlMessage::App(AppControl::KvmSupportAvailable {
+            kvm: NodeId::from("kvm"),
+            expires_in: 8,
+        });
+        let encoded = serde_json::to_string(&available).unwrap();
+        assert!(encoded.contains("\"kind\":\"kvm_support_available\""));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            available
         );
     }
 

@@ -61,6 +61,9 @@
 
   const node = $derived(app.consoleNode);
   const kvmSource = $derived(app.isKvm(node ?? undefined));
+  const consoleKvm = $derived(
+    node ? (kvmSource ? node : app.kvmAttachedTo(node.id)) : undefined,
+  );
   // What this machine actually shared with us — the console activates with
   // whatever subset is available and hides the toggles for the rest (a
   // screen-only share shows the screen, no inert Audio/Control buttons).
@@ -72,7 +75,12 @@
   const drivesAllowed = $derived(
     !!node && (kvmSource ? app.kvmDoors(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
   );
-  const kvmPowerAllowed = $derived(!!node && kvmSource && app.kvmDoors(node));
+  const kvmMediaAllowed = $derived(
+    !!node &&
+      !!consoleKvm &&
+      (kvmSource ? app.kvmDoors(consoleKvm) : app.kvmPassthroughDoors(consoleKvm, node)),
+  );
+  const kvmPowerAllowed = $derived(kvmMediaAllowed);
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
   const selected = $derived<Capability | null>(
@@ -368,7 +376,7 @@
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
-  type MenuKind = "session" | "screens" | "drives" | "power" | "video";
+  type MenuKind = "session" | "screens" | "drives" | "kvm-media" | "power" | "video";
   let openMenu = $state<MenuKind | null>(null);
   let openSub = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
   // The advanced rows' disclosure remembers the old slider/pills toggle:
@@ -2163,6 +2171,15 @@
               onclick={() => toggleMenu("drives")}>💾</button
             >
           {/if}
+          {#if !kvmSource && kvmMediaAllowed}
+            <button
+              class="kbtn slim"
+              class:open={openMenu === "kvm-media"}
+              title="Present install or recovery media through the KVM attached to this computer"
+              aria-label="KVM drives"
+              onclick={() => toggleMenu("kvm-media")}>💿</button
+            >
+          {/if}
           {#if kvmPowerAllowed}
             <button
               class="kbtn slim"
@@ -2205,7 +2222,7 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
-            class:drives-menu={openMenu === "drives"}
+            class:drives-menu={openMenu === "drives" || openMenu === "kvm-media"}
             style:transform={vertical
               ? `translateY(calc(-50% + ${menuShift}px))`
               : `translateX(calc(-50% + ${menuShift}px))`}
@@ -2273,6 +2290,11 @@
                   <span class="micon">💾</span>Drives
                 </button>
               {/if}
+              {#if !kvmSource && kvmMediaAllowed}
+                <button class="mrow" onclick={() => toggleMenu("kvm-media")}>
+                  <span class="micon">💿</span>KVM drives
+                </button>
+              {/if}
               {#if kvmPowerAllowed}
                 <button class="mrow" onclick={() => toggleMenu("power")}>
                   <span class="micon">⏻</span>Power
@@ -2284,11 +2306,13 @@
               </button>
             {:else if openMenu === "drives"}
               <DrivePanel target={node.id} />
+            {:else if openMenu === "kvm-media" && consoleKvm}
+              <DrivePanel target={consoleKvm.id} />
             {:else if openMenu === "power"}
               <div class="mhead">
                 <span class="mavatar">⏻</span>
                 <div class="mid">
-                  <div class="mname">Power via {displayName(node)}</div>
+                  <div class="mname">Power via {consoleKvm ? displayName(consoleKvm) : "KVM"}</div>
                   <div class="msub">Controls the computer attached to this KVM</div>
                 </div>
               </div>
@@ -2303,7 +2327,9 @@
                   class="mrow power-row"
                   onclick={() => {
                     openMenu = null;
-                    void app.kvmFeature(node.id, item.action as "wake" | "short" | "long" | "reset");
+                    if (consoleKvm) {
+                      void app.kvmFeature(consoleKvm.id, item.action as "wake" | "short" | "long" | "reset");
+                    }
                   }}
                 >
                   <span class="micon">{item.icon}</span>

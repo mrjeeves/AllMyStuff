@@ -89,8 +89,10 @@ import {
   onClockSkew,
   onControlRefused,
   onDeviceRestart,
+  onDriveMount,
   onFileProgress,
   onFileSaved,
+  onKvmMedia,
   onMeshEvent,
   openFilesWindow,
   pickFilesToShare,
@@ -1552,6 +1554,17 @@ class AppStore {
     await onDeviceRestart((e) => {
       const who = this.node(e.from)?.label ?? shortId(e.from);
       this.toast("warn", `Restarting this device — asked by ${who}`);
+    });
+    await onDriveMount((e) => {
+      const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
+      if (e.error) this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
+      else this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
+    });
+    await onKvmMedia((e) => {
+      const kvm = this.nodeByCanonical(e.kvm)?.label ?? "the KVM";
+      if (e.error)
+        this.toast("warn", `Couldn't stage ${e.label || "virtual media"} on ${kvm}: ${e.error}`);
+      else this.toast("ok", `${e.label || "Virtual media"} is mounted on ${kvm}`);
     });
     // The passive clock-skew verdict (this machine's clock vs its peers',
     // measured off traffic that was already flowing): keep the topbar pill
@@ -4155,7 +4168,8 @@ class AppStore {
     }
     try {
       await stageKvmMediaNative(sourceNode.id, kvmNode!.id, path, label);
-      this.toast("ok", `${label || "Virtual media"} is being staged on ${kvmNode!.label}`);
+      if (this.isMe(sourceNode.id))
+        this.toast("ok", `${label || "Virtual media"} is mounted on ${kvmNode!.label}`);
       return true;
     } catch (error) {
       this.toast("warn", errMsg(error));

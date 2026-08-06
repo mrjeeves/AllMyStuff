@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::UiSink;
 
@@ -122,6 +122,10 @@ pub struct Mesh {
     /// Explicit inbound pull requests. A drive pushed at us is fleet-only;
     /// this token is what lets a Files share/support source answer a pull.
     drive_pull_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// Remote KVM-media operations awaiting source acknowledgement and final
+    /// completion. Kept viewer-side so a peer cannot spoof a result without
+    /// both the unguessable request id and the expected source identity.
+    kvm_media_requests: Mutex<HashMap<String, KvmMediaRequest>>,
     /// Sequence for outbound file frames (requests viewer-side, response
     /// streams host-side — one stream per app run, like `term_seq`).
     file_seq: AtomicU64,
@@ -391,6 +395,14 @@ struct VideoWatcher {
     /// A post-disconnect-request poll is stronger liveness evidence than mere
     /// watcher presence because `video_unwatch` is fire-and-forget.
     last_poll: Instant,
+}
+
+struct KvmMediaRequest {
+    source: String,
+    kvm: String,
+    label: String,
+    made: Instant,
+    acknowledged: Option<oneshot::Sender<()>>,
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -1028,6 +1040,7 @@ impl Mesh {
             files: FilesPlane::new(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
+            kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
             site_seq: AtomicU64::new(0),
@@ -4272,11 +4285,50 @@ impl Mesh {
         {
             return Err("the KVM's attached computer cannot source its virtual media".into());
         }
-        self.send_control(
-            &source,
-            &ControlMessage::App(AppControl::StageKvmMedia { kvm, path, label }),
-        )
-        .await
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a KVM media request: {error}"))?;
+        let request = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (acknowledged, ack) = oneshot::channel();
+        {
+            let mut requests = self.kvm_media_requests.lock();
+            requests.retain(|_, pending| pending.made.elapsed() < Duration::from_secs(60 * 60 * 7));
+            requests.insert(
+                request.clone(),
+                KvmMediaRequest {
+                    source: source.clone(),
+                    kvm: kvm.clone(),
+                    label: label.clone(),
+                    made: Instant::now(),
+                    acknowledged: Some(acknowledged),
+                },
+            );
+        }
+        if let Err(error) = self
+            .send_control(
+                &source,
+                &ControlMessage::App(AppControl::StageKvmMedia {
+                    request: request.clone(),
+                    kvm,
+                    path,
+                    label,
+                }),
+            )
+            .await
+        {
+            self.kvm_media_requests.lock().remove(&request);
+            return Err(error);
+        }
+        match tokio::time::timeout(Duration::from_secs(15), ack).await {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                self.kvm_media_requests.lock().remove(&request);
+                Err("the source didn't accept virtual-media staging (it may need an AllMyStuff update)".into())
+            }
+        }
     }
 
     pub async fn kvm_media_unmount(self: &Arc<Self>, kvm: String) -> Result<(), String> {
@@ -4323,7 +4375,7 @@ impl Mesh {
         self.drive_pull_tokens
             .lock()
             .insert(request.clone(), (source.clone(), Instant::now()));
-        let sent = self
+        if let Err(error) = self
             .send_control(
                 &source,
                 &ControlMessage::App(AppControl::MapDrive {
@@ -4333,11 +4385,20 @@ impl Mesh {
                     request: request.clone(),
                 }),
             )
-            .await;
-        if sent.is_err() {
+            .await
+        {
             self.drive_pull_tokens.lock().remove(&request);
+            return Err(error);
         }
-        sent
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if !self.drive_pull_tokens.lock().contains_key(&request) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.drive_pull_tokens.lock().remove(&request);
+        Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
     }
 
     /// [`connect`](Self::connect) with an optional terminal **session** to
@@ -6362,6 +6423,46 @@ impl Mesh {
     /// rule a terminal/remote-control offer is screened by), so a command
     /// from anyone else is logged and dropped.
     async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
+        if let AppControl::StageKvmMediaResult {
+            request,
+            complete,
+            error,
+        } = &message
+        {
+            if !*complete {
+                let acknowledged = self
+                    .kvm_media_requests
+                    .lock()
+                    .get_mut(request)
+                    .filter(|pending| same_node(&pending.source, from.as_str()))
+                    .and_then(|pending| pending.acknowledged.take());
+                if let Some(acknowledged) = acknowledged {
+                    let _ = acknowledged.send(());
+                }
+                return;
+            }
+
+            let pending = {
+                let mut requests = self.kvm_media_requests.lock();
+                let matches = requests
+                    .get(request)
+                    .is_some_and(|pending| same_node(&pending.source, from.as_str()));
+                matches.then(|| requests.remove(request)).flatten()
+            };
+            if let Some(pending) = pending {
+                self.sink.emit(
+                    "allmystuff://kvm-media",
+                    json!({
+                        "from": from,
+                        "kvm": pending.kvm,
+                        "label": pending.label,
+                        "error": error,
+                    }),
+                );
+            }
+            return;
+        }
+
         let authorized = if matches!(
             &message,
             AppControl::MapDrive { .. } | AppControl::StageKvmMedia { .. }
@@ -6400,17 +6501,48 @@ impl Mesh {
                     }
                 });
             }
-            AppControl::StageKvmMedia { kvm, path, label } => {
+            AppControl::StageKvmMedia {
+                request,
+                kvm,
+                path,
+                label,
+            } => {
                 tracing::info!(
                     "KVM virtual media requested by {} from {}",
                     short_id(from.as_str()),
                     path
                 );
+                if self
+                    .send_control(
+                        from.as_str(),
+                        &ControlMessage::App(AppControl::StageKvmMediaResult {
+                            request: request.clone(),
+                            complete: false,
+                            error: None,
+                        }),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 let mesh = self.clone();
+                let requester = from.to_string();
                 crate::spawn(async move {
-                    if let Err(error) = mesh.kvm_media_stage(kvm, path, label).await {
+                    let error = mesh.kvm_media_stage(kvm, path, label).await.err();
+                    if let Some(error) = &error {
                         tracing::warn!("KVM virtual media request failed: {error}");
                     }
+                    let _ = mesh
+                        .send_control(
+                            &requester,
+                            &ControlMessage::App(AppControl::StageKvmMediaResult {
+                                request,
+                                complete: true,
+                                error,
+                            }),
+                        )
+                        .await;
                 });
             }
             AppControl::Upgrade => {
@@ -6480,7 +6612,7 @@ impl Mesh {
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
-            AppControl::Unknown => {}
+            AppControl::StageKvmMediaResult { .. } | AppControl::Unknown => {}
         }
     }
 
@@ -9373,16 +9505,36 @@ impl Mesh {
                             .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
                             .await
                         {
-                            Ok(info) => tracing::info!(
-                                "route {} active — native drive {} mounted from {}",
-                                route_id,
-                                info.mount,
-                                short_id(&from_node)
-                            ),
+                            Ok(info) => {
+                                tracing::info!(
+                                    "route {} active — native drive {} mounted from {}",
+                                    route_id,
+                                    info.mount,
+                                    short_id(&from_node)
+                                );
+                                mesh.sink.emit(
+                                    "allmystuff://drive-mount",
+                                    json!({
+                                        "route": route_id,
+                                        "from": from_node,
+                                        "mount": info.mount,
+                                        "label": info.label,
+                                        "error": null,
+                                    }),
+                                );
+                            }
                             Err(error) => {
                                 tracing::warn!(
                                     "route {} native drive mount failed: {error}",
                                     route_id
+                                );
+                                mesh.sink.emit(
+                                    "allmystuff://drive-mount",
+                                    json!({
+                                        "route": route_id,
+                                        "from": from_node,
+                                        "error": error,
+                                    }),
                                 );
                                 let _ = mesh.disconnect(route_id).await;
                             }

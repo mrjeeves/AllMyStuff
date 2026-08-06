@@ -695,9 +695,19 @@ pub enum AppControl {
     /// Ask this authorized source machine to stage one local ISO/image (or a
     /// whole removable disk) on a KVM as BIOS-visible USB virtual media.
     StageKvmMedia {
+        request: String,
         kvm: String,
         path: String,
         label: String,
+    },
+    /// The source accepted a KVM media request (`complete: false`) or reports
+    /// its final mount result (`complete: true`). The opaque request id lets
+    /// the viewer reject unsolicited/spoofed status messages.
+    StageKvmMediaResult {
+        request: String,
+        complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// "Update yourself and restart." Sent to a fleet machine running an
     /// AllMyStuff older than the channel's latest release. The receiver runs
@@ -1358,6 +1368,34 @@ mod tests {
         assert!(s.contains("\"kind\":\"upgrade\""));
         let back: ControlMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn kvm_media_control_round_trips_request_and_result() {
+        let request = ControlMessage::App(AppControl::StageKvmMedia {
+            request: "opaque".into(),
+            kvm: "kvm".into(),
+            path: "/tmp/windows.iso".into(),
+            label: "Windows".into(),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"kind\":\"stage_kvm_media\""));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            request
+        );
+
+        let result = ControlMessage::App(AppControl::StageKvmMediaResult {
+            request: "opaque".into(),
+            complete: true,
+            error: Some("upload failed".into()),
+        });
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(encoded.contains("\"kind\":\"stage_kvm_media_result\""));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            result
+        );
     }
 
     #[test]

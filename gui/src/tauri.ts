@@ -1068,6 +1068,39 @@ export async function onDeviceRestart(
   );
 }
 
+export interface DriveMountEvent {
+  route: string;
+  from: string;
+  mount?: string;
+  label?: string;
+  error?: string | null;
+}
+export async function onDriveMount(
+  cb: (e: DriveMountEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<DriveMountEvent>("allmystuff://drive-mount", (e) =>
+    cb(e.payload),
+  );
+}
+
+export interface KvmMediaEvent {
+  from: string;
+  kvm: string;
+  label: string;
+  error?: string | null;
+}
+export async function onKvmMedia(
+  cb: (e: KvmMediaEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<KvmMediaEvent>("allmystuff://kvm-media", (e) =>
+    cb(e.payload),
+  );
+}
+
 /** Progress of a registered download (`allmystuff://file-progress`),
  *  throttled backend-side. */
 export async function onFileProgress(

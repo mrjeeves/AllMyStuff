@@ -2218,11 +2218,11 @@ impl Mesh {
                     mesh.sink.emit("cec://viewing", cec_viewing_value(&viewing));
                     last_viewing = Some(viewing.clone());
                 }
-                // A customer computer with an attached KVM lends that
-                // appliance to the technician only while an input/control
-                // route is genuinely live. Both halves are short leases:
-                // discovery on the technician and authority on the KVM.
-                mesh.refresh_kvm_support(&viewing).await;
+                // An approved support session includes the customer's attached
+                // KVM from the start. Both halves stay short leases: discovery
+                // on the technician and authority on the KVM disappear shortly
+                // after the support session ends.
+                mesh.refresh_kvm_support().await;
                 for kvm in mesh.cec.prune_support_kvms() {
                     mesh.drop_transient_support_kvm(&kvm).await;
                 }
@@ -4446,19 +4446,13 @@ impl Mesh {
     /// passthrough. The customer tells its technician which KVM to expect, then
     /// tells that KVM which technician may drive it. The appliance independently
     /// verifies that this sender is its recorded attached computer.
-    async fn refresh_kvm_support(
-        &self,
-        viewing: &std::collections::BTreeMap<String, (bool, bool)>,
-    ) {
+    async fn refresh_kvm_support(&self) {
         const LEASE_SECS: u64 = 8;
         let kvms = self.locally_attached_kvms();
         if kvms.is_empty() {
             return;
         }
-        for (technician, (_, controlling)) in viewing {
-            if !*controlling {
-                continue;
-            }
+        for technician in self.cec.active_session_technicians() {
             for kvm in &kvms {
                 // Discovery goes first so the KVM's immediate targeted greet
                 // cannot race the technician's strict CEC presence filter.
@@ -4466,11 +4460,11 @@ impl Mesh {
                     kvm: NodeId::from(kvm.clone()),
                     expires_in: LEASE_SECS,
                 });
-                if let Err(error) = self.send_control(technician, &available).await {
+                if let Err(error) = self.send_control(&technician, &available).await {
                     tracing::debug!(
                         "couldn't announce support KVM {} to technician {}: {error}",
                         short_id(kvm),
-                        short_id(technician)
+                        short_id(&technician)
                     );
                     continue;
                 }
@@ -4481,7 +4475,7 @@ impl Mesh {
                 if let Err(error) = self.send_control(kvm, &grant).await {
                     tracing::debug!(
                         "couldn't delegate technician {} to attached KVM {}: {error}",
-                        short_id(technician),
+                        short_id(&technician),
                         short_id(kvm)
                     );
                 }
@@ -5756,6 +5750,10 @@ impl Mesh {
         // Bind the session to this technician so the consent sweep can end
         // exactly their sessions when the grant later lapses.
         self.cec.bind_session(&session_id, &tech);
+        // Prime attached-KVM discovery and authority now, rather than making
+        // the newly approved console wait for the next two-second renewal
+        // sweep before its KVM screen can be selected.
+        self.refresh_kvm_support().await;
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
             self.cec_send_decision(
@@ -6355,6 +6353,10 @@ impl Mesh {
                                 // technician so the consent sweep can end it
                                 // when the standing grant later lapses.
                                 self.cec.bind_session(&session_id, &from);
+                                // A standing approval is already active, so
+                                // make the attached KVM available before the
+                                // approval response reaches the technician.
+                                self.refresh_kvm_support().await;
                                 if let Some(rec) =
                                     self.cec.touch_dialed(crate::cec::pubkey_part(&from))
                                 {

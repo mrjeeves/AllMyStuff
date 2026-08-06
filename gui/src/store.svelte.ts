@@ -1408,12 +1408,16 @@ class AppStore {
   consoleSessionRoutes = $derived.by(() => {
     const remote = this.consoleNodeId;
     if (!remote) return [] as Route[];
+    const customer = this.machineByAnyId(remote);
+    const kvm = customer && this.isCecCustomer(customer.id) ? this.kvmAttachedTo(customer.id) : null;
+    const remoteEnds = [remote, ...(kvm ? [kvm.id] : [])];
     return this.catalog.routes.filter((r) => {
       const f = this.capability(r.from);
       const t = this.capability(r.to);
       if (!f || !t) return false;
       const ends = [f.node, t.node];
-      return ends.includes(remote) && ends.includes(this.localId);
+      return ends.some((end) => remoteEnds.some((peer) => sameMachine(end, peer))) &&
+        ends.some((end) => this.isMe(end));
     });
   });
 
@@ -3086,12 +3090,27 @@ class AppStore {
    *  — ordered so the screen leads and the default sits near the front. This
    *  is the console's "video inputs" tab bar. */
   consoleVideoInputs(nodeId: string): Capability[] {
-    return this.capsOf(nodeId)
+    const inputs = this.capsOf(nodeId)
       .filter((c) => (c.media === "display" || c.media === "video") && canSource(c.flow))
-      .sort((a, b) => {
-        const rank = (c: Capability) => (c.origin === "screen" ? 0 : c.default ? 1 : 2);
-        return rank(a) - rank(b) || a.id.localeCompare(b.id);
-      });
+      .map((c) => ({ ...c }));
+    const customer = this.machineByAnyId(nodeId);
+    if (customer && this.isCecCustomer(customer.id)) {
+      const kvm = this.kvmAttachedTo(customer.id);
+      if (kvm && this.kvmPassthroughDoors(kvm, customer)) {
+        for (const cap of this.capsOf(kvm.id)) {
+          if ((cap.media === "display" || cap.media === "video") && canSource(cap.flow)) {
+            inputs.push({ ...cap, label: `${kvm.label} KVM` });
+          }
+        }
+      }
+    }
+    return inputs.sort((a, b) => {
+      const aKvm = this.isKvm(this.machineByAnyId(a.node));
+      const bKvm = this.isKvm(this.machineByAnyId(b.node));
+      const rank = (c: Capability, kvm: boolean) =>
+        kvm ? 1 : c.origin === "screen" ? 0 : c.default ? 2 : 3;
+      return rank(a, aKvm) - rank(b, bKvm) || a.id.localeCompare(b.id);
+    });
   }
 
   /** Whether a machine's cameras actually *stream* when selected: its
@@ -3348,8 +3367,10 @@ class AppStore {
 
   /** Switch which remote source the console is showing. */
   setConsoleInput(capId: string) {
+    if (this.consoleInput === capId) return;
     this.consoleInput = capId;
     void this.applyConsoleVideo();
+    if (this.consoleControl) this.rewireConsoleControl();
   }
 
   /** Bumped per video (re)wire; an apply that awaited a teardown checks it
@@ -3542,8 +3563,7 @@ class AppStore {
    *  (the backend honours the share grant, so a shared "Control" actually
    *  drives the machine rather than lighting an inert route). */
   toggleConsoleControl() {
-    const remote = this.consoleNodeId;
-    if (!remote) return;
+    if (!this.consoleNodeId) return;
     if (this.consoleControl) {
       if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
       this.consoleControlRouteId = null;
@@ -3553,16 +3573,43 @@ class AppStore {
       return;
     }
     this.consoleUserOff.delete("control");
+    this.consoleControl = true;
+    if (!this.rewireConsoleControl()) {
+      this.consoleControl = false;
+      this.toast("warn", "No control path to that machine");
+    }
+  }
+
+  /** Route input to the machine behind the selected picture. The customer's
+   *  own screen/cameras use its software input sink; its attached KVM screen
+   *  uses the KVM HID sink under the same renewable support delegation. */
+  private consoleControlTarget(): MeshNode | null {
+    const customer = this.consoleNode;
+    if (!customer) return null;
+    const source = this.consoleInput ? this.capability(this.consoleInput) : null;
+    const sourceNode = source ? this.machineByAnyId(source.node) : undefined;
+    if (sourceNode && this.kvmPassthroughDoors(sourceNode, customer)) return sourceNode;
+    return customer;
+  }
+
+  /** Re-home an enabled keyboard/mouse route when the selected picture moves
+   *  between the customer computer and its attached KVM. */
+  private rewireConsoleControl(): boolean {
+    if (this.consoleControlRouteId) void this.disconnect(this.consoleControlRouteId);
+    this.consoleControlRouteId = null;
+    this.consoleControlLive = null;
+    if (!this.consoleControl) return false;
+    const remote = this.consoleControlTarget();
+    if (!remote) return false;
     const mySrc = matchEndpoint(this.catalog, this.localId, "input", "provide");
-    const remoteSink = matchEndpoint(this.catalog, remote, "input", "consume");
+    const remoteSink = matchEndpoint(this.catalog, remote.id, "input", "consume");
     const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
     if (leg) {
       this.consoleControlRouteId = leg.created ? leg.id : null;
       this.consoleControlLive = leg.id;
-      this.consoleControl = true;
-    } else {
-      this.toast("warn", "No control path to that machine");
+      return true;
     }
+    return false;
   }
 
   /** Clipboard passthrough: with it on, a paste in the console first pushes
@@ -3703,7 +3750,15 @@ class AppStore {
       const cap = this.capability(capId);
       return !!cap && !this.isMe(cap.node) && this.isCecCustomer(cap.node);
     });
-    if (cecLeg) {
+    // An attached KVM is a short-lived extension of the approved customer
+    // session, not a device claimed/shared into the technician's fleet. Offer
+    // its screen/input directly and let the KVM enforce the customer's lease.
+    const supportKvmLeg = [from, to].some((capId) => {
+      const cap = this.capability(capId);
+      const kvm = cap ? this.machineByAnyId(cap.node) : undefined;
+      return !!kvm && !!this.consoleNode && this.kvmPassthroughDoors(kvm, this.consoleNode);
+    });
+    if (cecLeg || supportKvmLeg) {
       if (!this.capability(from) || !this.capability(to)) return null;
       const id = `route:${from}→${to}`;
       const existedBefore = this.catalog.routes.some((r) => r.id === id);

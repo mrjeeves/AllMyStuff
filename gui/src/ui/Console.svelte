@@ -84,14 +84,18 @@
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
   const selected = $derived<Capability | null>(
-    (selectedId ? app.capability(selectedId) : null) ?? null,
+    (selectedId
+      ? inputs.find((input) => input.id === selectedId) ?? app.capability(selectedId)
+      : null) ?? null,
   );
   // Auto-select the first input (the screen leads the list) once the remote's
   // video sources land. The console opens before the caps arrive, so the
   // open-time pick can come up empty; pick reactively when they show up. Guarded
   // on nothing being selected, so it never overrides a manual pick.
   $effect(() => {
-    if (!selectedId && inputs.length > 0) app.setConsoleInput(inputs[0].id);
+    if ((!selectedId || !inputs.some((input) => input.id === selectedId)) && inputs.length > 0) {
+      app.setConsoleInput(inputs[0].id);
+    }
   });
   // Whether the machine's build streams its cameras at all — an older one
   // advertises the tabs but has no transport behind them, and the stage

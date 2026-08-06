@@ -987,6 +987,28 @@ impl Cec {
         })
     }
 
+    /// Customer-side technicians whose approved support sessions are active.
+    /// This is the authority window for attached-KVM delegation: the KVM is
+    /// part of the support console from session start, before the technician
+    /// happens to turn on (or send the first event over) its input route.
+    pub fn active_session_technicians(&self) -> Vec<String> {
+        let inner = self.inner.lock();
+        let mut peers: Vec<String> = inner
+            .session_tech
+            .iter()
+            .filter(|(session, _)| {
+                inner
+                    .sessions
+                    .get(*session)
+                    .is_some_and(|state| state == "active")
+            })
+            .map(|(_, peer)| peer.clone())
+            .collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
     /// Admit one customer-announced KVM through the CEC presence filter for a
     /// short renewable lease. Returns false for malformed or implausibly long
     /// leases; callers must never allow a wire value to mint standing access.
@@ -1554,6 +1576,23 @@ mod tests {
 
         cec.set_session("s1", "ended");
         assert!(!cec.has_active_session_with(TECH));
+    }
+
+    #[test]
+    fn active_session_technicians_are_canonical_deduped_and_live_only() {
+        let cec = Cec::new(None);
+        cec.set_session("active-a", "active");
+        cec.bind_session("active-a", &format!("{TECH}-AB12C"));
+        cec.set_session("active-b", "active");
+        cec.bind_session("active-b", TECH);
+        cec.set_session("waiting", "requested");
+        cec.bind_session("waiting", TECH_B);
+
+        assert_eq!(cec.active_session_technicians(), vec![TECH.to_string()]);
+
+        cec.set_session("active-a", "ended");
+        cec.set_session("active-b", "ended");
+        assert!(cec.active_session_technicians().is_empty());
     }
 
     #[test]

@@ -61,6 +61,10 @@ impl DriveMounts {
             .collect()
     }
 
+    pub async fn cleanup_stale(&self) {
+        cleanup_stale_native_mounts().await;
+    }
+
     pub async fn mount(
         &self,
         mesh: Arc<Mesh>,
@@ -112,7 +116,7 @@ impl DriveMounts {
             server_task.abort();
             return Err(error);
         }
-        if let Err(error) = label_native(&mount, &label).await {
+        if let Err(error) = label_native(&mount, &label, &route).await {
             tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
         }
         let info = NativeDriveInfo {
@@ -304,11 +308,20 @@ async fn unmount_native(_mount: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-async fn label_native(mount: &str, label: &str) -> Result<(), String> {
+async fn label_native(mount: &str, label: &str, route: &str) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
+    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
     let key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
+    let marked = tokio::process::Command::new("reg.exe")
+        .args(["add", &marker, "/ve", "/t", "REG_SZ", "/d", route, "/f"])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't record the AllMyStuff drive lease: {error}"))?;
+    if !marked.status.success() {
+        return Err(String::from_utf8_lossy(&marked.stderr).trim().to_string());
+    }
     let output = tokio::process::Command::new("reg.exe")
         .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
         .output()
@@ -322,19 +335,24 @@ async fn label_native(mount: &str, label: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-async fn label_native(_mount: &str, _label: &str) -> Result<(), String> {
+async fn label_native(_mount: &str, _label: &str, _route: &str) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(windows)]
 async fn clear_native_label(mount: &str) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
+    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
     let key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
     // A missing key is already the desired state, so deletion is best-effort.
     let _ = tokio::process::Command::new("reg.exe")
         .args(["delete", &key, "/f"])
+        .output()
+        .await;
+    let _ = tokio::process::Command::new("reg.exe")
+        .args(["delete", &marker, "/f"])
         .output()
         .await;
     refresh_explorer_drive_labels().await;
@@ -355,6 +373,36 @@ async fn refresh_explorer_drive_labels() {
         .output()
         .await;
 }
+
+#[cfg(windows)]
+async fn cleanup_stale_native_mounts() {
+    let base = r"HKCU\Software\AllMyStuff\MappedDrives";
+    let Ok(output) = tokio::process::Command::new("reg.exe")
+        .args(["query", base])
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let letters = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().rsplit('\\').next())
+        .filter(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_alphabetic())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    for letter in letters {
+        let mount = format!("{letter}:");
+        tracing::info!("cleaning stale AllMyStuff drive mapping {mount}");
+        let _ = unmount_native(&mount).await;
+        let _ = clear_native_label(&mount).await;
+    }
+}
+
+#[cfg(not(windows))]
+async fn cleanup_stale_native_mounts() {}
 
 #[derive(Clone)]
 pub struct RemoteDavFs {

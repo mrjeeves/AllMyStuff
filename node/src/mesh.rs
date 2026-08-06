@@ -1732,6 +1732,11 @@ impl Mesh {
         // before anything (the forwarders below) spawns.
         crate::set_runtime(tokio::runtime::Handle::current());
 
+        // A hard kill can strand Windows' `net use` entry after its loopback
+        // WebDAV server is gone. Only mappings carrying our private lease
+        // marker are touched; ordinary user/network drives are never swept.
+        self.drive_mounts.cleanup_stale().await;
+
         // Spawn the media forwarders now that we're on a runtime (see
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
         self.spawn_media_forwarders();

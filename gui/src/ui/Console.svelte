@@ -215,6 +215,11 @@
   let inBytes = 0;
   let queuePeek = () => 0;
   let stallKick = () => {};
+  // VideoToolbox can keep accepting compressed chunks after it has stopped
+  // producing pictures while still reporting a shallow decodeQueueSize.
+  // Track sustained input-without-output separately so that failure shape
+  // walks the decode ladder instead of freezing forever after a few frames.
+  let silentDecodeSeconds = 0;
   let decodeModeNote = "";
   // Whether the backend decodes for us (raw RGBA in, no webview codec).
   // Starts true where WebCodecs doesn't exist at all, and flips true at
@@ -659,10 +664,16 @@
         inRate > 2 && fps < inRate / 2
           ? `in ${inRate}/s · out ${fps}/s · q ${queuePeek()}${decodeModeNote ? ` · ${decodeModeNote}` : ""}`
           : "";
-      // Chunks flowing in, paints collapsed, queue deep: the decoder
-      // stopped consuming (the hardware-pool stall). Rebuild it — the
-      // ladder steps to software decode on the way.
-      if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // Rebuild either when the compressed queue backs up or when input keeps
+      // flowing without decoded output. The latter catches VideoToolbox's
+      // shallow-queue hardware-pool stall.
+      const queuedStall = inRate > 5 && fps < inRate / 4 && queuePeek() > 8;
+      const silentStall = !nativeDecode && inRate > 5 && decFps === 0;
+      silentDecodeSeconds = silentStall ? silentDecodeSeconds + 1 : 0;
+      if (queuedStall || silentDecodeSeconds >= 2) {
+        silentDecodeSeconds = 0;
+        stallKick();
+      }
       // (Letterbox auto-detect no longer runs here — it samples the decoded
       // frame from the paint path via maybeDetect(), so it never reads the
       // live canvas and can't trigger Chromium's CPU-raster demotion.)
@@ -770,6 +781,7 @@
     frameCount = 0;
     inCount = 0;
     decCount = 0;
+    silentDecodeSeconds = 0;
     recvMbps = 0;
     inBytes = 0;
     // A new stream starts at its natural fit, with the trackpad cursor
@@ -830,6 +842,10 @@
       : "webview (hw)";
 
     const rebuildDecoder = () => {
+      // A rebuilt decoder cannot consume deltas from the old reference
+      // chain. Ask for a clean entry immediately; healthy feedback may have
+      // relaxed the periodic IDR cadence to eight seconds.
+      askRefresh();
       if (decodeMode !== "prefer-software") {
         decodeMode = "prefer-software";
         decodeModeNote = "sw";
@@ -842,7 +858,6 @@
         nativeDecoderPreference = "software";
         nativeDecode = true;
         decodePath = "native (sw)";
-        askRefresh();
         return;
       }
       console.warn(

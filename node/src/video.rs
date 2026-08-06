@@ -363,7 +363,10 @@ const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(30);
 fn adaptive_idr_ms(fb: Option<RecvFeedback>) -> u64 {
     match fb {
         Some(fb)
-            if fb.at.elapsed() < FEEDBACK_FRESH && fb.decode_fails == 0 && fb.queue_depth <= 8 =>
+            if fb.at.elapsed() < FEEDBACK_FRESH
+                && fb.recv_fps > 0
+                && fb.decode_fails == 0
+                && fb.queue_depth <= 8 =>
         {
             IDR_MS_RELAXED
         }
@@ -5985,6 +5988,18 @@ mod tests {
         // Clean + draining → relax.
         assert_eq!(adaptive_idr_ms(fresh(0, 0)), IDR_MS_RELAXED);
         assert_eq!(adaptive_idr_ms(fresh(0, 8)), IDR_MS_RELAXED);
+        // A decoder that stopped producing pictures can still report a
+        // shallow queue (VideoToolbox does this). Zero rendered fps is not
+        // health and must keep clean-entry recovery at the tight cadence.
+        let silent = Some(RecvFeedback {
+            recv_fps: 0,
+            decode_fails: 0,
+            queue_depth: 0,
+            est_kbps: 0,
+            delay_trend_us_per_s: 0,
+            at: Instant::now(),
+        });
+        assert_eq!(adaptive_idr_ms(silent), IDR_MS_TIGHT);
         // Any decode failure → tighten.
         assert_eq!(adaptive_idr_ms(fresh(1, 0)), IDR_MS_TIGHT);
         // A backed-up queue → tighten.

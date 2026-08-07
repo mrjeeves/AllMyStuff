@@ -182,13 +182,25 @@ async fn go(opts: Opts) -> Result<i32, String> {
     // injecting a `cd` once the prompt is up. It's a local path, so it only
     // makes sense for a terminal on *this* machine; ignored (with a note) for a
     // remote one.
-    let initial_input = match &opts.cwd {
-        Some(dir) if host.is_me => Some(cd_command(dir)),
-        Some(_) => {
-            eprintln!("amst: --cwd is ignored for a remote machine (it's a local path).");
-            None
+    let initial_input = if opts.admin {
+        if !host.os.to_ascii_lowercase().contains("windows") {
+            return Err("--admin currently needs a Windows target".into());
         }
-        None => None,
+        Some(windows_admin_input(opts.run.as_deref()))
+    } else if let Some(command) = &opts.run {
+        Some(run_and_exit_command(
+            command,
+            host.os.to_ascii_lowercase().contains("windows"),
+        ))
+    } else {
+        match &opts.cwd {
+            Some(dir) if host.is_me => Some(cd_command(dir)),
+            Some(_) => {
+                eprintln!("amst: --cwd is ignored for a remote machine (it's a local path).");
+                None
+            }
+            None => None,
+        }
     };
 
     let code = attach::run(client.clone(), route_id, ev_rx, initial_input).await?;
@@ -211,6 +223,40 @@ fn cd_command(dir: &str) -> Vec<u8> {
         // Single-quote and escape embedded single quotes ('\'' closes, escapes,
         // reopens) so any path is passed literally.
         format!("cd '{}'\n", dir.replace('\'', "'\\''")).into_bytes()
+    }
+}
+
+/// Run one command in the remote shell and close that shell with its status.
+/// This is the scriptable twin of the interactive terminal; it travels through
+/// the exact same owner/fleet route authorization.
+fn run_and_exit_command(command: &str, windows_target: bool) -> Vec<u8> {
+    if windows_target {
+        format!("{command}\r\nexit $LASTEXITCODE\r\n").into_bytes()
+    } else {
+        format!("{command}\nexit $?\n").into_bytes()
+    }
+}
+
+/// Require the shell we are already attached to to be an administrator shell.
+/// There is deliberately no `RunAs`/UAC fallback: a remote terminal cannot
+/// operate a consent prompt safely. On an Always On Windows node the terminal
+/// host is the installed LocalSystem service, so the check succeeds and the
+/// same PTY remains fully attached. An ordinary desktop node fails closed with
+/// one actionable error instead of opening a disconnected elevated window.
+fn windows_admin_input(command: Option<&str>) -> Vec<u8> {
+    let guard = concat!(
+        "$__amstAdmin = ([Security.Principal.WindowsPrincipal] ",
+        "[Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(",
+        "[Security.Principal.WindowsBuiltInRole]::Administrator); ",
+        "if (-not $__amstAdmin) { Write-Error '",
+        "Administrator terminal unavailable. Install and run AllMyStuff Always On on this machine.'; ",
+        "exit 126 }; Remove-Variable __amstAdmin"
+    );
+    match command {
+        Some(command) => format!("{guard}; {command}; exit $LASTEXITCODE\r\n").into_bytes(),
+        None => {
+            format!("{guard}; $Host.UI.RawUI.WindowTitle='AMST Administrator'\r\n").into_bytes()
+        }
     }
 }
 
@@ -405,6 +451,9 @@ struct Machine {
     label: String,
     /// The machine's hostname, for matching.
     host: String,
+    /// Host OS from presence (`Windows`, `macOS`, …), used to refuse a
+    /// Windows-only administrator launch before typing nonsense into a shell.
+    os: String,
     online: bool,
     /// Whether it advertises terminal support.
     terminal: bool,
@@ -420,6 +469,7 @@ impl Machine {
             node: me.to_string(),
             label,
             host,
+            os: std::env::consts::OS.to_string(),
             online: true,
             terminal: true, // we host the terminal ourselves
             is_me: true,
@@ -484,6 +534,7 @@ fn peer_machines(snap: &Value) -> Vec<Machine> {
                 node,
                 label,
                 host: p.hostname,
+                os: p.summary.os,
                 online: true, // present in the snapshot ⇒ online
                 terminal: p.features.iter().any(|f| f == FEATURE_TERMINAL),
                 is_me: false,
@@ -763,6 +814,11 @@ struct Opts {
     /// terminal on this machine) — what the "open a terminal here" shell
     /// integration passes.
     cwd: Option<String>,
+    /// Run one command instead of staying interactive.
+    run: Option<String>,
+    /// On a Windows target, require the service-hosted administrator terminal.
+    /// This is OS posture, not a new mesh grant, and never opens a UAC prompt.
+    admin: bool,
     list: bool,
     sessions: bool,
     help: bool,
@@ -779,6 +835,17 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             "-V" | "--version" => o.version = true,
             "-l" | "--list" => o.list = true,
             "-s" | "--sessions" => o.sessions = true,
+            "--admin" => o.admin = true,
+            "-r" | "--run" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.run = Some(v.clone()),
+                    None => return Err("--run needs a command".into()),
+                }
+            }
+            s if s.starts_with("--run=") => {
+                o.run = Some(s["--run=".len()..].to_string());
+            }
             "-a" | "--attach" => {
                 i += 1;
                 match args.get(i) {
@@ -811,6 +878,15 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         }
         i += 1;
     }
+    if o.attach.is_some() && (o.admin || o.run.is_some()) {
+        return Err("--attach cannot be combined with --admin or --run".into());
+    }
+    if (o.list || o.sessions) && (o.admin || o.run.is_some()) {
+        return Err("--admin/--run cannot be combined with --list or --sessions".into());
+    }
+    if o.cwd.is_some() && (o.admin || o.run.is_some()) {
+        return Err("--cwd cannot be combined with --admin or --run".into());
+    }
     Ok(o)
 }
 
@@ -833,6 +909,11 @@ OPTIONS:
                          instead of opening a new one.
     -C, --cwd <DIR>      Start the shell in DIR (a terminal on this machine) —
                          what the 'open a terminal here' shell integration uses.
+    -r, --run <COMMAND>  Run one command through the terminal and return its
+                         exit status instead of staying interactive.
+    --admin              Windows: open the attached administrator shell on
+                         MACHINE, or run --run there. Requires the installed
+                         Always On service; never opens a UAC prompt.
     -h, --help           Show this help.
     -V, --version        Print the version.
 
@@ -855,10 +936,60 @@ mod tests {
             node: node.into(),
             label: label.into(),
             host: host.into(),
+            os: "windows".into(),
             online: true,
             terminal,
             is_me,
         }
+    }
+
+    #[test]
+    fn parse_admin_and_run_as_general_terminal_options() {
+        let a: Vec<String> = ["desk", "--admin", "--run", "sfc /scannow"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_args(&a).unwrap();
+        assert_eq!(opts.target.as_deref(), Some("desk"));
+        assert!(opts.admin);
+        assert_eq!(opts.run.as_deref(), Some("sfc /scannow"));
+
+        let a: Vec<String> = ["--run=whoami", "desk"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_args(&a).unwrap().run.as_deref(), Some("whoami"));
+    }
+
+    #[test]
+    fn parse_rejects_conflicting_terminal_modes() {
+        for args in [
+            &["--attach", "term-1", "--admin"][..],
+            &["--list", "--run", "whoami"][..],
+            &["--cwd", "C:\\\\", "--admin"][..],
+        ] {
+            let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert!(parse_args(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn one_shot_exit_syntax_follows_the_target_os() {
+        assert_eq!(
+            run_and_exit_command("whoami", true),
+            b"whoami\r\nexit $LASTEXITCODE\r\n".to_vec()
+        );
+        assert_eq!(run_and_exit_command("id", false), b"id\nexit $?\n".to_vec());
+    }
+
+    #[test]
+    fn administrator_command_stays_in_the_attached_service_shell() {
+        let input = String::from_utf8(windows_admin_input(Some("sfc /scannow"))).unwrap();
+        assert!(input.contains("IsInRole"));
+        assert!(input.contains("Always On"));
+        assert!(input.contains("sfc /scannow"));
+        assert!(!input.contains("RunAs"));
+        assert!(!input.contains("Start-Process"));
     }
 
     #[test]

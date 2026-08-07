@@ -12,7 +12,7 @@
 
 [package]
 name = "allmystuff-mobile"
-version = "0.2.56"
+version = "0.2.57"
 description = "AllMyStuff mobile (iOS/Android) — a Tauri 2 shell around the shared Svelte UI, backed by the phone's embedded viewer/controller core."
 authors = ["Chris Paul"]
 license = "MIT"

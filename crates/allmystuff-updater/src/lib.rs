@@ -537,15 +537,12 @@ fn apply_pending() -> Result<Option<String>> {
     Ok(Some(target_version))
 }
 
-/// Per-artifact downgrade guard. The CLI compares against its own running
-/// version; the GUI/node halves against the version stamp the updater last
-/// wrote for them (absent stamp ⇒ unknown ⇒ allow, so a half installed out
-/// of band by the shell installer is synced on the first update).
+/// Per-artifact downgrade guard. Every installed binary is paired with a
+/// version + content-hash marker. A missing, legacy, or mismatched marker is
+/// "unknown" and therefore repaired on the next check instead of trusting a
+/// version string that may no longer describe the file on disk.
 fn artifact_needs_apply(kind: ArtifactKind, target_version: &str) -> bool {
-    match kind {
-        ArtifactKind::Cli => version_is_newer(target_version, Some(current_version())),
-        _ => version_is_newer(target_version, installed_artifact_version(kind).as_deref()),
-    }
+    version_is_newer(target_version, installed_artifact_version(kind).as_deref())
 }
 
 /// Swap one staged artifact over its installed counterpart. `Ok(false)`
@@ -737,28 +734,67 @@ fn version_is_newer(target: &str, installed: Option<&str>) -> bool {
     }
 }
 
-/// The version stamp file for a half that exposes no readable version of its
-/// own (the GUI shell, the node engine). The CLI has no stamp — it's
-/// compared against its own running `CARGO_PKG_VERSION`.
+/// A version marker is useful only while it still describes the installed
+/// file. Earlier markers were a bare version string, so an installer rollback
+/// or partial repair could put an old binary back while the updater continued
+/// to report it current forever. Bind the version to the file's SHA-256 and
+/// fail open to a repair when the file changes.
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactVersionMarker {
+    version: String,
+    sha256: String,
+}
+
 fn artifact_version_marker(kind: ArtifactKind) -> Option<PathBuf> {
-    match kind {
-        ArtifactKind::Cli => None,
-        _ => updates_dir()
-            .ok()
-            .map(|d| d.join(format!("{}.version", kind.as_str()))),
-    }
+    updates_dir()
+        .ok()
+        .map(|d| d.join(format!("{}.version", kind.as_str())))
 }
 
 fn installed_artifact_version(kind: ArtifactKind) -> Option<String> {
-    let s = std::fs::read_to_string(artifact_version_marker(kind)?).ok()?;
-    let s = s.trim();
-    (!s.is_empty()).then(|| s.to_string())
+    let text = std::fs::read_to_string(artifact_version_marker(kind)?).ok()?;
+    let marker: ArtifactVersionMarker = serde_json::from_str(&text).ok()?;
+    let installed = installed_path(kind)?;
+    let actual = sha256_file(&installed).ok()?;
+    if actual == marker.sha256 {
+        return Some(marker.version);
+    }
+    None
 }
 
 fn record_artifact_version(kind: ArtifactKind, version: &str) {
-    if let Some(path) = artifact_version_marker(kind) {
-        let _ = std::fs::write(path, format!("{version}\n"));
+    let Some(path) = artifact_version_marker(kind) else {
+        return;
+    };
+    let Some(installed) = installed_path(kind) else {
+        return;
+    };
+    let Ok(sha256) = sha256_file(&installed) else {
+        return;
+    };
+    let marker = ArtifactVersionMarker {
+        version: version.to_string(),
+        sha256,
+    };
+    if let Ok(text) = serde_json::to_string(&marker) {
+        let _ = std::fs::write(path, text);
     }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Whether the half `kind` should be brought to `latest`. False when it
@@ -821,7 +857,7 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     // the binary but not the stamp) was stranded — every check short-circuited
     // and it was never re-staged. `serve` advertises this node's version to
     // peers, so a stranded serve makes the update "look like it did nothing".
-    let want = wanted_artifacts(&current, &latest);
+    let want = wanted_artifacts(&latest);
     if want.is_empty() {
         return Ok(CheckOutcome::UpToDate { current, latest });
     }
@@ -852,18 +888,11 @@ fn check_is_disabled(auto_enabled: bool, force: bool, disabled_by_env: bool) -> 
     disabled_by_env || (!auto_enabled && !force)
 }
 
-/// Which halves a release should bring forward: the CLI when it's behind, and
-/// each installed sibling (GUI, node) whose recorded version lags `latest`.
-fn wanted_artifacts(current: &str, latest: &str) -> Vec<ArtifactKind> {
+/// Which installed halves do not have a verified marker for `latest`.
+fn wanted_artifacts(latest: &str) -> Vec<ArtifactKind> {
     ALL_ARTIFACTS
         .into_iter()
-        .filter(|&kind| match kind {
-            // The CLI is gauged against the running binary's own version…
-            ArtifactKind::Cli => compare_semver(current, latest) == std::cmp::Ordering::Less,
-            // …the siblings against their recorded version stamp, and only
-            // when actually installed on this host.
-            _ => artifact_needs_update(kind, latest),
-        })
+        .filter(|&kind| artifact_needs_update(kind, latest))
         .collect()
 }
 
@@ -1100,7 +1129,7 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
     // Nothing to do only when the CLI is current *and* every installed
     // sibling already matches — otherwise a previous partial update left a
     // half behind and we still have work to do.
-    let want = wanted_artifacts(&current, &latest);
+    let want = wanted_artifacts(&latest);
     if want.is_empty() {
         return Ok(UpdateNowOutcome::UpToDate { current, latest });
     }
@@ -1927,15 +1956,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_apply_guard_compares_against_running_version() {
-        // The CLI arm reads no files — it compares the target against the
-        // running binary's own version, so a stale marker can't downgrade it
-        // and a no-longer-needed apply is skipped.
-        assert!(artifact_needs_apply(ArtifactKind::Cli, "999.0.0"));
-        assert!(!artifact_needs_apply(ArtifactKind::Cli, current_version()));
-    }
-
-    #[test]
     fn parse_pending_reads_all_kinds_and_skips_junk() {
         let doc = serde_json::json!({
             "version": "0.1.16",
@@ -1962,13 +1982,17 @@ mod tests {
 
     #[test]
     fn artifact_version_stamps_round_trip() {
-        // GUI/node stamps live under the updates dir; the CLI has none (it's
-        // gauged against its own running version).
+        // A stamp is accepted only while its hash still matches the installed
+        // binary. If something puts older/different bytes back afterward, an
+        // equal-version check must repair that split install.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+        let serve = tmp.path().join(ArtifactKind::Serve.bin_name());
+        std::fs::write(&serve, b"current serve").unwrap();
+        std::env::set_var("ALLMYSTUFF_SERVE_BIN", &serve);
 
-        assert!(artifact_version_marker(ArtifactKind::Cli).is_none());
+        assert!(artifact_version_marker(ArtifactKind::Cli).is_some());
         assert!(installed_artifact_version(ArtifactKind::Serve).is_none());
 
         record_artifact_version(ArtifactKind::Serve, "0.1.16");
@@ -1981,6 +2005,20 @@ mod tests {
         assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.1.16"));
         assert!(artifact_needs_apply(ArtifactKind::Serve, "0.1.17"));
 
+        std::fs::write(&serve, b"rolled-back serve").unwrap();
+        assert!(installed_artifact_version(ArtifactKind::Serve).is_none());
+        assert!(artifact_needs_apply(ArtifactKind::Serve, "0.1.16"));
+
+        // Bare-version markers from older updater builds cannot prove what is
+        // installed and are deliberately migrated by one repair pass.
+        std::fs::write(
+            artifact_version_marker(ArtifactKind::Serve).unwrap(),
+            "0.1.16\n",
+        )
+        .unwrap();
+        assert!(installed_artifact_version(ArtifactKind::Serve).is_none());
+
+        std::env::remove_var("ALLMYSTUFF_SERVE_BIN");
         std::env::remove_var("ALLMYSTUFF_HOME");
     }
 
@@ -1997,16 +2035,19 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+        let serve = tmp.path().join(ArtifactKind::Serve.bin_name());
+        std::fs::write(&serve, b"serve").unwrap();
+        std::env::set_var("ALLMYSTUFF_SERVE_BIN", &serve);
 
         // serve stamped a version behind the latest release…
         record_artifact_version(ArtifactKind::Serve, "0.2.0");
         // …is "behind" latest 0.2.1 even though the running CLI is already there.
         assert!(artifact_needs_apply(ArtifactKind::Serve, "0.2.1"));
-        assert!(!artifact_needs_apply(ArtifactKind::Cli, current_version()));
         // Once caught up, it's no longer behind — no churn on the next check.
         record_artifact_version(ArtifactKind::Serve, "0.2.1");
         assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.2.1"));
 
+        std::env::remove_var("ALLMYSTUFF_SERVE_BIN");
         std::env::remove_var("ALLMYSTUFF_HOME");
     }
 

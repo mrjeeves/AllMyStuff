@@ -2267,8 +2267,11 @@
         role="menuitem"
         disabled={app.isKvmUpdating(menuId)}
         onclick={() => {
+          // `menuId` is a reactive {@const} backed by `nodeMenu.id`. Capture
+          // it before closing the menu or Svelte re-evaluates it against null.
+          const id = menuId;
           nodeMenu = null;
-          void app.updateKvm(menuId);
+          void app.updateKvm(id);
         }}
       >
         <span class="nm-icon" aria-hidden="true">{@render cicon("update")}</span>
@@ -2278,8 +2281,9 @@
         class="nm-item"
         role="menuitem"
         onclick={() => {
+          const id = menuId;
           nodeMenu = null;
-          void app.openKvmWifi(menuId);
+          void app.openKvmWifi(id);
         }}
       >
         <span class="nm-icon" aria-hidden="true">⌁</span>
@@ -2289,8 +2293,9 @@
         class="nm-item"
         role="menuitem"
         onclick={() => {
+          const id = menuId;
           nodeMenu = null;
-          toggleKvmAttach(menuId);
+          toggleKvmAttach(id);
         }}
       >
         <span class="nm-icon" aria-hidden="true">🔗</span>

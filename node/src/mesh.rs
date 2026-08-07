@@ -119,8 +119,9 @@ pub struct Mesh {
     files: FilesPlane,
     /// OS-native drive letters/mounts backed by active Storage routes.
     drive_mounts: DriveMounts,
-    /// Explicit inbound pull requests. A drive pushed at us is fleet-only;
-    /// this token is what lets a Files share/support source answer a pull.
+    /// Explicit inbound pull requests. A drive pushed at us needs owner/fleet
+    /// trust or a live CEC Control grant; this token is what lets a Files
+    /// share/support source answer a pull in the opposite direction.
     drive_pull_tokens: Mutex<HashMap<String, DrivePullRequest>>,
     /// Successful receiver-initiated mappings, keyed by their current route.
     /// The route is one connection incarnation; this is the user's intent and
@@ -3146,12 +3147,17 @@ impl Mesh {
                             None
                         };
                         let explicit_drive_pull = accepted_drive_pull.is_some();
-                        // Drive pushes TO this machine are fleet-only. A
-                        // receiver-minted pull token is the explicit exception:
-                        // it lets this user pull FROM a Files share/support
-                        // source without turning that share into push access.
+                        // Drive pushes TO this machine need the Files plane:
+                        // owner/fleet, an explicit Files share, or a live CEC
+                        // Control grant. A receiver-minted pull token is the
+                        // opposite-direction exception: it lets this user pull
+                        // FROM a Files share/support source without turning that
+                        // share into unsolicited push access.
                         let authorized = if is_mapped_drive_route(route) {
-                            explicit_drive_pull || self.sender_may_control(&from)
+                            mapped_drive_offer_authorized(
+                                explicit_drive_pull,
+                                self.sender_may_drive(&from, DrivePlane::Files),
+                            )
                         } else {
                             route_drive_plane(route)
                                 .is_none_or(|plane| self.sender_may_drive(&from, plane))
@@ -4339,8 +4345,16 @@ impl Mesh {
         if target.is_empty() || same_node(&target, &me) {
             return Err("choose another machine for this drive".into());
         }
-        if request.is_none() && !self.sender_may_control(&target) {
-            return Err("mapping a drive to another device is fleet-only".into());
+        let owner_or_fleet = self.sender_may_control(&target);
+        let dialed_customer = self.cec.is_dialed(&target);
+        let active_support = self.cec.has_active_session_with(&target);
+        if request.is_none()
+            && !drive_push_may_start(owner_or_fleet, dialed_customer, active_support)
+        {
+            return Err(
+                "mapping a drive to another device requires Fleet or an active support session"
+                    .into(),
+            );
         }
         let root = std::path::PathBuf::from(root)
             .canonicalize()
@@ -13783,6 +13797,22 @@ fn is_mapped_drive_route(route: &Route) -> bool {
         && !route.from.as_str().ends_with(":storage-in")
 }
 
+/// A local drive push can start for an owned/fleet target, or for a customer
+/// this technician actually dialed while that exact support session is active.
+/// Keeping both CEC facts prevents a stale directory entry (or an unrelated
+/// active session) from widening native drive mapping.
+fn drive_push_may_start(owner_or_fleet: bool, dialed_customer: bool, active_support: bool) -> bool {
+    owner_or_fleet || (dialed_customer && active_support)
+}
+
+/// Admission for the mapped-drive offer at the destination. Receiver-minted
+/// pulls are already bound to a one-use token; unsolicited pushes need the
+/// Files plane, which includes owner/fleet, an explicit Files share, and a live
+/// CEC Control grant.
+fn mapped_drive_offer_authorized(explicit_pull: bool, files_plane: bool) -> bool {
+    explicit_pull || files_plane
+}
+
 /// Resolve the route's source capability against a fresh local inventory.
 /// The peer never supplies a root: it must exactly name a currently mounted
 /// volume this node advertised, and only its recorded mount point is retained.
@@ -15409,6 +15439,23 @@ mod tests {
         assert!(!is_mapped_drive_route(&wrong_sink));
         let wrong_media = term_route("host:disk:E:\\", "viewer:storage-in", MediaKind::Generic);
         assert!(!is_mapped_drive_route(&wrong_media));
+    }
+
+    #[test]
+    fn drive_push_start_requires_fleet_or_a_live_dialed_support_session() {
+        assert!(drive_push_may_start(true, false, false));
+        assert!(drive_push_may_start(false, true, true));
+        assert!(!drive_push_may_start(false, true, false));
+        assert!(!drive_push_may_start(false, false, true));
+        assert!(!drive_push_may_start(false, false, false));
+    }
+
+    #[test]
+    fn mapped_drive_offer_accepts_a_pull_token_or_the_files_plane() {
+        assert!(mapped_drive_offer_authorized(true, false));
+        assert!(mapped_drive_offer_authorized(false, true));
+        assert!(mapped_drive_offer_authorized(true, true));
+        assert!(!mapped_drive_offer_authorized(false, false));
     }
 
     #[test]

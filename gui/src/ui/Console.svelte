@@ -73,7 +73,10 @@
       : { remote: false, files: false, terminal: false, sites: false, audio: false, control: false, clipboard: false },
   );
   const drivesAllowed = $derived(
-    !!node && (kvmSource ? app.kvmDoors(node) : app.isFleetMember(node.id) || app.filesAllowed(node)),
+    !!node &&
+      (kvmSource
+        ? app.kvmDoors(node)
+        : app.isFleetMember(node.id) || app.filesAllowed(node) || app.isCecCustomer(node.id)),
   );
   const kvmMediaAllowed = $derived(
     !!node &&
@@ -2309,7 +2312,7 @@
                 <span class="micon">⏻</span>End session
               </button>
             {:else if openMenu === "drives"}
-              <DrivePanel target={node.id} />
+              <DrivePanel target={node.id} supportSession={app.isCecCustomer(node.id)} />
             {:else if openMenu === "kvm-media" && consoleKvm}
               <DrivePanel target={consoleKvm.id} />
             {:else if openMenu === "power"}

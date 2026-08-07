@@ -4281,9 +4281,14 @@ class AppStore {
     root: string,
     label: string,
     mount = "",
+    supportSession = false,
   ): Promise<boolean> {
     if (!this.driveTargets.some((node) => sameMachine(node.id, targetNodeId))) {
       this.toast("warn", "That machine can't receive a mapped drive");
+      return false;
+    }
+    if (!this.isFleetMember(targetNodeId) && !(supportSession && this.isCecCustomer(targetNodeId))) {
+      this.toast("warn", "Mapping a drive onto another machine requires Fleet or an active support session");
       return false;
     }
     try {
@@ -4306,8 +4311,12 @@ class AppStore {
     root: string,
     label: string,
     mount = "",
+    supportSession = false,
   ): Promise<boolean> {
-    if (!this.driveSources.some((node) => sameMachine(node.id, sourceNodeId))) {
+    if (
+      !this.driveSources.some((node) => sameMachine(node.id, sourceNodeId)) &&
+      !(supportSession && this.isCecCustomer(sourceNodeId))
+    ) {
       this.toast("warn", "That machine hasn't shared Files access with you");
       return false;
     }

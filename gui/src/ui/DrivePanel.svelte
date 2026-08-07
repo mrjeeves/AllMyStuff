@@ -3,7 +3,7 @@
   import RemoteFolderPicker from "./RemoteFolderPicker.svelte";
   import KvmMediaPanel from "./KvmMediaPanel.svelte";
 
-  let { target }: { target: string } = $props();
+  let { target, supportSession = false }: { target: string; supportSession?: boolean } = $props();
   let pending = $state<{ root: string; label: string; mount: string; source?: string } | null>(null);
   let choosingSource = $state(false);
   let choosingDirection = $state(false);
@@ -46,8 +46,8 @@
     saving = true;
     const draft = pending;
     const done = draft.source
-      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, draft.mount)
-      : await app.mapFolderToNode(target, draft.root, draft.label, draft.mount);
+      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, draft.mount, supportSession)
+      : await app.mapFolderToNode(target, draft.root, draft.label, draft.mount, supportSession);
     if (done) {
       pending = null;
       choosingSource = false;
@@ -120,19 +120,19 @@
     />
   {:else if choosingDirection && !pending}
     <div class="direction-list">
-      {#if app.filesAllowed(app.machineByAnyId(target) ?? undefined)}
+      {#if app.filesAllowed(app.machineByAnyId(target) ?? undefined) || supportSession}
         <button onclick={() => { choosingDirection = false; remoteSource = target; }}>
           <span aria-hidden="true">⇣</span>
           <span><strong>Use a folder from {targetLabel}</strong><small>It will appear as a drive on this computer</small></span>
         </button>
       {/if}
-      {#if app.isFleetMember(target)}
+      {#if app.isFleetMember(target) || supportSession}
         <button onclick={() => void chooseLocalForTarget()}>
           <span aria-hidden="true">⇡</span>
-          <span><strong>Map a folder onto {targetLabel}</strong><small>Choose a folder from this computer · fleet only</small></span>
+          <span><strong>Map a folder onto {targetLabel}</strong><small>Choose a folder from this computer · {supportSession ? "live support session" : "fleet only"}</small></span>
         </button>
       {/if}
-      {#if !app.filesAllowed(app.machineByAnyId(target) ?? undefined) && !app.isFleetMember(target)}
+      {#if !app.filesAllowed(app.machineByAnyId(target) ?? undefined) && !app.isFleetMember(target) && !supportSession}
         <div class="empty">You need Fleet access to map a folder onto {targetLabel}, or Files access to use a folder from it here.</div>
       {/if}
       <button class="source-cancel" onclick={() => (choosingDirection = false)}>Cancel</button>

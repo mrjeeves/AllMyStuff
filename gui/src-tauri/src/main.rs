@@ -2242,10 +2242,20 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
         .to_string_lossy()
         .replace('\'', "''");
     let sid = current_windows_user_sid()?.replace('\'', "''");
-    let elevated_args = format!(
-        "--service-do {verb} --service-home \"{home}\" --service-sid {sid}"
-    )
-    .replace('\'', "''");
+    // Resolve the daemon while we still have the desktop user's exact PATH
+    // and bundle context, then carry that absolute path across UAC.  The
+    // elevated child may see a different PATH; guessing there is what produced
+    // a service whose local node answered while no mesh daemon was running.
+    let mesh_arg = if verb == "install" {
+        let (mesh, _) = allmystuff_node::daemon_spawn::find_daemon_binary()
+            .map_err(|e| format!("locating MyOwnMesh for Always On: {e:#}"))?;
+        format!(" --service-mesh \"{}\"", mesh.to_string_lossy())
+    } else {
+        String::new()
+    };
+    let elevated_args =
+        format!("--service-do {verb} --service-home \"{home}\" --service-sid {sid}{mesh_arg}")
+            .replace('\'', "''");
     let ps = format!(
         "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '{elevated_args}' \
          -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
@@ -2310,7 +2320,9 @@ async fn service_install(state: tauri::State<'_, AppState>) -> Result<Value, Str
         .and_then(Value::as_bool)
         == Some(true);
     if installed && !wait_for_node_ready().await {
-        tracing::warn!("installed Windows host did not become ready within the startup grace window");
+        tracing::warn!(
+            "installed Windows host did not become ready within the startup grace window"
+        );
     }
     if !installed || !NodeClient::probe().await {
         // UAC cancellation or a failed service replacement should restore the
@@ -2718,6 +2730,9 @@ fn main() {
         if let Some(sid) = process_arg_value("--service-sid") {
             std::env::set_var("ALLMYSTUFF_SERVICE_CLIENT_SID", sid);
         }
+        if let Some(mesh) = process_arg_value("--service-mesh") {
+            std::env::set_var("ALLMYSTUFF_SERVICE_MESH_BIN", mesh);
+        }
         let code = match service_cmd(&verb) {
             Some(cmd) => match allmystuff_service::run(false, cmd) {
                 Ok(()) => 0,
@@ -2957,30 +2972,29 @@ fn main() {
                 // made older installs race the old service and replacement
                 // service for the machine control pipe.
                 if migrate_privileged_host {
-                    let migrated = match tokio::task::spawn_blocking(|| {
-                        service_mutate_blocking("install")
-                    })
-                    .await
-                    {
-                        Ok(Ok(value))
-                            if value.get("ok").and_then(Value::as_bool) == Some(true) =>
+                    let migrated =
+                        match tokio::task::spawn_blocking(|| service_mutate_blocking("install"))
+                            .await
                         {
-                            tracing::info!("installed the privileged interactive Windows host");
-                            true
-                        }
-                        Ok(Ok(_)) => {
-                            tracing::warn!("privileged Windows host setup did not complete");
-                            false
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("privileged Windows host setup failed: {e}");
-                            false
-                        }
-                        Err(e) => {
-                            tracing::warn!("privileged Windows host setup task failed: {e}");
-                            false
-                        }
-                    };
+                            Ok(Ok(value))
+                                if value.get("ok").and_then(Value::as_bool) == Some(true) =>
+                            {
+                                tracing::info!("installed the privileged interactive Windows host");
+                                true
+                            }
+                            Ok(Ok(_)) => {
+                                tracing::warn!("privileged Windows host setup did not complete");
+                                false
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("privileged Windows host setup failed: {e}");
+                                false
+                            }
+                            Err(e) => {
+                                tracing::warn!("privileged Windows host setup task failed: {e}");
+                                false
+                            }
+                        };
                     if migrated && !wait_for_node_ready().await {
                         tracing::warn!(
                             "migrated Windows host did not become ready; starting the GUI fallback"

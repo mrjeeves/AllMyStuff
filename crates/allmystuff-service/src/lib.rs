@@ -1017,11 +1017,9 @@ fn win_run(cmd: ServiceCmd) -> Result<()> {
 }
 
 fn win_install(log: Option<String>) -> Result<()> {
-    // The service runs the node binary in service mode — resolve it the same
-    // way `allmystuff serve` does, and run it *in place*. Leaving it where the
-    // installer dropped it (beside `allmystuff` and `allmystuff-gui`) is what
-    // lets the node's background self-updater refresh all three halves in
-    // lockstep — a copied-aside binary could only ever update itself.
+    // The service runs the node binary in service mode: resolve its source the
+    // same way `allmystuff serve` does, then stage a protected LocalSystem copy
+    // below ProgramData together with the daemon it supervises.
     let exec = find_serve_binary().ok_or_else(|| {
         anyhow!(
             "couldn't find the `allmystuff-serve` node binary to run.\n\n\
@@ -1035,21 +1033,25 @@ fn win_install(log: Option<String>) -> Result<()> {
     // ImagePath. find_serve_binary already returns absolute paths in practice.
     let exec = win_absolute(&exec)?;
 
-    // `sc create` refuses to clobber an existing service; replace cleanly so a
-    // reinstall picks up the new binary/args.
-    let replacing = win_installed();
-    if replacing {
-        let _ = capture(&sc_stop());
-        win_wait_stopped(Duration::from_secs(10));
-        win_run_checked(&sc_delete())?;
-        win_wait_absent(Duration::from_secs(5));
-    }
+    // Resolve the mesh payload before touching an existing service.  The
+    // desktop NSIS install does not necessarily leave `myownmesh.exe` beside
+    // `allmystuff-serve.exe` (and an older self-update may have refreshed only
+    // the four AllMyStuff executables).  Deleting a working service and only
+    // then discovering that its daemon cannot be staged leaves the GUI saying
+    // Always On is enabled while the replacement can never join a mesh.
+    let mesh_source = find_mesh_binary_for_service(&exec).ok_or_else(|| {
+        anyhow!(
+            "couldn't find the `myownmesh` daemon required by the Always On service.\n\n\
+             Re-run the AllMyStuff installer, install MyOwnMesh, or set \
+             MYOWNMESH_BIN before enabling Always On."
+        )
+    })?;
 
     // Never point a LocalSystem service at the current-user install directory:
     // that account could replace the executable and gain SYSTEM on reboot.
-    // Stage the node and its mesh daemon beneath ProgramData, then remove
-    // inherited write access for ordinary users.
-    let source_dir = exec.parent().unwrap_or_else(|| Path::new("."));
+    // Prepare both replacements beneath ProgramData *before* stopping an old
+    // service. If either source is missing/unreadable, the existing host keeps
+    // running instead of being deleted halfway through a repair.
     let service_dir = std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
@@ -1058,20 +1060,32 @@ fn win_install(log: Option<String>) -> Result<()> {
     std::fs::create_dir_all(&service_dir)
         .with_context(|| format!("create {}", service_dir.display()))?;
     let staged_exec = service_dir.join("allmystuff-serve.exe");
-    std::fs::copy(&exec, &staged_exec)
-        .with_context(|| format!("stage {} as {}", exec.display(), staged_exec.display()))?;
-    let mesh_source = source_dir.join("myownmesh.exe");
     let staged_mesh = service_dir.join("myownmesh.exe");
-    if runnable(&mesh_source) {
-        std::fs::copy(&mesh_source, &staged_mesh).with_context(|| {
-            format!(
-                "stage {} as {}",
-                mesh_source.display(),
-                staged_mesh.display()
-            )
-        })?;
-    }
+    let next_exec = service_dir.join("allmystuff-serve.next.exe");
+    let next_mesh = service_dir.join("myownmesh.next.exe");
+    std::fs::copy(&exec, &next_exec)
+        .with_context(|| format!("prepare {} as {}", exec.display(), next_exec.display()))?;
+    std::fs::copy(&mesh_source, &next_mesh).with_context(|| {
+        format!(
+            "prepare {} as {}",
+            mesh_source.display(),
+            next_mesh.display()
+        )
+    })?;
     win_harden_service_dir(&service_dir)?;
+
+    // `sc create` refuses to clobber an existing service. Only after a complete
+    // replacement payload is safely prepared do we stop and remove its record,
+    // promote the files, and recreate it with the current arguments.
+    let replacing = win_installed();
+    if replacing {
+        let _ = capture(&sc_stop());
+        win_wait_stopped(Duration::from_secs(10));
+        win_run_checked(&sc_delete())?;
+        win_wait_absent(Duration::from_secs(5));
+    }
+    win_promote_payload(&next_exec, &staged_exec)?;
+    win_promote_payload(&next_mesh, &staged_mesh)?;
 
     let profile_home = std::env::var_os("ALLMYSTUFF_SERVICE_HOME")
         .map(PathBuf::from)
@@ -1083,7 +1097,7 @@ fn win_install(log: Option<String>) -> Result<()> {
         log.as_deref(),
         &profile_home,
         client_sid.as_deref(),
-        runnable(&staged_mesh).then_some(staged_mesh.as_path()),
+        Some(staged_mesh.as_path()),
     );
     win_run_checked(&sc_create(&binpath))?;
     // Description + automatic restart-on-failure are nice-to-haves: best-effort
@@ -1108,6 +1122,16 @@ fn win_install(log: Option<String>) -> Result<()> {
     println!("  manage:  services.msc, or `sc query {WINDOWS_SERVICE_NAME}`");
     win_print_state();
     Ok(())
+}
+
+fn win_promote_payload(prepared: &Path, live: &Path) -> Result<()> {
+    match std::fs::remove_file(live) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("replace {}", live.display())),
+    }
+    std::fs::rename(prepared, live)
+        .with_context(|| format!("promote {} as {}", prepared.display(), live.display()))
 }
 
 fn win_lifecycle(life: Lifecycle) -> Result<()> {
@@ -1471,9 +1495,20 @@ fn win_status_value() -> Value {
         None
     };
     let enabled = config.as_deref().map(sc_autostart);
-    let privileged_host_current = config
-        .as_deref()
-        .is_some_and(|out| out.contains("--state-home"));
+    let service_dir = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("AllMyStuff")
+        .join("service");
+    // A responsive SCM parent is not enough: without the staged mesh daemon
+    // the console-session node binds its local pipe but remains invisible to
+    // every peer.  Older builds only checked `--state-home`, accepting exactly
+    // that half-installed state as "current" and therefore never repairing it.
+    let privileged_host_current = config.as_deref().is_some_and(|out| {
+        win_privileged_host_config_current(out)
+            && runnable(&service_dir.join("allmystuff-serve.exe"))
+            && runnable(&service_dir.join("myownmesh.exe"))
+    });
     json!({
         "platform": "windows",
         "supported": true,
@@ -1485,6 +1520,10 @@ fn win_status_value() -> Value {
         "privileged_host_current": privileged_host_current,
         "needs_privilege": true,
     })
+}
+
+fn win_privileged_host_config_current(config: &str) -> bool {
+    config.contains("--state-home") && config.contains("--mesh-bin")
 }
 
 /// systemd reports `active`; launchd, `running`. Either means "up".
@@ -1564,6 +1603,72 @@ pub fn find_serve_binary() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Locate the MyOwnMesh daemon that must be copied into the Windows Always On
+/// payload. This mirrors the node runtime's discovery order, with one extra
+/// hand-off variable used by the desktop process to carry its resolved binary
+/// through the UAC boundary (an elevated process can inherit a different
+/// PATH).
+fn find_mesh_binary_for_service(serve: &Path) -> Option<PathBuf> {
+    for key in ["ALLMYSTUFF_SERVICE_MESH_BIN", "MYOWNMESH_BIN"] {
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
+            if runnable(&path) {
+                return Some(path);
+            }
+        }
+    }
+
+    let exe = if cfg!(windows) {
+        "myownmesh.exe"
+    } else {
+        "myownmesh"
+    };
+    if let Some(candidate) = serve.parent().map(|dir| dir.join(exe)) {
+        if runnable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
+            if runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(exe);
+            if runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // GUI launches are not guaranteed to inherit the user's shell PATH.
+    // Search both products' installer homes explicitly.
+    let mut candidates = install_dirs();
+    #[cfg(windows)]
+    {
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(
+                home.join("AppData")
+                    .join("Local")
+                    .join("Programs")
+                    .join("MyOwnMesh"),
+            );
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local).join("Programs").join("MyOwnMesh"));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(program_files).join("MyOwnMesh"));
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|dir| dir.join(exe))
+        .find(|candidate| runnable(candidate))
 }
 
 /// A binary candidate is usable only if it's a non-empty file — skips the
@@ -2097,6 +2202,20 @@ mod tests {
             "\"C:\\PD\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service \
              --state-home \"C:\\Users\\u\" --log \"info,allmystuff_node=debug\""
         );
+    }
+
+    #[test]
+    fn privileged_host_requires_state_and_mesh_payload_arguments() {
+        let complete = r#"BINARY_PATH_NAME : "C:\ProgramData\AllMyStuff\service\allmystuff-serve.exe" --service --state-home "C:\Users\u" --mesh-bin "C:\ProgramData\AllMyStuff\service\myownmesh.exe""#;
+        assert!(win_privileged_host_config_current(complete));
+
+        // This was the broken migration shape: its local node could answer,
+        // but the service had no deterministic daemon to put it on the mesh.
+        let no_mesh = r#"BINARY_PATH_NAME : "C:\ProgramData\AllMyStuff\service\allmystuff-serve.exe" --service --state-home "C:\Users\u""#;
+        assert!(!win_privileged_host_config_current(no_mesh));
+        assert!(!win_privileged_host_config_current(
+            r#"BINARY_PATH_NAME : "C:\old\allmystuff-serve.exe" --service"#
+        ));
     }
 
     #[test]

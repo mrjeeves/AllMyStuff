@@ -30,7 +30,7 @@ members = [
 exclude = ["gui", "node"]
 
 [workspace.package]
-version = "0.2.58"
+version = "0.2.59"
 edition = "2021"
 rust-version = "1.88.0"
 license = "MIT"
@@ -39,16 +39,16 @@ repository = "https://github.com/mrjeeves/AllMyStuff"
 description = "Map all your stuff, then wire it together across a mesh you own."
 
 [workspace.dependencies]
-allmystuff-inventory = { path = "crates/allmystuff-inventory", version = "0.2.58" }
-allmystuff-graph = { path = "crates/allmystuff-graph", version = "0.2.58" }
-allmystuff-protocol = { path = "crates/allmystuff-protocol", version = "0.2.58" }
-allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.2.58" }
-allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.58" }
-allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.58" }
-allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.58" }
-allmystuff-mobile-core = { path = "crates/allmystuff-mobile-core", version = "0.2.58" }
-allmystuff-cec-protocol = { path = "crates/allmystuff-cec-protocol", version = "0.2.58" }
-allmystuff-cec-consent = { path = "crates/allmystuff-cec-consent", version = "0.2.58" }
+allmystuff-inventory = { path = "crates/allmystuff-inventory", version = "0.2.59" }
+allmystuff-graph = { path = "crates/allmystuff-graph", version = "0.2.59" }
+allmystuff-protocol = { path = "crates/allmystuff-protocol", version = "0.2.59" }
+allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.2.59" }
+allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.59" }
+allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.59" }
+allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.59" }
+allmystuff-mobile-core = { path = "crates/allmystuff-mobile-core", version = "0.2.59" }
+allmystuff-cec-protocol = { path = "crates/allmystuff-cec-protocol", version = "0.2.59" }
+allmystuff-cec-consent = { path = "crates/allmystuff-cec-consent", version = "0.2.59" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

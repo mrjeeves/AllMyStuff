@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-mobile"
-version = "0.2.58"
+version = "0.2.59"
 dependencies = [
  "allmystuff-inventory",
  "allmystuff-mobile-core",

@@ -260,15 +260,32 @@ fn configure_service_environment() {
         return;
     };
     let home = std::path::PathBuf::from(home);
-    std::env::set_var("MYOWNMESH_HOME", &home);
-    std::env::set_var("ALLMYSTUFF_HOME", home.join(".allmystuff"));
-    std::env::set_var("ALLMYSTUFF_USER_HOME", &home);
+    let (mesh_home, app_home, user_home) = service_environment_paths(&home);
+    // MYOWNMESH_HOME names the state directory itself, not the user's profile.
+    // Pointing it at `C:\Users\Chris` made the LocalSystem agent mint
+    // `C:\Users\Chris\.secrets\identity.json` instead of reusing
+    // `C:\Users\Chris\.myownmesh\.secrets\identity.json`. The resulting new
+    // device could read the fleet config but peers correctly refused to
+    // approve it, leaving the machine permanently "offline".
+    std::env::set_var("MYOWNMESH_HOME", mesh_home);
+    std::env::set_var("ALLMYSTUFF_HOME", app_home);
+    std::env::set_var("ALLMYSTUFF_USER_HOME", user_home);
     if let Some(sid) = arg_value("--client-sid") {
         std::env::set_var("ALLMYSTUFF_CLIENT_SID", sid);
     }
     if let Some(mesh_bin) = arg_value("--mesh-bin") {
         std::env::set_var("MYOWNMESH_BIN", mesh_bin);
     }
+}
+
+fn service_environment_paths(
+    profile_home: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    (
+        profile_home.join(".myownmesh"),
+        profile_home.join(".allmystuff"),
+        profile_home.to_path_buf(),
+    )
 }
 
 /// Build the async runtime and run the node to completion, stopping when
@@ -1003,5 +1020,19 @@ mod winsvc {
             .open(path)
             .ok()?;
         Some(move || file.try_clone().expect("clone service log file handle"))
+    }
+}
+
+#[cfg(test)]
+mod service_environment_tests {
+    use super::*;
+
+    #[test]
+    fn state_home_is_a_profile_not_the_mesh_state_directory() {
+        let profile = std::path::Path::new(r"C:\Users\Chris Paul");
+        let (mesh, app, user) = service_environment_paths(profile);
+        assert_eq!(mesh, profile.join(".myownmesh"));
+        assert_eq!(app, profile.join(".allmystuff"));
+        assert_eq!(user, profile);
     }
 }

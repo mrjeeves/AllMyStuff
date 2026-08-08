@@ -288,20 +288,6 @@ fn service_environment_paths(
     )
 }
 
-#[cfg(test)]
-mod service_environment_tests {
-    use super::*;
-
-    #[test]
-    fn state_home_is_a_profile_not_the_mesh_state_directory() {
-        let profile = std::path::Path::new(r"C:\Users\Chris Paul");
-        let (mesh, app, user) = service_environment_paths(profile);
-        assert_eq!(mesh, profile.join(".myownmesh"));
-        assert_eq!(app, profile.join(".allmystuff"));
-        assert_eq!(user, profile);
-    }
-}
-
 /// Build the async runtime and run the node to completion, stopping when
 /// `shutdown` resolves. Shared by the foreground path (a signal future) and
 /// the Windows service path (an SCM-stop future).
@@ -1034,5 +1020,19 @@ mod winsvc {
             .open(path)
             .ok()?;
         Some(move || file.try_clone().expect("clone service log file handle"))
+    }
+}
+
+#[cfg(test)]
+mod service_environment_tests {
+    use super::*;
+
+    #[test]
+    fn state_home_is_a_profile_not_the_mesh_state_directory() {
+        let profile = std::path::Path::new(r"C:\Users\Chris Paul");
+        let (mesh, app, user) = service_environment_paths(profile);
+        assert_eq!(mesh, profile.join(".myownmesh"));
+        assert_eq!(app, profile.join(".allmystuff"));
+        assert_eq!(user, profile);
     }
 }

@@ -1647,7 +1647,10 @@ fn find_mesh_binary_for_service(serve: &Path) -> Option<PathBuf> {
 
     // GUI launches are not guaranteed to inherit the user's shell PATH.
     // Search both products' installer homes explicitly.
+    #[cfg(windows)]
     let mut candidates = install_dirs();
+    #[cfg(not(windows))]
+    let candidates = install_dirs();
     #[cfg(windows)]
     {
         if let Some(home) = dirs::home_dir() {

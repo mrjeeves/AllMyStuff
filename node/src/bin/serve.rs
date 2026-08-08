@@ -252,7 +252,7 @@ fn main() -> ExitCode {
     // A console-session agent is supervised by the SCM process in Session 0.
     // It uses service relaunch semantics so an applied update exits and lets
     // that supervisor start the freshly replaced binary.
-    run_blocking(session_agent, wait_for_shutdown_signal())
+    run_blocking(session_agent, session_agent, wait_for_shutdown_signal())
 }
 
 fn configure_service_environment() {
@@ -274,7 +274,11 @@ fn configure_service_environment() {
 /// Build the async runtime and run the node to completion, stopping when
 /// `shutdown` resolves. Shared by the foreground path (a signal future) and
 /// the Windows service path (an SCM-stop future).
-fn run_blocking<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode {
+fn run_blocking<F: Future<Output = ()>>(
+    as_service: bool,
+    wait_for_existing_owner: bool,
+    shutdown: F,
+) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -285,10 +289,14 @@ fn run_blocking<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCo
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(run(as_service, shutdown))
+    runtime.block_on(run(as_service, wait_for_existing_owner, shutdown))
 }
 
-async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode {
+async fn run<F: Future<Output = ()>>(
+    as_service: bool,
+    wait_for_existing_owner: bool,
+    shutdown: F,
+) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "allmystuff node starting"
@@ -301,7 +309,7 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
     // one identity and then nothing connects, so step aside cleanly. Binding
     // before the mesh starts is also what makes two simultaneously-starting
     // nodes safe (see `bind_control_socket`).
-    let shutdown = std::pin::pin!(shutdown);
+    let mut shutdown = std::pin::pin!(shutdown);
     // A Windows re-exec has to spawn before the old process can exit. The
     // replacement can therefore reach this bind while its parent still owns
     // the socket. Only a child explicitly marked by `reexec_self` retries;
@@ -328,8 +336,32 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => {
+                if wait_for_existing_owner && node_control::NodeClient::probe().await {
+                    // A GUI-owned or CEC-owned node is healthy. This is not a
+                    // crash: remain as the service's supervised standby agent
+                    // and claim the pipe when that owner goes away. Exiting
+                    // here made the SCM supervisor relaunch us every second.
+                    tracing::info!(
+                        "another healthy node owns the control socket; privileged agent standing by"
+                    );
+                    while node_control::NodeClient::probe().await {
+                        tokio::select! {
+                            _ = shutdown.as_mut() => {
+                                tracing::info!("shutdown requested while standing by");
+                                return ExitCode::SUCCESS;
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                    tracing::info!("previous node stopped; privileged agent taking ownership");
+                    continue;
+                }
                 tracing::info!("not starting a second node ({e:#})");
-                return ExitCode::SUCCESS;
+                return if wait_for_existing_owner {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                };
             }
         }
     };
@@ -791,7 +823,7 @@ mod winsvc {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::process::ExitCode;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows_service::define_windows_service;
     use windows_service::service::{
@@ -863,20 +895,46 @@ mod winsvc {
             }
         };
         let mut agent: Option<allmystuff_node::win_privilege::ConsoleAgent> = None;
+        let mut agent_started: Option<Instant> = None;
+        let mut short_failures = 0u32;
+        let mut next_launch = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let replace = agent
-                .as_ref()
-                .is_some_and(|child| !child.alive() || child.session_moved());
+            let session_moved = agent.as_ref().is_some_and(|child| child.session_moved());
+            let exited = agent.as_ref().is_some_and(|child| !child.alive());
+            let replace = session_moved || exited;
             if replace {
                 if let Some(child) = agent.take() {
-                    child.stop();
+                    if !exited {
+                        child.stop();
+                    }
+                }
+                if session_moved {
+                    short_failures = 0;
+                    next_launch = Instant::now();
+                } else {
+                    let ran_for = agent_started
+                        .take()
+                        .map(|at| at.elapsed())
+                        .unwrap_or_default();
+                    short_failures = if ran_for >= Duration::from_secs(30) {
+                        1
+                    } else {
+                        short_failures.saturating_add(1)
+                    };
+                    let delay = restart_delay(short_failures);
+                    next_launch = Instant::now() + delay;
+                    tracing::warn!(
+                        ?delay,
+                        short_failures,
+                        "privileged node exited; delaying restart"
+                    );
                 }
             }
-            if agent.is_none() {
+            if agent.is_none() && Instant::now() >= next_launch {
                 match allmystuff_node::win_privilege::ConsoleAgent::launch(
                     &exe,
                     &["--session-agent"],
@@ -884,8 +942,14 @@ mod winsvc {
                     Ok(child) => {
                         tracing::info!("privileged node launched in the active console session");
                         agent = Some(child);
+                        agent_started = Some(Instant::now());
                     }
-                    Err(e) => tracing::debug!("waiting for an interactive console session: {e}"),
+                    Err(e) => {
+                        short_failures = short_failures.saturating_add(1);
+                        let delay = restart_delay(short_failures);
+                        next_launch = Instant::now() + delay;
+                        tracing::debug!(?delay, "waiting for an interactive console session: {e}");
+                    }
                 }
             }
         }
@@ -903,6 +967,23 @@ mod winsvc {
             process_id: None,
         })?;
         Ok(())
+    }
+
+    fn restart_delay(short_failures: u32) -> Duration {
+        Duration::from_secs(1u64 << short_failures.min(6))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rapid_agent_failures_back_off_and_cap() {
+            assert_eq!(restart_delay(1), Duration::from_secs(2));
+            assert_eq!(restart_delay(2), Duration::from_secs(4));
+            assert_eq!(restart_delay(6), Duration::from_secs(64));
+            assert_eq!(restart_delay(100), Duration::from_secs(64));
+        }
     }
 
     /// A `MakeWriter` over `%ProgramData%\AllMyStuff\logs\service.log` (append),

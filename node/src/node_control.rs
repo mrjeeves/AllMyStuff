@@ -39,6 +39,10 @@ use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::ListenerOptions;
+#[cfg(windows)]
+use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+#[cfg(windows)]
+use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -548,9 +552,23 @@ pub async fn bind_control_socket() -> Result<Listener> {
 /// security descriptor; an owner-only DACL via `security_descriptor()` is a
 /// documented follow-up.
 fn bind_owner_only(addr: &SocketAddr) -> Result<Listener> {
-    let listener = ListenerOptions::new()
-        .name(addr.to_name()?)
-        .create_tokio()?;
+    let options = ListenerOptions::new().name(addr.to_name()?);
+    #[cfg(windows)]
+    let options = if let Some(sid) = service_client_sid()? {
+        // A SYSTEM-hosted node exposes administrator terminals, files and
+        // input. Do not inherit the service account's default pipe DACL, and
+        // do not grant every authenticated local user. The account that
+        // installed the app is the only non-administrator client allowed.
+        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})");
+        let sddl = widestring::U16CString::from_str(&sddl)
+            .map_err(|e| anyhow!("invalid node pipe security descriptor: {e}"))?;
+        let descriptor = SecurityDescriptor::deserialize(sddl.as_ucstr())
+            .map_err(|e| anyhow!("couldn't create node pipe security descriptor: {e}"))?;
+        options.security_descriptor(descriptor)
+    } else {
+        options
+    };
+    let listener = options.create_tokio()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -564,6 +582,23 @@ fn bind_owner_only(addr: &SocketAddr) -> Result<Listener> {
         }
     }
     Ok(listener)
+}
+
+#[cfg(windows)]
+fn service_client_sid() -> Result<Option<String>> {
+    let Some(sid) = std::env::var_os("ALLMYSTUFF_CLIENT_SID") else {
+        return Ok(None);
+    };
+    let sid = sid.to_string_lossy().into_owned();
+    let valid = sid.starts_with("S-1-")
+        && sid
+            .split('-')
+            .skip(2)
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if !valid {
+        bail!("refusing invalid ALLMYSTUFF_CLIENT_SID value");
+    }
+    Ok(Some(sid))
 }
 
 /// Accept connections on an already-bound `listener` forever, each on its own

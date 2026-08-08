@@ -278,6 +278,7 @@ windows-sys = { version = "0.60", features = [
 # requires (a plain console binary would be killed for not answering it). The
 # CLI's `allmystuff service install` registers it with `sc.exe`.
 windows-service = "0.7"
+widestring = "1"
 
 [profile.release]
 panic = "abort"

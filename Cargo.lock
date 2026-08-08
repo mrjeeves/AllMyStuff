@@ -86,6 +86,7 @@ name = "allmystuff-protocol"
 version = "0.2.60"
 dependencies = [
  "allmystuff-graph",
+ "dirs",
  "serde",
  "serde_json",
 ]

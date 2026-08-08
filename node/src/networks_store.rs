@@ -131,10 +131,7 @@ fn persist(path: &Option<PathBuf>, value: &Persisted) -> bool {
 /// Same home as the rest of AllMyStuff's persisted state (and the mesh
 /// identity): `~/.myownmesh`, overridable via `MYOWNMESH_HOME`.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-networks.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-networks.json"))
 }
 
 #[cfg(test)]

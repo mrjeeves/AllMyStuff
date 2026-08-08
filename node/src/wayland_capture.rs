@@ -906,10 +906,7 @@ fn monitor_key(monitor_id: Option<u32>) -> String {
 /// Token file next to the app's other state (the ownership store keeps
 /// the same home: `MYOWNMESH_HOME` override, else `~`).
 fn token_store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-screencast.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-screencast.json"))
 }
 
 fn load_token(key: &str) -> Option<String> {

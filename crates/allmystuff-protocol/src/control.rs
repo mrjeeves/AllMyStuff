@@ -12,6 +12,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+
+/// Resolve the MyOwnMesh state directory shared by the daemon and every
+/// AllMyStuff store. `MYOWNMESH_HOME` names the state directory itself; only
+/// the ordinary profile-home fallback gains the `.myownmesh` suffix.
+pub fn myownmesh_state_dir() -> Option<PathBuf> {
+    myownmesh_state_dir_from(
+        std::env::var_os("MYOWNMESH_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+/// Pure form of [`myownmesh_state_dir`], exposed so path semantics can be
+/// tested without mutating process-global environment variables.
+pub fn myownmesh_state_dir_from(
+    configured_state_dir: Option<PathBuf>,
+    profile_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    configured_state_dir.or_else(|| profile_home.map(|home| home.join(".myownmesh")))
+}
 
 /// The daemon's per-connection client handle id. On the wire it's the
 /// `Display` string `c<n>` (e.g. `"c42"`), exactly matching
@@ -513,15 +533,34 @@ pub enum ServerOut {
 /// `ControlClient::new`). Honours `MYOWNMESH_HOME`.
 #[cfg(unix)]
 pub fn default_socket_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs_home)?;
-    Some(home.join(".myownmesh").join("daemon.sock"))
+    Some(myownmesh_state_dir()?.join("daemon.sock"))
 }
 
-#[cfg(unix)]
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+#[cfg(test)]
+mod state_dir_tests {
+    use super::myownmesh_state_dir_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn configured_home_is_the_state_directory_itself() {
+        let configured = PathBuf::from(r"C:\Users\Chris\.myownmesh");
+        assert_eq!(
+            myownmesh_state_dir_from(
+                Some(configured.clone()),
+                Some(PathBuf::from(r"C:\Users\LocalSystem")),
+            ),
+            Some(configured),
+        );
+    }
+
+    #[test]
+    fn profile_fallback_appends_myownmesh_once() {
+        let profile = PathBuf::from(r"C:\Users\Chris");
+        assert_eq!(
+            myownmesh_state_dir_from(None, Some(profile.clone())),
+            Some(profile.join(".myownmesh")),
+        );
+    }
 }
 
 /// On Windows the daemon listens on a namespaced pipe rather than a

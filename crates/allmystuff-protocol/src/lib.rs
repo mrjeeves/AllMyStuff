@@ -30,4 +30,6 @@ pub use app::{
     FEATURE_MEDIA_LANES, FEATURE_ROOMS, FEATURE_SITES, FEATURE_TERMINAL, LOCAL_CLAIM_NETWORK_ID,
     PROTOCOL_VERSION,
 };
-pub use control::{ClientId, Request, Response, ServerOut};
+pub use control::{
+    myownmesh_state_dir, myownmesh_state_dir_from, ClientId, Request, Response, ServerOut,
+};

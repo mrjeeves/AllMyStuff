@@ -443,10 +443,7 @@ struct PersistedDriveReconnects {
 }
 
 fn drive_reconnect_store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-drives.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drives.json"))
 }
 
 fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconnect> {
@@ -11059,12 +11056,18 @@ impl Mesh {
         if loopback {
             match event {
                 TermEvent::Data { bytes } => {
-                    let _ = self.terminal.write(&route_id, bytes);
-                    return Ok(());
+                    return self
+                        .terminal
+                        .write(&route_id, bytes)
+                        .then_some(())
+                        .ok_or_else(|| "local terminal PTY is no longer accepting input".into());
                 }
                 TermEvent::Resize { cols, rows } => {
-                    let _ = self.terminal.resize(&route_id, cols, rows);
-                    return Ok(());
+                    return self
+                        .terminal
+                        .resize(&route_id, cols, rows)
+                        .then_some(())
+                        .ok_or_else(|| "local terminal PTY is no longer accepting resize".into());
                 }
                 TermEvent::Exit { .. } => {
                     return Err("exit is reported by the host, not sent".into())

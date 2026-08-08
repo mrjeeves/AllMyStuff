@@ -47,10 +47,7 @@ use allmystuff_cec_protocol::{
 /// the ownership store and control socket use. `None` (no home resolvable) runs
 /// the store in memory.
 pub fn consent_store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("cec-consent.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("cec-consent.json"))
 }
 
 /// This machine's wall clock as Unix seconds — the injected `now` the consent

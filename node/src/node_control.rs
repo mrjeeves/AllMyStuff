@@ -197,10 +197,7 @@ const NODE_SOCKET_NAME: &str = "allmystuff-node";
 fn node_socket_addr() -> Result<SocketAddr> {
     #[cfg(unix)]
     {
-        let home = std::env::var_os("MYOWNMESH_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir)
-            .map(|h| h.join(".myownmesh"))
+        let home = allmystuff_protocol::myownmesh_state_dir()
             .context("resolve the ~/.myownmesh home for the node socket")?;
         Ok(SocketAddr::Path(home.join("allmystuff-node.sock")))
     }

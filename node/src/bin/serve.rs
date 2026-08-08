@@ -227,6 +227,12 @@ fn main() -> ExitCode {
     let as_service = std::env::args().skip(1).any(|a| a == "--service");
     #[cfg(not(windows))]
     let as_service = false;
+    #[cfg(windows)]
+    let session_agent = std::env::args().skip(1).any(|a| a == "--session-agent");
+    #[cfg(not(windows))]
+    let session_agent = false;
+
+    configure_service_environment();
 
     // Apply any update staged on a previous run before binding anything —
     // same "stage now, apply on next launch" model as the GUI and the daemon.
@@ -243,7 +249,26 @@ fn main() -> ExitCode {
 
     // Foreground (a console, or a systemd/launchd-supervised process): run
     // until a stop signal arrives.
-    run_blocking(as_service, wait_for_shutdown_signal())
+    // A console-session agent is supervised by the SCM process in Session 0.
+    // It uses service relaunch semantics so an applied update exits and lets
+    // that supervisor start the freshly replaced binary.
+    run_blocking(session_agent, wait_for_shutdown_signal())
+}
+
+fn configure_service_environment() {
+    let Some(home) = arg_value("--state-home") else {
+        return;
+    };
+    let home = std::path::PathBuf::from(home);
+    std::env::set_var("MYOWNMESH_HOME", &home);
+    std::env::set_var("ALLMYSTUFF_HOME", home.join(".allmystuff"));
+    std::env::set_var("ALLMYSTUFF_USER_HOME", &home);
+    if let Some(sid) = arg_value("--client-sid") {
+        std::env::set_var("ALLMYSTUFF_CLIENT_SID", sid);
+    }
+    if let Some(mesh_bin) = arg_value("--mesh-bin") {
+        std::env::set_var("MYOWNMESH_BIN", mesh_bin);
+    }
 }
 
 /// Build the async runtime and run the node to completion, stopping when
@@ -803,11 +828,10 @@ mod winsvc {
     }
 
     fn run_service() -> windows_service::Result<()> {
-        // The SCM control handler runs on its own thread. Bridge a Stop into
-        // the node's async shutdown with a tokio channel: an unbounded sender
-        // can fire from sync code with no runtime in scope, so the handler is
-        // free to call it directly.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // Session 0 cannot capture or control the user's desktop. Keep only the
+        // SCM supervisor here and launch the real privileged node into the
+        // active console session with a duplicated LocalSystem token.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handler = move |control| -> ServiceControlHandlerResult {
             match control {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
@@ -820,8 +844,7 @@ mod winsvc {
         };
         let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
 
-        // Report running straight away (the node starts asynchronously), then
-        // run it until the SCM asks us to stop.
+        // Report running straight away, then supervise the interactive agent.
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: ServiceState::Running,
@@ -832,11 +855,43 @@ mod winsvc {
             process_id: None,
         })?;
 
-        // `as_service = true`: the self-updater relaunches by exiting for the
-        // SCM to restart, not by re-execing.
-        super::run_blocking(true, async move {
-            let _ = rx.recv().await;
-        });
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                tracing::error!("couldn't locate the service executable: {e}");
+                return Ok(());
+            }
+        };
+        let mut agent: Option<allmystuff_node::win_privilege::ConsoleAgent> = None;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let replace = agent
+                .as_ref()
+                .is_some_and(|child| !child.alive() || child.session_moved());
+            if replace {
+                if let Some(child) = agent.take() {
+                    child.stop();
+                }
+            }
+            if agent.is_none() {
+                match allmystuff_node::win_privilege::ConsoleAgent::launch(
+                    &exe,
+                    &["--session-agent"],
+                ) {
+                    Ok(child) => {
+                        tracing::info!("privileged node launched in the active console session");
+                        agent = Some(child);
+                    }
+                    Err(e) => tracing::debug!("waiting for an interactive console session: {e}"),
+                }
+            }
+        }
+        if let Some(child) = agent.take() {
+            child.stop();
+        }
 
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,

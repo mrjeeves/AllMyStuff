@@ -1045,7 +1045,46 @@ fn win_install(log: Option<String>) -> Result<()> {
         win_wait_absent(Duration::from_secs(5));
     }
 
-    let binpath = win_binpath(&exec, log.as_deref());
+    // Never point a LocalSystem service at the current-user install directory:
+    // that account could replace the executable and gain SYSTEM on reboot.
+    // Stage the node and its mesh daemon beneath ProgramData, then remove
+    // inherited write access for ordinary users.
+    let source_dir = exec.parent().unwrap_or_else(|| Path::new("."));
+    let service_dir = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("AllMyStuff")
+        .join("service");
+    std::fs::create_dir_all(&service_dir)
+        .with_context(|| format!("create {}", service_dir.display()))?;
+    let staged_exec = service_dir.join("allmystuff-serve.exe");
+    std::fs::copy(&exec, &staged_exec)
+        .with_context(|| format!("stage {} as {}", exec.display(), staged_exec.display()))?;
+    let mesh_source = source_dir.join("myownmesh.exe");
+    let staged_mesh = service_dir.join("myownmesh.exe");
+    if runnable(&mesh_source) {
+        std::fs::copy(&mesh_source, &staged_mesh).with_context(|| {
+            format!(
+                "stage {} as {}",
+                mesh_source.display(),
+                staged_mesh.display()
+            )
+        })?;
+    }
+    win_harden_service_dir(&service_dir)?;
+
+    let profile_home = std::env::var_os("ALLMYSTUFF_SERVICE_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow!("couldn't resolve the installing user's profile directory"))?;
+    let client_sid = std::env::var("ALLMYSTUFF_SERVICE_CLIENT_SID").ok();
+    let binpath = win_binpath(
+        &staged_exec,
+        log.as_deref(),
+        &profile_home,
+        client_sid.as_deref(),
+        runnable(&staged_mesh).then_some(staged_mesh.as_path()),
+    );
     win_run_checked(&sc_create(&binpath))?;
     // Description + automatic restart-on-failure are nice-to-haves: best-effort
     // so a quirky `sc` build can't fail the install over cosmetics. The
@@ -1063,7 +1102,7 @@ fn win_install(log: Option<String>) -> Result<()> {
             "Installed"
         }
     );
-    println!("  binary:  {}", exec.display());
+    println!("  binary:  {}", staged_exec.display());
     println!("  service: {WINDOWS_SERVICE_NAME}  (Service Control Manager)");
     println!("  daemon:  the node spawns `myownmesh serve` itself — one service runs both");
     println!("  manage:  services.msc, or `sc query {WINDOWS_SERVICE_NAME}`");
@@ -1152,13 +1191,52 @@ fn win_absolute(exe: &Path) -> Result<PathBuf> {
 /// The command line baked into the service. The exe is quoted so a spaced path
 /// still parses, and `--service` flips the node into SCM-dispatcher mode; a
 /// `--log` filter rides along when the installer was given one.
-fn win_binpath(exec: &Path, log: Option<&str>) -> String {
-    let mut s = format!("\"{}\" --service", exec.display());
+fn win_binpath(
+    exec: &Path,
+    log: Option<&str>,
+    profile_home: &Path,
+    client_sid: Option<&str>,
+    mesh_bin: Option<&Path>,
+) -> String {
+    let mut s = format!(
+        "\"{}\" --service --state-home {}",
+        exec.display(),
+        win_quote_arg(&profile_home.to_string_lossy())
+    );
+    if let Some(sid) = client_sid {
+        s.push_str(" --client-sid ");
+        s.push_str(&win_quote_arg(sid));
+    }
+    if let Some(mesh_bin) = mesh_bin {
+        s.push_str(" --mesh-bin ");
+        s.push_str(&win_quote_arg(&mesh_bin.to_string_lossy()));
+    }
     if let Some(filter) = log {
         s.push_str(" --log ");
-        s.push_str(filter);
+        s.push_str(&win_quote_arg(filter));
     }
     s
+}
+
+fn win_harden_service_dir(path: &Path) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    let argv = vec![
+        "icacls".to_string(),
+        path,
+        "/inheritance:r".to_string(),
+        "/grant:r".to_string(),
+        "SYSTEM:(OI)(CI)F".to_string(),
+        "Administrators:(OI)(CI)F".to_string(),
+        "Users:(OI)(CI)RX".to_string(),
+    ];
+    win_run_checked(&argv)
+}
+
+fn win_quote_arg(value: &str) -> String {
+    // These values are paths, SIDs and log filters; reject an embedded quote
+    // rather than emitting an ambiguous SCM ImagePath command line.
+    let value = value.replace('"', "");
+    format!("\"{value}\"")
 }
 
 // ---- `sc.exe` argv builders (pure) ----------------------------------------
@@ -1386,12 +1464,16 @@ fn win_status_value() -> Value {
         let (_, out, _) = capture(&sc_query());
         sc_running(&out)
     };
-    let enabled = if installed {
+    let config = if installed {
         let (_, out, _) = capture(&sc_qc());
-        Some(sc_autostart(&out))
+        Some(out)
     } else {
         None
     };
+    let enabled = config.as_deref().map(sc_autostart);
+    let privileged_host_current = config
+        .as_deref()
+        .is_some_and(|out| out.contains("--state-home"));
     json!({
         "platform": "windows",
         "supported": true,
@@ -1400,6 +1482,7 @@ fn win_status_value() -> Value {
         "installed": installed,
         "enabled": enabled,
         "running": running,
+        "privileged_host_current": privileged_host_current,
         "needs_privilege": true,
     })
 }
@@ -1988,9 +2071,16 @@ mod tests {
         assert_eq!(
             win_binpath(
                 Path::new("C:\\ProgramData\\AllMyStuff\\bin\\allmystuff-serve.exe"),
-                None
+                None,
+                Path::new("C:\\Users\\Chris Paul"),
+                Some("S-1-5-21-1000"),
+                Some(Path::new(
+                    "C:\\ProgramData\\AllMyStuff\\service\\myownmesh.exe"
+                ))
             ),
-            "\"C:\\ProgramData\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service"
+            "\"C:\\ProgramData\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service \
+             --state-home \"C:\\Users\\Chris Paul\" --client-sid \"S-1-5-21-1000\" \
+             --mesh-bin \"C:\\ProgramData\\AllMyStuff\\service\\myownmesh.exe\""
         );
     }
 
@@ -1999,10 +2089,13 @@ mod tests {
         assert_eq!(
             win_binpath(
                 Path::new("C:\\PD\\AllMyStuff\\bin\\allmystuff-serve.exe"),
-                Some("info,allmystuff_node=debug")
+                Some("info,allmystuff_node=debug"),
+                Path::new("C:\\Users\\u"),
+                None,
+                None
             ),
             "\"C:\\PD\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service \
-             --log info,allmystuff_node=debug"
+             --state-home \"C:\\Users\\u\" --log \"info,allmystuff_node=debug\""
         );
     }
 

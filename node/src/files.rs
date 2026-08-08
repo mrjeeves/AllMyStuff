@@ -411,7 +411,7 @@ pub fn write_range_in_root(event: &FileEvent, root: Option<&Path>) -> Option<Fil
 /// Resolve a viewer path to a host path: `""`/`"~"` (and `~/…`) mean this
 /// user's home; relative paths hang off home too; absolute paths stand.
 fn resolve(path: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let home = user_home();
     if path.is_empty() || path == "~" {
         return home;
     }
@@ -506,10 +506,14 @@ fn scoped_is_root(path: &str) -> bool {
 }
 
 fn home_dir_string() -> String {
-    dirs::home_dir()
+    user_home().to_string_lossy().into_owned()
+}
+
+fn user_home() -> PathBuf {
+    std::env::var_os("ALLMYSTUFF_USER_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/"))
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn list_dir(path: &str, root: Option<&Path>) -> Result<(String, Vec<FileEntry>), String> {
@@ -914,7 +918,7 @@ mod tests {
 
     #[test]
     fn paths_resolve_against_home() {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let home = user_home();
         assert_eq!(resolve(""), home);
         assert_eq!(resolve("~"), home);
         assert_eq!(resolve("~/docs"), home.join("docs"));

@@ -2205,6 +2205,12 @@ fn service_do_verb() -> Option<String> {
     args.get(i + 1).cloned()
 }
 
+fn process_arg_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|arg| arg == flag)?;
+    args.get(i + 1).cloned()
+}
+
 /// Run a service mutation off the UI thread (it shells out to the init system,
 /// and on Windows waits on an elevated child). Returns `{ ok, output }`.
 async fn service_mutate(verb: &'static str) -> Result<Value, String> {
@@ -2231,8 +2237,17 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
 fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
     let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
     let exe = exe.to_string_lossy().replace('\'', "''");
+    let home = dirs::home_dir()
+        .ok_or_else(|| "couldn't resolve the current Windows profile".to_string())?
+        .to_string_lossy()
+        .replace('\'', "''");
+    let sid = current_windows_user_sid()?.replace('\'', "''");
+    let elevated_args = format!(
+        "--service-do {verb} --service-home \"{home}\" --service-sid {sid}"
+    )
+    .replace('\'', "''");
     let ps = format!(
-        "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '--service-do','{verb}' \
+        "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '{elevated_args}' \
          -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
          catch {{ exit 1223 }}"
     );
@@ -2261,9 +2276,35 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
     }))
 }
 
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String, String> {
+    use std::os::windows::process::CommandExt as _;
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|e| format!("reading the current Windows account SID: {e}"))?;
+    if !out.status.success() {
+        return Err("couldn't read the current Windows account SID".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sid = text
+        .split([',', '"', '\r', '\n'])
+        .map(str::trim)
+        .find(|part| part.starts_with("S-1-"))
+        .ok_or_else(|| "Windows returned no account SID".to_string())?;
+    Ok(sid.to_string())
+}
+
 #[tauri::command]
-async fn service_install() -> Result<Value, String> {
-    service_mutate("install").await
+async fn service_install(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let result = service_mutate("install").await?;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        // Release the medium-integrity transient node. The new service's
+        // console-session supervisor will claim the pipe as SYSTEM.
+        state.node_child.lock().take();
+    }
+    Ok(result)
 }
 #[tauri::command]
 async fn service_start() -> Result<Value, String> {
@@ -2624,11 +2665,31 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args().any(|arg| arg == "--service-bootstrap") {
+        let verb = process_arg_value("--service-bootstrap").unwrap_or_else(|| "install".into());
+        let code = match service_mutate_blocking(&verb) {
+            Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => 0,
+            Ok(_) => 1,
+            Err(e) => {
+                eprintln!("AllMyStuff privileged host setup failed: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     // Elevated service action: `<gui-exe> --service-do <verb>`. On Windows the
     // "Always On" tab re-launches this binary elevated to install/manage the
     // service; here we just run the verb in-process and exit, no webview. (The
     // unix path calls the crate directly and never reaches this.)
     if let Some(verb) = service_do_verb() {
+        if let Some(home) = process_arg_value("--service-home") {
+            std::env::set_var("ALLMYSTUFF_SERVICE_HOME", home);
+        }
+        if let Some(sid) = process_arg_value("--service-sid") {
+            std::env::set_var("ALLMYSTUFF_SERVICE_CLIENT_SID", sid);
+        }
         let code = match service_cmd(&verb) {
             Some(cmd) => match allmystuff_service::run(false, cmd) {
                 Ok(()) => 0,
@@ -2849,6 +2910,33 @@ fn main() {
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
             });
+            // Installer hooks cover new NSIS installs. Existing installations
+            // can arrive here through the self-updater, so migrate the old
+            // Session-0 service exactly once when its ImagePath lacks the new
+            // console-session host arguments. Development builds never prompt.
+            #[cfg(all(windows, not(debug_assertions)))]
+            {
+                let status = allmystuff_service::status_value(false).unwrap_or_default();
+                if status
+                    .get("privileged_host_current")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    let migration_handle = app.handle().clone();
+                    std::thread::spawn(move || match service_mutate_blocking("install") {
+                        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+                            migration_handle
+                                .state::<AppState>()
+                                .node_child
+                                .lock()
+                                .take();
+                            tracing::info!("installed the privileged interactive Windows host");
+                        }
+                        Ok(_) => tracing::warn!("privileged Windows host setup did not complete"),
+                        Err(e) => tracing::warn!("privileged Windows host setup failed: {e}"),
+                    });
+                }
+            }
             tauri::async_runtime::spawn(async move {
                 // One node per machine: reuse the Always-On service's node if
                 // it's up, else spawn a transient one tied to this app's

@@ -2298,13 +2298,29 @@ fn current_windows_user_sid() -> Result<String, String> {
 
 #[tauri::command]
 async fn service_install(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let result = service_mutate("install").await?;
-    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-        // Release the medium-integrity transient node. The new service's
-        // console-session supervisor will claim the pipe as SYSTEM.
-        state.node_child.lock().take();
+    // Release the medium-integrity transient node before the elevated
+    // installer starts its replacement. Older versions did this afterwards,
+    // allowing the GUI node and service session agent to race for one pipe.
+    state.node_child.lock().take();
+    let result = service_mutate("install").await;
+    let installed = result
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("ok"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if installed && !wait_for_node_ready().await {
+        tracing::warn!("installed Windows host did not become ready within the startup grace window");
     }
-    Ok(result)
+    if !installed || !NodeClient::probe().await {
+        // UAC cancellation or a failed service replacement should restore the
+        // temporary node that kept this machine available before the attempt.
+        // The same fallback covers a service that installs but never answers.
+        if let Ok(Some(child)) = ensure_node_running().await {
+            state.node_child.lock().install(child);
+        }
+    }
+    result
 }
 #[tauri::command]
 async fn service_start() -> Result<Value, String> {
@@ -2462,6 +2478,18 @@ fn heal_node(app: &tauri::AppHandle) {
             Err(e) => tracing::error!("couldn't bring the allmystuff node back up: {e:#}"),
         }
     });
+}
+
+/// Give a newly installed Windows service time to launch its console-session
+/// agent and bind the shared control pipe before considering a GUI fallback.
+async fn wait_for_node_ready() -> bool {
+    for _ in 0..50 {
+        if NodeClient::probe().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
 }
 
 /// Apply the persisted startup preferences once the app is built: reveal the
@@ -2915,29 +2943,50 @@ fn main() {
             // Session-0 service exactly once when its ImagePath lacks the new
             // console-session host arguments. Development builds never prompt.
             #[cfg(all(windows, not(debug_assertions)))]
-            {
+            let migrate_privileged_host = {
                 let status = allmystuff_service::status_value(false).unwrap_or_default();
-                if status
+                status
                     .get("privileged_host_current")
                     .and_then(Value::as_bool)
                     != Some(true)
-                {
-                    let migration_handle = app.handle().clone();
-                    std::thread::spawn(move || match service_mutate_blocking("install") {
-                        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
-                            migration_handle
-                                .state::<AppState>()
-                                .node_child
-                                .lock()
-                                .take();
-                            tracing::info!("installed the privileged interactive Windows host");
-                        }
-                        Ok(_) => tracing::warn!("privileged Windows host setup did not complete"),
-                        Err(e) => tracing::warn!("privileged Windows host setup failed: {e}"),
-                    });
-                }
-            }
+            };
+            #[cfg(not(all(windows, not(debug_assertions))))]
+            let migrate_privileged_host = false;
             tauri::async_runtime::spawn(async move {
+                // Migrate first. Starting a temporary GUI node concurrently
+                // made older installs race the old service and replacement
+                // service for the machine control pipe.
+                if migrate_privileged_host {
+                    let migrated = match tokio::task::spawn_blocking(|| {
+                        service_mutate_blocking("install")
+                    })
+                    .await
+                    {
+                        Ok(Ok(value))
+                            if value.get("ok").and_then(Value::as_bool) == Some(true) =>
+                        {
+                            tracing::info!("installed the privileged interactive Windows host");
+                            true
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::warn!("privileged Windows host setup did not complete");
+                            false
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("privileged Windows host setup failed: {e}");
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!("privileged Windows host setup task failed: {e}");
+                            false
+                        }
+                    };
+                    if migrated && !wait_for_node_ready().await {
+                        tracing::warn!(
+                            "migrated Windows host did not become ready; starting the GUI fallback"
+                        );
+                    }
+                }
                 // One node per machine: reuse the Always-On service's node if
                 // it's up, else spawn a transient one tied to this app's
                 // lifetime. The node owns the Mesh and supervises the myownmesh

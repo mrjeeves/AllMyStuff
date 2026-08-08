@@ -314,10 +314,7 @@ fn persist(path: &Option<PathBuf>, exposed: &BTreeMap<String, String>) -> bool {
 /// `~/.myownmesh/allmystuff-sites.json`, honouring `MYOWNMESH_HOME` — the
 /// same home the identity, ownership record, and networks store use.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-sites.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-sites.json"))
 }
 
 #[cfg(test)]

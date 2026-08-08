@@ -155,7 +155,10 @@ cpal = { version = "0.15", optional = true }
 # Cross-platform PTY for the mesh-native terminal — openpty on Unix, ConPTY
 # on Windows — so a terminal session behaves the same across the whole OS
 # matrix without an sshd anywhere.
-portable-pty = { version = "0.9", optional = true }
+# `xpty` is an API-compatible portable-pty fork whose Windows default omits
+# PSEUDOCONSOLE_INHERIT_CURSOR. That flag makes a headless ConPTY wait forever
+# for a DSR cursor reply — exactly the service/session-agent terminal deadlock.
+portable-pty = { package = "xpty", version = "0.3.6", optional = true }
 # Screen capture (PipeWire / AVFoundation; the in-house DXGI path on
 # Windows lives in win_capture.rs).
 xcap = { version = "0.9", optional = true }

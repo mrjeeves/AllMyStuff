@@ -328,10 +328,7 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
 /// `~/.myownmesh/allmystuff-shares.json`, honouring `MYOWNMESH_HOME` — the
 /// same home the control socket, identity, and ownership record use.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-shares.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-shares.json"))
 }
 
 #[cfg(test)]

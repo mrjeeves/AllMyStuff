@@ -139,13 +139,9 @@ const NODE_SOCKET_NAME: &str = "allmystuff-node";
 fn node_socket_addr() -> Result<SocketAddr, String> {
     #[cfg(unix)]
     {
-        let home = std::env::var_os("MYOWNMESH_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(dirs::home_dir)
-            .map(|h| h.join(".myownmesh"))
-            .ok_or_else(|| {
-                "couldn't resolve the ~/.myownmesh home for the node socket".to_string()
-            })?;
+        let home = allmystuff_protocol::myownmesh_state_dir().ok_or_else(|| {
+            "couldn't resolve the ~/.myownmesh home for the node socket".to_string()
+        })?;
         Ok(SocketAddr::Path(home.join("allmystuff-node.sock")))
     }
     #[cfg(not(unix))]

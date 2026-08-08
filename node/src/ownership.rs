@@ -717,10 +717,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> bool {
 /// `~/.myownmesh/allmystuff-ownership.json`, honouring `MYOWNMESH_HOME` —
 /// the same home the control socket and identity use.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-ownership.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-ownership.json"))
 }
 
 /// The start-time claim flag: `ALLMYSTUFF_CLAIMABLE` set to a truthy value.

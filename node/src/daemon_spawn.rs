@@ -187,15 +187,12 @@ impl Drop for DaemonChild {
     }
 }
 
-/// `<MYOWNMESH_HOME or ~>/.myownmesh/allmystuff-daemon.pid` — the record of
+/// `<MYOWNMESH_HOME or ~/.myownmesh>/allmystuff-daemon.pid` — the record of
 /// which `myownmesh` daemon *we* spawned, honouring `MYOWNMESH_HOME` exactly
 /// like [`crate::ownership`]'s store and the control socket. `None` when no
 /// home dir resolves (an ephemeral/test environment with neither set).
 fn daemon_pidfile() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-daemon.pid"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-daemon.pid"))
 }
 
 /// Write `pid` to the daemon pidfile, creating `~/.myownmesh` first. Best
@@ -907,8 +904,8 @@ mod tests {
         let path = daemon_pidfile().expect("a home resolves");
         assert_eq!(
             path,
-            tmp.join(".myownmesh").join("allmystuff-daemon.pid"),
-            "the pidfile lives under <MYOWNMESH_HOME>/.myownmesh"
+            tmp.join("allmystuff-daemon.pid"),
+            "MYOWNMESH_HOME is the state directory itself"
         );
         std::env::remove_var("MYOWNMESH_HOME");
     }

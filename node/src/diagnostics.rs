@@ -62,10 +62,7 @@ fn resolve_debug_logging(env: Option<&str>, stored: Option<bool>) -> bool {
 /// `~/.myownmesh/allmystuff-diagnostics.json`, honoring `MYOWNMESH_HOME` in
 /// the same way as the node socket and the other local stores.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-diagnostics.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-diagnostics.json"))
 }
 
 #[cfg(test)]

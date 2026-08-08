@@ -256,6 +256,13 @@ fn main() -> ExitCode {
 }
 
 fn configure_service_environment() {
+    // A developer service build is deliberately not a release artifact. The
+    // updater compares installed sibling artifacts as well as the semver, so
+    // without this guard a debug binary immediately replaces itself with the
+    // latest same-version release before it can be tested.
+    #[cfg(debug_assertions)]
+    std::env::set_var("ALLMYSTUFF_AUTOUPDATE", "0");
+
     let Some(home) = arg_value("--state-home") else {
         return;
     };
@@ -790,11 +797,7 @@ impl std::io::Write for TeeHandle {
 /// start so each node run leaves a clean, bounded log. `None` — logging falls
 /// back to stdout only — if the home dir can't be resolved or the file opened.
 fn node_log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static> {
-    let dir = std::env::var_os("MYOWNMESH_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)?
-        .join(".myownmesh")
-        .join("logs");
+    let dir = allmystuff_protocol::myownmesh_state_dir()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("node.log");
     let file = std::fs::OpenOptions::new()
@@ -990,19 +993,6 @@ mod winsvc {
         Duration::from_secs(1u64 << short_failures.min(6))
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn rapid_agent_failures_back_off_and_cap() {
-            assert_eq!(restart_delay(1), Duration::from_secs(2));
-            assert_eq!(restart_delay(2), Duration::from_secs(4));
-            assert_eq!(restart_delay(6), Duration::from_secs(64));
-            assert_eq!(restart_delay(100), Duration::from_secs(64));
-        }
-    }
-
     /// A `MakeWriter` over `%ProgramData%\AllMyStuff\logs\service.log` (append),
     /// so a service with no console still leaves a log. `None` if the file
     /// can't be opened, in which case logging falls back to stderr.
@@ -1020,6 +1010,19 @@ mod winsvc {
             .open(path)
             .ok()?;
         Some(move || file.try_clone().expect("clone service log file handle"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rapid_agent_failures_back_off_and_cap() {
+            assert_eq!(restart_delay(1), Duration::from_secs(2));
+            assert_eq!(restart_delay(2), Duration::from_secs(4));
+            assert_eq!(restart_delay(6), Duration::from_secs(64));
+            assert_eq!(restart_delay(100), Duration::from_secs(64));
+        }
     }
 }
 

@@ -134,8 +134,5 @@ fn persist(path: &Option<PathBuf>, value: &Behavior) -> bool {
 /// `~/.myownmesh/allmystuff-window.json` (MYOWNMESH_HOME-overridable), beside
 /// the rest of AllMyStuff's per-user state.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("MYOWNMESH_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
-    Some(home.join(".myownmesh").join("allmystuff-window.json"))
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-window.json"))
 }

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
 
 use crate::byte_queues::ByteQueues;
 
@@ -383,7 +383,10 @@ impl TerminalHost {
                         sb.append(&chunk);
                         let _ = reader_tx.send(OutMsg::Data(chunk));
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!(session = %sid_r, error = %e, "terminal PTY reader stopped");
+                        break;
+                    }
                 }
             }
         });
@@ -398,23 +401,30 @@ impl TerminalHost {
                 match msg {
                     CtlMsg::Data(bytes) => {
                         use std::io::Write as _;
-                        if writer
-                            .write_all(&bytes)
-                            .and_then(|()| writer.flush())
-                            .is_err()
-                        {
+                        if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
                             // Writer dead = shell gone; the wait thread
                             // reports it. Stop accepting input.
+                            tracing::warn!(
+                                session = %sid_c,
+                                error = %e,
+                                "terminal PTY writer stopped"
+                            );
                             break;
                         }
                     }
                     CtlMsg::Resize { cols, rows } => {
-                        let _ = _master.resize(PtySize {
+                        if let Err(e) = _master.resize(PtySize {
                             rows,
                             cols,
                             pixel_width: 0,
                             pixel_height: 0,
-                        });
+                        }) {
+                            tracing::warn!(
+                                session = %sid_c,
+                                error = %e,
+                                "terminal PTY resize failed"
+                            );
+                        }
                     }
                     CtlMsg::Shutdown => {
                         let _ = ctl_killer.kill();
@@ -618,8 +628,12 @@ impl TerminalHost {
         };
         match s.ctl_tx.try_send(msg) {
             Ok(()) => true,
-            Err(_) => {
-                tracing::warn!("terminal {route_id}: input dropped (shell not draining)");
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::warn!("terminal {route_id}: input dropped (shell input queue full)");
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("terminal {route_id}: input refused (PTY writer stopped)");
                 false
             }
         }
@@ -784,7 +798,9 @@ fn dressed(mut cmd: CommandBuilder) -> CommandBuilder {
 }
 
 fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
-    let _ = std::thread::Builder::new().name(name.to_string()).spawn(f);
+    if let Err(e) = std::thread::Builder::new().name(name.to_string()).spawn(f) {
+        tracing::error!(thread = name, error = %e, "couldn't start terminal worker thread");
+    }
 }
 
 #[cfg(test)]
@@ -797,7 +813,6 @@ mod tests {
     /// process-wide runtime, kept alive for the whole test binary, is the only
     /// correct shape. Every async-touching test calls this; all but the first
     /// are no-ops that just ensure it's up.
-    #[cfg(unix)]
     fn ensure_runtime() {
         use std::sync::OnceLock;
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -1246,7 +1261,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn spawn_cmd_echo_and_exit() {
+    fn spawn_cmd_echo_and_exit_without_cursor_handshake() {
+        ensure_runtime();
         let mut cmd = CommandBuilder::new("cmd.exe");
         cmd.arg("/C");
         cmd.arg("echo hello-from-conpty");
@@ -1254,10 +1270,10 @@ mod tests {
         let attach = host.open_with(Some("rw"), "rw", 80, 24, vec![cmd]).unwrap();
         let mut rx = bridge_to_mpsc(attach);
 
-        // ConPTY probes its "terminal" with CSI 6 n (report cursor
-        // position) and holds output until something answers — in the
-        // real app xterm.js answers and the reply rides the route back.
-        // The test plays the emulator: answer every probe it sees.
+        // A headless ConPTY must not request inherited cursor state: the DSR
+        // query blocks service terminals before their first byte of shell I/O.
+        // Count (and answer) any probe so a regression fails explicitly rather
+        // than hanging this test until its deadline.
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut seen: Vec<u8> = Vec::new();
         let mut answered = 0usize;
@@ -1288,6 +1304,10 @@ mod tests {
         assert!(
             transcript.contains("hello-from-conpty"),
             "transcript: {transcript:?}"
+        );
+        assert_eq!(
+            answered, 0,
+            "headless ConPTY unexpectedly requested inherited cursor state"
         );
         assert_eq!(exit, Some(Some(0)));
     }

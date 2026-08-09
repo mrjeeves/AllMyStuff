@@ -3728,7 +3728,9 @@ impl Mesh {
         // Closing it asynchronously here has an ABA race: a same-id re-offer
         // can reclaim lane N before the old MediaLaneClose arrives, and that
         // late close then destroys the replacement stream. Reusing the idle
-        // fixed lane is both cheaper and generation-safe.
+        // fixed lane is both cheaper and generation-safe. Audio agrees now
+        // ([`Self::release_audio_decoder`]) — neither plane hands the daemon
+        // a close, so no lane ever drains into the reaper's recycled m-line.
         self.video_lane_pins.lock().remove(route_id);
         // Viewer side: drop any lane binding that pointed at this route.
         let mut binds = self.video_lane_binds.lock();
@@ -3930,76 +3932,36 @@ impl Mesh {
             .is_current(route_id, generation)
     }
 
-    /// Ask the daemon to close a media lane toward `peer` — the
-    /// lifecycle-side of the pinned-lane free above. Spawned + logged:
-    /// teardown must never block on the daemon, and a failure only means
-    /// the lane idles until the connection ends (the pre-0.2.34 world).
-    fn close_daemon_media_lane(self: &Arc<Self>, peer: &str, kind: &'static str, lane: u8) {
-        let Some(network) = self.network_for_peer(peer) else {
-            return;
-        };
-        let client = self.client.clone();
-        let peer = pubkey_part(peer).to_string();
-        crate::spawn(async move {
-            match client
-                .request(&Request::MediaLaneClose {
-                    network,
-                    peer: peer.clone(),
-                    kind: kind.to_string(),
-                    lane,
-                })
-                .await
-            {
-                Ok(resp) if resp.ok => {
-                    tracing::debug!("closed {kind} lane {lane} toward {}", short_id(&peer));
-                }
-                Ok(resp) => {
-                    tracing::debug!(
-                        "daemon declined {kind} lane close (older daemon?): {:?}",
-                        resp.error
-                    );
-                }
-                Err(e) => tracing::debug!("{kind} lane close failed: {e}"),
-            }
-        });
-    }
-
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
-    /// Opus decoder when it ends — and close the daemon audio lane the
-    /// end freed. Audio lanes are positional, not pinned like video
-    /// ([`Self::audio_lane`]: a route streams on its rank among the
-    /// peer's live Opus routes), so the lane that goes idle is the old
-    /// **top** one — every survivor above the ended route shifts down —
-    /// which is why the index closed here is the survivor count, not the
-    /// ended route's own rank. A survivor mid-shift or a new route racing
-    /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
-    /// window and a write inside it revives the track with no SDP work.
-    fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
+    /// Opus decoder when it ends. That is the whole of it — **no daemon
+    /// lane is closed**, for the same reason the video side gives.
+    ///
+    /// A close is not free the way it looks. The daemon drains the lane,
+    /// and once the drain outlives its grace the reaper removes the track
+    /// and renegotiates — which recycles that m-line. A recycled m-line
+    /// does not reliably re-`ontrack` on the far side (the transport's own
+    /// `PRE_PROVISIONED_LANES` note records the symptom: a stream that sits
+    /// "connecting" with no frames arriving, fixed only by a full peer
+    /// restart). Video already refuses to pay that — it keeps the daemon's
+    /// track alive until the peer connection ends and reuses the idle lane
+    /// — and audio was the one plane still handing the daemon closes to
+    /// reap. Now neither does, so the recycle path never runs at all.
+    ///
+    /// Nothing accumulates. Audio lanes are positional
+    /// ([`Self::audio_lane`]: a route streams on its rank among the peer's
+    /// live Opus routes), so the lanes in use are always `[0, live)` and
+    /// survivors shift down into the vacated one on their own. What stays
+    /// open is the high-water mark of concurrent audio routes to that peer
+    /// — bounded by the pool, silent while idle (no writes, so no RTP), and
+    /// revived by the next write with zero SDP work. Exactly the trade the
+    /// video plane already makes.
+    ///
+    /// Because this now touches only *this* route's decoder, it is safe on
+    /// a route that is still live — the positional close is what used to
+    /// make that hazardous (it would have hit the top-ranked neighbour's
+    /// lane, not this route's).
+    fn release_audio_decoder(&self, route_id: &str) {
         self.audio_decoders.lock().remove(route_id);
-        let Some(peer) = self.route_peer(route_id) else {
-            return;
-        };
-        let cap = self.effective_audio_lanes(&peer);
-        if cap == 0 {
-            return;
-        }
-        // Excluding the ended route by id (rather than trusting it to be
-        // gone) keeps the count right at every call site: teardown leaves
-        // the route in the session map (only flipped to TornDown), and
-        // the StopMedia effect can run either side of that flip.
-        let survivors = self
-            .sorted_media_routes(&peer, true, "opus")
-            .iter()
-            .filter(|id| id.as_str() != route_id)
-            .count();
-        // Lanes [0, survivors) are still owned; lane `survivors` is the
-        // one this end vacated — when it had one at all. An overflow
-        // route beyond the pool frees nothing (survivors >= cap), and
-        // closing a lane that never opened is the daemon's idempotent
-        // no-op, so a non-Opus route ending here costs nothing.
-        if survivors < cap as usize {
-            self.close_daemon_media_lane(&peer, "audio", survivors as u8);
-        }
     }
 
     /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
@@ -5138,7 +5100,7 @@ impl Mesh {
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
-        self.release_audio_lanes(&route_id);
+        self.release_audio_decoder(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
         self.drive_mounts.stop(&route_id);
@@ -6861,7 +6823,7 @@ impl Mesh {
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
-                    self.release_audio_lanes(&id);
+                    self.release_audio_decoder(&id);
                     // A control route ending mid-chord must not leave this
                     // machine holding the keys it injected.
                     self.injector.release_route(&id);
@@ -9763,12 +9725,13 @@ impl Mesh {
                                     "opus encoder for {} failed ({e}) — falling back to PCM frames",
                                     route.id
                                 );
-                                // Decoder drop only — NOT release_audio_lanes:
-                                // the route is still live (it keeps its rank in
-                                // the peer's Opus order), so the positional
-                                // close there would hit the top-ranked
-                                // neighbour's lane, not this route's.
-                                self.audio_decoders.lock().remove(&route.id);
+                                // Safe on a live route now that this only
+                                // drops the route's own decoder — it used to
+                                // also close a lane by rank, which on a route
+                                // that keeps its place in the peer's Opus
+                                // order would have hit the top-ranked
+                                // neighbour's lane instead of this one's.
+                                self.release_audio_decoder(&route.id);
                                 None
                             }
                         }

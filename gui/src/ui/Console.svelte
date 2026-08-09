@@ -1365,16 +1365,20 @@
     activeRegion = fw && fh ? activeRegionForAspect(ratio, fw, fh) : { x0: 0, y0: 0, x1: 1, y1: 1 };
   });
 
-  // The KVM rule: with control live, the window under the mouse is the one
-  // your keyboard should reach — claim focus on hover, no click in between (a
-  // click would go to the *remote*). Raise the OS window AND pin keyboard
-  // focus on the stage element: setFocus() alone doesn't reliably push
-  // document focus into the webview on hover-without-click, so without the
-  // element focus the key handlers (now on the stage) never fire in a
-  // dedicated console window. Gated on the document not already holding focus
-  // so it never steals focus from an open bar menu once the window is active —
-  // and parked entirely while the soft keyboard types (its hidden input owns
-  // focus; stealing it drops the OS keyboard mid-word).
+  // The KVM rule: with control live, the window your keyboard should reach is
+  // the one you're working in — claimed without a click in between, because a
+  // click would go to the *remote*. Raise the OS window AND pin keyboard focus
+  // on the stage element: setFocus() alone doesn't reliably push document
+  // focus into the webview without a click, so without the element focus the
+  // key handlers (now on the stage) never fire in a dedicated console window.
+  //
+  // Callers decide *when* this is allowed to fire, and a bare hover is not one
+  // of the times (see the pointer-move handler): with several consoles open,
+  // crossing one en route to somewhere else would yank focus off whatever you
+  // were doing. Gated here on the document not already holding focus so it
+  // never steals from an open bar menu once the window is active — and parked
+  // entirely while the soft keyboard types (its hidden input owns focus;
+  // stealing it drops the OS keyboard mid-word).
   function claimFocus() {
     if (keysOpen) return;
     if (document.hasFocus()) return;
@@ -1583,8 +1587,16 @@
       return;
     }
     // Keep keyboard focus on the stage whenever control is on (even over a
-    // camera input, where pointer forwarding is off but typing still flows).
-    if (app.consoleControl) claimFocus();
+    // camera input, where pointer forwarding is off but typing still flows) —
+    // but only while a button is held. A bare hover raising and stealing the
+    // OS window is the KVM rule taken too literally: with several console
+    // windows open, just crossing one on the way somewhere else yanks focus
+    // off whatever you were doing. A held button means a *drag*, which is the
+    // one move that genuinely has to carry focus with it — dragging from one
+    // screen's window onto another must land on the window it ends over. A
+    // click still pins focus outright (see the button handler), so nothing
+    // that needs focus deliberately has lost a way to ask for it.
+    if (app.consoleControl && e.buttons !== 0) claimFocus();
     if (!stagePointerActive) {
       if (panFrom && view.scale > 1.001) {
         setView({

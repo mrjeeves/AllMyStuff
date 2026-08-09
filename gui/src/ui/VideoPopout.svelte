@@ -418,15 +418,17 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
 
-  // The KVM rule: with control live, the window under the mouse is the one
-  // the keyboard should reach — claim focus on hover, no click in between (a
-  // click would go to the *remote*). Raise the OS window AND pin keyboard
-  // focus on the surface element: `setFocus()` alone doesn't reliably push
-  // document focus into the webview on a hover-without-click, so without the
-  // element focus the key handlers (now on `stageEl`) never fire and only the
-  // already-focused window — usually the main one — could drive. Gated on the
-  // document not already holding focus so it never steals focus from an open
-  // pill menu once this window is active.
+  // The KVM rule: with control live, the window your keyboard should reach is
+  // the one you're working in — claimed without a click in between, because a
+  // click would go to the *remote*. Raise the OS window AND pin keyboard focus
+  // on the surface element: `setFocus()` alone doesn't reliably push document
+  // focus into the webview without a click, so without the element focus the
+  // key handlers (now on `stageEl`) never fire and only the already-focused
+  // window — usually the main one — could drive.
+  //
+  // Callers decide *when*; a bare hover is deliberately not one of the times
+  // (see `onPointerMove`). Gated here on the document not already holding
+  // focus so it never steals from an open pill menu once this window is active.
   function claimFocus() {
     if (document.hasFocus()) return;
     void focusThisWindow();
@@ -470,7 +472,11 @@
       }
       return;
     }
-    claimFocus();
+    // Only a drag carries focus — see the console's pointer-move note. A
+    // popped-out monitor sitting on a second display is exactly what a bare
+    // hover crosses by accident, so hovering it must not raise it; a held
+    // button (dragging across screens) still must.
+    if (e.buttons !== 0) claimFocus();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = norm(e);

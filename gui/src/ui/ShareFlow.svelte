@@ -19,9 +19,11 @@
   let chosen = $state<Set<ShareCap>>(new Set());
 
   const CAPS: { key: ShareCap; label: string; icon: string; popout?: boolean; note?: string; requires?: ShareCap }[] = [
-    { key: "video", label: "Video", icon: "🖥", note: "screen" },
-    { key: "audio", label: "Audio", icon: "🔊" },
-    { key: "control", label: "Control & clipboard", icon: "🕹", requires: "video" },
+    // One row for the console. Screen, sound, keyboard/mouse and clipboard
+    // are still four separate grants underneath — but they were never four
+    // separate *decisions*, and offering them separately only ever produced a
+    // console that came up half-dead.
+    { key: "console", label: "Remote control", icon: "🕹", note: "screen, sound, keyboard & mouse" },
     { key: "terminal", label: "Terminal", icon: "📟", popout: true },
     { key: "files", label: "Files", icon: "🗂", popout: true },
     { key: "sites", label: "Sites", icon: "🌐", popout: true },

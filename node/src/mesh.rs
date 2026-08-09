@@ -3728,7 +3728,9 @@ impl Mesh {
         // Closing it asynchronously here has an ABA race: a same-id re-offer
         // can reclaim lane N before the old MediaLaneClose arrives, and that
         // late close then destroys the replacement stream. Reusing the idle
-        // fixed lane is both cheaper and generation-safe.
+        // fixed lane is both cheaper and generation-safe. Audio agrees now
+        // ([`Self::release_audio_decoder`]) — neither plane hands the daemon
+        // a close, so no lane ever drains into the reaper's recycled m-line.
         self.video_lane_pins.lock().remove(route_id);
         // Viewer side: drop any lane binding that pointed at this route.
         let mut binds = self.video_lane_binds.lock();
@@ -3930,76 +3932,36 @@ impl Mesh {
             .is_current(route_id, generation)
     }
 
-    /// Ask the daemon to close a media lane toward `peer` — the
-    /// lifecycle-side of the pinned-lane free above. Spawned + logged:
-    /// teardown must never block on the daemon, and a failure only means
-    /// the lane idles until the connection ends (the pre-0.2.34 world).
-    fn close_daemon_media_lane(self: &Arc<Self>, peer: &str, kind: &'static str, lane: u8) {
-        let Some(network) = self.network_for_peer(peer) else {
-            return;
-        };
-        let client = self.client.clone();
-        let peer = pubkey_part(peer).to_string();
-        crate::spawn(async move {
-            match client
-                .request(&Request::MediaLaneClose {
-                    network,
-                    peer: peer.clone(),
-                    kind: kind.to_string(),
-                    lane,
-                })
-                .await
-            {
-                Ok(resp) if resp.ok => {
-                    tracing::debug!("closed {kind} lane {lane} toward {}", short_id(&peer));
-                }
-                Ok(resp) => {
-                    tracing::debug!(
-                        "daemon declined {kind} lane close (older daemon?): {:?}",
-                        resp.error
-                    );
-                }
-                Err(e) => tracing::debug!("{kind} lane close failed: {e}"),
-            }
-        });
-    }
-
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
-    /// Opus decoder when it ends — and close the daemon audio lane the
-    /// end freed. Audio lanes are positional, not pinned like video
-    /// ([`Self::audio_lane`]: a route streams on its rank among the
-    /// peer's live Opus routes), so the lane that goes idle is the old
-    /// **top** one — every survivor above the ended route shifts down —
-    /// which is why the index closed here is the survivor count, not the
-    /// ended route's own rank. A survivor mid-shift or a new route racing
-    /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
-    /// window and a write inside it revives the track with no SDP work.
-    fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
+    /// Opus decoder when it ends. That is the whole of it — **no daemon
+    /// lane is closed**, for the same reason the video side gives.
+    ///
+    /// A close is not free the way it looks. The daemon drains the lane,
+    /// and once the drain outlives its grace the reaper removes the track
+    /// and renegotiates — which recycles that m-line. A recycled m-line
+    /// does not reliably re-`ontrack` on the far side (the transport's own
+    /// `PRE_PROVISIONED_LANES` note records the symptom: a stream that sits
+    /// "connecting" with no frames arriving, fixed only by a full peer
+    /// restart). Video already refuses to pay that — it keeps the daemon's
+    /// track alive until the peer connection ends and reuses the idle lane
+    /// — and audio was the one plane still handing the daemon closes to
+    /// reap. Now neither does, so the recycle path never runs at all.
+    ///
+    /// Nothing accumulates. Audio lanes are positional
+    /// ([`Self::audio_lane`]: a route streams on its rank among the peer's
+    /// live Opus routes), so the lanes in use are always `[0, live)` and
+    /// survivors shift down into the vacated one on their own. What stays
+    /// open is the high-water mark of concurrent audio routes to that peer
+    /// — bounded by the pool, silent while idle (no writes, so no RTP), and
+    /// revived by the next write with zero SDP work. Exactly the trade the
+    /// video plane already makes.
+    ///
+    /// Because this now touches only *this* route's decoder, it is safe on
+    /// a route that is still live — the positional close is what used to
+    /// make that hazardous (it would have hit the top-ranked neighbour's
+    /// lane, not this route's).
+    fn release_audio_decoder(&self, route_id: &str) {
         self.audio_decoders.lock().remove(route_id);
-        let Some(peer) = self.route_peer(route_id) else {
-            return;
-        };
-        let cap = self.effective_audio_lanes(&peer);
-        if cap == 0 {
-            return;
-        }
-        // Excluding the ended route by id (rather than trusting it to be
-        // gone) keeps the count right at every call site: teardown leaves
-        // the route in the session map (only flipped to TornDown), and
-        // the StopMedia effect can run either side of that flip.
-        let survivors = self
-            .sorted_media_routes(&peer, true, "opus")
-            .iter()
-            .filter(|id| id.as_str() != route_id)
-            .count();
-        // Lanes [0, survivors) are still owned; lane `survivors` is the
-        // one this end vacated — when it had one at all. An overflow
-        // route beyond the pool frees nothing (survivors >= cap), and
-        // closing a lane that never opened is the daemon's idempotent
-        // no-op, so a non-Opus route ending here costs nothing.
-        if survivors < cap as usize {
-            self.close_daemon_media_lane(&peer, "audio", survivors as u8);
-        }
     }
 
     /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
@@ -5138,7 +5100,7 @@ impl Mesh {
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
-        self.release_audio_lanes(&route_id);
+        self.release_audio_decoder(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
         self.drive_mounts.stop(&route_id);
@@ -6679,6 +6641,69 @@ impl Mesh {
         }
     }
 
+    /// This device's fleet siblings, canonical and excluding self — who a share
+    /// extended to *this fleet* should also reach.
+    ///
+    /// Read from the **verified** membership only: the closed network's signed
+    /// roster ([`Mesh::fleet_authorized`]) plus, when we're the owner, our own
+    /// durable admit records. Advertised ownership is deliberately not
+    /// consulted — it's self-asserted, and a fleet list assembled from it would
+    /// let any node talk its way into a share by claiming the right owner.
+    /// Empty when not in a fleet, which degrades to exactly the old
+    /// one-device behaviour.
+    fn fleet_siblings(&self) -> Vec<NodeId> {
+        let me = self.local_node_id().unwrap_or_default();
+        let me = pubkey_part(&me).to_string();
+        let mut out: Vec<NodeId> = Vec::new();
+        let mut push = |canon: &str| {
+            if canon != me && !out.iter().any(|n| n.as_str() == canon) {
+                out.push(NodeId::from(canon));
+            }
+        };
+        for d in self.fleet_authorized.lock().iter() {
+            push(pubkey_part(d));
+        }
+        for m in self.ownership.fleet_members() {
+            push(pubkey_part(m.device.as_str()));
+        }
+        out
+    }
+
+    /// Pass a share this device just accepted on to the rest of the fleet.
+    ///
+    /// A share is one machine extended to a whole *fleet*, but the invite only
+    /// ever lands on the one device the sharer picked. Without this the other
+    /// machines never learn the grants exist, so they never show the consoles
+    /// they were granted — the receiving half of the same "people bring fleets"
+    /// promise that [`Shares::vouch_siblings`] handles on the sharer's side.
+    ///
+    /// Best-effort and fire-and-forget: a sibling that's offline simply learns
+    /// on the next invite or re-share, and this must never hold up the ack the
+    /// sharer is waiting on.
+    async fn relay_share_to_fleet(&self, source: &NodeId, name: &str, grants: &[Grant]) {
+        if grants.is_empty() {
+            return;
+        }
+        let source_canon = pubkey_part(source.as_str()).to_string();
+        for sibling in self.fleet_siblings() {
+            // Never relay a fleet member's own share back at it.
+            if sibling.as_str() == source_canon {
+                continue;
+            }
+            let msg = ControlMessage::Share(ShareControl::FleetShare {
+                source: NodeId::from(source_canon.as_str()),
+                name: name.to_string(),
+                grants: grants.to_vec(),
+            });
+            if let Err(e) = self.send_control(sibling.as_str(), &msg).await {
+                tracing::debug!(
+                    "couldn't relay the share to fleet sibling {}: {e}",
+                    short_id(sibling.as_str())
+                );
+            }
+        }
+    }
+
     /// Apply an inbound share-control message. Unlike app-control or a
     /// privileged offer, this is **not** gated on `sender_may_control`: a share
     /// is person-to-person, so the sharer is never the recipient's owner/fleet.
@@ -6690,7 +6715,7 @@ impl Mesh {
         match message {
             ShareControl::Invite { from: body, grants } => {
                 let person = self.peer_person(&from, Some(&body.name));
-                self.shares.record_inbound(&person, &from, grants);
+                self.shares.record_inbound(&person, &from, grants.clone());
                 self.emit_snapshot();
                 self.sink.emit(
                     "allmystuff://share",
@@ -6698,21 +6723,78 @@ impl Mesh {
                 );
                 // Acknowledge, carrying any grants I already extend back — so
                 // sharing can be mutual in one round trip (empty if I've granted
-                // them nothing; the ack never *mints* an outbound grant).
+                // them nothing; the ack never *mints* an outbound grant) — and
+                // this fleet's other devices, so the share they extended to
+                // *us* reaches all of them rather than only this machine.
                 let back = self.shares.out_grants_for(&person.id);
-                let reply = ControlMessage::Share(ShareControl::Accept { grants: back });
+                let reply = ControlMessage::Share(ShareControl::Accept {
+                    grants: back,
+                    fleet: self.fleet_siblings(),
+                });
                 if let Err(e) = self.send_control(from.as_str(), &reply).await {
                     tracing::warn!("couldn't ack share from {}: {e}", short_id(from.as_str()));
                 }
+                // One machine accepts; the whole fleet needs to know, or the
+                // rest never show the consoles they were granted.
+                self.relay_share_to_fleet(&from, &person.name, &grants)
+                    .await;
             }
-            ShareControl::Accept { grants } => {
+            ShareControl::Accept { grants, fleet } => {
                 let person = self.peer_person(&from, None);
                 self.shares.record_inbound(&person, &from, grants);
+                // Their fleet, vouched for by a device already inside this
+                // share — so a console we shared with *them* opens from any of
+                // their machines, not just the one we happened to invite.
+                if !fleet.is_empty() && self.shares.vouch_siblings(from.as_str(), &fleet) {
+                    tracing::info!(
+                        "{} vouched {} fleet sibling(s) into its share",
+                        short_id(from.as_str()),
+                        fleet.len()
+                    );
+                }
                 self.emit_snapshot();
                 self.sink.emit(
                     "allmystuff://share",
                     json!({ "from": from.to_string(), "kind": "accept", "person": person.name }),
                 );
+            }
+            ShareControl::FleetShare {
+                source,
+                name,
+                grants,
+            } => {
+                // Only our own owner/fleet may tell us what our fleet holds.
+                // Anyone else is ignored — nobody talks a machine into
+                // believing it has a share. (Even accepted it grants nothing
+                // here: an inbound grant only widens what we may *pull*, and
+                // the far side enforces its own grants regardless.)
+                if !self.sender_may_control(from.as_str()) {
+                    tracing::warn!(
+                        "fleet share relay from {} ignored: not owner/fleet",
+                        short_id(from.as_str())
+                    );
+                    return;
+                }
+                // Keyed off the *granting* device, exactly as a direct invite
+                // is — so every device in the fleet lands on the same person
+                // record the accepting one did.
+                let person = self.peer_person(&source, Some(&name));
+                if self.shares.record_inbound(&person, &source, grants) {
+                    tracing::info!(
+                        "learned a share from {} via fleet sibling {}",
+                        short_id(source.as_str()),
+                        short_id(from.as_str())
+                    );
+                    self.emit_snapshot();
+                    self.sink.emit(
+                        "allmystuff://share",
+                        json!({
+                            "from": source.to_string(),
+                            "kind": "invite",
+                            "person": person.name,
+                        }),
+                    );
+                }
             }
             ShareControl::Decline => {
                 tracing::info!("share declined by {}", short_id(from.as_str()));
@@ -6861,7 +6943,7 @@ impl Mesh {
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
-                    self.release_audio_lanes(&id);
+                    self.release_audio_decoder(&id);
                     // A control route ending mid-chord must not leave this
                     // machine holding the keys it injected.
                     self.injector.release_route(&id);
@@ -8900,10 +8982,29 @@ impl Mesh {
     }
 
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
-    /// from the fleet's closed-network **signed roster** (`RosterList`). No
-    /// fleet → clear it (only the owner, via the direct check in
-    /// `sender_may_control`, may control). Daemon unreachable → keep the prior
-    /// cache rather than briefly denying a legitimate controller.
+    /// from the fleet's closed-network **signed roster** (`RosterList`).
+    ///
+    /// Exactly one thing empties this cache: not being in a fleet at all. Every
+    /// other outcome keeps whatever we last knew, because on a joined closed
+    /// network there is no such thing as a truthful empty roster — the signed
+    /// roster always lists at least this device. An empty read therefore means
+    /// the roster is momentarily *unreadable* (the closed network mid-(re)join),
+    /// never that the fleet emptied, and installing it would deny every
+    /// legitimate controller on the strength of an answer that isn't one.
+    ///
+    /// This is the same resilience [`Mesh::fleet_roster_value`] already gives
+    /// the roster the GUI renders, via `fleet_roster_cache` — the difference
+    /// being that when the *display* flickers you see the wrong member list for
+    /// a moment, and when this flickers keyboard and mouse stop working. Only
+    /// the display path had it, which is what produced "the picture is fine but
+    /// control is refused, and the far side says I'm not in the fleet roster":
+    /// media is authorized once at the offer ([`Self::sender_may_source_media`])
+    /// and so survives the gap, while input is authorized *per frame*
+    /// ([`Self::sender_may_drive_admitted`]) and dies inside it.
+    ///
+    /// A non-empty read always replaces the cache, so an eviction still bites
+    /// the instant the roster is readable again — a removed member is never
+    /// resurrected.
     async fn refresh_fleet_authorization(self: &Arc<Self>) {
         let Some(network) = self.ownership.fleet_network_id() else {
             self.fleet_authorized.lock().clear();
@@ -8911,6 +9012,8 @@ impl Mesh {
         };
         let data = match self.client.request(&Request::RosterList { network }).await {
             Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            // Daemon unreachable — keep the prior cache rather than briefly
+            // denying a legitimate controller.
             _ => return,
         };
         let mut set = std::collections::HashSet::new();
@@ -8920,6 +9023,21 @@ impl Mesh {
                     set.insert(pubkey_part(id).to_string());
                 }
             }
+        }
+        if set.is_empty() {
+            // Loud, because the alternative is a machine that silently refuses
+            // every keystroke: this is the one state where the roster and the
+            // fleet disagree, and it's worth seeing in a log when someone asks
+            // why control stopped.
+            if self.diag_ok("fleet-auth-empty") {
+                tracing::warn!(
+                    "signed fleet roster read back empty — the closed network is likely \
+                     mid-(re)join; keeping the {} device(s) already authorized rather than \
+                     refusing them",
+                    self.fleet_authorized.lock().len()
+                );
+            }
+            return;
         }
         *self.fleet_authorized.lock() = set;
     }
@@ -9763,12 +9881,13 @@ impl Mesh {
                                     "opus encoder for {} failed ({e}) — falling back to PCM frames",
                                     route.id
                                 );
-                                // Decoder drop only — NOT release_audio_lanes:
-                                // the route is still live (it keeps its rank in
-                                // the peer's Opus order), so the positional
-                                // close there would hit the top-ranked
-                                // neighbour's lane, not this route's.
-                                self.audio_decoders.lock().remove(&route.id);
+                                // Safe on a live route now that this only
+                                // drops the route's own decoder — it used to
+                                // also close a lane by rank, which on a route
+                                // that keeps its place in the peer's Opus
+                                // order would have hit the top-ranked
+                                // neighbour's lane instead of this one's.
+                                self.release_audio_decoder(&route.id);
                                 None
                             }
                         }
@@ -12666,11 +12785,24 @@ impl Mesh {
     /// mic. Owner and fleet may source anything; a dialed CEC technician's live
     /// `ScreenView` consent covers the screen kinds (`Display`/`Video`; audio is
     /// not part of the CEC consent model); otherwise it takes an explicit
-    /// person-to-person share this device extended that lets that person
-    /// *consume* this media on this capability (the "Receive your screen"
-    /// grant). Mirrors the owner/fleet → CEC → share layering of
-    /// [`Self::may_drive`]; screen viewing stays gated here at the offer (and
-    /// torn down by [`Self::spawn_cec_consent_sweep`]), never per frame.
+    /// person-to-person share this device extended over this capability.
+    /// Mirrors the owner/fleet → CEC → share layering of [`Self::may_drive`];
+    /// screen viewing stays gated here at the offer (and torn down by
+    /// [`Self::spawn_cec_consent_sweep`]), never per frame.
+    ///
+    /// The grant's role is keyed to **the end of the route being authorized**,
+    /// not to who ends up watching. `Catalog::authorize` is the model:
+    ///
+    /// ```text
+    /// check_endpoint(&route.from, media, GrantRole::Provide)  // the source end
+    /// check_endpoint(&route.to,   media, GrantRole::Consume)  // the sink end
+    /// ```
+    ///
+    /// This gate is the *source* end — the capability being captured is
+    /// `route.from`, here on this machine — so the grant it needs is `Provide`.
+    /// Reading "they *receive* my screen, so the grant is Consume" is the trap:
+    /// that describes the far end, which lives on their machine and is checked
+    /// by their catalog.
     fn sender_may_source_media(&self, sender: &str, route: &Route) -> bool {
         if self.sender_may_control(sender) {
             return true;
@@ -12684,16 +12816,16 @@ impl Mesh {
         {
             return true;
         }
-        // An explicit share this device extended letting that person consume
-        // exactly this media on this capability (honours capability pinning and
-        // the media/role scope via the canonical `Grant::permits`).
+        // An explicit share this device extended over exactly this capability
+        // (honours capability pinning and the media/role scope via the canonical
+        // `Grant::permits`).
         let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
             return false;
         };
         self.shares.out_grants_for(&person.id).iter().any(|g| {
             g.permits(
                 route.media,
-                allmystuff_graph::GrantRole::Consume,
+                allmystuff_graph::GrantRole::Provide,
                 &route.from,
             )
         })
@@ -13523,14 +13655,32 @@ impl Mesh {
     /// blocking the caller — waiting for the link is
     /// [`Self::send_control_reliable`]'s job.
     ///
-    /// Every candidate network is dialed rather than stopping at the first the
-    /// daemon accepts: unlike a send, a dial's "ok" only means the request was
-    /// taken, so an early return could leave us dialing a network the peer
-    /// doesn't live on. Best-effort throughout — a failure here just means the
-    /// reliable send has to wait longer for the engine to get there on its own.
+    /// **Only meshes we have evidence the peer lives on are dialed.** With a
+    /// proven `peer_networks` slot — set by a daemon-confirmed send or an
+    /// inbound frame — that one mesh is the answer and the rest are noise. Only
+    /// a peer we have no evidence for at all falls back to the full candidate
+    /// list, and then every candidate is tried rather than stopping at the
+    /// first the daemon accepts, because a dial's "ok" only means the request
+    /// was taken.
+    ///
+    /// Fanning out unconditionally was wrong in a way worth naming: it dialed
+    /// ordinary peers into `cecsupport-clients` and the claim rendezvous, which
+    /// are **signaling-only directories** that are never meant to carry a
+    /// session (`cec::help_network_config` sets `auto_approve: false` precisely
+    /// so a stray one-sided dial can't become an admitted link). Best-effort
+    /// throughout — a failure here just means the reliable send waits longer
+    /// for the engine to get there on its own.
     async fn ensure_peer_link(&self, peer: &str) {
         let canon = pubkey_part(peer).to_string();
-        for network in self.peer_network_candidates(peer) {
+        let proven = {
+            let st = self.state.lock();
+            st.peer_networks.get(&canon).cloned()
+        };
+        let targets = match proven {
+            Some(network) => vec![network],
+            None => self.peer_network_candidates(peer),
+        };
+        for network in targets {
             match self
                 .client
                 .request(&Request::NetworkConnectPeer {
@@ -15737,6 +15887,67 @@ mod tests {
         // owner/fleet rule) is what keeps it to explicitly-shared files.
         let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
         assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    /// The grant role is keyed to the *end of the route being authorized*, not
+    /// to who ends up watching. `sender_may_source_media` gates the **source**
+    /// end (this machine's screen is `route.from`), so it needs `Provide` —
+    /// exactly what `Catalog::authorize` checks that end with, and exactly what
+    /// the share builder mints for "see its screen".
+    ///
+    /// Asking for `Consume` there instead reads plausibly ("they receive my
+    /// screen") and denies every screen share ever granted: `Provide` fails
+    /// `allows_sink()`. It stayed invisible because the drive planes never hit
+    /// this path — `grant_authorizes_plane` checks the role only for input, and
+    /// terminal/files/sites match on the capability suffix alone — so terminal
+    /// and files worked over a share while its screen was refused.
+    #[test]
+    fn a_screen_share_is_authorized_at_the_source_end_it_actually_gates() {
+        use allmystuff_graph::{Grant, GrantRole, MediaKind};
+
+        let alex = allmystuff_graph::PersonId::from("person:alex");
+        let screen: allmystuff_graph::CapabilityId = "me-A3285:screen".into();
+        // What the share builder mints for "see its screen": the source
+        // capability, role Provide.
+        let granted = Grant::scoped(
+            &alex,
+            MediaKind::Display,
+            GrantRole::Provide,
+            Some(screen.clone()),
+            "see its screen",
+        );
+
+        // The role this gate must ask for — the source end's role.
+        assert!(
+            granted.permits(MediaKind::Display, GrantRole::Provide, &screen),
+            "the minted share grant must authorize the source end it names"
+        );
+        // The role the gate used to ask for, and why every screen share died.
+        assert!(
+            !granted.permits(MediaKind::Display, GrantRole::Consume, &screen),
+            "Consume is the sink end's role — asking for it here denies every screen share"
+        );
+
+        // The audio share rides the same shape (`system-audio`, Provide), so it
+        // was broken and is fixed by the same pairing.
+        let sound: allmystuff_graph::CapabilityId = "me-A3285:system-audio".into();
+        let audio = Grant::scoped(
+            &alex,
+            MediaKind::Audio,
+            GrantRole::Provide,
+            Some(sound.clone()),
+            "hear its audio",
+        );
+        assert!(audio.permits(MediaKind::Audio, GrantRole::Provide, &sound));
+        assert!(!audio.permits(MediaKind::Audio, GrantRole::Consume, &sound));
+
+        // The pin is still a pin: a grant over the screen authorizes nothing
+        // else on the machine.
+        assert!(!granted.permits(
+            MediaKind::Display,
+            GrantRole::Provide,
+            &"me-A3285:cam".into()
+        ));
     }
 
     #[test]

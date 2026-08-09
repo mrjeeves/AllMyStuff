@@ -1107,6 +1107,41 @@ pub enum ShareControl {
     Accept {
         #[serde(default)]
         grants: Vec<Grant>,
+        /// The invitee's **fleet siblings** — the other devices a share with
+        /// this person is meant to reach.
+        ///
+        /// A share is one machine of mine extended to a whole fleet, but the
+        /// invite only ever reaches the one device the sharer picked, and the
+        /// sharer authorizes by *node*. Without this the share works from that
+        /// device and is refused from every other machine of theirs.
+        ///
+        /// This is a **vouch, not an assertion**: the sharer binds these only
+        /// into the share the authenticated sender already belongs to. A device
+        /// can't add itself, and a stranger's list binds nothing — only a peer
+        /// already inside a share can widen it, and only to that share.
+        /// Absent from an older peer, which simply keeps the one-device
+        /// behaviour.
+        #[serde(default)]
+        fleet: Vec<NodeId>,
+    },
+    /// A fleet sibling relaying a share **our** fleet was granted, so every
+    /// device knows about it — not just the one that happened to accept.
+    ///
+    /// Accepted only from this device's owner or a signed-roster fleet member;
+    /// from anyone else it's ignored, so nobody can talk a machine into
+    /// believing it holds a share. Safe by construction even so: these are
+    /// *inbound* grants, which only ever widen what we may pull from them, and
+    /// the far side enforces its own grants regardless.
+    FleetShare {
+        /// The device that extended the grants. The person is derived from
+        /// this — never from a self-asserted id — exactly as an inbound invite
+        /// is keyed by its authenticated sender.
+        source: NodeId,
+        /// Their display name. UI only.
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        grants: Vec<Grant>,
     },
     /// The invitee declines.
     Decline,

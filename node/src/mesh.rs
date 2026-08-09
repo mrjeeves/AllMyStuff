@@ -531,6 +531,18 @@ const MAX_JPEG_CHUNK_BYTES: usize = 40 * 1024;
 /// keystrokes instead of wedging the channel behind one giant message.
 const MAX_TERM_DATA_BYTES: usize = 16 * 1024;
 
+/// How long the daemon holds a route offer for a peer whose link isn't up
+/// yet, retransmitting it across session rebuilds.
+///
+/// Sized to cover a genuinely *cold* connect, because that is the case this
+/// exists for: the engine's hello schedule runs out to 10 s
+/// (`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`) and a connecting peer isn't given up
+/// on until `DATA_CHANNEL_OPEN_TIMEOUT_MS` (30 s). A TTL under that would
+/// expire the offer while the link it's waiting for is still legitimately
+/// being built — the exact race that made a share "fail" when it was merely
+/// slow.
+const ROUTE_OFFER_TTL: Duration = Duration::from_secs(30);
+
 /// A terminal host whose sends keep failing this long (viewer offline,
 /// network gone) kills the shell and tears the route down — nothing else
 /// reaps a session whose peer silently vanished.
@@ -4907,35 +4919,68 @@ impl Mesh {
                 );
             }
         }
+        // No mesh in common is a misconfiguration, not a slow link — fail it
+        // here rather than spending the offer's whole TTL discovering it.
+        if self.peer_network_candidates(&peer).is_empty() {
+            let mut st = self.state.lock();
+            if let Some(s) = st.session.as_mut() {
+                let _ = s.teardown(&route.id);
+            }
+            return Err(format!("no shared network with {peer}"));
+        }
+        // Bring the link up before offering over it. Cheap and idempotent when
+        // the session is already live (every fleet console), and the whole
+        // difference between connecting and not when it isn't.
+        self.ensure_peer_link(&peer).await;
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
             s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
         };
-        if let Err(e) = self.send_control(&peer, &msg).await {
-            // The peer never saw the offer — drop it rather than leave a
-            // phantom half-open route in the session.
-            tracing::warn!(
-                "route {} offer to {} undeliverable: {e}",
-                route.id,
-                short_id(&peer)
-            );
-            let mut st = self.state.lock();
-            if let Some(s) = st.session.as_mut() {
-                let _ = s.teardown(&route.id);
-            }
-            return Err(e);
+        // Hand the offer to the daemon's acknowledged delivery and return —
+        // the route is legitimately "connecting" while a cold link is built,
+        // and blocking here would freeze the console for the length of it.
+        // Only a TTL that actually lapses tears the route down, so the failure
+        // the user sees is "this peer never came up", not "you clicked while
+        // the link was still settling".
+        {
+            let mesh = self.clone();
+            let peer = peer.clone();
+            let route_id = route.id.clone();
+            crate::spawn(async move {
+                let Err(e) = mesh
+                    .send_control_reliable(&peer, &msg, ROUTE_OFFER_TTL)
+                    .await
+                else {
+                    // The accept lands moments later as the route's "active"
+                    // line; the silence after this is the tell that the peer
+                    // took the offer and never answered it.
+                    tracing::info!(
+                        "route {route_id} offered to {} — awaiting accept",
+                        short_id(&peer)
+                    );
+                    return;
+                };
+                // The peer never took the offer inside the TTL — drop it
+                // rather than leave a phantom half-open route in the session.
+                tracing::warn!(
+                    "route {route_id} offer to {} undeliverable: {e}",
+                    short_id(&peer)
+                );
+                {
+                    let mut st = mesh.state.lock();
+                    if let Some(s) = st.session.as_mut() {
+                        let _ = s.teardown(&route_id);
+                    }
+                }
+                mesh.emit_snapshot();
+            });
         }
-        // The accept lands moments later as the route's "active" line; an
-        // offer that goes nowhere has its own warns above and below. At
-        // INFO (not DEBUG) so a default-level capture shows the whole
-        // offer → accept → active arc — the silence after this line is the
-        // tell when a route is offered but the peer never accepts.
-        tracing::info!(
-            "route {} offered to {} — awaiting accept",
-            route.id,
-            short_id(&peer)
-        );
+        // The route is in the session as `Offered` from here — the snapshot
+        // is what puts it on the graph as "connecting" while delivery runs.
+        // The "offered … awaiting accept" line moved into the delivery task
+        // above, so it now marks the offer genuinely reaching the peer rather
+        // than merely being handed to the daemon.
         self.emit_snapshot();
         Ok(route.id)
     }
@@ -13457,6 +13502,75 @@ impl Mesh {
         )
     }
 
+    /// Ask the daemon to bring the link to `peer` up, before we try to talk
+    /// to it.
+    ///
+    /// [`Self::send_control`] dispatches into whatever session exists at that
+    /// instant. A peer that is merely `Sighted` (announced on signaling but
+    /// never dialed), parked by the topology, or freshly dropped has none, so
+    /// the send is refused and the message is simply gone. Nothing in this
+    /// process ever asked for that link — until now the only `connect_peer`
+    /// calls in the node were CEC's, which is why a support session reliably
+    /// connects and a person-to-person share appears to hang: the fleet hides
+    /// the gap (few peers, usually co-present, kept Active by the engine's own
+    /// auto-dial), and a share does not.
+    ///
+    /// Idempotent — a live session makes this a no-op, so the common case pays
+    /// one control round trip and nothing else. Deliberately **unpinned**: a
+    /// pin is a standing redial intent that never ages out and is exempt from
+    /// topology shelving, which is right for a support session and wrong for
+    /// every route anyone ever opens. `wait_ms: 0` kicks the dial without
+    /// blocking the caller — waiting for the link is
+    /// [`Self::send_control_reliable`]'s job.
+    ///
+    /// Every candidate network is dialed rather than stopping at the first the
+    /// daemon accepts: unlike a send, a dial's "ok" only means the request was
+    /// taken, so an early return could leave us dialing a network the peer
+    /// doesn't live on. Best-effort throughout — a failure here just means the
+    /// reliable send has to wait longer for the engine to get there on its own.
+    async fn ensure_peer_link(&self, peer: &str) {
+        let canon = pubkey_part(peer).to_string();
+        for network in self.peer_network_candidates(peer) {
+            match self
+                .client
+                .request(&Request::NetworkConnectPeer {
+                    network: network.clone(),
+                    peer: canon.clone(),
+                    pin: false,
+                    wait_ms: 0,
+                })
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    // `active: false` is the interesting case — the link
+                    // wasn't up and this dial is what starts it. Logged at
+                    // info because it's the difference between "the offer
+                    // went out on a live link" and "we're waiting on a
+                    // cold connect", which is the first thing you want to
+                    // know from a log when a share is slow.
+                    let active = resp
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("active"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !active {
+                        tracing::info!(
+                            "dialing {} on {network} — no live session yet, the offer will wait for it",
+                            short_id(peer)
+                        );
+                    }
+                }
+                Ok(resp) => tracing::debug!(
+                    "dial of {} on {network} declined: {}",
+                    short_id(peer),
+                    resp.error.unwrap_or_default()
+                ),
+                Err(e) => tracing::debug!("dial of {} on {network} failed: {e}", short_id(peer)),
+            }
+        }
+    }
+
     /// Record that a send to `peer` was daemon-confirmed on `network`, so the
     /// tunnel traffic that follows (site/input frames ride the slot) sticks to
     /// a mesh that provably reaches the peer — until the next inbound frame or
@@ -13512,6 +13626,65 @@ impl Mesh {
             }
         }
         tracing::warn!("control send to {peer} failed on every shared network: {last_err}");
+        Err(last_err)
+    }
+
+    /// The acknowledged-delivery twin of [`Self::send_control`]: the daemon
+    /// queues the frame until the peer's link is up, retransmits it across
+    /// session rebuilds, and resolves only once the peer's node has actually
+    /// taken it — or `ttl` lapses.
+    ///
+    /// A route offer rides this rather than the fire-and-forget path because
+    /// `send_control` has exactly one chance: if the link is still settling
+    /// when the offer is dispatched, the send fails, the offer is dropped, and
+    /// **nothing re-sends it** — the route sits "connecting" against a peer
+    /// that never heard the offer. CEC already reached for this
+    /// ([`Self::cec_send_control_acked`]); routes never did.
+    ///
+    /// `ttl` is split across the candidate networks so the total wait stays
+    /// what the caller asked for, however many meshes are shared with the peer
+    /// (in practice one). Resolving a network confirms the peer's home the
+    /// same way an ordinary send does.
+    async fn send_control_reliable(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        ttl: Duration,
+    ) -> Result<(), String> {
+        let candidates = self.peer_network_candidates(peer);
+        if candidates.is_empty() {
+            return Err(format!("no shared network with {peer}"));
+        }
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let per_attempt = per_attempt_ttl(ttl, candidates.len());
+        let mut last_err = String::new();
+        for network in candidates {
+            let resp = self
+                .client
+                .request_with_timeout(
+                    &Request::ChannelSendReliable {
+                        network: network.clone(),
+                        channel: CHANNEL_CONTROL.to_string(),
+                        peer: pubkey_part(peer).to_string(),
+                        payload: payload.clone(),
+                        ttl_ms: per_attempt.as_millis() as u64,
+                    },
+                    // Outlive the daemon's own deadline so a lapsed TTL comes
+                    // back as its real reason rather than a client timeout.
+                    per_attempt + Duration::from_secs(5),
+                )
+                .await;
+            match resp {
+                Ok(r) if r.ok => {
+                    self.note_peer_network(peer, &network);
+                    return Ok(());
+                }
+                Ok(r) => {
+                    last_err = r.error.unwrap_or_else(|| "reliable send failed".into());
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
         Err(last_err)
     }
 
@@ -14171,6 +14344,17 @@ fn ordered_send_candidates(
         }
     }
     out
+}
+
+/// How long each candidate network gets of a reliable send's total budget.
+///
+/// The caller's `ttl` is a promise about the **whole** send — how long a route
+/// offer may wait for a link before it's declared undeliverable — so sharing
+/// several meshes with a peer must not multiply the wait into minutes. Pure,
+/// so the division (and its zero-candidate edge) is testable without a daemon;
+/// [`Mesh::send_control_reliable`] feeds it the resolved candidate count.
+fn per_attempt_ttl(ttl: Duration, candidates: usize) -> Duration {
+    ttl / candidates.max(1) as u32
 }
 
 /// One peer row's link class off the daemon's `selected_pair` — the
@@ -15193,6 +15377,24 @@ mod tests {
             ordered_send_candidates(None, None, &[]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn a_reliable_sends_ttl_is_the_whole_budget_however_many_meshes_are_shared() {
+        // The TTL a route offer carries is a promise about how long the
+        // *offer* may wait for a link — not how long each mesh may. Sharing
+        // three networks with a peer must not turn a 30s budget into 90s of
+        // a console sitting on "connecting".
+        assert_eq!(
+            per_attempt_ttl(ROUTE_OFFER_TTL, 3) * 3,
+            ROUTE_OFFER_TTL,
+            "the per-network slices must add back up to the caller's budget"
+        );
+        // The ordinary case — one shared mesh — spends the whole budget on it.
+        assert_eq!(per_attempt_ttl(ROUTE_OFFER_TTL, 1), ROUTE_OFFER_TTL);
+        // Zero candidates never reaches this (the caller returns early), but
+        // the divide must not panic if that ever changes.
+        assert_eq!(per_attempt_ttl(ROUTE_OFFER_TTL, 0), ROUTE_OFFER_TTL);
     }
 
     #[test]

@@ -12665,11 +12665,24 @@ impl Mesh {
     /// mic. Owner and fleet may source anything; a dialed CEC technician's live
     /// `ScreenView` consent covers the screen kinds (`Display`/`Video`; audio is
     /// not part of the CEC consent model); otherwise it takes an explicit
-    /// person-to-person share this device extended that lets that person
-    /// *consume* this media on this capability (the "Receive your screen"
-    /// grant). Mirrors the owner/fleet → CEC → share layering of
-    /// [`Self::may_drive`]; screen viewing stays gated here at the offer (and
-    /// torn down by [`Self::spawn_cec_consent_sweep`]), never per frame.
+    /// person-to-person share this device extended over this capability.
+    /// Mirrors the owner/fleet → CEC → share layering of [`Self::may_drive`];
+    /// screen viewing stays gated here at the offer (and torn down by
+    /// [`Self::spawn_cec_consent_sweep`]), never per frame.
+    ///
+    /// The grant's role is keyed to **the end of the route being authorized**,
+    /// not to who ends up watching. `Catalog::authorize` is the model:
+    ///
+    /// ```text
+    /// check_endpoint(&route.from, media, GrantRole::Provide)  // the source end
+    /// check_endpoint(&route.to,   media, GrantRole::Consume)  // the sink end
+    /// ```
+    ///
+    /// This gate is the *source* end — the capability being captured is
+    /// `route.from`, here on this machine — so the grant it needs is `Provide`.
+    /// Reading "they *receive* my screen, so the grant is Consume" is the trap:
+    /// that describes the far end, which lives on their machine and is checked
+    /// by their catalog.
     fn sender_may_source_media(&self, sender: &str, route: &Route) -> bool {
         if self.sender_may_control(sender) {
             return true;
@@ -12683,16 +12696,16 @@ impl Mesh {
         {
             return true;
         }
-        // An explicit share this device extended letting that person consume
-        // exactly this media on this capability (honours capability pinning and
-        // the media/role scope via the canonical `Grant::permits`).
+        // An explicit share this device extended over exactly this capability
+        // (honours capability pinning and the media/role scope via the canonical
+        // `Grant::permits`).
         let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
             return false;
         };
         self.shares.out_grants_for(&person.id).iter().any(|g| {
             g.permits(
                 route.media,
-                allmystuff_graph::GrantRole::Consume,
+                allmystuff_graph::GrantRole::Provide,
                 &route.from,
             )
         })
@@ -13522,14 +13535,32 @@ impl Mesh {
     /// blocking the caller — waiting for the link is
     /// [`Self::send_control_reliable`]'s job.
     ///
-    /// Every candidate network is dialed rather than stopping at the first the
-    /// daemon accepts: unlike a send, a dial's "ok" only means the request was
-    /// taken, so an early return could leave us dialing a network the peer
-    /// doesn't live on. Best-effort throughout — a failure here just means the
-    /// reliable send has to wait longer for the engine to get there on its own.
+    /// **Only meshes we have evidence the peer lives on are dialed.** With a
+    /// proven `peer_networks` slot — set by a daemon-confirmed send or an
+    /// inbound frame — that one mesh is the answer and the rest are noise. Only
+    /// a peer we have no evidence for at all falls back to the full candidate
+    /// list, and then every candidate is tried rather than stopping at the
+    /// first the daemon accepts, because a dial's "ok" only means the request
+    /// was taken.
+    ///
+    /// Fanning out unconditionally was wrong in a way worth naming: it dialed
+    /// ordinary peers into `cecsupport-clients` and the claim rendezvous, which
+    /// are **signaling-only directories** that are never meant to carry a
+    /// session (`cec::help_network_config` sets `auto_approve: false` precisely
+    /// so a stray one-sided dial can't become an admitted link). Best-effort
+    /// throughout — a failure here just means the reliable send waits longer
+    /// for the engine to get there on its own.
     async fn ensure_peer_link(&self, peer: &str) {
         let canon = pubkey_part(peer).to_string();
-        for network in self.peer_network_candidates(peer) {
+        let proven = {
+            let st = self.state.lock();
+            st.peer_networks.get(&canon).cloned()
+        };
+        let targets = match proven {
+            Some(network) => vec![network],
+            None => self.peer_network_candidates(peer),
+        };
+        for network in targets {
             match self
                 .client
                 .request(&Request::NetworkConnectPeer {
@@ -15736,6 +15767,67 @@ mod tests {
         // owner/fleet rule) is what keeps it to explicitly-shared files.
         let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
         assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    /// The grant role is keyed to the *end of the route being authorized*, not
+    /// to who ends up watching. `sender_may_source_media` gates the **source**
+    /// end (this machine's screen is `route.from`), so it needs `Provide` —
+    /// exactly what `Catalog::authorize` checks that end with, and exactly what
+    /// the share builder mints for "see its screen".
+    ///
+    /// Asking for `Consume` there instead reads plausibly ("they receive my
+    /// screen") and denies every screen share ever granted: `Provide` fails
+    /// `allows_sink()`. It stayed invisible because the drive planes never hit
+    /// this path — `grant_authorizes_plane` checks the role only for input, and
+    /// terminal/files/sites match on the capability suffix alone — so terminal
+    /// and files worked over a share while its screen was refused.
+    #[test]
+    fn a_screen_share_is_authorized_at_the_source_end_it_actually_gates() {
+        use allmystuff_graph::{Grant, GrantRole, MediaKind};
+
+        let alex = allmystuff_graph::PersonId::from("person:alex");
+        let screen: allmystuff_graph::CapabilityId = "me-A3285:screen".into();
+        // What the share builder mints for "see its screen": the source
+        // capability, role Provide.
+        let granted = Grant::scoped(
+            &alex,
+            MediaKind::Display,
+            GrantRole::Provide,
+            Some(screen.clone()),
+            "see its screen",
+        );
+
+        // The role this gate must ask for — the source end's role.
+        assert!(
+            granted.permits(MediaKind::Display, GrantRole::Provide, &screen),
+            "the minted share grant must authorize the source end it names"
+        );
+        // The role the gate used to ask for, and why every screen share died.
+        assert!(
+            !granted.permits(MediaKind::Display, GrantRole::Consume, &screen),
+            "Consume is the sink end's role — asking for it here denies every screen share"
+        );
+
+        // The audio share rides the same shape (`system-audio`, Provide), so it
+        // was broken and is fixed by the same pairing.
+        let sound: allmystuff_graph::CapabilityId = "me-A3285:system-audio".into();
+        let audio = Grant::scoped(
+            &alex,
+            MediaKind::Audio,
+            GrantRole::Provide,
+            Some(sound.clone()),
+            "hear its audio",
+        );
+        assert!(audio.permits(MediaKind::Audio, GrantRole::Provide, &sound));
+        assert!(!audio.permits(MediaKind::Audio, GrantRole::Consume, &sound));
+
+        // The pin is still a pin: a grant over the screen authorizes nothing
+        // else on the machine.
+        assert!(!granted.permits(
+            MediaKind::Display,
+            GrantRole::Provide,
+            &"me-A3285:cam".into()
+        ));
     }
 
     #[test]

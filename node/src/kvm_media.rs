@@ -102,14 +102,44 @@ async fn open_source(path: &str, label: &str) -> Result<Source, String> {
     Err("choose an .iso/.img file or the root of a removable USB drive".into())
 }
 
+/// The drive letter a Windows path names, if it names one.
+///
+/// The path reaching this has been through `canonicalize`, and on Windows that
+/// returns an extended-length ("verbatim") path: `E:\` comes back as `\\?\E:\`.
+/// The first byte is therefore a backslash, never a letter — so testing
+/// `bytes[0].is_ascii_alphabetic()` against the canonical form rejected every
+/// real drive root and told the operator to "choose the root of a drive",
+/// which is exactly what they had just done.
+///
+/// Kept as string surgery rather than `std::path::Prefix` so it compiles and
+/// unit-tests on any host: prefix parsing is Windows-only behaviour, so a
+/// `Prefix`-based version could never be exercised by CI's Linux job.
+#[cfg(any(target_os = "windows", test))]
+fn windows_drive_letter(path: &str) -> Option<char> {
+    // A UNC share — `\\?\UNC\server\share` or `\\server\share` — has no drive
+    // letter and is not a local disk, so it keeps the caller's error.
+    if path.starts_with(r"\\?\UNC\") || (path.starts_with(r"\\") && !path.starts_with(r"\\?\")) {
+        return None;
+    }
+    let rest = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let mut chars = rest.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    Some(letter.to_ascii_uppercase())
+}
+
 #[cfg(target_os = "windows")]
 async fn open_removable_disk(path: &Path, label: &str) -> Result<Source, String> {
     let text = path.to_string_lossy();
-    let bytes = text.as_bytes();
-    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
-        return Err("choose the root of a drive (for example E:\\)".into());
-    }
-    let letter = (bytes[0] as char).to_ascii_uppercase();
+    let Some(letter) = windows_drive_letter(&text) else {
+        // Name what we actually got: the operator picked a drive root and was
+        // told to pick a drive root, with nothing to act on in between.
+        return Err(format!(
+            "choose the root of a drive (for example E:\\) — {text} isn't one"
+        ));
+    };
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct DiskInfo {
@@ -563,4 +593,48 @@ pub async fn unmount(local_port: u16) -> Result<(), String> {
     let body = response.text().await.unwrap_or_default();
     response_ok(status, &body, "unmount")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_drive_letter;
+
+    /// The regression. `std::fs::canonicalize("E:\\")` on Windows returns the
+    /// extended-length form `\\?\E:\`, and every path reaching
+    /// `open_removable_disk` has been canonicalized — so this, not the form a
+    /// human types, is what the drive-letter test actually sees. Reading the
+    /// letter off byte 0 found a backslash and refused the mapping every time:
+    /// installable media could never be mapped from Windows at all.
+    #[test]
+    fn canonicalized_drive_root_still_yields_its_letter() {
+        assert_eq!(windows_drive_letter(r"\\?\E:\"), Some('E'));
+        assert_eq!(windows_drive_letter(r"\\?\e:\"), Some('E'));
+        assert_eq!(windows_drive_letter(r"\\?\C:\media\win11"), Some('C'));
+    }
+
+    /// The plain form keeps working — a caller that skips canonicalize, and
+    /// the shape every error message tells the operator to use.
+    #[test]
+    fn plain_drive_root_still_yields_its_letter() {
+        assert_eq!(windows_drive_letter(r"E:\"), Some('E'));
+        assert_eq!(windows_drive_letter("E:"), Some('E'));
+        assert_eq!(windows_drive_letter(r"d:\images"), Some('D'));
+    }
+
+    /// A network share has no local disk behind it to read raw sectors from,
+    /// so it must keep failing rather than being parsed into some letter.
+    #[test]
+    fn unc_shares_are_not_drives() {
+        assert_eq!(windows_drive_letter(r"\\?\UNC\server\share"), None);
+        assert_eq!(windows_drive_letter(r"\\server\share"), None);
+    }
+
+    #[test]
+    fn non_drive_paths_are_rejected() {
+        assert_eq!(windows_drive_letter(""), None);
+        assert_eq!(windows_drive_letter("E"), None);
+        assert_eq!(windows_drive_letter("1:"), None);
+        assert_eq!(windows_drive_letter("/home/user/media"), None);
+        assert_eq!(windows_drive_letter(r"\\?\"), None);
+    }
 }

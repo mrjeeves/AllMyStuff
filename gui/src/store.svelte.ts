@@ -1556,6 +1556,19 @@ class AppStore {
       this.seedDemoNetworks();
       this.seedDemoRoom();
     }
+    // The CEC dialed directory, FIRST — everything below is a prerequisite for
+    // nothing here, and a dedicated console window cannot open its target
+    // until this lands. `ConsoleHost`'s readiness gate exempts a dialed CEC
+    // customer from the fleet-relationship stage (they approve you, you never
+    // claim them), and `isCecCustomer` reads `cecCustomers`, which only this
+    // fills. Anywhere further down the chain, that window sits on "resolving
+    // whether it's yours (fleet roster loading)…" — the one screen whose text
+    // is actively wrong for a CEC customer — until a hardware scan, a local
+    // service scan and a per-network mesh sync have all finished. On Windows
+    // those take long enough to read as broken; on macOS they merely hid the
+    // ordering. Fire-and-forget, so starting it here overlaps it with the rest
+    // of bring-up instead of queueing it behind ~29 awaits.
+    void this.loadCec();
     // Update discovery starts before mesh hydration and hardware scans. Those
     // can take seconds on a cold Windows launch; version checking must not wait
     // behind them or depend on the later background ticker.
@@ -1730,15 +1743,10 @@ class AppStore {
     // window, the console window, the chat pop-out) keeps threads live. The
     // append dedupes by id, so the sender's own echoed line shows once.
     await onCecChat((e) => this.appendChat(e.peer, e.message));
-    void cecStatus().then((s) => {
-      if (s) this.cecStatusInfo = s;
-    });
-    // Load the CEC dialed directory in *every* window, not just where the
-    // Support tab mounted it: a dedicated console window boots its own store,
-    // and without `cecCustomers` it can't recognise its target as a CEC
-    // customer — its readiness gate then waits forever for a fleet
-    // relationship the customer will never have.
-    void this.loadCec();
+    // (The CEC directory — `loadCec`, which every window needs and not just
+    // the one where the Support tab mounted — is kicked off at the very top of
+    // init instead of here. It gates a console window's readiness, so it must
+    // not queue behind this chain; see the comment there.)
     // Re-assert the Experimental tier the user last chose: the node's gate
     // is process-local (a fresh serve boots it off), so every window pushes
     // its persisted setting — harmless when off (the default), and the one

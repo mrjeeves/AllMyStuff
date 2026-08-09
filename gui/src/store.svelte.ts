@@ -309,7 +309,15 @@ export type NetworksSubtab = "status" | "servers";
  *  Audio / Video (the screen feed) / Control all ride the remote-control
  *  console; Control needs Video to map focus. Terminal / Files / Sites are
  *  their own console shares. */
-export type ShareCap = "audio" | "video" | "control" | "terminal" | "files" | "sites";
+/** What a share can hand over, as a *person* thinks about it.
+ *
+ *  `console` is the remote-control console as one thing — screen, sound,
+ *  keyboard/mouse and clipboard. Those are four separate grants underneath
+ *  and stay that way on the wire (each is scoped to its own capability and
+ *  revocable on its own), but nobody shares "display without input" on
+ *  purpose: picking them apart only ever produced a console that came up
+ *  half-dead. One toggle, four grants. */
+export type ShareCap = "console" | "terminal" | "files" | "sites";
 
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
@@ -2861,9 +2869,10 @@ class AppStore {
     const sc = canonicalNodeId(senderId);
     const forSender = (g: Grant) => !!g.capability && this.capNodeOf(g.capability) === sc;
     const out: ShareCap[] = [];
-    if (grants.some((g) => forSender(g) && g.media === "display")) out.push("video");
-    if (grants.some((g) => forSender(g) && g.media === "audio")) out.push("audio");
-    if (grants.some((g) => forSender(g) && g.media === "input")) out.push("control");
+    // The console reads back from its screen grant — the one piece it can't
+    // work without, and the one every older split share is guaranteed to have
+    // if it granted anything console-ish at all.
+    if (grants.some((g) => forSender(g) && g.media === "display")) out.push("console");
     if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
@@ -2878,13 +2887,15 @@ class AppStore {
     if (!node) return false;
     const n = this.node(node);
     if (!n) return false;
-    if (cap === "audio") return !!matchEndpoint(this.catalog, node, "audio", "provide");
-    // "Video" is the device's screen feed — what the receiver sees in the
-    // remote-control console (and what Control needs to map focus).
-    if (cap === "video") return !!matchEndpoint(this.catalog, node, "display", "provide");
-    // Control & clipboard: the device must accept remote control (a control
-    // sink). The UI also gates it behind Video.
-    if (cap === "control") return !!matchEndpoint(this.catalog, node, "input", "consume");
+    // The console needs a screen to show and a control sink to drive. Audio
+    // and clipboard ride along without gating it — a machine with no sound
+    // card still has a perfectly good console.
+    if (cap === "console") {
+      return (
+        !!matchEndpoint(this.catalog, node, "display", "provide") &&
+        !!matchEndpoint(this.catalog, node, "input", "consume")
+      );
+    }
     const feats = n.features ?? [];
     if (cap === "files") return isAppNode(n) && feats.includes(FEATURE_FILES);
     if (cap === "terminal") return isAppNode(n) && feats.includes(FEATURE_TERMINAL);
@@ -2904,12 +2915,10 @@ class AppStore {
     const who = n?.label ?? "this device";
     if (!n || !isAppNode(n)) return `${who} isn't running AllMyStuff`;
     switch (cap) {
-      case "audio":
-        return `${who} has no audio output to share`;
-      case "video":
-        return `${who} has no screen to share`;
-      case "control":
-        return `${who} doesn't accept remote control`;
+      case "console":
+        return matchEndpoint(this.catalog, node, "display", "provide")
+          ? `${who} doesn't accept remote control`
+          : `${who} has no screen to share`;
       case "terminal":
         return `${who} isn't offering its terminal (older AllMyStuff, or it's turned off)`;
       case "files":
@@ -2940,19 +2949,23 @@ class AppStore {
       };
     };
     switch (cap) {
-      case "video":
-        return [mk("display", "provide", "screen", "see its screen")];
-      case "audio":
-        // The machine's audio source is the synthetic `system-audio`
-        // endpoint the bridge advertises (`<node>:system-audio`), NOT a bare
-        // `:audio` — scope the grant to the id `matchEndpoint(remote,"audio",
-        // "provide")` actually resolves, or it authorizes nothing and the
-        // route is denied (the way video's `screen` / control's `control`
-        // already match their endpoints).
-        return [mk("audio", "provide", "system-audio", "hear its audio")];
-      case "control":
-        // Control rides with the clipboard, and needs Video to map focus.
+      case "console":
+        // One visible share, four real grants — the console is useless
+        // without all of them, and each stays scoped to its own capability so
+        // the wire contract and per-grant revoke are unchanged.
+        //
+        // Each capability suffix must be the id `matchEndpoint` actually
+        // resolves for that media, or the grant authorizes nothing and the
+        // route is denied: the machine's audio source is the synthetic
+        // `<node>:system-audio`, never a bare `:audio`.
+        //
+        // The role names the end being authorized, not who benefits: `screen`
+        // and `system-audio` are sources on this machine (`provide`), while
+        // `control` is an input *sink* on it (`consume`). Getting that
+        // backwards is what silently denied every screen share.
         return [
+          mk("display", "provide", "screen", "see its screen"),
+          mk("audio", "provide", "system-audio", "hear its audio"),
           mk("input", "consume", "control", "control it"),
           mk("clipboard", "both", "clipboard", "share its clipboard"),
         ];
@@ -3008,11 +3021,11 @@ class AppStore {
     const senderLabel = this.node(sender)?.label ?? "device";
 
     // Reconcile against what's chosen: grant the selected consoles, revoke the
-    // ones turned off — so the builder *manages* the share, not just adds to it.
-    // Control implies Video (to map focus).
+    // ones turned off — so the builder *manages* the share, not just adds to
+    // it. The console's own pieces no longer need reconciling against each
+    // other (they are one cap now), so nothing implies anything here.
     const want = new Set(caps);
-    if (want.has("control")) want.add("video");
-    const ALL: ShareCap[] = ["video", "audio", "control", "files", "terminal", "sites"];
+    const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
     for (const cap of ALL) {
       const grants = this.shareCapGrants(person.id, cap, sender, senderLabel);
       if (want.has(cap)) {

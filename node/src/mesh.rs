@@ -8862,10 +8862,29 @@ impl Mesh {
     }
 
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
-    /// from the fleet's closed-network **signed roster** (`RosterList`). No
-    /// fleet → clear it (only the owner, via the direct check in
-    /// `sender_may_control`, may control). Daemon unreachable → keep the prior
-    /// cache rather than briefly denying a legitimate controller.
+    /// from the fleet's closed-network **signed roster** (`RosterList`).
+    ///
+    /// Exactly one thing empties this cache: not being in a fleet at all. Every
+    /// other outcome keeps whatever we last knew, because on a joined closed
+    /// network there is no such thing as a truthful empty roster — the signed
+    /// roster always lists at least this device. An empty read therefore means
+    /// the roster is momentarily *unreadable* (the closed network mid-(re)join),
+    /// never that the fleet emptied, and installing it would deny every
+    /// legitimate controller on the strength of an answer that isn't one.
+    ///
+    /// This is the same resilience [`Mesh::fleet_roster_value`] already gives
+    /// the roster the GUI renders, via `fleet_roster_cache` — the difference
+    /// being that when the *display* flickers you see the wrong member list for
+    /// a moment, and when this flickers keyboard and mouse stop working. Only
+    /// the display path had it, which is what produced "the picture is fine but
+    /// control is refused, and the far side says I'm not in the fleet roster":
+    /// media is authorized once at the offer ([`Self::sender_may_source_media`])
+    /// and so survives the gap, while input is authorized *per frame*
+    /// ([`Self::sender_may_drive_admitted`]) and dies inside it.
+    ///
+    /// A non-empty read always replaces the cache, so an eviction still bites
+    /// the instant the roster is readable again — a removed member is never
+    /// resurrected.
     async fn refresh_fleet_authorization(self: &Arc<Self>) {
         let Some(network) = self.ownership.fleet_network_id() else {
             self.fleet_authorized.lock().clear();
@@ -8873,6 +8892,8 @@ impl Mesh {
         };
         let data = match self.client.request(&Request::RosterList { network }).await {
             Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            // Daemon unreachable — keep the prior cache rather than briefly
+            // denying a legitimate controller.
             _ => return,
         };
         let mut set = std::collections::HashSet::new();
@@ -8882,6 +8903,21 @@ impl Mesh {
                     set.insert(pubkey_part(id).to_string());
                 }
             }
+        }
+        if set.is_empty() {
+            // Loud, because the alternative is a machine that silently refuses
+            // every keystroke: this is the one state where the roster and the
+            // fleet disagree, and it's worth seeing in a log when someone asks
+            // why control stopped.
+            if self.diag_ok("fleet-auth-empty") {
+                tracing::warn!(
+                    "signed fleet roster read back empty — the closed network is likely \
+                     mid-(re)join; keeping the {} device(s) already authorized rather than \
+                     refusing them",
+                    self.fleet_authorized.lock().len()
+                );
+            }
+            return;
         }
         *self.fleet_authorized.lock() = set;
     }

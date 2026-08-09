@@ -187,6 +187,48 @@ impl Shares {
         true
     }
 
+    /// Bind `siblings` into the share `voucher` already belongs to — how a
+    /// share extended to a *fleet* reaches every machine in it.
+    ///
+    /// A share is one device of mine offered to a whole fleet, but the invite
+    /// only ever reaches the one device the sharer picked, and enforcement
+    /// resolves peers by node ([`Shares::person_for_node`]). So without this
+    /// the share works from that device and is refused from every other machine
+    /// of theirs — while the sharer's own GUI, which folds a fleet by its
+    /// advertised owner, cheerfully shows the buttons on all of them.
+    ///
+    /// The trust rule is unchanged and is why this takes a voucher rather than
+    /// a person: **only a peer already inside a share can widen it, and only to
+    /// that share.** An unknown voucher binds nothing (`false`), a device can
+    /// never add itself, and no self-asserted person id is consulted — the
+    /// share is found by the authenticated sender's own node. Advertised
+    /// ownership stays untrusted here, which is the whole point: it's
+    /// self-asserted, and trusting it at the enforcement layer is the
+    /// conscription vector the fleet's signed roster exists to close.
+    ///
+    /// Returns whether anything was added.
+    pub fn vouch_siblings(&self, voucher: &str, siblings: &[NodeId]) -> bool {
+        let canon = pubkey_part(voucher);
+        let mut i = self.inner.lock();
+        let Some(s) = i
+            .shares
+            .iter_mut()
+            .find(|s| s.nodes.iter().any(|n| pubkey_part(n.as_str()) == canon))
+        else {
+            return false;
+        };
+        let before = s.nodes.len();
+        for node in siblings {
+            add_node(s, node);
+        }
+        if s.nodes.len() == before {
+            return false;
+        }
+        i.version += 1;
+        persist(&self.path, &i);
+        true
+    }
+
     /// Revoke a grant by id from this person's share (either direction).
     /// The id is content-derived, so it names the same grant across a restart
     /// and on both peers. Returns whether anything was removed.
@@ -466,6 +508,51 @@ mod tests {
         // Unknown person → empty, never a panic.
         assert!(sh.out_grants_for(&"person:nobody".into()).is_empty());
         assert!(sh.nodes_for(&"person:nobody".into()).is_empty());
+    }
+
+    #[test]
+    fn a_share_partner_vouches_its_fleet_into_the_share_and_nobody_else_can() {
+        let sh = memory();
+        let desk = NodeId::from("alexdesk-AB12C");
+        sh.grant(&alex(), &desk, screen_to_alex());
+        // Only the device we invited resolves — the gap that made a share work
+        // from one machine of theirs and be refused from the rest.
+        assert!(sh.person_for_node("alexlaptop").is_none());
+
+        // The device already in the share vouches for its siblings.
+        let siblings = vec![NodeId::from("alexlaptop-99XYZ"), NodeId::from("alexphone")];
+        assert!(sh.vouch_siblings("alexdesk", &siblings));
+        assert_eq!(sh.person_for_node("alexlaptop").unwrap().id, alex().id);
+        assert_eq!(sh.person_for_node("alexphone").unwrap().id, alex().id);
+        // Bound canonically, so either id form of the same machine resolves.
+        assert_eq!(
+            sh.person_for_node("alexlaptop-99XYZ").unwrap().id,
+            alex().id
+        );
+        // Idempotent — the same vouch again changes nothing.
+        assert!(!sh.vouch_siblings("alexdesk", &siblings));
+
+        // A voucher in no share of ours binds nothing: a stranger can't inject
+        // devices, and no device can add itself.
+        assert!(!sh.vouch_siblings("stranger", &[NodeId::from("mallory")]));
+        assert!(sh.person_for_node("mallory").is_none());
+        assert!(!sh.vouch_siblings("mallory", &[NodeId::from("mallory")]));
+        assert!(sh.person_for_node("mallory").is_none());
+
+        // Vouching only ever widens the voucher's OWN share. A second person's
+        // partner can't reach into the first's.
+        let bob = Person {
+            id: "person:bob".into(),
+            name: "Bob".into(),
+        };
+        sh.grant(&bob, &NodeId::from("bobbox"), screen_to_alex());
+        assert!(sh.vouch_siblings("bobbox", &[NodeId::from("bob2")]));
+        assert_eq!(sh.person_for_node("bob2").unwrap().id, bob.id);
+        // …and Alex's share didn't grow Bob's machine.
+        assert!(!sh
+            .nodes_for(&alex().id)
+            .iter()
+            .any(|n| n.as_str() == "bob2"));
     }
 
     #[test]

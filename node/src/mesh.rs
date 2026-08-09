@@ -6641,6 +6641,69 @@ impl Mesh {
         }
     }
 
+    /// This device's fleet siblings, canonical and excluding self — who a share
+    /// extended to *this fleet* should also reach.
+    ///
+    /// Read from the **verified** membership only: the closed network's signed
+    /// roster ([`Mesh::fleet_authorized`]) plus, when we're the owner, our own
+    /// durable admit records. Advertised ownership is deliberately not
+    /// consulted — it's self-asserted, and a fleet list assembled from it would
+    /// let any node talk its way into a share by claiming the right owner.
+    /// Empty when not in a fleet, which degrades to exactly the old
+    /// one-device behaviour.
+    fn fleet_siblings(&self) -> Vec<NodeId> {
+        let me = self.local_node_id().unwrap_or_default();
+        let me = pubkey_part(&me).to_string();
+        let mut out: Vec<NodeId> = Vec::new();
+        let mut push = |canon: &str| {
+            if canon != me && !out.iter().any(|n| n.as_str() == canon) {
+                out.push(NodeId::from(canon));
+            }
+        };
+        for d in self.fleet_authorized.lock().iter() {
+            push(pubkey_part(d));
+        }
+        for m in self.ownership.fleet_members() {
+            push(pubkey_part(m.device.as_str()));
+        }
+        out
+    }
+
+    /// Pass a share this device just accepted on to the rest of the fleet.
+    ///
+    /// A share is one machine extended to a whole *fleet*, but the invite only
+    /// ever lands on the one device the sharer picked. Without this the other
+    /// machines never learn the grants exist, so they never show the consoles
+    /// they were granted — the receiving half of the same "people bring fleets"
+    /// promise that [`Shares::vouch_siblings`] handles on the sharer's side.
+    ///
+    /// Best-effort and fire-and-forget: a sibling that's offline simply learns
+    /// on the next invite or re-share, and this must never hold up the ack the
+    /// sharer is waiting on.
+    async fn relay_share_to_fleet(&self, source: &NodeId, name: &str, grants: &[Grant]) {
+        if grants.is_empty() {
+            return;
+        }
+        let source_canon = pubkey_part(source.as_str()).to_string();
+        for sibling in self.fleet_siblings() {
+            // Never relay a fleet member's own share back at it.
+            if sibling.as_str() == source_canon {
+                continue;
+            }
+            let msg = ControlMessage::Share(ShareControl::FleetShare {
+                source: NodeId::from(source_canon.as_str()),
+                name: name.to_string(),
+                grants: grants.to_vec(),
+            });
+            if let Err(e) = self.send_control(sibling.as_str(), &msg).await {
+                tracing::debug!(
+                    "couldn't relay the share to fleet sibling {}: {e}",
+                    short_id(sibling.as_str())
+                );
+            }
+        }
+    }
+
     /// Apply an inbound share-control message. Unlike app-control or a
     /// privileged offer, this is **not** gated on `sender_may_control`: a share
     /// is person-to-person, so the sharer is never the recipient's owner/fleet.
@@ -6652,7 +6715,7 @@ impl Mesh {
         match message {
             ShareControl::Invite { from: body, grants } => {
                 let person = self.peer_person(&from, Some(&body.name));
-                self.shares.record_inbound(&person, &from, grants);
+                self.shares.record_inbound(&person, &from, grants.clone());
                 self.emit_snapshot();
                 self.sink.emit(
                     "allmystuff://share",
@@ -6660,21 +6723,78 @@ impl Mesh {
                 );
                 // Acknowledge, carrying any grants I already extend back — so
                 // sharing can be mutual in one round trip (empty if I've granted
-                // them nothing; the ack never *mints* an outbound grant).
+                // them nothing; the ack never *mints* an outbound grant) — and
+                // this fleet's other devices, so the share they extended to
+                // *us* reaches all of them rather than only this machine.
                 let back = self.shares.out_grants_for(&person.id);
-                let reply = ControlMessage::Share(ShareControl::Accept { grants: back });
+                let reply = ControlMessage::Share(ShareControl::Accept {
+                    grants: back,
+                    fleet: self.fleet_siblings(),
+                });
                 if let Err(e) = self.send_control(from.as_str(), &reply).await {
                     tracing::warn!("couldn't ack share from {}: {e}", short_id(from.as_str()));
                 }
+                // One machine accepts; the whole fleet needs to know, or the
+                // rest never show the consoles they were granted.
+                self.relay_share_to_fleet(&from, &person.name, &grants)
+                    .await;
             }
-            ShareControl::Accept { grants } => {
+            ShareControl::Accept { grants, fleet } => {
                 let person = self.peer_person(&from, None);
                 self.shares.record_inbound(&person, &from, grants);
+                // Their fleet, vouched for by a device already inside this
+                // share — so a console we shared with *them* opens from any of
+                // their machines, not just the one we happened to invite.
+                if !fleet.is_empty() && self.shares.vouch_siblings(from.as_str(), &fleet) {
+                    tracing::info!(
+                        "{} vouched {} fleet sibling(s) into its share",
+                        short_id(from.as_str()),
+                        fleet.len()
+                    );
+                }
                 self.emit_snapshot();
                 self.sink.emit(
                     "allmystuff://share",
                     json!({ "from": from.to_string(), "kind": "accept", "person": person.name }),
                 );
+            }
+            ShareControl::FleetShare {
+                source,
+                name,
+                grants,
+            } => {
+                // Only our own owner/fleet may tell us what our fleet holds.
+                // Anyone else is ignored — nobody talks a machine into
+                // believing it has a share. (Even accepted it grants nothing
+                // here: an inbound grant only widens what we may *pull*, and
+                // the far side enforces its own grants regardless.)
+                if !self.sender_may_control(from.as_str()) {
+                    tracing::warn!(
+                        "fleet share relay from {} ignored: not owner/fleet",
+                        short_id(from.as_str())
+                    );
+                    return;
+                }
+                // Keyed off the *granting* device, exactly as a direct invite
+                // is — so every device in the fleet lands on the same person
+                // record the accepting one did.
+                let person = self.peer_person(&source, Some(&name));
+                if self.shares.record_inbound(&person, &source, grants) {
+                    tracing::info!(
+                        "learned a share from {} via fleet sibling {}",
+                        short_id(source.as_str()),
+                        short_id(from.as_str())
+                    );
+                    self.emit_snapshot();
+                    self.sink.emit(
+                        "allmystuff://share",
+                        json!({
+                            "from": source.to_string(),
+                            "kind": "invite",
+                            "person": person.name,
+                        }),
+                    );
+                }
             }
             ShareControl::Decline => {
                 tracing::info!("share declined by {}", short_id(from.as_str()));

@@ -8082,6 +8082,31 @@ impl Mesh {
         self.send_control(&node, &msg).await
     }
 
+    /// Relaunch **this** node onto whatever build is on disk right now.
+    ///
+    /// The local twin of [`Mesh::request_restart`], and the half that made
+    /// "app and node update together" impossible without it. An app that
+    /// applies a self-update rewrites every installed half on disk, including
+    /// `allmystuff-serve` — but a node it did not spawn (the Always On
+    /// service, now the default backend) keeps executing its old image until
+    /// something restarts it. Its own unattended updater only checks every 24
+    /// hours, so until then the freshly-updated app drives a stale node and
+    /// every fix in it silently isn't there.
+    ///
+    /// The relaunch itself is the sink's, which is what makes this safe on a
+    /// Windows service: `LogSink::restart` picks the OS-aware strategy
+    /// (exit-for-the-SCM under a service, re-exec elsewhere), and
+    /// `SocketSink::restart` first emits `NodeEvent::Restart` so an attached
+    /// GUI relaunches its window in step. Runs on a fresh task so the caller
+    /// gets its reply before this process goes away.
+    pub fn restart_self(self: &Arc<Self>) {
+        tracing::info!("local restart requested — relaunching this node onto the on-disk build");
+        let sink = self.sink.clone();
+        crate::spawn(async move {
+            sink.restart();
+        });
+    }
+
     /// Front-end command: reboot a machine's whole OS — the recovery step
     /// heavier than [`Mesh::request_restart`]. Our own device reboots
     /// directly (no wire round-trip to ourselves); a peer is asked with

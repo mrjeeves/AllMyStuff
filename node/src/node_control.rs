@@ -930,6 +930,18 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_restart_device(node).await)
         }
+        // The two halves of "app and node update together". An app that just
+        // applied a self-update rewrote allmystuff-serve on disk, but a node it
+        // did not spawn — the Always On service — is still executing the old
+        // image; `node_version` is how the app notices, `restart_self` is how
+        // it says so. Answered before the process goes (see Mesh::restart_self).
+        "node_version" => DispatchOut::Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+        "restart_self" => {
+            mesh.restart_self();
+            DispatchOut::Json(serde_json::json!({ "restarting": true }))
+        }
         "link_status" => {
             // The engine's daemon-link status as last emitted — poll-safe
             // truth for a GUI that missed the one-shot subscription event.
@@ -2027,7 +2039,14 @@ async fn ensure_node_current(bin: &Path, pin: &str) {
 /// [`crate::daemon_spawn::ensure_daemon_running`]'s shape; the GUI will call
 /// this in Phase B.
 pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
-    ensure_node_running_impl(None, false).await
+    // Pin to OUR OWN version — this crate is compiled into whatever app is
+    // calling, so its version is the version that app was built against. A
+    // reused node older than that is a skew by definition, and since the Always
+    // On service is the default backend it is the skew an app self-update
+    // leaves behind every time. Convergence is therefore the default rather
+    // than something only the CEC app opts into; pass an explicit pin to
+    // ensure_node_running_pinned to override it.
+    ensure_node_running_impl(Some(env!("CARGO_PKG_VERSION")), false).await
 }
 
 /// Like [`ensure_node_running`], but the caller supplies the AllMyStuff version
@@ -2102,6 +2121,132 @@ async fn windows_node_process_session() -> Result<(u32, u32)> {
     Ok((pid, session_id))
 }
 
+/// What to do about a reused node that may be behind the caller's pin.
+///
+/// Split out as a pure decision so the ordering that matters can be tested
+/// without a socket, a service manager, or a network.
+#[derive(Debug, PartialEq, Eq)]
+enum Converge {
+    /// Running node meets the pin (or we can't tell) — leave it be.
+    Nothing,
+    /// Disk is already current; only the running process is stale. This is the
+    /// state a just-updated app leaves behind, because applying an update
+    /// rewrites allmystuff-serve on disk and cannot touch a running service.
+    RestartOnly,
+    /// Disk is behind too: update it first, then restart onto it.
+    UpdateThenRestart,
+}
+
+/// `running`/`disk` are `None` when that half wouldn't report a version.
+///
+/// The restart is deliberately gated on the DISK binary meeting the pin. A
+/// restart that lands on the same old build changes nothing and costs the user
+/// a bounced service — and because a node restart makes an attached GUI
+/// relaunch too, an ungated version would restart both halves on every single
+/// launch for as long as the update kept failing. Only ever ask when the
+/// restart has somewhere newer to land.
+fn converge_action(
+    running: Option<(u64, u64, u64)>,
+    disk: Option<(u64, u64, u64)>,
+    want: (u64, u64, u64),
+) -> Converge {
+    // No answer from the running node means an older build with no
+    // `node_version` op — or a node mid-restart. Either way, guessing it is
+    // stale and bouncing it is worse than waiting for its own updater.
+    let Some(running) = running else {
+        return Converge::Nothing;
+    };
+    if running >= want {
+        return Converge::Nothing;
+    }
+    match disk {
+        Some(disk) if disk >= want => Converge::RestartOnly,
+        // Includes disk == None: an unreadable binary still gets the update
+        // attempt, and run_node_update's re-check decides whether the restart
+        // actually happens.
+        _ => Converge::UpdateThenRestart,
+    }
+}
+
+/// Bring a node we did not spawn up to `pin` — binary *and* process.
+///
+/// The half that was missing: applying a self-update rewrites every installed
+/// half on disk, including `allmystuff-serve`, but it cannot restart a service
+/// it doesn't own. The old code updated the binary and told the user to "quit
+/// whatever started it (or reboot)", which is not a thing a customer does —
+/// and with the Always On service now the default backend, that skew is the
+/// normal state after every update, not an edge case. The node's own
+/// unattended updater would close it eventually, but only on its 24-hour tick.
+///
+/// So: ask the running node what version it *is*, and if it's behind, ask it
+/// to relaunch (`restart_self`) once there is a newer build on disk to land
+/// on. A node too old to answer either op is left alone — see
+/// [`converge_action`].
+async fn converge_reused_node(pin: &str) {
+    let Some(want) = crate::daemon_spawn::parse_semverish(pin) else {
+        return;
+    };
+    let Some(client) = NodeClient::new().ok() else {
+        return;
+    };
+    let running = client
+        .request("node_version", serde_json::json!({}))
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("version")
+                .and_then(|v| v.as_str())
+                .and_then(crate::daemon_spawn::parse_semverish)
+        });
+    // Only an Installed node is ours to update; a dev/override build is the
+    // developer's business, exactly as before.
+    let installed = match find_node_binary() {
+        Some((bin, NodeSource::Installed)) => Some(bin),
+        _ => None,
+    };
+    let disk = match &installed {
+        Some(bin) => node_binary_version(bin).await,
+        None => None,
+    };
+    match converge_action(running, disk, want) {
+        Converge::Nothing => {}
+        Converge::UpdateThenRestart => {
+            let Some(bin) = installed else {
+                tracing::warn!(
+                    "the running allmystuff-serve is below the {pin} pin, but its binary isn't one we install — leaving it alone"
+                );
+                return;
+            };
+            tracing::info!(
+                "the reused allmystuff-serve is below the {pin} pin — updating it on disk…"
+            );
+            if !run_node_update(&bin, want).await {
+                tracing::warn!(
+                    "couldn't bring allmystuff-serve to {pin} on disk — NOT restarting it, since it would come back the same version"
+                );
+                return;
+            }
+            request_node_restart(&client, pin).await;
+        }
+        Converge::RestartOnly => request_node_restart(&client, pin).await,
+    }
+}
+
+/// Ask the running node to relaunch onto the on-disk build. Best-effort: the
+/// node answers *before* it goes, so a transport error here means an older
+/// node with no `restart_self` op — say so plainly rather than leaving a
+/// silent skew.
+async fn request_node_restart(client: &NodeClient, pin: &str) {
+    tracing::info!(
+        "allmystuff-serve on disk now meets {pin} but the running node is older — asking it to relaunch onto it"
+    );
+    if let Err(e) = client.request("restart_self", serde_json::json!({})).await {
+        tracing::warn!(
+            "the running node wouldn't take a restart ({e}) — it predates `restart_self`, so it keeps the old build until its own updater or a service restart bounces it"
+        );
+    }
+}
+
 async fn ensure_node_running_impl(
     pin: Option<&str>,
     require_interactive_windows_node: bool,
@@ -2136,30 +2281,11 @@ async fn ensure_node_running_impl(
             );
         }
         tracing::info!("existing allmystuff node found on the control socket");
-        // A node we didn't spawn is already serving. If the caller pins a
-        // version and the on-disk Installed binary is behind it, refresh it so
-        // the *next* start runs a current node — the running one keeps its
-        // version until it restarts (we can't restart a node we don't own).
+        // A node we didn't spawn is already serving. Bring it up to the pin —
+        // both halves of it: the binary on disk, and the process actually
+        // running. See converge_reused_node.
         if let Some(pin) = pin {
-            if let (Some((bin, NodeSource::Installed)), Some(want)) = (
-                find_node_binary(),
-                crate::daemon_spawn::parse_semverish(pin),
-            ) {
-                if node_binary_version(&bin)
-                    .await
-                    .map(|have| have < want)
-                    .unwrap_or(false)
-                {
-                    tracing::info!(
-                        "the reused allmystuff-serve is below the {pin} pin — updating it on disk for the next start…"
-                    );
-                    if run_node_update(&bin, want).await {
-                        tracing::warn!(
-                            "updated allmystuff-serve on disk, but the running node keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch to pick it up"
-                        );
-                    }
-                }
-            }
+            converge_reused_node(pin).await;
         }
         return Ok(None);
     }
@@ -2391,5 +2517,76 @@ mod tests {
             serde_json::from_slice::<NodeEvent>(&restart).unwrap(),
             NodeEvent::Restart
         ));
+    }
+
+    /// The skew this whole path exists for: an app self-update rewrote
+    /// allmystuff-serve on disk, but the Always On service — now the default
+    /// backend — is still executing the image it started with. Nothing on disk
+    /// is wrong, so the old on-disk-only check saw a current binary and did
+    /// nothing at all, while every fix in that update silently wasn't there.
+    #[test]
+    fn a_stale_service_on_a_current_binary_is_restarted() {
+        assert_eq!(
+            converge_action(Some((0, 2, 63)), Some((0, 2, 64)), (0, 2, 64)),
+            Converge::RestartOnly
+        );
+    }
+
+    /// Both halves behind (the node's own updater never ran): update the disk
+    /// first, then restart onto it. Restarting first would land on the same
+    /// build.
+    #[test]
+    fn a_stale_binary_is_updated_before_the_restart() {
+        assert_eq!(
+            converge_action(Some((0, 2, 60)), Some((0, 2, 60)), (0, 2, 64)),
+            Converge::UpdateThenRestart
+        );
+        // An unreadable binary still gets the attempt; run_node_update's
+        // re-check is what decides whether the restart follows.
+        assert_eq!(
+            converge_action(Some((0, 2, 60)), None, (0, 2, 64)),
+            Converge::UpdateThenRestart
+        );
+    }
+
+    /// A node at or past the pin is left alone — including one AHEAD of the
+    /// app, which is an app that hasn't relaunched yet, not a node to bounce.
+    #[test]
+    fn a_current_node_is_left_alone() {
+        assert_eq!(
+            converge_action(Some((0, 2, 64)), Some((0, 2, 64)), (0, 2, 64)),
+            Converge::Nothing
+        );
+        assert_eq!(
+            converge_action(Some((0, 2, 65)), Some((0, 2, 65)), (0, 2, 64)),
+            Converge::Nothing
+        );
+    }
+
+    /// A node that won't say what it is predates `node_version`, so it also
+    /// predates `restart_self` — and may simply be mid-restart. Bouncing it on
+    /// a guess is worse than waiting for its own updater.
+    #[test]
+    fn a_silent_node_is_never_bounced_on_a_guess() {
+        assert_eq!(
+            converge_action(None, Some((0, 2, 60)), (0, 2, 64)),
+            Converge::Nothing
+        );
+        assert_eq!(converge_action(None, None, (0, 2, 64)), Converge::Nothing);
+    }
+
+    /// The loop guard. A node restart makes an attached GUI relaunch too, so
+    /// asking for one that can't change the version would restart BOTH halves
+    /// on every launch, forever. The restart is gated on disk >= pin precisely
+    /// so it always has somewhere newer to land.
+    #[test]
+    fn a_restart_is_never_asked_for_when_it_would_change_nothing() {
+        for disk in [Some((0, 2, 60)), Some((0, 2, 63)), None] {
+            assert_ne!(
+                converge_action(Some((0, 2, 63)), disk, (0, 2, 64)),
+                Converge::RestartOnly,
+                "disk {disk:?} cannot satisfy the pin, so a bare restart would spin"
+            );
+        }
     }
 }

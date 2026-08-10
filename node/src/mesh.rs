@@ -180,6 +180,14 @@ pub struct Mesh {
     /// the fleet-conscription takeover (AMS-01). Refreshed on ownership changes
     /// and on a periodic tick.
     fleet_authorized: Mutex<std::collections::HashSet<String>>,
+    /// Serializes [`Mesh::refresh_fleet_authorization`]. The refresh awaits a
+    /// `RosterList` and then assigns [`Mesh::fleet_authorized`] wholesale, so
+    /// two overlapping refreshes resolve in completion order rather than the
+    /// order they were asked — letting a slower reply carrying an older,
+    /// still-converging roster clobber a newer complete one, and deny a
+    /// legitimate controller until the next refresh happens to fix it. An
+    /// async mutex because it is held across that request.
+    fleet_auth_refresh: tokio::sync::Mutex<()>,
     /// Canonical pubkeys of devices THIS node has sent an ownership `Claim` to
     /// and is awaiting a `Claimed` confirmation from. An inbound
     /// `OwnershipControl::Claimed` is honoured only when its authenticated
@@ -1156,6 +1164,7 @@ impl Mesh {
             }),
             ownership: Arc::new(Ownership::load()),
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
+            fleet_auth_refresh: tokio::sync::Mutex::new(()),
             pending_claims: Mutex::new(std::collections::HashSet::new()),
             peer_clock_skew: Mutex::new(HashMap::new()),
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4893,15 +4902,52 @@ impl Mesh {
         // Bring the link up before offering over it. Cheap and idempotent when
         // the session is already live (every fleet console), and the whole
         // difference between connecting and not when it isn't.
-        self.ensure_peer_link(&peer).await;
+        let link_live = self.ensure_peer_link(&peer).await;
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
             s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
         };
-        // Hand the offer to the daemon's acknowledged delivery and return —
-        // the route is legitimately "connecting" while a cold link is built,
-        // and blocking here would freeze the console for the length of it.
+        // **A live link sends inline, in order.** Every other piece of route
+        // control — Teardown, Accept, Reject — goes out through
+        // `process_effects`' awaited `send_control`, so it is ordered by
+        // construction. Handing only the *offer* to a spawned task made it the
+        // one unordered message on the plane, and two offers to the same peer
+        // then raced: flipping console tabs A→B→C spawns Offer B and Offer C
+        // independently, and whichever acknowledged delivery resolved first
+        // won. That is a switch that lands on the wrong screen, or appears not
+        // to happen — for a plane whose own machinery (stable route ids across
+        // a re-offer, the video generation fence, the teardown quarantine) is
+        // built on the assumption that the console's serialized
+        // teardown-then-offer arrives in that order.
+        //
+        // So the deferred path is now scoped to what it was actually for: a
+        // peer whose link is *not* up, where the alternative is the offer being
+        // dropped on the floor. There the route legitimately sits "connecting"
+        // while a cold link is built, blocking would freeze the console for the
+        // length of it, and there is no ordering to lose — nothing else is in
+        // flight to that peer.
+        if link_live {
+            if let Err(e) = self.send_control(&peer, &msg).await {
+                tracing::warn!(
+                    "route {} offer to {} undeliverable: {e}",
+                    route.id,
+                    short_id(&peer)
+                );
+                let mut st = self.state.lock();
+                if let Some(s) = st.session.as_mut() {
+                    let _ = s.teardown(&route.id);
+                }
+                return Err(e);
+            }
+            tracing::info!(
+                "route {} offered to {} — awaiting accept",
+                route.id,
+                short_id(&peer)
+            );
+            self.emit_snapshot();
+            return Ok(route.id);
+        }
         // Only a TTL that actually lapses tears the route down, so the failure
         // the user sees is "this peer never came up", not "you clicked while
         // the link was still settling".
@@ -9005,11 +9051,24 @@ impl Mesh {
     /// A non-empty read always replaces the cache, so an eviction still bites
     /// the instant the roster is readable again — a removed member is never
     /// resurrected.
+    ///
+    /// **Serialized**, because a dozen call sites fire this from inbound events
+    /// (a peer approval, each claim-status check, every fleet edit) and two can
+    /// easily overlap. Each awaits its own `RosterList` and then assigns the
+    /// cache wholesale, so without a lock the *last to return* wins rather than
+    /// the last to be asked — and a slower reply carrying an older, still-
+    /// converging roster silently clobbers a newer complete one. That reads
+    /// exactly like the field report it came from: control refused as "not in
+    /// the fleet roster", intermittently, on a fleet whose roster is fine.
     async fn refresh_fleet_authorization(self: &Arc<Self>) {
         let Some(network) = self.ownership.fleet_network_id() else {
             self.fleet_authorized.lock().clear();
             return;
         };
+        // Held across the request so the read and the assignment are one
+        // step; concurrent callers queue and the last one to *start* is the
+        // last one to finish.
+        let _serialize = self.fleet_auth_refresh.lock().await;
         let data = match self.client.request(&Request::RosterList { network }).await {
             Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
             // Daemon unreachable — keep the prior cache rather than briefly
@@ -13670,7 +13729,11 @@ impl Mesh {
     /// so a stray one-sided dial can't become an admitted link). Best-effort
     /// throughout — a failure here just means the reliable send waits longer
     /// for the engine to get there on its own.
-    async fn ensure_peer_link(&self, peer: &str) {
+    /// Returns whether a live session **already existed** — the caller's cue
+    /// that ordinary ordered delivery will reach this peer, and that the
+    /// deferred, acknowledged path (which trades ordering for surviving a cold
+    /// connect) is neither needed nor wanted.
+    async fn ensure_peer_link(&self, peer: &str) -> bool {
         let canon = pubkey_part(peer).to_string();
         let proven = {
             let st = self.state.lock();
@@ -13680,6 +13743,7 @@ impl Mesh {
             Some(network) => vec![network],
             None => self.peer_network_candidates(peer),
         };
+        let mut live = false;
         for network in targets {
             match self
                 .client
@@ -13704,7 +13768,9 @@ impl Mesh {
                         .and_then(|d| d.get("active"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    if !active {
+                    if active {
+                        live = true;
+                    } else {
                         tracing::info!(
                             "dialing {} on {network} — no live session yet, the offer will wait for it",
                             short_id(peer)
@@ -13719,6 +13785,7 @@ impl Mesh {
                 Err(e) => tracing::debug!("dial of {} on {network} failed: {e}", short_id(peer)),
             }
         }
+        live
     }
 
     /// Record that a send to `peer` was daemon-confirmed on `network`, so the

@@ -238,6 +238,9 @@ pub struct Mesh {
     /// a path, so this registry is what stands between a folder share and the
     /// rest of the disk.
     folders: Arc<crate::folders::Folders>,
+    /// In-flight [`AppControl::ShareFolder`] asks, by request id — what
+    /// [`Mesh::folder_share_from`] waits on.
+    folder_mint_replies: Mutex<HashMap<String, FolderMintReply>>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel. Bounded like video: a stalled
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
@@ -429,6 +432,12 @@ struct KvmMediaRequest {
     made: Instant,
     acknowledged: Option<oneshot::Sender<()>>,
 }
+
+/// One in-flight ask to a device of ours to share a folder: `None` while it
+/// is still thinking, then its answer — the minted `(id, label)`, or why not.
+/// Two layers deep because "hasn't replied yet" and "replied, and refused"
+/// are different states and the waiter treats them differently.
+type FolderMintReply = Option<Result<(String, String), String>>;
 
 /// A receiver-initiated native-drive pull. The request token is also the
 /// authorization proof for the source's inbound offer; retaining the user's
@@ -1185,6 +1194,7 @@ impl Mesh {
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             folders: Arc::new(crate::folders::Folders::load()),
+            folder_mint_replies: Mutex::new(HashMap::new()),
             audio_out,
             video_out,
             audio_rx: Mutex::new(Some(audio_rx)),
@@ -4818,6 +4828,72 @@ impl Mesh {
         }))
     }
 
+    /// Share a folder that lives on **another machine of mine**, returning the
+    /// id that machine minted.
+    ///
+    /// The share builder lets you share any device you own, and a folder id can
+    /// only be minted against the disk the folder is on — so this is the round
+    /// trip that lets you pick a folder on your laptop while sitting at your
+    /// desktop. Browsing to *find* that folder needs nothing new: the remote
+    /// folder picker already walks a device's disk over the ordinary files
+    /// plane, and hands back the path this carries.
+    ///
+    /// Sending a path here is not the leak that sending one in `MapFolder`
+    /// would be. It travels inward — from the owner to their own device,
+    /// naming what to share — which is the opposite direction from a peer
+    /// naming what it wants to open.
+    pub async fn folder_share_from(
+        self: &Arc<Self>,
+        source: String,
+        path: String,
+        label: String,
+    ) -> Result<Value, String> {
+        let source = pubkey_part(&node_of(&source)).to_string();
+        if source.is_empty() {
+            return Err("choose a device of yours".into());
+        }
+        // Sitting at the machine that owns the folder — no round trip needed.
+        if self
+            .local_node_id()
+            .is_some_and(|me| same_node(&source, &me))
+        {
+            return self.folder_share(path, label);
+        }
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a folder request: {error}"))?;
+        let request = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.folder_mint_replies
+            .lock()
+            .insert(request.clone(), None);
+        let sent = self
+            .send_control(
+                &source,
+                &ControlMessage::App(AppControl::ShareFolder {
+                    path,
+                    label,
+                    request: request.clone(),
+                }),
+            )
+            .await;
+        if let Err(error) = sent {
+            self.folder_mint_replies.lock().remove(&request);
+            return Err(error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(Some(reply)) = self.folder_mint_replies.lock().remove(&request) {
+                return reply.map(|(id, label)| json!({ "id": id, "label": label }));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.folder_mint_replies.lock().remove(&request);
+        Err("that device didn't answer (it may need an AllMyStuff update)".into())
+    }
+
     /// Stop sharing a folder. Every open dies with it, since the registry is
     /// the only way back from an id to a path — revoking the grants that named
     /// it is the caller's separate, and also sufficient, move.
@@ -7401,6 +7477,56 @@ impl Mesh {
                         tracing::warn!("shared folder request refused: {error}");
                     }
                 });
+            }
+            AppControl::ShareFolder {
+                path,
+                label,
+                request,
+            } => {
+                // Owner/fleet only, via the default gate above — this is the
+                // owner telling their own machine to share a folder.
+                let reply = match self.folder_share(path, label) {
+                    Ok(folder) => AppControl::ShareFolderResult {
+                        request,
+                        folder: folder
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        label: folder
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        error: None,
+                    },
+                    Err(error) => AppControl::ShareFolderResult {
+                        request,
+                        folder: String::new(),
+                        label: String::new(),
+                        error: Some(error),
+                    },
+                };
+                let _ = self
+                    .send_control(from.as_str(), &ControlMessage::App(reply))
+                    .await;
+            }
+            AppControl::ShareFolderResult {
+                request,
+                folder,
+                label,
+                error,
+            } => {
+                // Only a request we actually made is answerable, so an
+                // unsolicited or replayed result lands nowhere.
+                let mut pending = self.folder_mint_replies.lock();
+                if let Some(slot) = pending.get_mut(&request) {
+                    *slot = Some(match error {
+                        Some(error) => Err(error),
+                        None if folder.is_empty() => Err("that machine minted no folder id".into()),
+                        None => Ok((folder, label)),
+                    });
+                }
             }
             AppControl::StageKvmMedia {
                 request,

@@ -726,6 +726,35 @@ pub enum AppControl {
         mount: String,
         request: String,
     },
+    /// Ask one of *my own* machines to start sharing one of its folders, and
+    /// report back the id it minted.
+    ///
+    /// The share builder lets you share any device you own, but a folder id
+    /// can only be minted against the disk the folder is on — so picking a
+    /// folder on another of your machines needs this round trip. Owner/fleet
+    /// only (the default app-control gate): this says "share a folder of
+    /// yours", which is a thing only its owner may say.
+    ///
+    /// A `path` here is not the leak `MapFolder` would be. It travels *inward*,
+    /// from the owner to their own device, naming what to share — the opposite
+    /// direction from a peer naming what it wants to open.
+    ShareFolder {
+        path: String,
+        #[serde(default)]
+        label: String,
+        request: String,
+    },
+    /// The minted folder — the reply to [`AppControl::ShareFolder`]. The
+    /// opaque request id lets the asker ignore anything it didn't ask for.
+    ShareFolderResult {
+        request: String,
+        #[serde(default)]
+        folder: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Ask this authorized source machine to stage one local ISO/image (or a
     /// whole removable disk) on a KVM as BIOS-visible USB virtual media.
     StageKvmMedia {

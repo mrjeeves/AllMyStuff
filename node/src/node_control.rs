@@ -912,6 +912,16 @@ pub async fn dispatch(
                 .to_string();
             json_result(mesh.folder_share(path, label))
         }
+        "folder_share_from" => {
+            let source: String = try_arg!(arg(a, "source"));
+            let path: String = try_arg!(arg(a, "path"));
+            let label: String = a
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            json_result(mesh.folder_share_from(source, path, label).await)
+        }
         "folder_unshare" => {
             let id: String = try_arg!(arg(a, "id"));
             DispatchOut::Json(json!({ "removed": mesh.folder_unshare(id) }))

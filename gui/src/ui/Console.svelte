@@ -1549,21 +1549,53 @@
   // "fullscreen game doesn't capture the cursor" field report. Esc (the
   // browser's own gesture) releases; leaving theater or control drops it.
   let pointerLocked = $state(false);
+  // Relative mouse, asked for deliberately rather than inferred from theater.
+  //
+  // A remote fullscreen app or game captures the mouse on ITS machine: it
+  // warps the cursor to centre each frame and reads the delta. Absolute
+  // coordinates fight that — every move we send yanks the cursor back to
+  // where our pointer is, so aiming is unusable — and it doesn't matter one
+  // bit whether the *viewer* happens to be fullscreen. Tying capture to
+  // theater meant the only way to drive such an app was to also give up your
+  // own screen, so this is its own switch.
+  //
+  // Turning it on grabs the pointer on the next click (pointer lock needs a
+  // user gesture); Esc — the browser's own gesture — releases the lock, and
+  // the effect below turns the mode off with it, so one press hands your
+  // cursor back rather than leaving a mode armed to re-grab.
+  let relativeMouse = $state(false);
   function lockChanged() {
     pointerLocked = document.pointerLockElement === stageEl;
+    if (!pointerLocked) relativeMouse = false;
   }
+  /** Whether capture is wanted at all right now — theater as before, or an
+   *  explicit relative-mouse session. Control over a real desktop either way;
+   *  a KVM source has no pointer to capture. */
+  const wantsCapture = $derived((theater || relativeMouse) && stagePointerActive && !kvmSource);
   function maybePointerLock() {
-    if (theater && stagePointerActive && !kvmSource && !pointerLocked) {
+    if (wantsCapture && !pointerLocked) {
       void stageEl?.requestPointerLock();
     }
+  }
+  function toggleRelativeMouse() {
+    if (pointerLocked) {
+      relativeMouse = false;
+      document.exitPointerLock();
+      return;
+    }
+    relativeMouse = true;
+    // This click IS the user gesture, so grab now rather than waiting for
+    // the next one.
+    maybePointerLock();
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
     return () => document.removeEventListener("pointerlockchange", lockChanged);
   });
   $effect(() => {
-    // Falling out of theater or control releases the capture.
-    if (pointerLocked && (!theater || !stagePointerActive || kvmSource)) {
+    // Losing control (or the desktop under it) releases the capture, and
+    // leaving theater releases it only when relative mouse isn't holding it.
+    if (pointerLocked && !wantsCapture) {
       document.exitPointerLock();
     }
   });
@@ -2219,6 +2251,21 @@
             aria-label="Video menu"
             onclick={() => toggleMenu("video")}>🎚</button
           >
+          {#if stagePointerActive && !kvmSource}
+            <!-- Relative mouse. Only meaningful over a desktop we're driving:
+                 a game on the far side captures its own cursor and wants
+                 deltas, not coordinates. Esc gives the pointer back. -->
+            <button
+              class="kbtn"
+              class:on={pointerLocked}
+              title={pointerLocked
+                ? "Release the mouse (Esc)"
+                : "Capture the mouse — relative motion for a fullscreen app or game"}
+              aria-label="Relative mouse"
+              aria-pressed={pointerLocked}
+              onclick={toggleRelativeMouse}>🎯</button
+            >
+          {/if}
           {#if !mobileShell}
             <!-- The phone shell IS full-screen — a fullscreen button
                  there is a knob with nothing behind it. -->

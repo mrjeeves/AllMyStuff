@@ -442,21 +442,40 @@
   // (the browser's own gesture) releases it; leaving fullscreen or
   // control drops it too.
   let pointerLocked = $state(false);
+  // Relative mouse — the console's switch, in the popped-out window. See the
+  // note there: a remote game captures its own cursor and wants deltas, and
+  // whether *this* window is fullscreen has nothing to do with it. A popped
+  // out monitor is if anything the likelier place to want it, since the game
+  // is on one screen and the rest of the desk stays usable.
+  let relativeMouse = $state(false);
   function lockChanged() {
     pointerLocked = document.pointerLockElement === stageEl;
+    if (!pointerLocked) relativeMouse = false;
   }
+  const wantsCapture = $derived((fullscreen || relativeMouse) && controlActive && !kvmSource);
   function maybePointerLock() {
-    if (fullscreen && controlActive && !kvmSource && !pointerLocked) {
+    if (wantsCapture && !pointerLocked) {
       void stageEl?.requestPointerLock();
     }
+  }
+  function toggleRelativeMouse() {
+    if (pointerLocked) {
+      relativeMouse = false;
+      document.exitPointerLock();
+      return;
+    }
+    relativeMouse = true;
+    // The click is the user gesture pointer lock needs — grab on it.
+    maybePointerLock();
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
     return () => document.removeEventListener("pointerlockchange", lockChanged);
   });
   $effect(() => {
-    // Falling out of fullscreen or control releases the capture.
-    if (pointerLocked && (!fullscreen || !controlActive || kvmSource)) {
+    // Losing control (or the desktop under it) releases the capture; leaving
+    // fullscreen releases it only when relative mouse isn't holding it.
+    if (pointerLocked && !wantsCapture) {
       document.exitPointerLock();
     }
   });
@@ -685,6 +704,25 @@
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}
       {@render pillMenu("rate", "Rate", RATE_CHOICES, tune.bitrate, "bitrate")}
     {/if}
+    {#if controlActive && !kvmSource}
+      <!-- Relative mouse: deltas for a remote app that captures its own
+           cursor. Esc gives the pointer back. -->
+      <button
+        class="corner-btn"
+        class:on={pointerLocked}
+        title={pointerLocked
+          ? "Release the mouse (Esc)"
+          : "Capture the mouse — relative motion for a fullscreen app or game"}
+        aria-label="Relative mouse"
+        aria-pressed={pointerLocked}
+        onpointerdown={(e) => e.stopPropagation()}
+        onpointerup={(e) => e.stopPropagation()}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleRelativeMouse();
+        }}>🎯</button
+      >
+    {/if}
     <button
       class="corner-btn"
       title={fullscreen ? `Exit fullscreen${controlActive ? "" : " (Esc)"}` : "Fullscreen"}
@@ -902,5 +940,12 @@
   }
   .corner-btn:hover {
     background: rgba(0, 0, 0, 0.85);
+  }
+  /* Mouse captured: the cursor is gone from this machine, so the control
+     that took it has to be visibly lit — otherwise "where did my pointer
+     go" has no answer on screen. */
+  .corner-btn.on {
+    border-color: var(--accent, #4ade80);
+    background: color-mix(in srgb, var(--accent, #4ade80) 28%, rgba(0, 0, 0, 0.75));
   }
 </style>

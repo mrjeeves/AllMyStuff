@@ -147,6 +147,7 @@ import {
   autostartSet,
   clipboardPaste,
   clipboardPull,
+  shareFolderFrom,
   sendInput,
   debugLoggingGet,
   debugLoggingSet,
@@ -774,6 +775,14 @@ class AppStore {
   /** Consoles to pre-toggle when the builder opens — used by "Manage share" to
    *  show what's already granted to that fleet. */
   shareFlowInitialCaps = $state<ShareCap[]>([]);
+  /** The folder the builder's Files toggle is about, once one is picked — the
+   *  minted id is what its grant pins to, so this is what turns "Files" from
+   *  "the whole disk" into "this folder". Null until picked, which is why the
+   *  toggle can't be completed without choosing one. */
+  shareFlowFolder = $state<{ id: string; label: string; path: string } | null>(null);
+  /** Set while the pick is being minted on the device that holds the folder,
+   *  so the builder can say it's working rather than look stuck. */
+  shareFlowFolderPending = $state(false);
 
   // ---- remote console (the pikvm-style session popup) -------------
   /** The remote machine a console session is open on, if any. */
@@ -2882,6 +2891,18 @@ class AppStore {
     // if it granted anything console-ish at all.
     if (grants.some((g) => forSender(g) && g.media === "display")) out.push("console");
     if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
+    // Re-opening a share whose folder grant is already in place shows the
+    // folder it names, so "Manage share" reads as what was actually shared
+    // rather than a bare toggle with no folder behind it.
+    const folderGrant = grants.find(
+      (g) => forSender(g) && g.media === "storage" && !!g.capability?.includes(":folder:"),
+    );
+    if (folderGrant?.capability) {
+      const id = folderGrant.capability.split(":folder:")[1] ?? "";
+      if (id && !id.includes(":")) {
+        this.shareFlowFolder = { id, label: folderGrant.label || "Shared folder", path: "" };
+      }
+    }
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
     return out;
@@ -2938,6 +2959,41 @@ class AppStore {
     }
   }
 
+  /** Pick a folder on the sender device to share.
+   *
+   *  The path goes *inward* — to my own machine, naming what to share — and
+   *  comes back as a minted id. That id is what the grant pins to and the only
+   *  name for the folder that ever reaches the other fleet, which is what keeps
+   *  a folder share to one folder instead of the disk it sits on.
+   *
+   *  Browsing to find it needs nothing special: `RemoteFolderPicker` already
+   *  walks any of my devices over the ordinary files plane. */
+  async pickShareFolder(path: string, label: string): Promise<boolean> {
+    const sender = this.shareFlowSender;
+    if (!sender) return false;
+    this.shareFlowFolderPending = true;
+    try {
+      const minted = await shareFolderFrom(sender, path, label);
+      if (!minted?.id) {
+        this.toast("warn", "That device couldn't share the folder");
+        return false;
+      }
+      this.shareFlowFolder = { id: minted.id, label: minted.label || label, path };
+      return true;
+    } catch (error) {
+      this.toast("warn", `Couldn't share that folder: ${error}`);
+      return false;
+    } finally {
+      this.shareFlowFolderPending = false;
+    }
+  }
+
+  /** Forget the picked folder — the builder's Files toggle going off, or the
+   *  sender changing under it (a folder id belongs to one machine). */
+  clearShareFolder() {
+    this.shareFlowFolder = null;
+  }
+
   /** The grants one chosen capability mints — a persistent permission for the
    *  receiving fleet to open my sender device's console, NOT a live route.
    *  Each is scoped to the sender device so it only ever unlocks *that* device.
@@ -2977,8 +3033,16 @@ class AppStore {
           mk("input", "consume", "control", "control it"),
           mk("clipboard", "both", "clipboard", "share its clipboard"),
         ];
-      case "files":
-        return [mk("storage", "both", "files", "use its files")];
+      case "files": {
+        // A folder, never the whole-machine files console. The console
+        // (`<sender>:files`) stays owner/fleet-only; what a share hands over
+        // is one folder, named by the id its own machine minted, and the
+        // sharer's node resolves that id back to a path locally. No path is
+        // in the grant, so a grant can't be read as "where their files are".
+        const folder = this.shareFlowFolder;
+        if (!folder) return [];
+        return [mk("storage", "both", `folder:${folder.id}`, `share ${folder.label}`)];
+      }
       case "terminal":
         return [mk("generic", "provide", "terminal", "use its terminal")];
       case "sites":
@@ -3033,6 +3097,13 @@ class AppStore {
     // it. The console's own pieces no longer need reconciling against each
     // other (they are one cap now), so nothing implies anything here.
     const want = new Set(caps);
+    // `shareCapGrants` mints nothing for Files without a folder, which would
+    // make the toggle look accepted and hand over precisely nothing. Say so
+    // instead — a share nobody can open is worse than a refused one.
+    if (want.has("files") && !this.shareFlowFolder) {
+      this.toast("warn", "Pick the folder to share first");
+      return 0;
+    }
     const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
     for (const cap of ALL) {
       const grants = this.shareCapGrants(person.id, cap, sender, senderLabel);

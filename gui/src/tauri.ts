@@ -363,6 +363,34 @@ export async function mapNativeDriveFrom(
   await invoke("drive_map_from", { source, root, label, mount });
 }
 
+/** Share a folder on `source` — whichever machine of mine holds it — and get
+ *  back the id it minted. The share builder pins its grant to that id; the
+ *  path never leaves the machine that owns the disk. */
+export async function shareFolderFrom(
+  source: string,
+  path: string,
+  label: string,
+): Promise<{ id: string; label: string } | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("folder_share_from", { source, path, label })) as {
+    id: string;
+    label: string;
+  };
+}
+
+/** Open a folder someone shared with us as a native drive here. `mount` is
+ *  ours to choose — it describes this desktop, not theirs. */
+export async function openSharedFolder(
+  source: string,
+  folder: string,
+  mount: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("folder_open", { source, folder, mount });
+}
+
 export async function stageKvmMedia(
   source: string,
   kvm: string,

@@ -186,6 +186,46 @@ async fn drive_map_from(
     Ok(())
 }
 
+/// Share a folder on `source` — whichever machine of mine holds it — and
+/// return the id it minted. The share builder pins its grant to that id, so
+/// the path stays on the machine that owns the disk.
+#[tauri::command]
+async fn folder_share_from(
+    state: State<'_, AppState>,
+    source: String,
+    path: String,
+    label: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request(
+            "folder_share_from",
+            json!({ "source": source, "path": path, "label": label }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Open a folder someone shared with us as a native drive here, at our own
+/// choice of mount point.
+#[tauri::command]
+async fn folder_open(
+    state: State<'_, AppState>,
+    source: String,
+    folder: String,
+    mount: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "folder_open",
+            json!({ "source": source, "folder": folder, "mount": mount }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn kvm_media_stage(
     state: State<'_, AppState>,
@@ -2807,6 +2847,8 @@ fn main() {
             connect_route,
             drive_map,
             drive_map_from,
+            folder_share_from,
+            folder_open,
             kvm_media_stage,
             kvm_media_unmount,
             disconnect_route,

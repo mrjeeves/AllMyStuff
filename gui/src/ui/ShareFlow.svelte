@@ -9,6 +9,7 @@
   // pre-fills the already-granted consoles), or by dragging a device onto a
   // fleet on the graph.
   import { app, type ShareCap } from "../store.svelte";
+  import RemoteFolderPicker from "./RemoteFolderPicker.svelte";
   import { displayName, isAppNode } from "../types";
 
   type Side = "receiver" | "sender";
@@ -25,7 +26,7 @@
     // console that came up half-dead.
     { key: "console", label: "Remote control", icon: "🕹", note: "screen, sound, keyboard & mouse" },
     { key: "terminal", label: "Terminal", icon: "📟", popout: true },
-    { key: "files", label: "Files", icon: "🗂", popout: true },
+    { key: "files", label: "Folder", icon: "🗂", popout: true, note: "one folder, not the disk" },
     { key: "sites", label: "Sites", icon: "🌐", popout: true },
   ];
 
@@ -58,10 +59,17 @@
   function osOf(id: string | null): string {
     return nodeOf(id)?.summary?.os ?? "";
   }
+  // The folder picker, open over the sender while a folder is being chosen.
+  let pickingFolder = $state(false);
+
   function pickSender(id: string) {
     app.shareFlowSender = id;
     picking = null;
-    chosen = new Set([...chosen].filter((c) => app.shareFlowCapAvailable(id, c)));
+    // A folder id belongs to the machine that minted it, so changing the
+    // sender invalidates the pick rather than silently re-aiming it at a
+    // folder on a different disk.
+    app.clearShareFolder();
+    chosen = new Set([...chosen].filter((c) => c !== "files" && app.shareFlowCapAvailable(id, c)));
   }
   function pickFleet(nodeId: string) {
     app.shareFlowReceiver = nodeId;
@@ -69,9 +77,16 @@
   }
   function toggleCap(c: ShareCap) {
     if (!app.shareFlowCapAvailable(sender, c)) return;
+    // Sharing a folder means choosing *which* folder — there is no sensible
+    // default, and the old toggle's default was the whole disk.
+    if (c === "files" && !chosen.has(c)) {
+      pickingFolder = true;
+      return;
+    }
     const next = new Set(chosen);
     if (next.has(c)) {
       next.delete(c);
+      if (c === "files") app.clearShareFolder();
       // Turning off Video turns off anything that depends on it (Control).
       for (const dep of CAPS) if (dep.requires === c) next.delete(dep.key);
     } else {
@@ -148,12 +163,30 @@
                 onclick={() => toggleCap(c.key)}
               >
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
-                {c.label}{#if c.note}<span class="cap-note"> · {c.note}</span>{/if}
+                {c.label}{#if c.key === "files" && app.shareFlowFolder}<span class="cap-note">
+                    · {app.shareFlowFolder.label}</span
+                  >{:else if c.note}<span class="cap-note"> · {c.note}</span>{/if}
                 {#if needs}<span class="cap-req">needs Video</span>
                 {:else if c.popout}<span class="cap-pop">popout</span>{/if}
               </button>
             {/each}
           </div>
+          {#if chosen.has("files") && app.shareFlowFolder}
+            <!-- Which folder, spelled out. A grant that says only "Folder"
+                 is one nobody can audit later. -->
+            <button
+              class="folder-line"
+              title="Choose a different folder"
+              onclick={() => (pickingFolder = true)}
+            >
+              <span class="fl-k">Folder</span>
+              <span class="fl-v">{app.shareFlowFolder.label}</span>
+              <span class="fl-change">change</span>
+            </button>
+          {/if}
+          {#if app.shareFlowFolderPending}
+            <div class="folder-line pending">Sharing that folder…</div>
+          {/if}
         </section>
 
         <!-- Middle: direction + actions -->
@@ -181,6 +214,21 @@
           </p>
         </section>
       </div>
+      {#if pickingFolder && sender}
+        <!-- The picker the drive panel already uses: it walks the sender's
+             disk over the ordinary files plane and hands back a path, which
+             we send inward to be minted into an id. -->
+        <RemoteFolderPicker
+          source={sender}
+          onpick={async (path, label) => {
+            pickingFolder = false;
+            if (await app.pickShareFolder(path, label)) {
+              chosen = new Set([...chosen, "files"]);
+            }
+          }}
+          oncancel={() => (pickingFolder = false)}
+        />
+      {/if}
     </div>
   </div>
 {/if}
@@ -559,6 +607,41 @@
   }
   .cap-i {
     font-size: 0.95rem;
+  }
+  /* Which folder is being shared, under the toggles — a grant that says only
+     "Folder" is one nobody can audit later. */
+  .folder-line {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    width: 100%;
+    margin-top: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .folder-line.pending {
+    cursor: default;
+    opacity: 0.7;
+  }
+  .fl-k {
+    opacity: 0.65;
+    font-size: 0.82em;
+  }
+  .fl-v {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fl-change {
+    opacity: 0.65;
+    font-size: 0.82em;
   }
   .cap-note {
     color: var(--ink-faint);

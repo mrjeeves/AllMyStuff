@@ -233,6 +233,14 @@ pub struct Mesh {
     /// ownership record, and projected into [`Mesh::snapshot`] so the GUI
     /// renders a peer as *shared* with its grants across a restart.
     shares: Arc<Shares>,
+    /// Which folders of this machine other people may open. The only id→path
+    /// resolution there is: a `MapFolder` request names a minted id and never
+    /// a path, so this registry is what stands between a folder share and the
+    /// rest of the disk.
+    folders: Arc<crate::folders::Folders>,
+    /// In-flight [`AppControl::ShareFolder`] asks, by request id — what
+    /// [`Mesh::folder_share_from`] waits on.
+    folder_mint_replies: Mutex<HashMap<String, FolderMintReply>>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel. Bounded like video: a stalled
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
@@ -425,6 +433,12 @@ struct KvmMediaRequest {
     acknowledged: Option<oneshot::Sender<()>>,
 }
 
+/// One in-flight ask to a device of ours to share a folder: `None` while it
+/// is still thinking, then its answer — the minted `(id, label)`, or why not.
+/// Two layers deep because "hasn't replied yet" and "replied, and refused"
+/// are different states and the waiter treats them differently.
+type FolderMintReply = Option<Result<(String, String), String>>;
+
 /// A receiver-initiated native-drive pull. The request token is also the
 /// authorization proof for the source's inbound offer; retaining the user's
 /// selections lets the receiver rebuild the mapping when that source reports
@@ -435,6 +449,11 @@ struct DrivePullRequest {
     root: String,
     label: String,
     mount: String,
+    /// Set when this pull asked for a **shared folder** rather than a path.
+    /// A folder pull carries no root — that is the point — so it also
+    /// registers no reconnect: a mapped drive reconnects by re-sending the
+    /// root it remembers, and a folder is re-opened by its id instead.
+    folder: Option<String>,
     made: Instant,
 }
 
@@ -1174,6 +1193,8 @@ impl Mesh {
             last_status: Mutex::new(("unknown".into(), None)),
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
+            folders: Arc::new(crate::folders::Folders::load()),
+            folder_mint_replies: Mutex::new(HashMap::new()),
             audio_out,
             video_out,
             audio_rx: Mutex::new(Some(audio_rx)),
@@ -3190,6 +3211,7 @@ impl Mesh {
                         };
                         if authorized && is_mapped_drive_route(route) {
                             let reconnect = accepted_drive_pull
+                                .filter(|pull| pull.folder.is_none())
                                 .map(|pull| DriveReconnect {
                                     source: pull.source,
                                     root: pull.root,
@@ -4677,6 +4699,7 @@ impl Mesh {
                 root: root.clone(),
                 label: label.clone(),
                 mount: mount.clone(),
+                folder: None,
                 made: Instant::now(),
             },
         );
@@ -4704,6 +4727,291 @@ impl Mesh {
         }
         self.drive_pull_tokens.lock().remove(&request);
         Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
+    }
+
+    /// Open a folder someone shared with us, as a native drive on this
+    /// machine at our own choice of `mount`.
+    ///
+    /// The receiver's half of a folder share, and the twin of
+    /// [`Self::drive_map_from`] — with the one difference that matters: that
+    /// one names a `root` on the source's disk (fine, it's owner/fleet gated),
+    /// while this names only the minted folder id. We could not name a path
+    /// here even if we wanted to, which is what keeps a folder share to one
+    /// folder.
+    ///
+    /// The mount point is ours to pick because it describes *this* desktop —
+    /// the sharer has no business choosing a drive letter on someone else's
+    /// machine.
+    pub async fn folder_open(
+        self: &Arc<Self>,
+        source: String,
+        folder: String,
+        mount: String,
+    ) -> Result<(), String> {
+        let source = pubkey_part(&node_of(&source)).to_string();
+        if source.is_empty()
+            || self
+                .local_node_id()
+                .is_some_and(|me| same_node(&source, &me))
+        {
+            return Err("choose another machine as the folder's source".into());
+        }
+        if folder.trim().is_empty() {
+            return Err("no folder named".into());
+        }
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a folder request: {error}"))?;
+        let request = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.drive_pull_tokens
+            .lock()
+            .retain(|_, pull| pull.made.elapsed() < Duration::from_secs(120));
+        self.drive_pull_tokens.lock().insert(
+            request.clone(),
+            DrivePullRequest {
+                source: source.clone(),
+                root: String::new(),
+                label: String::new(),
+                mount: mount.clone(),
+                folder: Some(folder.clone()),
+                made: Instant::now(),
+            },
+        );
+        if let Err(error) = self
+            .send_control(
+                &source,
+                &ControlMessage::App(AppControl::MapFolder {
+                    folder,
+                    mount,
+                    request: request.clone(),
+                }),
+            )
+            .await
+        {
+            self.drive_pull_tokens.lock().remove(&request);
+            return Err(error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if !self.drive_pull_tokens.lock().contains_key(&request) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.drive_pull_tokens.lock().remove(&request);
+        // Deliberately vague about *why*. The source refuses an unshared
+        // folder and an uncovered one identically and silently, so this can't
+        // become a way to probe which folder ids exist.
+        Err("the source didn't offer that folder — the share may have been withdrawn".into())
+    }
+
+    /// Share one of this machine's folders, returning its minted record. The
+    /// id is what a grant gets pinned to; the path stays here.
+    pub fn folder_share(&self, path: String, label: String) -> Result<Value, String> {
+        let path = std::path::PathBuf::from(path)
+            .canonicalize()
+            .map_err(|error| format!("couldn't open that folder: {error}"))?;
+        if !path.is_dir() {
+            return Err("choose a folder".into());
+        }
+        let folder = self.folders.share(path, label);
+        if folder.id.is_empty() {
+            return Err("couldn't mint a folder id".into());
+        }
+        Ok(json!({
+            "id": folder.id,
+            "label": folder.label,
+            "path": folder.path.to_string_lossy(),
+        }))
+    }
+
+    /// Share a folder that lives on **another machine of mine**, returning the
+    /// id that machine minted.
+    ///
+    /// The share builder lets you share any device you own, and a folder id can
+    /// only be minted against the disk the folder is on — so this is the round
+    /// trip that lets you pick a folder on your laptop while sitting at your
+    /// desktop. Browsing to *find* that folder needs nothing new: the remote
+    /// folder picker already walks a device's disk over the ordinary files
+    /// plane, and hands back the path this carries.
+    ///
+    /// Sending a path here is not the leak that sending one in `MapFolder`
+    /// would be. It travels inward — from the owner to their own device,
+    /// naming what to share — which is the opposite direction from a peer
+    /// naming what it wants to open.
+    pub async fn folder_share_from(
+        self: &Arc<Self>,
+        source: String,
+        path: String,
+        label: String,
+    ) -> Result<Value, String> {
+        let source = pubkey_part(&node_of(&source)).to_string();
+        if source.is_empty() {
+            return Err("choose a device of yours".into());
+        }
+        // Sitting at the machine that owns the folder — no round trip needed.
+        if self
+            .local_node_id()
+            .is_some_and(|me| same_node(&source, &me))
+        {
+            return self.folder_share(path, label);
+        }
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| format!("couldn't create a folder request: {error}"))?;
+        let request = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.folder_mint_replies
+            .lock()
+            .insert(request.clone(), None);
+        let sent = self
+            .send_control(
+                &source,
+                &ControlMessage::App(AppControl::ShareFolder {
+                    path,
+                    label,
+                    request: request.clone(),
+                }),
+            )
+            .await;
+        if let Err(error) = sent {
+            self.folder_mint_replies.lock().remove(&request);
+            return Err(error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(Some(reply)) = self.folder_mint_replies.lock().remove(&request) {
+                return reply.map(|(id, label)| json!({ "id": id, "label": label }));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.folder_mint_replies.lock().remove(&request);
+        Err("that device didn't answer (it may need an AllMyStuff update)".into())
+    }
+
+    /// Stop sharing a folder. Every open dies with it, since the registry is
+    /// the only way back from an id to a path — revoking the grants that named
+    /// it is the caller's separate, and also sufficient, move.
+    pub fn folder_unshare(&self, id: String) -> bool {
+        self.folders.unshare(&id)
+    }
+
+    /// This machine's shared folders, for the share builder and the
+    /// "what am I sharing" pane.
+    pub fn folders(&self) -> Value {
+        let folders: Vec<Value> = self
+            .folders
+            .list()
+            .into_iter()
+            .map(|f| {
+                json!({
+                    "id": f.id,
+                    "label": f.label,
+                    "path": f.path.to_string_lossy(),
+                    "capability": crate::folders::folder_capability(
+                        &self.local_node_id().unwrap_or_default(),
+                        &f.id,
+                    ),
+                })
+            })
+            .collect();
+        json!({ "folders": folders })
+    }
+
+    /// Serve a `MapFolder` request: turn the requester's folder **id** into a
+    /// root here, and offer that folder as a native drive on their machine.
+    ///
+    /// The path is resolved locally and never echoed back — the offer carries
+    /// a label and the requester's own mount choice, nothing about where the
+    /// folder lives. Both gates are re-checked at the moment of the offer, not
+    /// at grant time: the folder must still be shared *and* the grant must
+    /// still cover it, so unsharing the folder or revoking the grant each
+    /// close it on their own.
+    async fn folder_map_requested(
+        self: &Arc<Self>,
+        target: String,
+        folder_id: String,
+        mount: String,
+        request: String,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let target = pubkey_part(&node_of(&target)).to_string();
+        if target.is_empty() || same_node(&target, &me) {
+            return Err("choose another machine for this folder".into());
+        }
+        if !self.sender_may_open_folder(&target, &folder_id) {
+            return Err("no live share covers that folder".into());
+        }
+        // The registry is the only id→path resolution there is, and it answers
+        // `None` for an id nobody shared, one since unshared, or a folder whose
+        // path has gone — so an unauthorized or stale open fails here rather
+        // than rooting a session somewhere unintended.
+        let root = self
+            .folders
+            .root_for(&folder_id)
+            .ok_or("that folder isn't shared any more")?;
+        let label = self
+            .folders
+            .list()
+            .into_iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.label)
+            .unwrap_or_else(|| "Shared folder".into());
+
+        let from = crate::folders::folder_capability(&me, &folder_id);
+        let to = format!("{target}:storage-in");
+        let route = Route {
+            id: format!("route:{from}→{to}"),
+            from: from.into(),
+            to: to.into(),
+            media: MediaKind::Storage,
+        };
+        // Binds the session's virtual `/` to this folder. Requests are held
+        // inside it by `FilesPlane`'s existing root discipline — `..`, symlink
+        // escapes and deleting the root are refused exactly as for a mapped
+        // drive.
+        self.files.map_root(&route.id, root);
+        let drive = DriveRouteOffer {
+            label,
+            // No root on the wire, ever. A mapped drive sends one so the
+            // receiver can re-request it on reconnect; a folder is re-opened
+            // by its id instead, which is the whole reason the path stays
+            // here.
+            root: None,
+            mount: mount.trim().to_string(),
+            request: Some(request),
+        };
+        let message = {
+            let mut state = self.state.lock();
+            let session = state.session.as_mut().ok_or("mesh not ready")?;
+            session.offer_with_drive(
+                route.clone(),
+                target.as_str(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(drive),
+            )
+        };
+        if let Err(error) = self.send_control(&target, &message).await {
+            self.files.stop(&route.id);
+            if let Some(session) = self.state.lock().session.as_mut() {
+                let _ = session.teardown(&route.id);
+            }
+            return Err(error);
+        }
+        tracing::info!(
+            "shared folder {} offered to {}",
+            folder_id,
+            short_id(&target)
+        );
+        self.emit_snapshot();
+        Ok(())
     }
 
     fn persist_drive_reconnects(&self) {
@@ -7106,6 +7414,15 @@ impl Mesh {
             AppControl::MapDrive { .. } | AppControl::StageKvmMedia { .. }
         ) {
             self.sender_may_drive(from.as_str(), DrivePlane::Files)
+        } else if matches!(&message, AppControl::MapFolder { .. }) {
+            // Opening a shared folder is the one app-control a peer outside
+            // the fleet may send, so neither blanket gate fits: owner/fleet is
+            // too narrow (it would refuse the very person the folder was
+            // shared with) and the Files plane is far too wide (it is the
+            // whole disk). `folder_map_requested` asks the exact question —
+            // is there a live grant over *this* folder — against the id in the
+            // message, which isn't readable from here.
+            true
         } else {
             self.sender_may_control(from.as_str())
         };
@@ -7138,6 +7455,78 @@ impl Mesh {
                         tracing::warn!("native drive request failed: {error}");
                     }
                 });
+            }
+            AppControl::MapFolder {
+                folder,
+                mount,
+                request,
+            } => {
+                tracing::info!(
+                    "shared folder {folder} requested by {}",
+                    short_id(from.as_str())
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    if let Err(error) = mesh
+                        .folder_map_requested(from.to_string(), folder, mount, request)
+                        .await
+                    {
+                        // Refusals land here rather than on the wire on
+                        // purpose: a peer learns nothing about which folder
+                        // ids exist from a request that goes unanswered.
+                        tracing::warn!("shared folder request refused: {error}");
+                    }
+                });
+            }
+            AppControl::ShareFolder {
+                path,
+                label,
+                request,
+            } => {
+                // Owner/fleet only, via the default gate above — this is the
+                // owner telling their own machine to share a folder.
+                let reply = match self.folder_share(path, label) {
+                    Ok(folder) => AppControl::ShareFolderResult {
+                        request,
+                        folder: folder
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        label: folder
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        error: None,
+                    },
+                    Err(error) => AppControl::ShareFolderResult {
+                        request,
+                        folder: String::new(),
+                        label: String::new(),
+                        error: Some(error),
+                    },
+                };
+                let _ = self
+                    .send_control(from.as_str(), &ControlMessage::App(reply))
+                    .await;
+            }
+            AppControl::ShareFolderResult {
+                request,
+                folder,
+                label,
+                error,
+            } => {
+                // Only a request we actually made is answerable, so an
+                // unsolicited or replayed result lands nowhere.
+                let mut pending = self.folder_mint_replies.lock();
+                if let Some(slot) = pending.get_mut(&request) {
+                    *slot = Some(match error {
+                        Some(error) => Err(error),
+                        None if folder.is_empty() => Err("that machine minted no folder id".into()),
+                        None => Ok((folder, label)),
+                    });
+                }
             }
             AppControl::StageKvmMedia {
                 request,
@@ -12861,6 +13250,43 @@ impl Mesh {
             .out_grants_for(&person.id)
             .iter()
             .any(|g| grant_authorizes_plane(g, plane))
+    }
+
+    /// Whether `sender` may open shared folder `folder_id` on this machine.
+    ///
+    /// Deliberately **not** the Files plane. `AppControl::MapDrive` is gated on
+    /// `sender_may_drive(Files)` — the whole-machine console — which is right
+    /// for a fleet pull and completely wrong here: the point of sharing a
+    /// folder is that it hands over one folder and nothing else, to someone
+    /// who has no business browsing the disk. So this asks the narrower
+    /// question, and a Files grant deliberately does *not* answer it.
+    ///
+    /// Matched by **folder id**, not by comparing the whole capability string.
+    /// The id is the unguessable part, while the node prefix comes in two
+    /// forms (bare pubkey and the suffixed display id) depending on which side
+    /// minted the grant — comparing whole strings would deny a perfectly good
+    /// grant on a cosmetic difference, which is exactly the class of bug that
+    /// made screen shares fail. [`folders::folder_id_of`] rejects every other
+    /// capability shape, so `:files` can never read as a folder.
+    ///
+    /// Owner/fleet passes first: they already hold the whole-machine console,
+    /// so refusing them one folder of it would be theatre.
+    fn sender_may_open_folder(&self, sender: &str, folder_id: &str) -> bool {
+        if self.sender_may_control(sender) {
+            return true;
+        }
+        let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
+            return false;
+        };
+        self.shares.out_grants_for(&person.id).iter().any(|g| {
+            g.media == MediaKind::Storage
+                && g.role.allows_source()
+                && g.capability
+                    .as_ref()
+                    .map(|c| c.as_str())
+                    .and_then(crate::folders::folder_id_of)
+                    == Some(folder_id)
+        })
     }
 
     /// Whether a **screen-viewing** (`Display`/`Video`) offer from `sender` is

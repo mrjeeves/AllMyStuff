@@ -129,13 +129,32 @@ rules, no I/O.
 - **Relationship** — `Mine` (a device you own or manage) or `Shared { person,
   grants }`. A `Grant` authorizes a shared endpoint to play one role
   (`Provide` = they source, `Consume` = they sink) for one media, optionally
-  pinned to one capability. A grant is **to the person, not one machine**:
+  pinned to one capability. The role names **the end of the route being
+  authorized**, not who benefits: `Catalog::authorize` checks `route.from`
+  (the source end) for `Provide` and `route.to` (the sink end) for `Consume`,
+  so "let them see my screen" is a `Provide` grant over *my screen*, and
+  reading it as "they consume, therefore Consume" denies every screen share
+  ever granted. A grant is **to the person, not one machine**:
   authorization unions the grants across every node shared with the same
   person (people bring fleets — what you allow works to whichever of their
   devices is handy), and the GUI keys the person by the *owner* the devices
   advertise, so a machine of theirs that appears later folds into the same
   share. `required_grants` returns the minimal grant that would unblock a
   denied route — the "one-tap allow."
+- **A share reaches the whole receiving fleet**, which takes two halves that
+  are each useless alone. The invite lands on one device, so that device
+  **relays the grants to its own fleet** (`ShareControl::FleetShare`, keyed
+  off the granting device so every sibling lands on the same person record,
+  and accepted only from this machine's owner or a signed-roster fleet
+  member). And the sharer only ever authorizes peer nodes recorded on the
+  share, so the accepter's ack **vouches for its siblings**
+  (`ShareControl::Accept.fleet` → `Shares::vouch_siblings`). The trust rule
+  is unchanged: a vouch widens only the share its authenticated sender
+  already belongs to, a device can never add itself, and the sibling list is
+  built from *verified* membership (the signed roster, plus the owner's own
+  admit records) — advertised ownership is self-asserted and deliberately
+  never trusted here, being the conscription vector the signed roster exists
+  to close.
 - **Ownership** (in `allmystuff-protocol` + the GUI) — distinct from a
   relationship: a device *advertises* who owns it and whether it's
   *claimable*. You can't flat-take a box — a claim only lands if the device
@@ -344,7 +363,18 @@ Tauri 2 + Svelte 5, a client of the daemon.
   takes the whole window over (chrome hidden) and, in an OS window, the
   window goes fullscreen with it — Esc steps out unless control is
   live, where every key belongs to the far machine and the hover
-  control is the way back. The top bar's gear
+  control is the way back. Beside it, over a desktop we're driving, is
+  **relative mouse**: a remote fullscreen app or game captures the cursor
+  on *its* machine — warping it to centre each frame and reading the delta
+  — which absolute coordinates fight, since every move we send yanks the
+  cursor back to where our pointer is. Capturing the pointer here streams
+  `mouse_move_rel` deltas instead (the injector applies them
+  `Coordinate::Rel`). It is deliberately its own switch rather than a
+  consequence of fullscreen: whether the *viewer* is fullscreen has
+  nothing to do with whether the far app captures its cursor, and tying
+  the two meant the only way to drive such an app was to give up your own
+  screen. Esc releases the lock and the mode drops with it, so one press
+  hands the cursor back for good. The top bar's gear
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
   Fleet (the owned roster's shared key + members), and Updates (the
   `allmystuff-updater` controls). The **Networks** tab is itself split into
@@ -464,7 +494,15 @@ Tauri 2 + Svelte 5, a client of the daemon.
    its session.
 4. If a **shared** endpoint isn't covered, `requiredGrants` raises the share
    sheet ("Let Alex receive your screen?"). Approving adds exactly that grant
-   and completes the connection.
+   and completes the connection. The **share builder** (`ShareFlow.svelte`)
+   is the deliberate version of the same thing — one of *your* devices to a
+   whole receiving fleet — and it composes in the units a person actually
+   decides in: **Remote control** is one toggle that mints all four console
+   grants (screen, sound, keyboard/mouse, clipboard), because nobody shares a
+   display without input on purpose and offering them apart mostly produced a
+   console that came up half-dead; **Folder** picks one folder rather than
+   handing over the whole `:files` console. Underneath, each grant is still
+   scoped to its own capability and revocable on its own.
 5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
    audio route, the source captures what its capability names — the
@@ -586,20 +624,24 @@ Tauri 2 + Svelte 5, a client of the daemon.
    longer arrive (window blur, control toggled off, session close).
    A **clipboard route** (`MediaKind::Clipboard`, the synthetic per-machine
    `clipboard` endpoint) rides the same plane as a third console toggle
-   next to audio and control, default-on in a session. To keep each
-   machine's clipboard its own, it carries nothing until you *paste* or
-   *copy/cut from the remote*; the route is **bidirectional**, like the files
-   plane. On **paste**, the console intercepts the paste chord and the backend
-   reads this machine's clipboard and pushes it as `"clip"` frames over
-   `CHANNEL_MEDIA`, only then forwarding the paste keystroke — both ordered to
-   the same peer, so the sink writes the clipboard (gated exactly like input
-   injection) before the injected paste reads it. On **copy/cut from the
-   remote** (Ctrl/Cmd+C·X with control on), the mirror runs: the console
-   forwards the copy keystroke first so the remote copies its selection into
-   its own clipboard, then sends a `pull`; the remote waits a beat for the
-   copy to land, reads its clipboard, and streams it back on the same route,
-   where the controller writes it to its own clipboard (accepted only inside
-   the window the pull opened, so nothing lands unasked). **Text** rides one
+   next to audio and control, default-on in a session, and it **syncs** —
+   you copy somewhere, you paste somewhere else, and it works. Opening the
+   link pushes what's on the initiator's clipboard right then; from there
+   both ends stay level whichever side does the copying, with no chord
+   intercepted. Change detection is the platform's own
+   (`clipboard-rs`'s `ClipboardWatcherContext` on its own thread), never a
+   poll: a poll cheap enough to run often can't see an image change, and one
+   that can costs a PNG encode every tick, so this costs nothing until
+   someone copies. The **echo** is the whole difficulty — applying the peer's
+   clipboard changes ours, which the OS reports exactly like a user copy, so
+   forwarding it would send it straight back and one copy would ping-pong
+   forever. Both the applying and the sending side stamp a fingerprint of
+   what they handled (`Mesh::clip_synced`) and a change matching the stamp is
+   our own doing; files fingerprint by path and size, so noticing a change
+   never means reading every file on the clipboard. Acceptance is symmetric —
+   an arriving clipboard is ordinary traffic on a live route, so a live
+   clipboard route *is* the standing consent (it still has to be active, a
+   clipboard route, and from its peer). **Text** rides one
    frame; an **image** or a set of **files** rides a chunked transfer (`open`
    manifest → base64 `chunk`s → `close`, split under the channel's ~64 KiB
    ceiling like a video frame), file bytes streaming from disk and landing in
@@ -674,6 +716,40 @@ browse and edit that one volume without gaining the whole-machine `:files`
 permission. AllMyStuff exposes this in Settings → Drives, while CECSupport uses
 the same route and frame contract in its Drive mapping card. No KVM participates.
 
+**A shared folder** is that same lease made *durable*, and is what a share
+hands over instead of the whole-machine `:files` console (which stays
+owner/fleet-only). Sharing a folder mints an id for it in a durable registry
+(`folders.rs`) and the grant pins to `<node>:folder:<id>`, so the file half of
+a share is one named folder and nothing else on the disk.
+
+The load-bearing rule is that **the path never crosses the wire**. Opening one
+is `AppControl::MapFolder`, which names the id and nothing else; only the
+source's own registry turns that back into a path, on the machine that owns
+the disk. That is the difference from the mapped-drive pull it otherwise
+mirrors: `MapDrive` carries a `root`, which is fine because it is owner/fleet
+gated — naming a path on your own machine is no more than you could already do
+— while a share reaches *outside* the fleet, where a receiver that could name a
+root could name `/`. Ids are minted rather than derived from the path, so a
+folder keeps its identity across a rename and its grants survive with it.
+
+Authorization is its own gate (`sender_may_open_folder`), deliberately neither
+of the neighbouring two: owner/fleet would refuse the very person the folder
+was shared with, and the Files plane is the whole disk. It matches on the
+**id** rather than the whole capability string, because the node prefix comes
+in two forms depending on which side minted the grant. Both the grant and the
+folder are re-checked at the offer, so unsharing the folder and revoking the
+grant each close it independently, and a refusal is silent and identical either
+way so nobody can probe which ids exist. The receiver picks its own mount
+point; folder routes register no reconnect, since a folder is re-opened by id
+rather than by a remembered root.
+
+Minting happens on the machine that holds the folder — the builder shares any
+device you own, so `AppControl::ShareFolder` asks that device to share it and
+hand back the id (owner/fleet only; a path *there* travels inward, the owner
+naming to their own device what to share). Browsing to find it needs nothing
+new: `RemoteFolderPicker` already walks a device's disk over the ordinary files
+plane.
+
 ## Persistent state
 
 AllMyStuff rides on MyOwnMesh's identity + roster (under `~/.myownmesh/`,
@@ -712,12 +788,16 @@ goes to everyone.
   device (audio still uses the default input/output; monitors are routed
   per-screen and cameras per-device now), and an audio codec (Opus) so
   the media channel isn't raw PCM.
-- **Share-grant-gated control** — input injection currently trusts only the
-  device's owner/fleet; honouring a *shared* person's explicit control grant
-  rides on the share-enforcement work.
-- **Persisted relationships + grants** — remember per peer whether it's
-  *mine* or a *guest*, and its grants, across restarts (today a freshly
-  discovered peer defaults to "mine" and is reclassified from its drawer).
+- **Folder-share reconnect** — a mapped drive rebuilds itself when its source
+  returns with a fresh incarnation, by re-sending the root it remembers. A
+  shared folder has no root to remember (that's the point), so it is re-opened
+  by id instead; making that automatic is the remaining half.
+
+Done since this list was last true: **share-grant-gated control** (input
+injection honours a shared person's explicit control grant — `may_drive`), and
+**persisted relationships + grants** (`shares.rs`, durable beside ownership,
+which is what lets a restart reclassify a peer as *shared* with its grants
+rather than forgetting them).
 
 Deliberately out of scope: embedding `myownmesh-core` at the source level —
 AllMyStuff is a control-socket client by design, matching the rest of the

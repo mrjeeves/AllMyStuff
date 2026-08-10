@@ -266,11 +266,13 @@ pub struct Mesh {
     /// transfer id). Image bytes accumulate in memory; file bytes stream to
     /// a per-transfer staging dir.
     clip_inbound: Mutex<HashMap<(String, u64), ClipInbound>>,
-    /// When we last sent a clipboard [`Pull`](ClipboardEvent::Pull) per route
-    /// — the gate that lets the remote's reply land on *our* clipboard. Only a
-    /// reply that arrives within [`CLIPBOARD_PULL_WINDOW`] of our own pull is
-    /// accepted, so a misbehaving peer can't clobber our clipboard unasked.
-    clip_pull_at: Mutex<HashMap<String, std::time::Instant>>,
+    /// Fingerprint of the clipboard content this machine last *synced* —
+    /// either applied from a peer or sent to one. The OS reports a clipboard
+    /// we wrote ourselves exactly like one the user copied, so without this
+    /// stamp every sync would echo: we apply their copy, our watcher fires, we
+    /// send it back, their watcher fires, forever. A change matching the stamp
+    /// is our own doing and is not forwarded.
+    clip_synced: Mutex<Option<u64>>,
     /// Our presence boot id — how peers detect that we (re)started and answer
     /// with their state (see `NodeProfile::boot`). Seeded once per app run, but
     /// **refreshed whenever a local network reset drops our peer caches** (see
@@ -1181,7 +1183,7 @@ impl Mesh {
             clipboard_transfer: AtomicU64::new(0),
             clipboard: ClipboardService::spawn(),
             clip_inbound: Mutex::new(HashMap::new()),
-            clip_pull_at: Mutex::new(HashMap::new()),
+            clip_synced: Mutex::new(None),
             boot_id: AtomicU64::new(fresh_boot_id()),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
@@ -1859,6 +1861,12 @@ impl Mesh {
         // input frame: a lapsed grant (revoke/expiry) tears the session's
         // routes down here. Engine-lifetime; a no-op on a technician node.
         self.spawn_cec_consent_sweep();
+
+        // Keep the clipboard level across every live clipboard route, from the
+        // OS's own change notification — so copying on either machine is
+        // simply copying, with no chord to intercept. Idle until something is
+        // copied AND a clipboard route exists.
+        self.spawn_clipboard_sync();
 
         // The daemon-link loop: subscribe → bring up → drain events → and on
         // any end of the stream, around again with a fresh subscription and
@@ -10079,9 +10087,23 @@ impl Mesh {
                 }
             }
             MediaKind::Clipboard => {
-                // Nothing to start eagerly: the source reads + streams its
-                // clipboard per paste (`clipboard_paste`), and the sink
-                // reassembles + writes it on arrival (`handle_clipboard_frame`).
+                // A clipboard link starts by *syncing*, not by waiting for a
+                // chord: whoever opened it pushes what's on their clipboard
+                // now, so the far side can paste it immediately instead of
+                // discovering the link only does something if you press the
+                // right keys first. From here [`Self::spawn_clipboard_sync`]
+                // keeps both ends level off the OS's own change notification,
+                // whichever side does the copying.
+                if from_node == me {
+                    let mesh = self.clone();
+                    let peer = to_node.clone();
+                    let route_id = route.id.clone();
+                    crate::spawn(async move {
+                        if let Err(e) = mesh.sync_clipboard_to(&peer, &route_id).await {
+                            tracing::debug!("initial clipboard sync on {route_id} failed: {e}");
+                        }
+                    });
+                }
                 // Say the link is live so "awaiting accept" isn't the last
                 // word on a working clipboard route.
                 if from_node == me {
@@ -13316,13 +13338,90 @@ impl Mesh {
             }
             r.peer.to_string()
         };
-        // Open the acceptance window *before* the request goes out, so the
-        // reply can never beat it (the remote replies on this same route).
-        self.clip_pull_at
-            .lock()
-            .insert(route_id.clone(), std::time::Instant::now());
         self.send_clip_frame(&peer, &route_id, ClipboardEvent::Pull)
             .await
+    }
+
+    /// Push this machine's clipboard to one peer **for sync** — the same send
+    /// as a paste, but recording what went out so the change it causes on the
+    /// far side can't come straight back at us.
+    async fn sync_clipboard_to(self: &Arc<Self>, peer: &str, route_id: &str) -> Result<(), String> {
+        let svc = self.clipboard.clone();
+        let clip = tokio::task::spawn_blocking(move || svc.read())
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(clip) = clip else {
+            return Ok(()); // empty / unreadable — nothing to sync
+        };
+        *self.clip_synced.lock() = Some(clip.fingerprint());
+        self.send_clipboard_contents(peer, route_id).await
+    }
+
+    /// Every peer we hold a live clipboard route to, as `(peer, route_id)`.
+    fn active_clipboard_routes(&self) -> Vec<(String, String)> {
+        let st = self.state.lock();
+        let Some(session) = st.session.as_ref() else {
+            return Vec::new();
+        };
+        session
+            .routes()
+            .filter(|r| r.is_active() && r.route.media == MediaKind::Clipboard)
+            .map(|r| (r.peer.to_string(), r.route.id.clone()))
+            .collect()
+    }
+
+    /// Keep the clipboard level across every live clipboard route, in both
+    /// directions, off the OS's own change notification.
+    ///
+    /// The old plane only moved on keystrokes: you had to press the native
+    /// copy chord on one side and the native paste chord on the other, and
+    /// the console intercepted both. That is not how a clipboard is supposed
+    /// to feel — you copy somewhere, you paste somewhere else, and it works.
+    ///
+    /// The echo is the whole difficulty. Applying the peer's clipboard changes
+    /// *our* clipboard, which the watcher reports exactly like a user copy; if
+    /// we forwarded that, the peer would apply it, its watcher would fire, and
+    /// one copy would ping-pong between the machines forever. So both the
+    /// applying and the sending side stamp what they last handled
+    /// ([`Mesh::clip_synced`]) and a change matching that stamp is not news.
+    ///
+    /// Costs nothing while nobody is copying: this awaits a platform
+    /// notification rather than polling, so an image on the clipboard is never
+    /// re-encoded just to discover it hasn't changed.
+    fn spawn_clipboard_sync(self: &Arc<Self>) {
+        let mesh = Arc::downgrade(self);
+        let mut changes = self.clipboard.subscribe();
+        crate::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(()) => {}
+                    // Lagged just means several copies happened while we were
+                    // busy; the clipboard only has a *current* value, so one
+                    // pass over the latest is the correct catch-up.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+                let Some(mesh) = mesh.upgrade() else { return };
+                let routes = mesh.active_clipboard_routes();
+                if routes.is_empty() {
+                    continue;
+                }
+                let svc = mesh.clipboard.clone();
+                let Ok(Some(clip)) = tokio::task::spawn_blocking(move || svc.read()).await else {
+                    continue;
+                };
+                let fingerprint = clip.fingerprint();
+                if *mesh.clip_synced.lock() == Some(fingerprint) {
+                    continue; // our own doing — applying the peer's clipboard
+                }
+                *mesh.clip_synced.lock() = Some(fingerprint);
+                for (peer, route_id) in routes {
+                    if let Err(e) = mesh.send_clipboard_contents(&peer, &route_id).await {
+                        tracing::debug!("clipboard sync to {} failed: {e}", short_id(&peer));
+                    }
+                }
+            }
+        });
     }
 
     /// Read this machine's OS clipboard and stream it to `peer` on `route_id`
@@ -13517,11 +13616,16 @@ impl Mesh {
             // pull), and its later Chunk/Close ride through on the
             // clip_inbound entry the Open registered (unknown transfers no-op).
             let accept = match &frame.event {
-                ClipboardEvent::Text { .. } | ClipboardEvent::Open { .. } => self
-                    .clip_pull_at
-                    .lock()
-                    .remove(&frame.route)
-                    .is_some_and(|t| t.elapsed() < CLIPBOARD_PULL_WINDOW),
+                // Sync is symmetric: the far side pushes whenever ITS
+                // clipboard changes, so an arriving clipboard is ordinary
+                // traffic on a live route rather than something that must
+                // answer a pull we made. The per-route pull window that used
+                // to gate this is gone with it — a live clipboard route IS
+                // the standing consent now, which is what "stays in sync"
+                // means. The route still has to be active, still has to be a
+                // clipboard route, and the sender still has to be its peer
+                // (all checked above).
+                ClipboardEvent::Text { .. } | ClipboardEvent::Open { .. } => true,
                 ClipboardEvent::Chunk { .. } | ClipboardEvent::Close { .. } => true,
                 ClipboardEvent::Pull | ClipboardEvent::Unknown => false,
             };
@@ -13538,7 +13642,14 @@ impl Mesh {
     /// the OS clipboard is then pointed at.
     fn apply_clipboard_event(&self, route: String, event: ClipboardEvent) {
         match event {
-            ClipboardEvent::Text { text } => self.clipboard.set_text(text),
+            ClipboardEvent::Text { text } => {
+                // Stamp before writing: the OS reports a clipboard we wrote
+                // exactly like one the user copied, and the sync loop must be
+                // able to tell that change is our own doing.
+                *self.clip_synced.lock() =
+                    Some(crate::clipboard::LocalClip::Text(text.clone()).fingerprint());
+                self.clipboard.set_text(text)
+            }
             ClipboardEvent::Open {
                 transfer,
                 content,
@@ -13604,14 +13715,34 @@ impl Mesh {
                     return;
                 };
                 match t.content {
-                    ClipboardContentKind::Image => self.clipboard.set_image(t.image),
+                    ClipboardContentKind::Image => {
+                        // Stamped for the same reason as text above — this
+                        // write is about to look like a fresh user copy.
+                        *self.clip_synced.lock() =
+                            Some(crate::clipboard::LocalClip::Image(t.image.clone()).fingerprint());
+                        self.clipboard.set_image(t.image)
+                    }
                     ClipboardContentKind::Files => {
                         let dir = crate::clipboard::staging_dir(transfer);
-                        let paths = t
+                        let paths: Vec<String> = t
                             .items
                             .iter()
                             .map(|i| dir.join(safe_name(&i.name)).to_string_lossy().into_owned())
                             .collect();
+                        // Fingerprinted over the staged paths — which is what
+                        // the OS clipboard will now hold, and so what the
+                        // watcher will read back.
+                        let staged: Vec<crate::clipboard::LocalFile> = t
+                            .items
+                            .iter()
+                            .map(|i| crate::clipboard::LocalFile {
+                                name: i.name.clone(),
+                                path: dir.join(safe_name(&i.name)),
+                                size: i.size,
+                            })
+                            .collect();
+                        *self.clip_synced.lock() =
+                            Some(crate::clipboard::LocalClip::Files(staged).fingerprint());
                         self.clipboard.set_files(paths);
                     }
                     // A content kind a newer build introduced — nothing to
@@ -14730,12 +14861,6 @@ const MAX_CLIPBOARD_BYTES: u64 = 256 * 1024 * 1024;
 /// clipboard. The keystroke arrives just ahead of the pull on the same
 /// ordered channel; this covers the asynchronous gap after injection.
 const CLIPBOARD_COPY_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
-
-/// How long after sending a [`Pull`](ClipboardEvent::Pull) the controller
-/// will accept the reply onto its own clipboard. Generous for the round trip
-/// plus the settle above; outside it, a clipboard frame on a route we source
-/// is unsolicited and dropped.
-const CLIPBOARD_PULL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// An inbound clipboard transfer being reassembled (see
 /// [`Mesh::handle_clipboard_frame`]).

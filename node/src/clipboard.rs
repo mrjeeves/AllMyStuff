@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 
 use clipboard_rs::common::RustImage;
-use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat, RustImageData};
+use clipboard_rs::{
+    Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
+    ContentFormat, RustImageData,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// One file referenced on the clipboard — its base name, real path on this
@@ -47,11 +50,67 @@ enum Cmd {
     SetFiles(Vec<String>),
 }
 
+impl LocalClip {
+    /// A stable identity for "is this the same clipboard content?".
+    ///
+    /// The sync loop compares fingerprints to tell a change the *user* made
+    /// from one it caused itself by applying the peer's clipboard — without
+    /// which every sync would echo straight back and the two machines would
+    /// bounce one copy between them forever.
+    ///
+    /// Files hash by path, not by content: a file's identity on the clipboard
+    /// *is* its path, and hashing the bytes would mean reading every copied
+    /// file on every clipboard change.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            LocalClip::Text(t) => {
+                0u8.hash(&mut h);
+                t.hash(&mut h);
+            }
+            LocalClip::Image(png) => {
+                1u8.hash(&mut h);
+                png.hash(&mut h);
+            }
+            LocalClip::Files(files) => {
+                2u8.hash(&mut h);
+                for f in files {
+                    f.path.hash(&mut h);
+                    f.size.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+}
+
+/// Bridges the OS clipboard's own change notification onto a broadcast the
+/// engine can await. The handler must do nothing but signal: it runs on the
+/// watcher thread, inside the platform's clipboard callback, and reading the
+/// clipboard from there would deadlock against the context that owns it.
+struct ChangeHandler {
+    tx: tokio::sync::broadcast::Sender<()>,
+}
+
+impl ClipboardHandler for ChangeHandler {
+    fn on_clipboard_change(&mut self) {
+        // Err just means nobody is listening yet — a clipboard change with no
+        // live sync route is not news.
+        let _ = self.tx.send(());
+    }
+}
+
 /// Handle to the clipboard thread. Cheap to clone (just the command sender).
 /// A tokio sender so it's `Send + Sync` — `Mesh` holds it inside an `Arc`.
 #[derive(Clone)]
 pub struct ClipboardService {
     tx: UnboundedSender<Cmd>,
+    /// Fires whenever the OS clipboard changes, from the platform's own
+    /// notification rather than a poll — so a sync costs nothing while
+    /// nobody is copying, and an image never gets re-encoded just to notice
+    /// it hasn't changed.
+    changes: tokio::sync::broadcast::Sender<()>,
 }
 
 impl ClipboardService {
@@ -103,7 +162,39 @@ impl ClipboardService {
                 }
             })
             .expect("spawn clipboard thread");
-        ClipboardService { tx }
+
+        // A second thread for the platform's change notification. It needs its
+        // own context (`start_watch` blocks for the app's life) and must not
+        // touch the one above — reads still go through the command thread, so
+        // the single-context rule that keeps an X11 selection served is intact.
+        // Capacity 8 because a receiver only ever needs to know *that* the
+        // clipboard changed; lagging past it collapses to one wake-up, which
+        // is the right answer anyway.
+        let (changes, _) = tokio::sync::broadcast::channel(8);
+        let watch_tx = changes.clone();
+        std::thread::Builder::new()
+            .name("clipboard-watch".into())
+            .spawn(move || match ClipboardWatcherContext::new() {
+                Ok(mut watcher) => {
+                    watcher.add_handler(ChangeHandler { tx: watch_tx });
+                    // Blocks until shutdown; this thread exists to sit here.
+                    watcher.start_watch();
+                }
+                // No watcher (headless, no display) means no sync — the
+                // explicit copy/paste path still works, so this is a
+                // degradation, not a failure.
+                Err(e) => tracing::warn!("clipboard change watcher unavailable: {e}"),
+            })
+            .expect("spawn clipboard watcher thread");
+
+        ClipboardService { tx, changes }
+    }
+
+    /// Await OS clipboard changes. Each subscriber gets its own receiver; a
+    /// receiver that falls behind is fine, since every message means the same
+    /// thing ("go look").
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.changes.subscribe()
     }
 
     /// Read this machine's clipboard. Blocking — call from a blocking
@@ -252,5 +343,48 @@ mod tests {
     #[test]
     fn base_name_is_the_final_component() {
         assert_eq!(base_name(Path::new("/a/b/c.png")), "c.png");
+    }
+
+    /// The fingerprint is what stops a synced clipboard ping-ponging between
+    /// two machines forever, so it has to be stable for identical content and
+    /// different for anything a user would call a different copy.
+    #[test]
+    fn the_fingerprint_identifies_content_not_the_moment_it_was_read() {
+        let a = LocalClip::Text("hello".into());
+        let b = LocalClip::Text("hello".into());
+        let c = LocalClip::Text("hello ".into());
+        assert_eq!(a.fingerprint(), b.fingerprint(), "same text, same identity");
+        assert_ne!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "a trailing space is a different copy"
+        );
+
+        // Kinds never collide, even when their payloads look alike — an image
+        // whose bytes spell a string must not read as that string.
+        let img = LocalClip::Image(b"hello".to_vec());
+        assert_ne!(a.fingerprint(), img.fingerprint());
+
+        // Files hash by path + size, so re-copying the same files is the same
+        // clipboard and won't be forwarded back around the loop.
+        let f = |name: &str, size: u64| LocalFile {
+            name: name.into(),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            size,
+        };
+        let one = LocalClip::Files(vec![f("a.txt", 10), f("b.txt", 20)]);
+        let same = LocalClip::Files(vec![f("a.txt", 10), f("b.txt", 20)]);
+        let reordered = LocalClip::Files(vec![f("b.txt", 20), f("a.txt", 10)]);
+        let resized = LocalClip::Files(vec![f("a.txt", 11), f("b.txt", 20)]);
+        assert_eq!(one.fingerprint(), same.fingerprint());
+        assert_ne!(
+            one.fingerprint(),
+            resized.fingerprint(),
+            "an edited file is a new copy"
+        );
+        // Order is part of the identity — the OS hands back what it was given,
+        // so a differently-ordered selection is genuinely a different clipboard
+        // and re-syncing it is correct, not an echo.
+        assert_ne!(one.fingerprint(), reordered.fingerprint());
     }
 }

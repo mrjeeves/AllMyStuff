@@ -28,19 +28,64 @@ pub enum LocalClip {
     Files(Vec<LocalFile>),
 }
 
+impl LocalClip {
+    /// Real twin's identity hash, kept here so the sync loop compiles
+    /// unchanged. It is never reached in practice — [`ClipboardService::read`]
+    /// answers `None` on this build, so there is no clipboard content to
+    /// fingerprint — but it is a pure function of the value and costs nothing
+    /// to keep honest rather than stubbing it to a constant.
+    #[allow(dead_code)]
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            LocalClip::Text(t) => {
+                0u8.hash(&mut h);
+                t.hash(&mut h);
+            }
+            LocalClip::Image(png) => {
+                1u8.hash(&mut h);
+                png.hash(&mut h);
+            }
+            LocalClip::Files(files) => {
+                2u8.hash(&mut h);
+                for f in files {
+                    f.path.hash(&mut h);
+                    f.size.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+}
+
 /// Handle the mesh holds either way. Cheap to clone; owns nothing.
-#[derive(Clone, Default)]
-pub struct ClipboardService {}
+#[derive(Clone)]
+pub struct ClipboardService {
+    /// Never sent on — held only so [`ClipboardService::subscribe`] can hand
+    /// back a receiver with the same type as the real service's. It parks the
+    /// sync loop on a channel that stays silent for the process's life, which
+    /// is exactly right: no OS clipboard here means nothing ever changes.
+    changes: tokio::sync::broadcast::Sender<()>,
+}
 
 impl ClipboardService {
     /// No thread to spawn — there is no OS clipboard here to watch.
     pub fn spawn() -> ClipboardService {
-        ClipboardService::default()
+        let (changes, _) = tokio::sync::broadcast::channel(1);
+        ClipboardService { changes }
     }
 
     #[allow(dead_code)]
     pub fn read(&self) -> Option<LocalClip> {
         None
+    }
+
+    /// A receiver that never fires. Keeping the sender alive on the struct is
+    /// what makes that "silent" rather than "closed" — a closed channel would
+    /// end the sync loop, and this build should simply have nothing to sync.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.changes.subscribe()
     }
 
     pub fn set_text(&self, _text: String) {}

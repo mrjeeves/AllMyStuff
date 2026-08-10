@@ -899,6 +899,34 @@ pub async fn dispatch(
             json_result(mesh.drive_map_from(source, root, label, mount).await)
         }
         "native_drives" => DispatchOut::Json(json!(mesh.native_drives())),
+        // Shared folders — the file half of a person-to-person share. The
+        // sharer mints an id for a folder (`folder_share`) and pins a grant to
+        // its capability; the receiver opens it by that id at a mount point of
+        // its own choosing (`folder_open`). No path ever crosses the wire.
+        "folder_share" => {
+            let path: String = try_arg!(arg(a, "path"));
+            let label: String = a
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            json_result(mesh.folder_share(path, label))
+        }
+        "folder_unshare" => {
+            let id: String = try_arg!(arg(a, "id"));
+            DispatchOut::Json(json!({ "removed": mesh.folder_unshare(id) }))
+        }
+        "folders" => DispatchOut::Json(mesh.folders()),
+        "folder_open" => {
+            let source: String = try_arg!(arg(a, "source"));
+            let folder: String = try_arg!(arg(a, "folder"));
+            let mount: String = a
+                .get("mount")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            json_result(mesh.folder_open(source, folder, mount).await)
+        }
         "kvm_media_stage" => {
             let source: String = try_arg!(arg(a, "source"));
             let kvm: String = try_arg!(arg(a, "kvm"));

@@ -703,6 +703,29 @@ pub enum AppControl {
         mount: String,
         request: String,
     },
+    /// Open one **shared folder** on this machine as a native drive on the
+    /// authenticated requester — the person-to-person twin of `MapDrive`.
+    ///
+    /// The difference is the whole point: `MapDrive` carries a `root`, which
+    /// is fine because it is owner/fleet gated (naming a path on your own
+    /// machine is no more than you could already do). A share reaches outside
+    /// the fleet, so it carries **no path at all**. The requester names the
+    /// minted `folder` id, and only the source's own registry can turn that
+    /// back into a path — a receiver that could name a root could name `/`.
+    ///
+    /// The source accepts this only when it still holds a live share grant
+    /// covering that folder's capability for this person, and only while the
+    /// folder is still shared, so revoking either end closes it.
+    ///
+    /// `mount` is the *requester's* choice of where the drive appears on its
+    /// own machine, exactly as for `MapDrive` — the sharer has no business
+    /// picking a drive letter on someone else's desktop.
+    MapFolder {
+        folder: String,
+        #[serde(default)]
+        mount: String,
+        request: String,
+    },
     /// Ask this authorized source machine to stage one local ISO/image (or a
     /// whole removable disk) on a KVM as BIOS-visible USB virtual media.
     StageKvmMedia {

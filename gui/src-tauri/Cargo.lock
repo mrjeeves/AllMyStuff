@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "serde",
  "serde_json",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "serde",
  "serde_json",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "serde",
  "serde_json",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
@@ -160,7 +160,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "allmystuff-graph",
  "dirs 5.0.1",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -865,15 +865,16 @@ dependencies = [
 
 [[package]]
 name = "clipboard-rs"
-version = "0.2.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afede46921767868c5c7f8f55202bdd8bec0bab6bc9605174200f45924f93c62"
+checksum = "d1c988a897ea030e32f0668c90b0192800e0c561b3d941fc366f9ad5a1bf26ba"
 dependencies = [
  "clipboard-win",
  "image",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-ui-kit",
  "windows 0.59.0",
  "x11rb",
 ]

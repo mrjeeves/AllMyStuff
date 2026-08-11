@@ -184,7 +184,7 @@ sysinfo = "0.38"
 # Cross-platform *rich* clipboard — text, image, and file lists — for the
 # clipboard plane. The clipboard-manager bits the GUI used are a webview
 # concern and stay in the GUI; this is the OS-clipboard side the node owns.
-clipboard-rs = { version = "0.2", optional = true }
+clipboard-rs = { version = "0.3.5", optional = true }
 # The per-pixel hot loops (frame downscale/strip), split out so dev builds
 # optimize them — see the crate's manifest.
 allmystuff-pixels = { path = "pixels" }

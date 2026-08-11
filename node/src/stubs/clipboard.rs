@@ -88,11 +88,21 @@ impl ClipboardService {
         self.changes.subscribe()
     }
 
-    pub fn set_text(&self, _text: String) {}
+    pub fn set_text(&self, _text: String) -> Result<(), String> {
+        Err("OS clipboard is unavailable on this build".into())
+    }
 
-    pub fn set_image(&self, _png: Vec<u8>) {}
+    pub fn set_image(&self, _png: Vec<u8>) -> Result<(), String> {
+        Err("OS clipboard is unavailable on this build".into())
+    }
 
-    pub fn set_files(&self, _paths: Vec<String>) {}
+    pub fn set_files(&self, _paths: Vec<String>) -> Result<(), String> {
+        Err("OS clipboard is unavailable on this build".into())
+    }
+}
+
+pub fn local_files(_paths: Vec<String>) -> Result<Vec<LocalFile>, String> {
+    Err("local file drops are unavailable on this build".into())
 }
 
 /// The staging directory a received clipboard transfer lands in. Per-transfer

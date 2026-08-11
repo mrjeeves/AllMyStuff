@@ -540,6 +540,26 @@ async fn clipboard_paste(state: State<'_, AppState>, route_id: String) -> Result
     Ok(())
 }
 
+/// Stream files selected by the OS-native drag/drop event down the live
+/// clipboard route. The webview supplies trusted local paths; the node opens
+/// and chunks them, so the GUI never loads a whole file into JavaScript.
+#[tauri::command]
+async fn clipboard_drop(
+    state: State<'_, AppState>,
+    route_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "clipboard_drop",
+            json!({ "route_id": route_id, "paths": paths }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Copy/cut **from** the remote: ask the far end to read its clipboard now and
 /// send it back down the route, so the selection it just copied lands on this
 /// machine. The console calls this right after forwarding the copy/cut
@@ -2987,6 +3007,7 @@ fn main() {
             share_stop,
             send_input,
             clipboard_paste,
+            clipboard_drop,
             clipboard_pull,
             video_watch,
             video_poll,

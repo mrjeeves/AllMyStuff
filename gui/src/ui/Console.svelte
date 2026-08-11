@@ -34,6 +34,7 @@
     focusThisWindow,
     isMobile,
     isTauri,
+    onNativeFileDrag,
     onThisWindowClose,
     refreshRoute,
     sendVideoFeedback,
@@ -159,6 +160,36 @@
   // window's keyboard reaches the remote (window-level setFocus alone doesn't
   // push document focus into the webview on hover).
   let stageEl = $state<HTMLElement | null>(null);
+  let dropHover = $state(false);
+  let dropBusy = $state(false);
+  let dropCount = $state(0);
+
+  function pointIsOnStage(x: number, y: number): boolean {
+    const r = stageEl?.getBoundingClientRect();
+    return !!r && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  async function dropFiles(paths: string[], x: number, y: number) {
+    dropHover = false;
+    if (!pointIsOnStage(x, y)) return;
+    const point = normPoint({ clientX: x, clientY: y });
+    if (!point || !stagePointerActive || !app.consoleClipboard) {
+      app.toast("warn", "Turn on Keyboard & mouse and Clipboard before dropping files");
+      return;
+    }
+    const targetName = node ? displayName(node) : "the remote machine";
+    dropBusy = true;
+    try {
+      await app.dropConsoleFiles(paths, { ...point, screen: controlScreen });
+      const noun = paths.length === 1 ? "file" : "files";
+      app.toast("info", `${paths.length} ${noun} sent to ${targetName}`);
+    } catch (error) {
+      app.toast("warn", `Couldn't send dropped files: ${error}`);
+    } finally {
+      dropBusy = false;
+      dropCount = 0;
+    }
+  }
   // A thin aiming crosshair at the position we're COMMANDING (`virt`) — drawn
   // instantly, with none of the video's latency, so you can line things up
   // precisely instead of guessing where the cursor will land. It complements
@@ -622,6 +653,21 @@
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
+    let unlistenFileDrag: (() => void) | undefined;
+    let mounted = true;
+    void onNativeFileDrag((event) => {
+      if (event.type === "leave") {
+        dropHover = false;
+        dropCount = 0;
+        return;
+      }
+      if (event.type === "enter") dropCount = event.paths.length;
+      dropHover = pointIsOnStage(event.x, event.y);
+      if (event.type === "drop") void dropFiles(event.paths, event.x, event.y);
+    }).then((unlisten) => {
+      if (!mounted) unlisten();
+      else unlistenFileDrag = unlisten;
+    });
     // "VideoDecoder exists" stopped meaning "H.264 decode works":
     // WebKitGTK 2.4x ships the WebCodecs shape with codec support
     // delegated to GStreamer plugins that usually aren't installed. Ask
@@ -700,7 +746,9 @@
       onViewport();
     }
     return () => {
+      mounted = false;
       unlistenClose?.();
+      unlistenFileDrag?.();
       clearInterval(fpsTimer);
       if (vv) {
         vv.removeEventListener("resize", onViewport);
@@ -1986,6 +2034,17 @@
         onblur={() => keys.releaseAll()}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
+        {#if dropHover || dropBusy}
+          <div class="file-drop" class:busy={dropBusy} aria-live="polite">
+            <div class="file-drop-icon">{dropBusy ? "↗" : "⇩"}</div>
+            <strong>{dropBusy ? "Sending files…" : "Drop onto the remote"}</strong>
+            <span>
+              {dropBusy
+                ? "The remote clipboard and paste are being completed"
+                : `${dropCount || 1} ${dropCount === 1 ? "file" : "files"} · releases at this location`}
+            </span>
+          </div>
+        {/if}
         {#if selectedPopped}
           <!-- This input lives in its own window right now; here's its
                way home — findable even when that window is fullscreen on
@@ -2686,6 +2745,45 @@
     background:
       radial-gradient(1200px 400px at 50% -10%, oklch(0.62 0.2 292 / 0.1), transparent),
       #0c0b14;
+  }
+
+  .file-drop {
+    position: absolute;
+    inset: 18px;
+    z-index: 40;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 8px;
+    padding: 28px;
+    border: 2px dashed color-mix(in srgb, var(--green, #4fe29a) 82%, white);
+    border-radius: 18px;
+    color: white;
+    background: color-mix(in srgb, #07150f 86%, transparent);
+    box-shadow: inset 0 0 60px color-mix(in srgb, var(--green, #4fe29a) 16%, transparent);
+    pointer-events: none;
+    text-align: center;
+  }
+  .file-drop.busy {
+    border-style: solid;
+  }
+  .file-drop-icon {
+    display: grid;
+    place-items: center;
+    width: 54px;
+    height: 54px;
+    border-radius: 16px;
+    color: #07150f;
+    background: var(--green, #4fe29a);
+    font-size: 30px;
+    font-weight: 900;
+  }
+  .file-drop strong {
+    font-size: 18px;
+  }
+  .file-drop span {
+    color: #cbd8d1;
+    font-size: 13px;
   }
   .stage.grabbing {
     cursor: crosshair;

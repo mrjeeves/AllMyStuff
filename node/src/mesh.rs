@@ -55,6 +55,9 @@ use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge, DecoderPreference};
 use std::time::{Duration, Instant};
 
+type ClipboardReceiptWaiters =
+    Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>;
+
 pub struct Mesh {
     client: Arc<ControlClient>,
     /// The media plane's dedicated daemon connection: frame chunks ride it
@@ -282,7 +285,7 @@ pub struct Mesh {
     /// Binary clipboard transfers waiting for the destination OS to confirm
     /// that it actually published the image/native file list. Keyed by the
     /// outbound route + transfer id; negotiated so older peers keep working.
-    clip_receipts: Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    clip_receipts: ClipboardReceiptWaiters,
     /// Fingerprint of the clipboard content this machine last *synced* —
     /// either applied from a peer or sent to one. The OS reports a clipboard
     /// we wrote ourselves exactly like one the user copied, so without this

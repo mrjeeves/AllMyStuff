@@ -98,6 +98,8 @@ import {
   pickFilesToShare,
   pickDriveFolder,
   roomShareFiles,
+  roomScopeLeave,
+  roomScopeSet,
   roomSetSharePeers,
   roomUnshare,
   meshIdentity,
@@ -949,6 +951,9 @@ class AppStore {
    *  wired (never a route the user made on the graph, never another
    *  room's legs). */
   private roomRoutes: Record<string, Record<RoomChannel, string[]>> = {};
+  /** Backend room-authority lease heartbeats. A room grants only transient
+   *  call routes; missing three 10 s beats expires it node-side. */
+  private roomScopeTimers: Record<string, ReturnType<typeof setInterval>> = {};
   /** Files *this* device is offering into each room's Shared Files area
    *  (the uploader's own list). Cleared when we leave; not persisted —
    *  shares are stream-only, like everything else in a room. */
@@ -3234,8 +3239,9 @@ class AppStore {
     to: string,
     media: MediaKind,
     codec?: "auto" | "h264" | "mjpeg",
+    room?: string,
   ) {
-    if (this.backendConnected) void connectRoute(from, to, media, codec);
+    if (this.backendConnected) void connectRoute(from, to, media, codec, null, room);
   }
 
   private addRoute(from: string, to: string) {
@@ -6264,8 +6270,8 @@ class AppStore {
   }
 
   /** Nodes you can put in a room: machines on the graph running
-   *  AllMyStuff, other than this one. (Unclaimed ones can chat once
-   *  invited, but can't be routed to until claimed or shared.) */
+   *  AllMyStuff, other than this one. A joined room carries its own transient
+   *  media/control consent, independent of a durable share relationship. */
   roomCandidateNodes = $derived.by(() =>
     this.catalog.nodes.filter((n) => !this.isMe(n.id) && isAppNode(n)),
   );
@@ -6422,6 +6428,7 @@ class AppStore {
     if (add.length === 0) return;
     room.members = [...room.members, ...add];
     this.saveRooms();
+    this.refreshRoomScope(roomId);
     // No toast — the invited machines appear in the room's roster immediately.
     this.broadcastRoom(room, this.inviteMessage(room));
     // The new members may now fetch what we're offering — widen the gate.
@@ -6444,6 +6451,7 @@ class AppStore {
     room.members = room.members.filter((m) => !sameMachine(m, target));
     if (room.members.length === before.length) return;
     this.saveRooms();
+    this.refreshRoomScope(roomId);
     this.presenceDrop(room.id, target);
     // No toast — the member disappears from the room's People panel.
     if (this.backendConnected) {
@@ -6555,13 +6563,14 @@ class AppStore {
    *  until a toggle is turned on. Being in several rooms at once is fine —
    *  the panel just shows one; use [`AppStore.closeRoomPanel`] to look
    *  away without hanging up. */
-  joinRoomHere(roomId: string) {
+  async joinRoomHere(roomId: string) {
     const room = this.rooms.find((r) => r.id === roomId);
     if (!room) return;
     if (!this.isJoined(roomId)) {
       this.joinedRoomIds = [...this.joinedRoomIds, roomId];
       this.roomSend = { ...this.roomSend, [roomId]: { ...ROOM_SEND_OFF } };
       this.roomRoutes[roomId] = emptyRoomRoutes();
+      await this.startRoomScope(room);
       this.roomJoinedAt = { ...this.roomJoinedAt, [roomId]: Date.now() };
       this.presenceAdd(roomId, canonicalNodeId(this.localId));
       this.callLog(`join ${roomId} — announcing presence to ${room.members.length - 1} member(s)`);
@@ -6612,6 +6621,7 @@ class AppStore {
   private unjoinRoom(roomId: string) {
     for (const channel of ROOM_CHANNELS) this.dropRoomLegs(roomId, channel);
     delete this.roomRoutes[roomId];
+    this.stopRoomScope(roomId);
     const { [roomId]: _gone, ...rest } = this.roomSend;
     this.roomSend = rest;
     const { [roomId]: _at, ...restAt } = this.roomJoinedAt;
@@ -6623,6 +6633,35 @@ class AppStore {
     this.clearRoomShares(roomId);
     if (this.roomOpenId === roomId) this.roomOpenId = null;
     void emitRoomLocal({ token: this.windowToken, kind: "leave", room: roomId });
+  }
+
+  /** Start/refresh the backend's short room-membership lease. This permits
+   *  only live call routes between roster members and never creates a durable
+   *  person-to-person share. */
+  private async startRoomScope(room: VirtualRoom) {
+    await this.refreshRoomScope(room.id);
+    if (this.roomScopeTimers[room.id]) return;
+    this.roomScopeTimers[room.id] = setInterval(() => void this.refreshRoomScope(room.id), 10_000);
+  }
+
+  private async refreshRoomScope(roomId: string): Promise<void> {
+    const room = this.rooms.find((candidate) => candidate.id === roomId);
+    if (!room || !this.isJoined(roomId) || !this.backendConnected) return;
+    const present = this.roomPresence[roomId] ?? [];
+    const active = [canonicalNodeId(this.localId)];
+    for (const member of present) {
+      if (!room.members.some((listed) => sameMachine(listed, member))) continue;
+      const node = this.machineByAnyId(member);
+      if (this.isMe(member) || node?.online) active.push(canonicalNodeId(member));
+    }
+    await roomScopeSet(room.id, [...new Set(active)]);
+  }
+
+  private stopRoomScope(roomId: string) {
+    const timer = this.roomScopeTimers[roomId];
+    if (timer) clearInterval(timer);
+    delete this.roomScopeTimers[roomId];
+    if (this.backendConnected) void roomScopeLeave(roomId);
   }
 
   /** One event off the same-device room bus (another window of this app
@@ -6775,9 +6814,8 @@ class AppStore {
 
   /** Let the room drive this machine: each member's keyboard & mouse is
    *  wired to this machine's control. Members then click and type over
-   *  your screen-share tile. Injection stays gated on the far side's
-   *  facts: only your owner/fleet can actually move things (a guest's
-   *  events are dropped until share-gated control lands). */
+   *  your screen-share tile. Injection is authorized only while both devices
+   *  remain active members of this joined room; it creates no standing share. */
   toggleRoomControl() {
     const roomId = this.roomOpenId;
     if (!roomId) return;
@@ -6792,12 +6830,13 @@ class AppStore {
       return;
     }
     let wired = 0;
+    const present = this.roomPresence[roomId] ?? [];
     for (const { node } of this.roomMemberNodes) {
       if (!node || !isAppNode(node) || !node.online) continue;
-      if (node.relationship.kind === "unclaimed") continue;
+      if (!present.some((member) => sameMachine(member, node.id))) continue;
       const theirSrc = matchEndpoint(this.catalog, node.id, "input", "provide");
       if (!theirSrc) continue;
-      const leg = this.roomConnect(theirSrc.id, mySink.id);
+      const leg = this.roomConnect(roomId, theirSrc.id, mySink.id);
       if (leg?.created) this.legsOf(roomId).control.push(leg.id);
       if (leg) wired += 1;
     }
@@ -6975,9 +7014,10 @@ class AppStore {
     }
     const existing = this.sharedDownloads[file.token];
     if (existing && existing.state === "fetching") return; // already going
-    const routeId = this.sharedConnect(from);
+    let routeId: string | null = null;
     const req = this.sharedReqSeq++;
     try {
+      routeId = await this.sharedConnect(from);
       const dest = await fileDownload(routeId, req, file.name);
       this.sharedReqToken[`${routeId}:${req}`] = file.token;
       this.sharedDownloads = {
@@ -6986,7 +7026,7 @@ class AppStore {
       };
       await fileSend(routeId, { kind: "fetch", req, token: file.token });
     } catch (e) {
-      void disconnectRoute(routeId);
+      if (routeId) void disconnectRoute(routeId);
       this.toast("warn", `Couldn't start the download: ${errMsg(e)}`);
     }
   }
@@ -6996,12 +7036,30 @@ class AppStore {
    *  Mirrors [`AppStore.filesConnect`], but `:shared` is token-gated, not
    *  owner/fleet, so any room member may open one. One route per download;
    *  it's torn down when the file lands ([`AppStore.onSharedSaved`]). */
-  private sharedConnect(host: string): string {
+  private async sharedConnect(host: string): Promise<string> {
     const fromEp = `${host}:shared`;
     const n = ++this.sharedViewSeq;
     const toEp = `${this.localId}:shared-view:${Date.now().toString(36)}-${n}`;
-    void connectRoute(fromEp, toEp, "generic");
-    return `route:${fromEp}→${toEp}`;
+    const routeId = `route:${fromEp}→${toEp}`;
+    const offered = await connectRoute(fromEp, toEp, "generic");
+    if (!offered) throw new Error("the shared-file route could not be offered");
+
+    // Fetch frames sent before Accept are correctly rejected by the host as
+    // not belonging to a live route. Wait for the handshake instead of racing
+    // the first (and only) Fetch into that gate.
+    const deadline = Date.now() + 8_000;
+    while (this.routeStates[routeId]?.state !== "active" && Date.now() < deadline) {
+      await this.refreshSession();
+      const state = this.routeStates[routeId];
+      if (state?.state === "rejected" || state?.state === "torn_down") {
+        throw new Error(state.reason || "the shared-file route was refused");
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    if (this.routeStates[routeId]?.state !== "active") {
+      throw new Error("the shared-file route did not become active");
+    }
+    return routeId;
   }
 
   /** A shared download reported progress — find its row by route+req. */
@@ -7105,6 +7163,7 @@ class AppStore {
           this.toast("info", `${senderLabel} added you to “${msg.name?.trim() || "a room"}”`);
         }
         this.saveRooms();
+        this.refreshRoomScope(msg.room);
         // The roster the host just restated may add or drop members the
         // files we're offering are allowed to reach — refresh that gate.
         this.refreshSharePeers(msg.room);
@@ -7123,6 +7182,9 @@ class AppStore {
         if (existing) {
           const knewThem = (this.roomPresence[existing.id] ?? []).includes(sender);
           this.presenceAdd(msg.room, sender);
+          const scopeReady = this.isJoined(existing.id)
+            ? this.refreshRoomScope(existing.id)
+            : Promise.resolve();
           // Presence echo: a newcomer can't know who was already in the
           // call (joins are only broadcast as they happen) — so if *we're*
           // in, say so straight back to them. Echoes terminate because
@@ -7130,6 +7192,7 @@ class AppStore {
           if (!knewThem && this.isJoined(existing.id) && this.backendConnected) {
             this.callLog(`  echoing our presence back to ${senderLabel}`);
             void roomSend([sender], { room: existing.id, name: existing.name, kind: "join" });
+            void scopeReady.then(() => this.wireActiveRoomLegsToMember(existing.id, sender));
           }
           // We host the list: a newcomer can't know what's already shared,
           // so restate the room's Shared Files list now they're present.
@@ -7140,6 +7203,7 @@ class AppStore {
       case "leave": {
         this.callLog(`recv leave from ${senderLabel} for ${msg.room}`);
         this.presenceDrop(msg.room, sender);
+        if (existing && this.isJoined(existing.id)) void this.refreshRoomScope(existing.id);
         // The list lives with the host: when an uploader leaves, their
         // files come off it (the bytes were only theirs to serve).
         if (existing && this.isRoomHost(existing)) {
@@ -7217,6 +7281,7 @@ class AppStore {
           if (this.isMainWindow) {
             existing.members = [...existing.members, sender];
             this.saveRooms();
+            this.refreshRoomScope(existing.id);
             this.toast("ok", `${senderLabel} joined the open room “${existing.name}”`);
             this.broadcastRoom(existing, this.inviteMessage(existing));
           }
@@ -7338,6 +7403,7 @@ class AppStore {
     if (!room.members.some((m) => sameMachine(m, from))) {
       room.members = [...room.members, canonicalNodeId(from)];
       this.saveRooms();
+      this.refreshRoomScope(roomId);
       this.broadcastRoom(room, this.inviteMessage(room));
       // The admitted machine may now fetch what we're offering.
       this.refreshSharePeers(roomId);
@@ -7457,14 +7523,18 @@ class AppStore {
    *  happens in a room changes nothing about what its members may do to
    *  each other outside it. The route still validates structurally and
    *  still rides the real backend offer. */
-  private roomConnect(from: string, to: string): { id: string; created: boolean } | null {
+  private roomConnect(
+    roomId: string,
+    from: string,
+    to: string,
+  ): { id: string; created: boolean } | null {
     const res = proposeRoomRoute(this.catalog, from, to);
     if (!res.ok) return null;
     const id = res.route.id;
     const existedBefore = this.catalog.routes.some((r) => r.id === id);
     if (!existedBefore) {
       this.addRoute(res.route.from, res.route.to);
-      this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
+      this.fireBackendConnect(res.route.from, res.route.to, res.route.media, undefined, roomId);
     }
     return { id, created: !existedBefore };
   }
@@ -7480,6 +7550,7 @@ class AppStore {
   ): number {
     let wired = 0;
     const members = this.roomMemberNodes;
+    const present = this.roomPresence[roomId] ?? [];
     this.callLog(
       `wire "${channel}" (${media}) from ${from.label} — ${members.length} member(s) on the roster`,
     );
@@ -7499,8 +7570,8 @@ class AppStore {
         this.callLog(`  ${who}: skip — reads offline (node.online=false — the gate chat ignores)`);
         continue;
       }
-      if (node.relationship.kind === "unclaimed") {
-        this.callLog(`  ${who}: skip — unclaimed (claim or share it before media can route there)`);
+      if (!present.some((member) => sameMachine(member, id))) {
+        this.callLog(`  ${who}: skip — not currently in the call`);
         continue;
       }
       const sink = matchEndpoint(this.catalog, node.id, media, "consume");
@@ -7508,7 +7579,7 @@ class AppStore {
         this.callLog(`  ${who}: skip — advertises no ${media} sink to receive on`);
         continue;
       }
-      const leg = this.roomConnect(from.id, sink.id);
+      const leg = this.roomConnect(roomId, from.id, sink.id);
       if (!leg) {
         this.callLog(`  ${who}: skip — route ${from.id} → ${sink.id} failed validateRoute`);
         continue;
@@ -7521,6 +7592,47 @@ class AppStore {
     }
     this.callLog(`wire "${channel}": ${wired}/${members.length} member(s) wired`);
     return wired;
+  }
+
+  /** A member may join after this room's toggles were already turned on.
+   *  Add only their missing legs so screen/camera/mic/control follows room
+   *  presence instead of requiring the sharer to toggle everything off/on. */
+  private wireActiveRoomLegsToMember(roomId: string, memberId: string) {
+    const state = this.roomSendState(roomId);
+    const node = this.machineByAnyId(memberId);
+    if (!node || !isAppNode(node) || !node.online) return;
+
+    const wire = (channel: RoomChannel, from: Capability | undefined, media: MediaKind) => {
+      if (!from) return;
+      const sink = matchEndpoint(this.catalog, node.id, media, "consume");
+      if (!sink) return;
+      const leg = this.roomConnect(roomId, from.id, sink.id);
+      if (leg?.created) this.legsOf(roomId)[channel].push(leg.id);
+    };
+
+    if (state.mic) wire("mic", this.localAudioSource("mic"), "audio");
+    if (state.sound) wire("sound", this.localAudioSource("system"), "audio");
+    if (state.cam) {
+      const camera = this.capsOf(this.localId)
+        .filter((cap) => cap.media === "video" && canSource(cap.flow) && cap.origin === "camera")
+        .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false))[0];
+      wire("cam", camera, "video");
+    }
+    if (state.screen) {
+      const existingSource = this.legsOf(roomId).screen
+        .map((routeId) => this.catalog.routes.find((route) => route.id === routeId))
+        .map((route) => (route ? this.capability(route.from) : undefined))
+        .find((cap): cap is Capability => !!cap);
+      wire("screen", existingSource ?? this.roomScreenSources[0], "display");
+    }
+    if (state.control) {
+      const theirSource = matchEndpoint(this.catalog, node.id, "input", "provide");
+      const mySink = matchEndpoint(this.catalog, this.localId, "input", "consume");
+      if (theirSource && mySink) {
+        const leg = this.roomConnect(roomId, theirSource.id, mySink.id);
+        if (leg?.created) this.legsOf(roomId).control.push(leg.id);
+      }
+    }
   }
 
   /** Tear down the routes one room's toggle created (and only those). */

@@ -170,6 +170,10 @@ pub struct Mesh {
     /// area never becomes a way to read the disk. Bytes flow straight to
     /// the downloader; the room host only ever carries the *list*.
     shared: Mutex<HashMap<String, SharedReg>>,
+    /// Short-lived local room memberships used to authorize room-scoped
+    /// display/video/audio/input routes. The GUI refreshes these while the room
+    /// is joined; leaving or lease expiry tears the routes down.
+    room_scopes: Mutex<HashMap<String, RoomScope>>,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -543,6 +547,15 @@ struct SharedReg {
     allowed: std::collections::HashSet<String>,
 }
 
+/// A virtual room this local UI currently has joined. This is deliberately a
+/// short lease rather than durable state: room membership may authorize live
+/// call media/control, but it must never survive a closed or crashed room
+/// window as a standing share grant.
+struct RoomScope {
+    members: std::collections::HashSet<String>,
+    expires: Instant,
+}
+
 /// Receive-side counters for one route's stream.
 struct VideoInStats {
     since: std::time::Instant,
@@ -583,6 +596,10 @@ const MAX_TERM_DATA_BYTES: usize = 16 * 1024;
 /// being built — the exact race that made a share "fail" when it was merely
 /// slow.
 const ROUTE_OFFER_TTL: Duration = Duration::from_secs(30);
+
+/// Room windows refresh their membership lease every 10 seconds. Missing
+/// three beats expires the scope and tears down every route that used it.
+const ROOM_SCOPE_TTL: Duration = Duration::from_secs(30);
 
 /// A terminal host whose sends keep failing this long (viewer offline,
 /// network gone) kills the shell and tears the route down — nothing else
@@ -1184,6 +1201,7 @@ impl Mesh {
             site_nack_at: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             shared: Mutex::new(HashMap::new()),
+            room_scopes: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
                 session: None,
                 network: None,
@@ -1892,6 +1910,11 @@ impl Mesh {
         // sit "awaiting accept" forever — a black console with no error.
         self.spawn_offer_reaper();
 
+        // A room is live consent, not a durable relationship. Its membership
+        // lease is refreshed by the joined room window; a crashed/closed UI
+        // therefore loses authority automatically and its scoped routes stop.
+        self.spawn_room_scope_sweep();
+
         // Enforce CEC consent by teardown on a ~2s sweep rather than on every
         // input frame: a lapsed grant (revoke/expiry) tears the session's
         // routes down here. Engine-lifetime; a no-op on a technician node.
@@ -2236,13 +2259,15 @@ impl Mesh {
                     if !mesh.cec.knows_technician(&peer) {
                         continue;
                     }
+                    let room_authorized = mesh.live_route_room_authorizes(&route.id, &peer);
                     let is_screen = matches!(route.media, MediaKind::Display | MediaKind::Video);
                     let screen_lapsed = is_screen
                         && cec_screen_consent_blocks(
-                            mesh.sender_may_source_media(&peer, &route),
+                            room_authorized || mesh.sender_may_source_media(&peer, &route),
                             mesh.cec_screen_offer_denied(&peer),
                         );
-                    let drive_lapsed = plane.is_some_and(|pl| !mesh.sender_may_drive(&peer, pl));
+                    let drive_lapsed = plane
+                        .is_some_and(|pl| !room_authorized && !mesh.sender_may_drive(&peer, pl));
                     if screen_lapsed || drive_lapsed {
                         stale_routes.push(route.id.clone());
                         lapsed_techs.insert(crate::cec::pubkey_part(&peer).to_string());
@@ -3176,7 +3201,10 @@ impl Mesh {
                     // StartMedia in one step), and a shell — or this disk —
                     // is owner/fleet-only, the same rule as input injection,
                     // enforced before any reply exists.
-                    if let ControlMessage::Route(RouteControl::Offer { route, drive, .. }) = &msg {
+                    if let ControlMessage::Route(RouteControl::Offer {
+                        route, drive, room, ..
+                    }) = &msg
+                    {
                         // Log every inbound offer at the point it's received, so
                         // a host's node log shows whether an offer even arrived
                         // (vs. an offerer stuck "awaiting accept" because nothing
@@ -3190,6 +3218,9 @@ impl Mesh {
                         let hosts_here = self
                             .local_node_id()
                             .is_some_and(|me| route_sources_on(route, &me));
+                        let room_authorized = room
+                            .as_deref()
+                            .is_some_and(|room| self.room_scope_authorizes(room, &from, route));
                         // Authorized for this exact plane: owner/fleet, or a
                         // share grant the owner extended for it. Non-privileged
                         // routes (`None` plane) are never refused here.
@@ -3221,8 +3252,9 @@ impl Mesh {
                                 self.sender_may_drive(&from, DrivePlane::Files),
                             )
                         } else {
-                            route_drive_plane(route)
-                                .is_none_or(|plane| self.sender_may_drive(&from, plane))
+                            route_drive_plane(route).is_none_or(|plane| {
+                                room_authorized || self.sender_may_drive(&from, plane)
+                            })
                         };
                         if authorized && is_mapped_drive_route(route) {
                             let reconnect = accepted_drive_pull
@@ -3258,7 +3290,7 @@ impl Mesh {
                         if hosts_here
                             && matches!(route.media, MediaKind::Display | MediaKind::Video)
                             && cec_screen_consent_blocks(
-                                self.sender_may_source_media(&from, route),
+                                room_authorized || self.sender_may_source_media(&from, route),
                                 self.cec_screen_offer_denied(&from),
                             )
                         {
@@ -3297,7 +3329,7 @@ impl Mesh {
                                 route.media,
                                 MediaKind::Display | MediaKind::Video | MediaKind::Audio
                             )
-                            && !self.sender_may_source_media(&from, route)
+                            && !(room_authorized || self.sender_may_source_media(&from, route))
                         {
                             tracing::warn!(
                                 "media source offer {} from {} refused: not owner/fleet/share",
@@ -3689,7 +3721,10 @@ impl Mesh {
                         // a lapsed grant tears the route down within a couple of
                         // seconds, so here a live CEC route just passes.
                         let route_ok = self.inbound_media_ok(&ev.route, &from, MediaKind::Input);
-                        if route_ok && self.sender_may_drive_admitted(&from, DrivePlane::Input) {
+                        let room_ok = self.live_route_room_authorizes(&ev.route, &from);
+                        if route_ok
+                            && (room_ok || self.sender_may_drive_admitted(&from, DrivePlane::Input))
+                        {
                             self.injector.apply(&ev.route, ev.action);
                         } else {
                             // Refusing silently is how "controls just stopped
@@ -5129,6 +5164,22 @@ impl Mesh {
         video: Vec<String>,
         session: Option<String>,
     ) -> Result<String, String> {
+        self.connect_term_scoped(from, to, media, video, session, None)
+            .await
+    }
+
+    /// Offer a route with optional transient virtual-room authorization.
+    /// Ordinary graph/console calls pass `None`; room toggles pass their joined
+    /// room id, which the receiving node verifies against its own live lease.
+    pub async fn connect_term_scoped(
+        self: &Arc<Self>,
+        from: String,
+        to: String,
+        media: String,
+        video: Vec<String>,
+        session: Option<String>,
+        room: Option<String>,
+    ) -> Result<String, String> {
         // Only advertise transports the *whole* local stack can consume.
         // H.264 decode is always covered (WebCodecs where the webview has
         // it, the native decoder where it doesn't) — but inbound samples
@@ -5188,13 +5239,23 @@ impl Mesh {
                 // Loopback terminals carry the attach session too, so two
                 // local windows can share one local shell (multi-attach to
                 // yourself); harmless `None` on every other loopback route.
-                let _ = s.offer_terminal(
-                    route.clone(),
-                    me.as_str(),
-                    Vec::new(),
-                    Vec::new(),
-                    session.clone(),
-                );
+                if room.is_some() {
+                    let _ = s.offer_room(
+                        route.clone(),
+                        me.as_str(),
+                        Vec::new(),
+                        Vec::new(),
+                        room.clone(),
+                    );
+                } else {
+                    let _ = s.offer_terminal(
+                        route.clone(),
+                        me.as_str(),
+                        Vec::new(),
+                        Vec::new(),
+                        session.clone(),
+                    );
+                }
                 s.handle(
                     NodeId::from(me.as_str()),
                     ControlMessage::Route(RouteControl::Accept {
@@ -5237,7 +5298,11 @@ impl Mesh {
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
-            s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
+            if room.is_some() {
+                s.offer_room(route.clone(), peer.as_str(), video, audio, room)
+            } else {
+                s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
+            }
         };
         // **A live link sends inline, in order.** Every other piece of route
         // control — Teardown, Accept, Reject — goes out through
@@ -12956,6 +13021,137 @@ impl Mesh {
 
     // ---- Shared Files (the call's "Shared Files" area) ------------------
 
+    /// Register or refresh this device's short-lived membership in a virtual
+    /// room. The local GUI is the authority for its saved roster; the backend
+    /// canonicalizes it and independently checks it again on every scoped
+    /// offer/control frame. Updating a roster immediately tears down room
+    /// routes to members no longer listed.
+    pub async fn room_scope_set(
+        self: &Arc<Self>,
+        room: String,
+        members: Vec<String>,
+    ) -> Result<(), String> {
+        if room.trim().is_empty() {
+            return Err("room id is empty".into());
+        }
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let members: std::collections::HashSet<String> = members
+            .into_iter()
+            .map(|member| pubkey_part(&member).to_string())
+            .collect();
+        if !members.contains(pubkey_part(&me)) {
+            return Err("this device is not in that room roster".into());
+        }
+        self.room_scopes.lock().insert(
+            room.clone(),
+            RoomScope {
+                members,
+                expires: Instant::now() + ROOM_SCOPE_TTL,
+            },
+        );
+        self.reap_invalid_room_routes(Some(&room)).await;
+        Ok(())
+    }
+
+    /// Leave a virtual room and revoke every route whose only authority was
+    /// that room. Idempotent so a closing room window can fire-and-forget it.
+    pub async fn room_scope_leave(self: &Arc<Self>, room: String) -> Result<(), String> {
+        self.room_scopes.lock().remove(&room);
+        self.reap_invalid_room_routes(Some(&room)).await;
+        Ok(())
+    }
+
+    /// Whether this active local room lease authorizes `sender` to participate
+    /// in `route`. Both endpoints must be exactly this device and that
+    /// authenticated sender; a room never grants terminal/files/sites/storage,
+    /// and an id alone is useless without the locally registered roster.
+    fn room_scope_authorizes(&self, room: &str, sender: &str, route: &Route) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let scopes = self.room_scopes.lock();
+        let Some(scope) = scopes.get(room) else {
+            return false;
+        };
+        if scope.expires <= Instant::now() {
+            return false;
+        }
+        room_members_authorize_route(&scope.members, &me, sender, route)
+    }
+
+    /// Per-frame room check for an already negotiated route. This is the room
+    /// twin of `sender_may_drive_admitted`: leaving, a roster removal, or lease
+    /// expiry stops input immediately even before the teardown reaches the peer.
+    fn live_route_room_authorizes(&self, route_id: &str, sender: &str) -> bool {
+        let scoped = {
+            let st = self.state.lock();
+            st.session.as_ref().and_then(|session| {
+                let live = session.route(route_id)?;
+                Some((live.room.clone()?, live.route.clone()))
+            })
+        };
+        scoped.is_some_and(|(room, route)| self.room_scope_authorizes(&room, sender, &route))
+    }
+
+    /// Tear down room routes that no longer have a live matching local scope.
+    async fn reap_invalid_room_routes(self: &Arc<Self>, only_room: Option<&str>) {
+        let routes: Vec<(String, String, String, Route)> = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .routes()
+                        .filter_map(|live| {
+                            let room = live.room.as_ref()?;
+                            if only_room.is_some_and(|wanted| wanted != room) {
+                                return None;
+                            }
+                            Some((
+                                live.route.id.clone(),
+                                live.peer.to_string(),
+                                room.clone(),
+                                live.route.clone(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (id, peer, room, route) in routes {
+            if !self.room_scope_authorizes(&room, &peer, &route) {
+                tracing::info!("room scope ended — tearing down route {id}");
+                let _ = self.disconnect(id).await;
+            }
+        }
+    }
+
+    fn spawn_room_scope_sweep(self: &Arc<Self>) {
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let Some(mesh) = mesh.upgrade() else { break };
+                let now = Instant::now();
+                let expired: Vec<String> = {
+                    let mut scopes = mesh.room_scopes.lock();
+                    let expired = scopes
+                        .iter()
+                        .filter(|(_, scope)| scope.expires <= now)
+                        .map(|(room, _)| room.clone())
+                        .collect::<Vec<_>>();
+                    for room in &expired {
+                        scopes.remove(room);
+                    }
+                    expired
+                };
+                for room in expired {
+                    mesh.reap_invalid_room_routes(Some(&room)).await;
+                }
+            }
+        });
+    }
+
     /// Offer files into a room's Shared Files area. Each readable path gets
     /// an opaque fetch token, registered with the set of members allowed to
     /// pull it (`members`, canonical node ids). Returns one
@@ -15280,6 +15476,34 @@ fn cec_screen_consent_blocks(media_authorized: bool, cec_consent_denied: bool) -
     cec_consent_denied && !media_authorized
 }
 
+/// Structural half of virtual-room authorization. The room's local lease has
+/// already established `members`; this makes sure the route cannot use that
+/// membership as a confused deputy for a third node or a privileged plane the
+/// call UI never exposes.
+fn room_members_authorize_route(
+    members: &std::collections::HashSet<String>,
+    me: &str,
+    sender: &str,
+    route: &Route,
+) -> bool {
+    if !matches!(
+        route.media,
+        MediaKind::Display | MediaKind::Video | MediaKind::Audio | MediaKind::Input
+    ) {
+        return false;
+    }
+    let me = pubkey_part(me);
+    let sender = pubkey_part(sender);
+    if me == sender || !members.contains(me) || !members.contains(sender) {
+        return false;
+    }
+    let from_node = node_of(route.from.as_str());
+    let to_node = node_of(route.to.as_str());
+    let from = pubkey_part(&from_node);
+    let to = pubkey_part(&to_node);
+    (from == me && to == sender) || (from == sender && to == me)
+}
+
 /// Why an inbound terminal/files/site offer must be refused, if it must: it
 /// asks *this* machine to host a shell (or hand over its disk, or proxy a
 /// service) and the offerer is neither owner/fleet nor holds a share grant for
@@ -16870,6 +17094,44 @@ mod tests {
         // owner/fleet rule) is what keeps it to explicitly-shared files.
         let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
         assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    #[test]
+    fn room_membership_authorizes_only_call_routes_between_the_two_members() {
+        let members = std::collections::HashSet::from([
+            "me".to_string(),
+            "peer".to_string(),
+            "third".to_string(),
+        ]);
+        let display = term_route("me:screen", "peer:display", MediaKind::Display);
+        let input = term_route("peer:input", "me:control", MediaKind::Input);
+        assert!(room_members_authorize_route(&members, "me", "peer", &display));
+        assert!(room_members_authorize_route(&members, "me", "peer", &input));
+
+        let third_party = term_route("me:screen", "third:display", MediaKind::Display);
+        assert!(!room_members_authorize_route(
+            &members,
+            "me",
+            "peer",
+            &third_party
+        ));
+        assert!(!room_members_authorize_route(
+            &members,
+            "me",
+            "stranger",
+            &display
+        ));
+
+        // A room is a call, never a shortcut to machine-wide planes.
+        for route in [
+            term_route("me:terminal", "peer:term-view", MediaKind::Generic),
+            term_route("me:files", "peer:files-view", MediaKind::Storage),
+            term_route("me:clipboard", "peer:clipboard", MediaKind::Clipboard),
+        ] {
+            assert!(!room_members_authorize_route(
+                &members, "me", "peer", &route
+            ));
+        }
     }
 
     /// The grant role is keyed to the *end of the route being authorized*, not

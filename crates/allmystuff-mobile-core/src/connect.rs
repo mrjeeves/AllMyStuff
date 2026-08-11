@@ -73,6 +73,7 @@ pub fn offer_route(
         audio,
         session: None,
         drive: None,
+        room: None,
     }))
 }
 
@@ -160,6 +161,7 @@ pub fn offer_terminal(
         audio: Vec::new(),
         session: attach,
         drive: None,
+        room: None,
     })
 }
 
@@ -174,6 +176,7 @@ pub fn offer_files(host: &NodeId, me: &NodeId, nonce: &str) -> ControlMessage {
         audio: Vec::new(),
         session: None,
         drive: None,
+        room: None,
     })
 }
 

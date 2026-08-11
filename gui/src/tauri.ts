@@ -230,6 +230,7 @@ export function connectRoute(
   media: MediaKind,
   codec?: "auto" | "h264" | "mjpeg",
   session?: string | null,
+  room?: string | null,
 ): Promise<string | null> {
   const video =
     (media === "display" || media === "video") && codec !== "mjpeg"
@@ -245,6 +246,7 @@ export function connectRoute(
     media,
     video,
     session: session ?? null,
+    room: room ?? null,
   });
 }
 
@@ -1227,6 +1229,16 @@ export function roomSetSharePeers(
  *  the room). No-op in web mode. */
 export function roomUnshare(tokens: string[]): Promise<null> {
   return tryInvoke("room_unshare", { tokens });
+}
+
+/** Register/refresh this window's short-lived joined-room authorization. */
+export function roomScopeSet(room: string, members: string[]): Promise<null> {
+  return tryInvoke("room_scope_set", { room, members });
+}
+
+/** Revoke a joined-room authorization and its live scoped routes. */
+export function roomScopeLeave(room: string): Promise<null> {
+  return tryInvoke("room_scope_leave", { room });
 }
 
 /** Pick local files to share, via the OS open dialog (multi-select).

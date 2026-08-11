@@ -97,12 +97,24 @@ pub struct LiveRoute {
     /// Receiver-side native mount request for a mapped Storage route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive: Option<DriveRouteOffer>,
+    /// Transient virtual-room authorization scope, when this route belongs to
+    /// a joined call. Kept with the live route so per-frame control checks can
+    /// revalidate membership and leaving/expiry can tear it down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
 }
 
 impl LiveRoute {
     pub fn is_active(&self) -> bool {
         self.state == RouteState::Active
     }
+}
+
+#[derive(Default)]
+struct OfferContext {
+    session: Option<String>,
+    drive: Option<DriveRouteOffer>,
+    room: Option<String>,
 }
 
 /// Something the backend must do as a result of handling a message. The
@@ -280,6 +292,29 @@ impl Session {
         self.offer_with_drive(route, peer, video, audio, session, None)
     }
 
+    /// Offer a route scoped to a currently joined virtual room. The room id is
+    /// authorization context, not a standing grant; both nodes independently
+    /// verify their short-lived local membership before using it.
+    pub fn offer_room(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        room: Option<String>,
+    ) -> ControlMessage {
+        self.offer_scoped(
+            route,
+            peer,
+            video,
+            audio,
+            OfferContext {
+                room,
+                ..OfferContext::default()
+            },
+        )
+    }
+
     /// Offer a route carrying an optional native-drive mount request.
     pub fn offer_with_drive(
         &mut self,
@@ -290,6 +325,32 @@ impl Session {
         session: Option<String>,
         drive: Option<DriveRouteOffer>,
     ) -> ControlMessage {
+        self.offer_scoped(
+            route,
+            peer,
+            video,
+            audio,
+            OfferContext {
+                session,
+                drive,
+                room: None,
+            },
+        )
+    }
+
+    fn offer_scoped(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        context: OfferContext,
+    ) -> ControlMessage {
+        let OfferContext {
+            session,
+            drive,
+            room,
+        } = context;
         let peer = peer.into();
         self.routes.insert(
             route.id.clone(),
@@ -302,6 +363,7 @@ impl Session {
                 audio: audio.clone(),
                 term_session: session.clone(),
                 drive: drive.clone(),
+                room: room.clone(),
             },
         );
         ControlMessage::Route(RouteControl::Offer {
@@ -310,6 +372,7 @@ impl Session {
             audio,
             session,
             drive,
+            room,
         })
     }
 
@@ -405,6 +468,7 @@ impl Session {
                 audio,
                 session,
                 drive,
+                room,
             } => {
                 // A duplicate Offer for a route we have already accepted and
                 // started. The daemon redelivers the same Offer once per
@@ -451,6 +515,7 @@ impl Session {
                         // [`set_term_session`](Self::set_term_session).
                         term_session: session,
                         drive,
+                        room,
                     },
                 );
                 if accept {
@@ -713,6 +778,28 @@ mod tests {
     }
 
     #[test]
+    fn room_scope_round_trips_into_both_live_route_sides() {
+        let mut sender = Session::new("this");
+        let msg = sender.offer_room(
+            route("room-route"),
+            "desk",
+            vec!["h264".into()],
+            Vec::new(),
+            Some("room:this:abc".into()),
+        );
+        assert_eq!(
+            sender.route("room-route").unwrap().room.as_deref(),
+            Some("room:this:abc")
+        );
+        let mut receiver = Session::new("desk");
+        receiver.handle("this".into(), msg);
+        assert_eq!(
+            receiver.route("room-route").unwrap().room.as_deref(),
+            Some("room:this:abc")
+        );
+    }
+
+    #[test]
     fn terminal_attach_session_threads_through_offer_and_accept() {
         // Viewer side: offering with a session to attach records it and puts
         // it on the wire; the host's accept echoing the resolved id updates
@@ -791,6 +878,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: Some("term-2".into()),
+                room: None,
             }),
         );
         assert_eq!(
@@ -816,6 +904,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
@@ -846,6 +935,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         // A host-resolved terminal session id is recorded after the first start.
@@ -860,6 +950,7 @@ mod tests {
                 // A re-offer might still carry the viewer's original ask;
                 // honouring it must not clobber the resolved id below.
                 session: Some("term-1".into()),
+                room: None,
             }),
         );
         // No second StartMedia…
@@ -892,6 +983,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Incoming);
@@ -929,6 +1021,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         let effects = s.handle(
@@ -952,6 +1045,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         let effects = s.drop_peer(&"this".into());
@@ -972,6 +1066,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         let had_peer = s.peer(&"this".into()).is_some();
@@ -993,6 +1088,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         let effects = s.reap_peer_routes(&"peerpubkey-A1B2C".into());
@@ -1057,6 +1153,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         assert!(fx.iter().any(|e| matches!(e, Effect::StartMedia(_))));
@@ -1121,6 +1218,7 @@ mod tests {
                 audio: Vec::new(),
                 drive: None,
                 session: None,
+                room: None,
             }),
         );
         // The route's peer may re-key and tune it.

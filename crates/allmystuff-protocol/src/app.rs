@@ -1005,6 +1005,12 @@ pub enum RouteControl {
         /// other route and for peers predating native mapped drives.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         drive: Option<DriveRouteOffer>,
+        /// A transient virtual-room scope. The receiving node accepts this
+        /// only while its own UI has the same room joined and lists the
+        /// authenticated sender as a member. It never becomes a durable share
+        /// grant, and absent keeps ordinary/older route offers unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
     },
     /// "Go ahead" — media may start. For a terminal route the host echoes
     /// the **resolved** session id it attached this route to (the minted
@@ -1752,6 +1758,7 @@ mod tests {
                 audio: Vec::new(),
                 session: None,
                 drive: None,
+                room: None,
             },
             _ => unreachable!(),
         };
@@ -1759,6 +1766,38 @@ mod tests {
         assert!(s.contains("\"video\":[\"h264\"]"));
         let back: RouteControl = serde_json::from_str(&s).unwrap();
         assert_eq!(offered, back);
+    }
+
+    #[test]
+    fn route_offer_room_scope_is_optional_and_round_trips() {
+        let legacy = r#"{"kind":"offer","route":{
+            "id":"r1","from":"a:screen","to":"b:view","media":"display"
+        }}"#;
+        let plain: RouteControl = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(plain, RouteControl::Offer { room: None, .. }));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("\"room\""));
+
+        let scoped = match plain {
+            RouteControl::Offer {
+                route,
+                video,
+                audio,
+                session,
+                drive,
+                ..
+            } => RouteControl::Offer {
+                route,
+                video,
+                audio,
+                session,
+                drive,
+                room: Some("room:a:abc".into()),
+            },
+            _ => unreachable!(),
+        };
+        let json = serde_json::to_string(&scoped).unwrap();
+        assert!(json.contains("\"room\":\"room:a:abc\""));
+        assert_eq!(serde_json::from_str::<RouteControl>(&json).unwrap(), scoped);
     }
 
     #[test]
@@ -1781,6 +1820,7 @@ mod tests {
                 audio: vec!["opus".into()],
                 session: None,
                 drive: None,
+                room: None,
             },
             _ => unreachable!(),
         };
@@ -1814,6 +1854,7 @@ mod tests {
                 audio: Vec::new(),
                 session: Some("term-3".into()),
                 drive: None,
+                room: None,
             },
             _ => unreachable!(),
         };

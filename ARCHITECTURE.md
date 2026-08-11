@@ -295,6 +295,14 @@ Tauri 2 + Svelte 5, a client of the daemon.
   itself, or installing one next to the app, which `daemon_spawn` finds in
   the same next-to-the-binary slot.) `update_*` commands drive
   `allmystuff-updater`.
+- **Backend version convergence** is owned by the process answering the local
+  node socket. The GUI and dependency consumers such as CEC Support send
+  `request_update { minimum }`; that node updates the installation it is
+  actually executing, relaunches, and callers verify the replacement's
+  `node_version`. This distinction is load-bearing on Windows, where the
+  Always On node is a protected copy under `ProgramData`, separate from either
+  app's bundled sidecar. A release build repairs a pre-contract installed
+  service once at startup; later updates use the request path without UAC.
 - **Front-end** (`src/`) — the graph. `catalog.ts` is a faithful TypeScript
   port of the graph crate's rules, so the canvas is fully interactive on
   demo data with no backend; when the backend is present it validates the

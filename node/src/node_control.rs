@@ -976,6 +976,10 @@ pub async fn dispatch(
         "node_version" => DispatchOut::Json(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
         })),
+        "request_update" => {
+            let minimum: String = try_arg!(arg(a, "minimum"));
+            json_result(mesh.request_self_update(minimum).await)
+        }
         "restart_self" => {
             mesh.restart_self();
             DispatchOut::Json(serde_json::json!({ "restarting": true }))
@@ -2216,26 +2220,108 @@ fn converge_action(
 /// normal state after every update, not an edge case. The node's own
 /// unattended updater would close it eventually, but only on its 24-hour tick.
 ///
-/// So: ask the running node what version it *is*, and if it's behind, ask it
-/// to relaunch (`restart_self`) once there is a newer build on disk to land
-/// on. A node too old to answer either op is left alone — see
-/// [`converge_action`].
-async fn converge_reused_node(pin: &str) {
-    let Some(want) = crate::daemon_spawn::parse_semverish(pin) else {
-        return;
-    };
-    let Some(client) = NodeClient::new().ok() else {
-        return;
-    };
-    let running = client
+/// The primary path asks the running node to update the installation it owns,
+/// then verifies the process that returns. [`converge_action`] remains only for
+/// the 0.2.65 compatibility path, before `request_update` existed.
+async fn running_node_version(client: &NodeClient) -> Option<(u64, u64, u64)> {
+    client
         .request("node_version", serde_json::json!({}))
         .await
         .ok()
-        .and_then(|v| {
-            v.get("version")
-                .and_then(|v| v.as_str())
+        .and_then(|value| {
+            value
+                .get("version")
+                .and_then(|version| version.as_str())
                 .and_then(crate::daemon_spawn::parse_semverish)
-        });
+        })
+}
+
+/// Wait through the update's socket drop/relaunch and prove the process that
+/// comes back actually satisfies the caller's pin. A successful request is not
+/// convergence; the version reported by the replacement process is.
+async fn wait_for_running_node_version(
+    client: &NodeClient,
+    want: (u64, u64, u64),
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if running_node_version(client)
+            .await
+            .is_some_and(|running| running >= want)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Reconcile the process answering the shared node socket with a consumer's
+/// minimum AllMyStuff version. Public so the desktop shell can decide whether a
+/// legacy Windows service needs the one-time elevated repair path.
+pub async fn reconcile_running_node(pin: &str) -> bool {
+    converge_reused_node(pin).await
+}
+
+/// Cheap post-start verification used after reconciliation or a legacy service
+/// repair. Unlike [`reconcile_running_node`], this never downloads or restarts.
+pub async fn running_node_satisfies(pin: &str) -> bool {
+    let Some(want) = crate::daemon_spawn::parse_semverish(pin) else {
+        return true;
+    };
+    let Some(client) = NodeClient::new().ok() else {
+        return false;
+    };
+    running_node_version(&client)
+        .await
+        .is_some_and(|running| running >= want)
+}
+
+async fn converge_reused_node(pin: &str) -> bool {
+    let Some(want) = crate::daemon_spawn::parse_semverish(pin) else {
+        return true;
+    };
+    let Some(client) = NodeClient::new().ok() else {
+        return false;
+    };
+    let running = running_node_version(&client).await;
+    if running.is_some_and(|version| version >= want) {
+        return true;
+    }
+
+    // Ask the owner of the socket to update the installation it is actually
+    // executing. This is the path that correctly reaches a protected
+    // ProgramData service copy and is shared by AllMyStuff and CEC Support.
+    match client
+        .request("request_update", serde_json::json!({ "minimum": pin }))
+        .await
+    {
+        Ok(_) => {
+            if wait_for_running_node_version(
+                &client,
+                want,
+                NODE_UPDATE_TIMEOUT + Duration::from_secs(20),
+            )
+            .await
+            {
+                return true;
+            }
+            tracing::warn!(
+                "the shared node accepted the {pin} update request but did not return at that version"
+            );
+            return false;
+        }
+        Err(error) => tracing::warn!(
+            "the shared node could not accept a dependency update request ({error}); trying the pre-request compatibility path"
+        ),
+    }
+
+    // Compatibility for 0.2.65-era nodes: update the ordinary installed
+    // sidecar and ask the running process to restart. This works when that
+    // sidecar is the process owner. A protected Windows service is a distinct
+    // copy, so verification below intentionally fails and lets the desktop
+    // shell perform its one-time service repair.
     // Only an Installed node is ours to update; a dev/override build is the
     // developer's business, exactly as before.
     let installed = match find_node_binary() {
@@ -2247,13 +2333,13 @@ async fn converge_reused_node(pin: &str) {
         None => None,
     };
     match converge_action(running, disk, want) {
-        Converge::Nothing => {}
+        Converge::Nothing => false,
         Converge::UpdateThenRestart => {
             let Some(bin) = installed else {
                 tracing::warn!(
                     "the running allmystuff-serve is below the {pin} pin, but its binary isn't one we install — leaving it alone"
                 );
-                return;
+                return false;
             };
             tracing::info!(
                 "the reused allmystuff-serve is below the {pin} pin — updating it on disk…"
@@ -2262,11 +2348,15 @@ async fn converge_reused_node(pin: &str) {
                 tracing::warn!(
                     "couldn't bring allmystuff-serve to {pin} on disk — NOT restarting it, since it would come back the same version"
                 );
-                return;
+                return false;
             }
-            request_node_restart(&client, pin).await;
+            request_node_restart(&client, pin).await
+                && wait_for_running_node_version(&client, want, Duration::from_secs(20)).await
         }
-        Converge::RestartOnly => request_node_restart(&client, pin).await,
+        Converge::RestartOnly => {
+            request_node_restart(&client, pin).await
+                && wait_for_running_node_version(&client, want, Duration::from_secs(20)).await
+        }
     }
 }
 
@@ -2274,14 +2364,18 @@ async fn converge_reused_node(pin: &str) {
 /// node answers *before* it goes, so a transport error here means an older
 /// node with no `restart_self` op — say so plainly rather than leaving a
 /// silent skew.
-async fn request_node_restart(client: &NodeClient, pin: &str) {
+async fn request_node_restart(client: &NodeClient, pin: &str) -> bool {
     tracing::info!(
         "allmystuff-serve on disk now meets {pin} but the running node is older — asking it to relaunch onto it"
     );
-    if let Err(e) = client.request("restart_self", serde_json::json!({})).await {
-        tracing::warn!(
-            "the running node wouldn't take a restart ({e}) — it predates `restart_self`, so it keeps the old build until its own updater or a service restart bounces it"
-        );
+    match client.request("restart_self", serde_json::json!({})).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "the running node wouldn't take a restart ({e}) — it predates `restart_self`, so it keeps the old build until its own updater or a service restart bounces it"
+            );
+            false
+        }
     }
 }
 

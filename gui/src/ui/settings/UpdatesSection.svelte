@@ -30,33 +30,19 @@
     return d.toLocaleString();
   }
 
-  // ---- Danger Zone ----
-  // Two-click arming so a reset can't fire on a stray click. Each level reboots
-  // the whole stack (node + daemon + app) after clearing state: the daemon is
-  // the real datastore, so without the reboot an in-memory cache can re-persist
-  // ("resurrect") what was wiped. Desktop only — it needs the local daemon and
-  // a relaunch.
-  let armed = $state<null | "leave" | "network" | "factory">(null);
-  let resetting = $state<null | "leave" | "network" | "factory">(null);
-  let resetError = $state<string | null>(null);
+  function cleanVersion(v: string | null | undefined): string {
+    return v?.replace(/^v/, "") || "Unknown";
+  }
 
-  async function runReset(kind: "leave" | "network" | "factory") {
-    if (armed !== kind) {
-      armed = kind; // first click arms; a second confirms
-      return;
+  function behind(current: string | null, pinned: string | null): boolean {
+    if (!current || !pinned) return true;
+    const have = cleanVersion(current).split(/[.-]/).slice(0, 3).map(Number);
+    const want = cleanVersion(pinned).split(/[.-]/).slice(0, 3).map(Number);
+    for (let i = 0; i < 3; i += 1) {
+      if ((have[i] || 0) < (want[i] || 0)) return true;
+      if ((have[i] || 0) > (want[i] || 0)) return false;
     }
-    armed = null;
-    resetting = kind;
-    resetError = null;
-    try {
-      if (kind === "leave") await app.dangerLeaveFleet();
-      else if (kind === "network") await app.dangerResetNetworking();
-      else await app.dangerFactoryReset();
-      // The app relaunches on success, so control doesn't normally return here.
-    } catch (e) {
-      resetError = String(e);
-      resetting = null;
-    }
+    return false;
   }
 </script>
 
@@ -93,6 +79,37 @@
     {#if checkResult && !app.updateBusy}
       <p class="check-result">{checkResult}</p>
     {/if}
+
+    <section class="block components">
+      <div class="component-intro">
+        <b>Installed components</b>
+        <span class="hint">Live process versions are separate, so a partial update cannot hide behind the GUI version.</span>
+      </div>
+      {#if app.componentVersions.length === 0}
+        <p class="hint">Reading component versions…</p>
+      {:else}
+        <div class="component-list">
+          {#each app.componentVersions as row (row.id)}
+            <div class="component-row" class:stale={behind(row.current, row.pinned)}>
+              <div class="component-copy">
+                <div class="component-name">{row.label}</div>
+                <div class="component-detail">{row.detail}</div>
+                {#if row.installed && cleanVersion(row.installed) !== cleanVersion(row.current)}
+                  <div class="component-disk">On disk: {cleanVersion(row.installed)}</div>
+                {/if}
+              </div>
+              <div class="versions">
+                <span><small>Current</small><b>{cleanVersion(row.current)}</b></span>
+                <span><small>Pinned</small><b>{cleanVersion(row.pinned)}</b></span>
+              </div>
+              <button class="btn small repair" disabled={app.componentBusy !== null} onclick={() => app.repairComponent(row.id)}>
+                {app.componentBusy === row.id ? "Working…" : behind(row.current, row.pinned) ? "Update" : "Repair"}
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
 
     {#if pkg}
       <section class="block">
@@ -196,92 +213,6 @@
     {/if}
   {/if}
 
-  <!-- Danger Zone — desktop only (it needs the local daemon and a relaunch).
-       Each action reboots the node + daemon + app so cleared state genuinely
-       flushes instead of being resurrected from an in-memory cache. -->
-  {#if !web && !mobile}
-    <section class="danger">
-      <div class="danger-head">⚠ Danger Zone</div>
-      <p class="danger-lead">
-        Each of these clears state and then <b>restarts the app and the mesh
-        daemon</b>, so every layer reloads from disk. Without the reboot, cached
-        state can quietly reappear.
-      </p>
-
-      <div class="danger-row">
-        <div class="danger-copy">
-          <div class="danger-title">Leave the fleet</div>
-          <div class="danger-desc">
-            Remove this device from its fleet — drops ownership, the fleet key,
-            and the fleet's signed roster. Keeps your other meshes and settings.
-          </div>
-        </div>
-        <button
-          class="danger-btn"
-          class:armed={armed === "leave"}
-          disabled={resetting !== null}
-          onclick={() => runReset("leave")}
-        >
-          {resetting === "leave"
-            ? "Restarting…"
-            : armed === "leave"
-              ? "Confirm — reboots"
-              : "Leave fleet"}
-        </button>
-      </div>
-
-      <div class="danger-row">
-        <div class="danger-copy">
-          <div class="danger-title">Reset networking</div>
-          <div class="danger-desc">
-            Leave the fleet <b>and</b> forget every mesh — all rosters and signed
-            state — keeping this device's identity. A clean networking slate.
-          </div>
-        </div>
-        <button
-          class="danger-btn"
-          class:armed={armed === "network"}
-          disabled={resetting !== null}
-          onclick={() => runReset("network")}
-        >
-          {resetting === "network"
-            ? "Restarting…"
-            : armed === "network"
-              ? "Confirm — reboots"
-              : "Reset networking"}
-        </button>
-      </div>
-
-      <div class="danger-row">
-        <div class="danger-copy">
-          <div class="danger-title">Factory reset</div>
-          <div class="danger-desc">
-            Erase <b>everything</b> — identity, config, every mesh, and fleet
-            ownership. This device becomes brand-new to all peers. No undo.
-          </div>
-        </div>
-        <button
-          class="danger-btn nuke"
-          class:armed={armed === "factory"}
-          disabled={resetting !== null}
-          onclick={() => runReset("factory")}
-        >
-          {resetting === "factory"
-            ? "Resetting…"
-            : armed === "factory"
-              ? "Confirm wipe — reboots"
-              : "Factory reset"}
-        </button>
-      </div>
-
-      {#if armed}
-        <button class="danger-cancel" onclick={() => (armed = null)}>Cancel</button>
-      {/if}
-      {#if resetError}
-        <p class="danger-err">Reset failed: {resetError}</p>
-      {/if}
-    </section>
-  {/if}
 </div>
 
 <style>
@@ -414,91 +345,23 @@
     text-transform: capitalize;
   }
 
-  /* ---- Danger Zone ---- */
-  .danger {
-    margin-top: 1.4rem;
-    padding: 0.9rem;
-    border: 1px solid var(--danger);
-    border-radius: var(--r-sm);
-    background: var(--danger-soft);
-    display: flex;
-    flex-direction: column;
-    gap: 0.7rem;
-  }
-  .danger-head {
-    color: var(--danger);
-    font-weight: 700;
-    font-size: 0.9rem;
-    letter-spacing: 0.02em;
-  }
-  .danger-lead {
-    color: var(--ink-soft);
-    font-size: 0.78rem;
-    margin: 0;
-    line-height: 1.4;
-  }
-  .danger-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.8rem;
-    padding-top: 0.6rem;
-    border-top: 1px solid var(--line);
-  }
-  .danger-copy {
-    min-width: 0;
-  }
-  .danger-title {
-    color: var(--ink);
-    font-size: 0.85rem;
-    font-weight: 600;
-  }
-  .danger-desc {
-    color: var(--ink-soft);
-    font-size: 0.76rem;
-    line-height: 1.4;
-    margin-top: 0.15rem;
-  }
-  .danger-btn {
-    flex: 0 0 auto;
-    white-space: nowrap;
-    background: var(--danger-soft);
-    color: var(--danger);
-    border: 1px solid var(--danger);
-    border-radius: var(--r-sm);
-    padding: 0.4rem 0.7rem;
-    font-size: 0.8rem;
-    cursor: pointer;
-  }
-  .danger-btn:hover:not(:disabled) {
-    filter: brightness(1.15);
-  }
-  .danger-btn.armed {
-    background: var(--danger);
-    color: #fff;
-    font-weight: 600;
-  }
-  .danger-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-  .danger-cancel {
-    align-self: flex-start;
-    background: none;
-    border: none;
-    color: var(--ink-faint);
-    font-size: 0.76rem;
-    cursor: pointer;
-    text-decoration: underline;
-    padding: 0;
-  }
-  .danger-err {
-    color: var(--danger);
-    background: var(--danger-soft);
-    border: 1px solid var(--danger);
-    border-radius: var(--r-sm);
-    padding: 0.45rem 0.6rem;
-    font-size: 0.8rem;
-    margin: 0;
+  .components { display: flex; flex-direction: column; gap: 0.65rem; }
+  .component-intro { display: flex; flex-direction: column; }
+  .component-list { border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden; }
+  .component-row { display: grid; grid-template-columns: minmax(10rem, 1fr) auto auto; align-items: center; gap: 0.8rem; padding: 0.65rem 0.7rem; border-top: 1px solid var(--line); }
+  .component-row:first-child { border-top: none; }
+  .component-row.stale { background: color-mix(in srgb, var(--danger-soft) 50%, transparent); }
+  .component-copy { min-width: 0; }
+  .component-name { font-size: 0.84rem; font-weight: 650; }
+  .component-detail, .component-disk { color: var(--ink-faint); font-size: 0.7rem; margin-top: 0.1rem; }
+  .versions { display: flex; gap: 0.8rem; }
+  .versions span { min-width: 4.2rem; display: flex; flex-direction: column; }
+  .versions small { color: var(--ink-faint); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .versions b { font-size: 0.78rem; }
+  .repair { min-width: 4.3rem; }
+  @media (max-width: 700px) {
+    .component-row { grid-template-columns: 1fr auto; }
+    .versions { grid-column: 1; }
+    .repair { grid-column: 2; grid-row: 1 / span 2; }
   }
 </style>

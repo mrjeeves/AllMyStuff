@@ -373,6 +373,30 @@ fn pinned_version() -> Option<(&'static str, (u64, u64, u64))> {
     Some((pin, want))
 }
 
+/// The MyOwnMesh release pin compiled into this AllMyStuff node.
+pub fn daemon_pin() -> Option<&'static str> {
+    option_env!("MYOWNMESH_PIN")
+}
+
+/// Read the version of the daemon binary this process would launch. This is
+/// distinct from the version answering the socket; Settings shows both the
+/// on-disk repair target and the live daemon through the node status RPC.
+pub async fn installed_daemon_version() -> anyhow::Result<Option<String>> {
+    let (bin, _) = find_daemon_binary()?;
+    Ok(binary_version(&bin).await.map(fmt_ver))
+}
+
+/// Ask an installed MyOwnMesh binary to repair/update itself. Development
+/// artifacts and explicit overrides are intentionally not overwritten.
+pub async fn repair_installed_daemon() -> anyhow::Result<Option<String>> {
+    let (bin, source) = find_daemon_binary()?;
+    if source != DaemonSource::Installed {
+        anyhow::bail!("this MyOwnMesh binary is a development build or explicit override; rebuild or replace it at its configured path")
+    }
+    let _ = run_daemon_update(&bin).await;
+    Ok(binary_version(&bin).await.map(fmt_ver))
+}
+
 /// `bin --version`, parsed. `None` when the binary won't answer.
 async fn binary_version(bin: &Path) -> Option<(u64, u64, u64)> {
     let mut cmd = tokio::process::Command::new(bin);

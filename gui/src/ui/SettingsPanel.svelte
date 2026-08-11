@@ -13,6 +13,7 @@
   import DevicesSection from "./settings/DevicesSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
   import CecSection from "./settings/CecSection.svelte";
+  import DangerSection from "./settings/DangerSection.svelte";
 
   // Ordered to match the model's flow — venue → mesh → fleet → sharing — the
   // same sequence the "How it connects" explainer teaches. Devices (the
@@ -38,6 +39,7 @@
     // On the phone/tablet the App Store owns updates, so the pane is a plain
     // "About" (see UpdatesSection) — the nav entry matches.
     { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
+    ...(!isMobile() ? [{ id: "danger" as SettingsTab, label: "Danger Zone", icon: "⚠️" }] : []),
   ]);
 
   function close() {
@@ -90,6 +92,8 @@
         <AlwaysOnSection />
       {:else if app.settingsTab === "updates"}
         <UpdatesSection />
+      {:else if app.settingsTab === "danger" && !isMobile()}
+        <DangerSection />
       {/if}
     </section>
   </div>

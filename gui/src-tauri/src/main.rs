@@ -2072,6 +2072,120 @@ async fn update_status() -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Every independently replaceable part of the local install. Runtime RPCs
+/// are used for the two long-lived processes so this reports what is actually
+/// executing, while updater markers cover optional sibling tools on disk.
+#[tauri::command]
+async fn component_status(state: State<'_, AppState>) -> Result<Value, String> {
+    let app_pin = env!("CARGO_PKG_VERSION");
+    let node = state.node.request("node_version", json!({})).await.ok();
+    let mesh = state.node.request("mesh_status", json!({})).await.ok();
+    let service = tokio::task::spawn_blocking(|| {
+        allmystuff_service::status_value(false).unwrap_or_else(|_| json!({}))
+    })
+    .await
+    .map_err(|e| format!("service status task failed: {e}"))?;
+    let artifacts = allmystuff_updater::installed_artifact_statuses();
+
+    let node_version = node
+        .as_ref()
+        .and_then(|v| v.get("version"))
+        .and_then(Value::as_str);
+    let mesh_version = mesh
+        .as_ref()
+        .and_then(|v| v.get("version"))
+        .and_then(Value::as_str);
+    let mesh_disk = allmystuff_node::daemon_spawn::installed_daemon_version()
+        .await
+        .ok()
+        .flatten();
+    let artifact = |name: &str| {
+        artifacts
+            .iter()
+            .find(|a| a.component == name && a.installed)
+            .and_then(|a| a.version.clone())
+    };
+
+    let mut rows = vec![
+        json!({ "id": "gui", "label": "AllMyStuff GUI", "current": app_pin, "pinned": app_pin, "detail": "Running desktop app" }),
+        json!({ "id": "serve", "label": "AllMyStuff Serve", "current": node_version, "pinned": app_pin, "detail": "Running mesh and media backend" }),
+        json!({ "id": "myownmesh", "label": "MyOwnMesh Serve", "current": mesh_version, "pinned": allmystuff_node::daemon_spawn::daemon_pin(), "installed": mesh_disk, "detail": "Running mesh transport daemon" }),
+    ];
+    if service.get("installed").and_then(Value::as_bool) == Some(true) {
+        rows.push(json!({
+            "id": "service",
+            "label": "Always On service payload",
+            "current": service.get("payload_version"),
+            "pinned": app_pin,
+            "detail": "Binary installed in the operating-system service"
+        }));
+    }
+    if artifacts
+        .iter()
+        .any(|a| a.component == "cli" && a.installed)
+    {
+        rows.push(json!({ "id": "cli", "label": "AllMyStuff CLI", "current": artifact("cli"), "pinned": app_pin, "detail": "Command-line launcher" }));
+    }
+    if artifacts
+        .iter()
+        .any(|a| a.component == "amst" && a.installed)
+    {
+        rows.push(json!({ "id": "amst", "label": "AMSTerm", "current": artifact("amst"), "pinned": app_pin, "detail": "Standalone mesh terminal" }));
+    }
+    Ok(json!({ "rows": rows }))
+}
+
+/// Repair one row without making the user infer which updater/service owns it.
+/// The release updater intentionally reconciles all installed AllMyStuff
+/// siblings together; selecting one row still repairs that row plus any other
+/// skew it discovers in the same pass.
+#[tauri::command]
+async fn component_repair(state: State<'_, AppState>, component: String) -> Result<Value, String> {
+    match component.as_str() {
+        "gui" | "cli" | "amst" => serde_json::to_value(
+            allmystuff_updater::update_now()
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string()),
+        "serve" => state
+            .node
+            .request(
+                "request_update",
+                json!({ "minimum": env!("CARGO_PKG_VERSION") }),
+            )
+            .await
+            .map_err(|e| e.to_string()),
+        "service" => service_install(state).await,
+        "myownmesh" => {
+            let installed_service = tokio::task::spawn_blocking(|| {
+                allmystuff_service::status_value(false)
+                    .ok()
+                    .and_then(|v| v.get("installed").and_then(Value::as_bool))
+                    == Some(true)
+            })
+            .await
+            .unwrap_or(false);
+            if installed_service {
+                allmystuff_node::daemon_spawn::repair_installed_daemon()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return service_install(state).await;
+            } else {
+                allmystuff_node::daemon_spawn::repair_installed_daemon()
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            state
+                .node
+                .request("restart_self", json!({}))
+                .await
+                .map_err(|e| e.to_string())
+        }
+        other => Err(format!("unknown component: {other}")),
+    }
+}
+
 #[tauri::command]
 async fn update_check() -> Result<Value, String> {
     let outcome = allmystuff_updater::check_now(true)
@@ -2958,6 +3072,8 @@ fn main() {
             mesh_roster_list,
             mesh_identity_set_label,
             update_status,
+            component_status,
+            component_repair,
             update_check,
             update_apply,
             update_relaunch,

@@ -6,6 +6,7 @@
 import type {
   Capability,
   CheckOutcome,
+  ComponentStatus,
   FileEvent,
   Grant,
   RoomWireMessage,
@@ -2044,6 +2045,18 @@ export async function onNodeSites(
 
 export function updateStatus(): Promise<UpdateStatus | null> {
   return tryInvoke<UpdateStatus>("update_status");
+}
+
+/** Versions of the independently replaceable local components. */
+export function componentStatus(): Promise<ComponentStatus | null> {
+  return tryInvoke<ComponentStatus>("component_status");
+}
+
+/** Repair/update one component row. Uses a raw invoke so failures reach UI. */
+export async function componentRepair(component: string): Promise<unknown> {
+  if (!isTauri()) throw new Error("component repair needs the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke("component_repair", { component });
 }
 
 /** The background auto-update ticker reporting what a check decided — the

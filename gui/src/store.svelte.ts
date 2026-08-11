@@ -146,6 +146,7 @@ import {
   autostartGet,
   autostartSet,
   clipboardPaste,
+  clipboardDrop,
   clipboardPull,
   shareFolderFrom,
   sendInput,
@@ -3778,6 +3779,43 @@ class AppStore {
     if (!this.consoleControlLive || !this.consoleClipboardLive) return;
     await this.sendConsoleClipboard();
     await this.forwardClipboardChord(key, code, heldMeta);
+  }
+
+  /** Drop native local files onto the remote desktop. Publish a real file-list
+   * clipboard on the far OS, place and click the remote pointer where the user
+   * released the drag, then press that OS's paste chord. The clipboard write
+   * completes before the chord is sent, so slow image/file formats cannot
+   * race the paste. */
+  async dropConsoleFiles(
+    paths: string[],
+    point: { x: number; y: number; screen?: number },
+  ): Promise<void> {
+    const control = this.consoleControlLive;
+    const clipboard = this.consoleClipboardLive;
+    if (!control || !clipboard) {
+      throw new Error("Keyboard & mouse and Clipboard must both be on");
+    }
+    await clipboardDrop(clipboard, paths);
+    await sendInput(control, { kind: "mouse_move", ...point });
+    await sendInput(control, { kind: "mouse_button", button: 0, down: true });
+    await sendInput(control, { kind: "mouse_button", button: 0, down: false });
+    await this.sendRemotePasteChord();
+  }
+
+  /** A complete paste chord when no physical modifier is already held (the
+   * native file-drop path). `forwardClipboardChord` serves keyboard events and
+   * intentionally assumes the user's Ctrl/Cmd is already down remotely. */
+  private async sendRemotePasteChord(): Promise<void> {
+    const control = this.consoleControlLive;
+    if (!control) return;
+    const remoteMeta = (this.consoleNode?.summary?.os ?? "").toLowerCase().includes("mac");
+    const modifier = remoteMeta
+      ? { key: "Meta", code: "MetaLeft" }
+      : { key: "Control", code: "ControlLeft" };
+    await sendInput(control, { kind: "key", ...modifier, down: true });
+    await sendInput(control, { kind: "key", key: "v", code: "KeyV", down: true });
+    await sendInput(control, { kind: "key", key: "v", code: "KeyV", down: false });
+    await sendInput(control, { kind: "key", ...modifier, down: false });
   }
 
   /** Forward a copy/cut/paste chord to the remote, translating the modifier

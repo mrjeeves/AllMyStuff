@@ -1060,6 +1060,11 @@ pub async fn dispatch(
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.clipboard_paste(route_id).await)
         }
+        "clipboard_drop" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            json_result(mesh.clipboard_drop(route_id, paths).await)
+        }
         "clipboard_pull" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.clipboard_pull(route_id).await)

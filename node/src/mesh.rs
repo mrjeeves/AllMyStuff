@@ -13857,6 +13857,37 @@ impl Mesh {
         self.send_clipboard_contents(&peer, &route_id).await
     }
 
+    /// Front-end command for a native file drop onto the remote console.
+    /// Unlike `clipboard_paste`, the paths come directly from Tauri's trusted
+    /// OS drag event rather than whatever happens to be on the clipboard.
+    /// They still ride the authenticated clipboard route and become a real OS
+    /// file list at the far end; the GUI follows this with the platform's
+    /// paste chord at the drop point.
+    pub async fn clipboard_drop(
+        self: &Arc<Self>,
+        route_id: String,
+        paths: Vec<String>,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && r.route.media == MediaKind::Clipboard
+                && route_sources_on(&r.route, &me))
+            {
+                return Err("route isn't an active outbound clipboard link".into());
+            }
+            r.peer.to_string()
+        };
+        let files = crate::clipboard::local_files(paths)?;
+        self.send_clipboard_files(&peer, &route_id, files).await
+    }
+
     /// Front-end command: copy/cut **from** the remote — ask the far end to
     /// read its clipboard now and send it back on `route_id`, so the content
     /// it just copied lands on *this* machine. The mirror of
@@ -14023,57 +14054,64 @@ impl Mesh {
                 self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
                     .await
             }
-            LocalClip::Files(files) => {
-                let total: u64 = files.iter().map(|f| f.size).sum();
-                if total > MAX_CLIPBOARD_BYTES {
-                    return Err(format!(
-                        "clipboard files are too large to paste across ({total} bytes)"
-                    ));
+            LocalClip::Files(files) => self.send_clipboard_files(peer, route_id, files).await,
+        }
+    }
+
+    async fn send_clipboard_files(
+        &self,
+        peer: &str,
+        route_id: &str,
+        files: Vec<crate::clipboard::LocalFile>,
+    ) -> Result<(), String> {
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        if total > MAX_CLIPBOARD_BYTES {
+            return Err(format!(
+                "clipboard files are too large to paste across ({total} bytes)"
+            ));
+        }
+        let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
+        let items = files
+            .iter()
+            .map(|f| ClipboardItem {
+                name: f.name.clone(),
+                size: f.size,
+            })
+            .collect();
+        self.send_clip_frame(
+            peer,
+            route_id,
+            ClipboardEvent::Open {
+                transfer,
+                content: ClipboardContentKind::Files,
+                items,
+            },
+        )
+        .await?;
+        for (i, f) in files.iter().enumerate() {
+            // Stream each file from disk in channel-sized pieces, so a
+            // big paste never loads the whole file into memory.
+            let mut file = std::fs::File::open(&f.path).map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; CLIPBOARD_CHUNK_BYTES];
+            loop {
+                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
                 }
-                let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
-                let items = files
-                    .iter()
-                    .map(|f| ClipboardItem {
-                        name: f.name.clone(),
-                        size: f.size,
-                    })
-                    .collect();
                 self.send_clip_frame(
                     peer,
                     route_id,
-                    ClipboardEvent::Open {
+                    ClipboardEvent::Chunk {
                         transfer,
-                        content: ClipboardContentKind::Files,
-                        items,
+                        item: i as u32,
+                        data: buf[..n].to_vec(),
                     },
                 )
                 .await?;
-                for (i, f) in files.iter().enumerate() {
-                    // Stream each file from disk in channel-sized pieces, so a
-                    // big paste never loads the whole file into memory.
-                    let mut file = std::fs::File::open(&f.path).map_err(|e| e.to_string())?;
-                    let mut buf = vec![0u8; CLIPBOARD_CHUNK_BYTES];
-                    loop {
-                        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-                        if n == 0 {
-                            break;
-                        }
-                        self.send_clip_frame(
-                            peer,
-                            route_id,
-                            ClipboardEvent::Chunk {
-                                transfer,
-                                item: i as u32,
-                                data: buf[..n].to_vec(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
-                self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
-                    .await
             }
         }
+        self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
+            .await
     }
 
     /// Send one clipboard frame to `peer` on `route_id`, fire-and-forget over
@@ -14192,7 +14230,9 @@ impl Mesh {
                 // able to tell that change is our own doing.
                 *self.clip_synced.lock() =
                     Some(crate::clipboard::LocalClip::Text(text.clone()).fingerprint());
-                self.clipboard.set_text(text)
+                if let Err(e) = self.clipboard.set_text(text) {
+                    tracing::warn!("clipboard set_text failed: {e}");
+                }
             }
             ClipboardEvent::Open {
                 transfer,
@@ -14202,6 +14242,19 @@ impl Mesh {
                 let total: u64 = items.iter().map(|i| i.size).sum();
                 if total > MAX_CLIPBOARD_BYTES {
                     tracing::warn!("clipboard transfer too large ({total} bytes) — refused");
+                    return;
+                }
+                let names_are_unique = {
+                    let mut names = std::collections::HashSet::new();
+                    items.iter().all(|item| names.insert(safe_name(&item.name)))
+                };
+                let manifest_ok = match content {
+                    ClipboardContentKind::Image => items.len() == 1,
+                    ClipboardContentKind::Files => !items.is_empty() && names_are_unique,
+                    ClipboardContentKind::Unknown => false,
+                };
+                if !manifest_ok {
+                    tracing::warn!("invalid clipboard transfer manifest — refused");
                     return;
                 }
                 if content == ClipboardContentKind::Files {
@@ -14226,9 +14279,16 @@ impl Mesh {
                 let Some(t) = inbound.get_mut(&key) else {
                     return; // unknown / already-dropped transfer
                 };
+                let Some(expected) = t.items.get(item as usize).map(|i| i.size) else {
+                    inbound.remove(&key);
+                    tracing::warn!("clipboard chunk named an unknown item — dropped");
+                    return;
+                };
+                let next_item = t.received_by[item as usize].saturating_add(data.len() as u64);
                 t.received += data.len() as u64;
-                let over = t.received > MAX_CLIPBOARD_BYTES;
+                let over = t.received > MAX_CLIPBOARD_BYTES || next_item > expected;
                 if !over {
+                    t.received_by[item as usize] = next_item;
                     match t.content {
                         ClipboardContentKind::Image => t.image.extend_from_slice(&data),
                         ClipboardContentKind::Files => {
@@ -14258,16 +14318,35 @@ impl Mesh {
                 let Some(t) = entry else {
                     return;
                 };
+                if t.items
+                    .iter()
+                    .zip(&t.received_by)
+                    .any(|(item, received)| item.size != *received)
+                {
+                    tracing::warn!("clipboard transfer closed before every item arrived — dropped");
+                    if t.content == ClipboardContentKind::Files {
+                        let _ = std::fs::remove_dir_all(crate::clipboard::staging_dir(transfer));
+                    }
+                    return;
+                }
                 match t.content {
                     ClipboardContentKind::Image => {
                         // Stamped for the same reason as text above — this
                         // write is about to look like a fresh user copy.
                         *self.clip_synced.lock() =
                             Some(crate::clipboard::LocalClip::Image(t.image.clone()).fingerprint());
-                        self.clipboard.set_image(t.image)
+                        if let Err(e) = self.clipboard.set_image(t.image) {
+                            tracing::warn!("clipboard set_image failed: {e}");
+                        }
                     }
                     ClipboardContentKind::Files => {
                         let dir = crate::clipboard::staging_dir(transfer);
+                        for item in t.items.iter().filter(|item| item.size == 0) {
+                            if let Err(e) = std::fs::File::create(dir.join(safe_name(&item.name))) {
+                                tracing::warn!("clipboard empty-file stage failed: {e}");
+                                return;
+                            }
+                        }
                         let paths: Vec<String> = t
                             .items
                             .iter()
@@ -14287,7 +14366,9 @@ impl Mesh {
                             .collect();
                         *self.clip_synced.lock() =
                             Some(crate::clipboard::LocalClip::Files(staged).fingerprint());
-                        self.clipboard.set_files(paths);
+                        if let Err(e) = self.clipboard.set_files(paths) {
+                            tracing::warn!("clipboard set_files failed: {e}");
+                        }
                     }
                     // A content kind a newer build introduced — nothing to
                     // commit to the OS clipboard.
@@ -15414,6 +15495,10 @@ struct ClipInbound {
     /// Per-item: whether its staging file exists yet — so the first chunk
     /// truncates and the rest append.
     started: Vec<bool>,
+    /// Bytes received for each manifest item. `Close` commits only when every
+    /// value exactly matches the advertised size; an incomplete binary burst
+    /// must never publish a truncated image/file to the OS clipboard.
+    received_by: Vec<u64>,
     /// Accumulated bytes for an image transfer (files stream to disk).
     image: Vec<u8>,
     /// Running total, enforced against [`MAX_CLIPBOARD_BYTES`].
@@ -15427,6 +15512,7 @@ impl ClipInbound {
             content,
             items,
             started: vec![false; n],
+            received_by: vec![0; n],
             image: Vec::new(),
             received: 0,
         }

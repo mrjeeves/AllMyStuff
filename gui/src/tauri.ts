@@ -642,6 +642,46 @@ export function clipboardPaste(routeId: string): Promise<null> {
   return tryInvoke("clipboard_paste", { routeId });
 }
 
+/** Stream native local file paths down the active clipboard route. Unlike a
+ * browser `<input>`, Tauri's OS drag event supplies real paths, so the backend
+ * can open and chunk the files without loading them into the webview. Errors
+ * deliberately propagate: a drop needs a visible success/failure result. */
+export async function clipboardDrop(routeId: string, paths: string[]): Promise<void> {
+  if (!isTauri()) throw new Error("File drops need the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clipboard_drop", { routeId, paths });
+}
+
+export type NativeFileDragEvent =
+  | { type: "enter" | "drop"; paths: string[]; x: number; y: number }
+  | { type: "over"; x: number; y: number }
+  | { type: "leave" };
+
+/** Follow OS-native file drags over this webview. Positions from Tauri are
+ * physical pixels; DOM hit testing is logical pixels, so normalize them here
+ * once and keep the console component platform-agnostic. */
+export async function onNativeFileDrag(
+  cb: (event: NativeFileDragEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const [{ getCurrentWebview }, { getCurrentWindow }] = await Promise.all([
+    import("@tauri-apps/api/webview"),
+    import("@tauri-apps/api/window"),
+  ]);
+  const scale = await getCurrentWindow().scaleFactor();
+  return getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+    if (payload.type === "leave") {
+      cb({ type: "leave" });
+      return;
+    }
+    const x = payload.position.x / scale;
+    const y = payload.position.y / scale;
+    if (payload.type === "over") cb({ type: "over", x, y });
+    else cb({ type: payload.type, paths: payload.paths, x, y });
+  });
+}
+
 /** Copy/cut *from* the remote: ask the far side to read its clipboard and send
  *  it back down this route, so the selection it just copied lands on this
  *  machine. The console calls this right after forwarding the copy/cut

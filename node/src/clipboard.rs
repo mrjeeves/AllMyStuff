@@ -45,9 +45,9 @@ pub enum LocalClip {
 
 enum Cmd {
     Read(SyncSender<Option<LocalClip>>),
-    SetText(String),
-    SetImage(Vec<u8>), // PNG bytes
-    SetFiles(Vec<String>),
+    SetText(String, SyncSender<Result<(), String>>),
+    SetImage(Vec<u8>, SyncSender<Result<(), String>>), // PNG bytes
+    SetFiles(Vec<String>, SyncSender<Result<(), String>>),
 }
 
 impl LocalClip {
@@ -131,8 +131,15 @@ impl ClipboardService {
                 };
                 while let Some(cmd) = rx.blocking_recv() {
                     let Some(ctx) = ctx.as_ref() else {
-                        if let Cmd::Read(resp) = cmd {
-                            let _ = resp.send(None);
+                        match cmd {
+                            Cmd::Read(resp) => {
+                                let _ = resp.send(None);
+                            }
+                            Cmd::SetText(_, resp)
+                            | Cmd::SetImage(_, resp)
+                            | Cmd::SetFiles(_, resp) => {
+                                let _ = resp.send(Err("OS clipboard is unavailable".into()));
+                            }
                         }
                         continue;
                     };
@@ -140,23 +147,19 @@ impl ClipboardService {
                         Cmd::Read(resp) => {
                             let _ = resp.send(read_clipboard(ctx));
                         }
-                        Cmd::SetText(t) => {
-                            if let Err(e) = ctx.set_text(t) {
-                                tracing::warn!("clipboard set_text failed: {e}");
-                            }
+                        Cmd::SetText(t, resp) => {
+                            let result = ctx.set_text(t).map_err(|e| e.to_string());
+                            let _ = resp.send(result);
                         }
-                        Cmd::SetImage(png) => match RustImageData::from_bytes(&png) {
-                            Ok(img) => {
-                                if let Err(e) = ctx.set_image(img) {
-                                    tracing::warn!("clipboard set_image failed: {e}");
-                                }
-                            }
-                            Err(e) => tracing::warn!("clipboard image decode failed: {e}"),
-                        },
-                        Cmd::SetFiles(paths) => {
-                            if let Err(e) = ctx.set_files(paths) {
-                                tracing::warn!("clipboard set_files failed: {e}");
-                            }
+                        Cmd::SetImage(png, resp) => {
+                            let result = RustImageData::from_bytes(&png)
+                                .map_err(|e| e.to_string())
+                                .and_then(|img| ctx.set_image(img).map_err(|e| e.to_string()));
+                            let _ = resp.send(result);
+                        }
+                        Cmd::SetFiles(paths, resp) => {
+                            let result = ctx.set_files(paths).map_err(|e| e.to_string());
+                            let _ = resp.send(result);
                         }
                     }
                 }
@@ -206,20 +209,68 @@ impl ClipboardService {
         resp_rx.recv().ok().flatten()
     }
 
-    pub fn set_text(&self, text: String) {
-        let _ = self.tx.send(Cmd::SetText(text));
+    pub fn set_text(&self, text: String) -> Result<(), String> {
+        self.write(|resp| Cmd::SetText(text, resp))
     }
 
     /// Set the clipboard to a PNG image (decoded on the clipboard thread).
-    pub fn set_image(&self, png: Vec<u8>) {
-        let _ = self.tx.send(Cmd::SetImage(png));
+    pub fn set_image(&self, png: Vec<u8>) -> Result<(), String> {
+        self.write(|resp| Cmd::SetImage(png, resp))
     }
 
     /// Point the clipboard at real files on this machine, so a paste in a
     /// file manager materializes them.
-    pub fn set_files(&self, paths: Vec<String>) {
-        let _ = self.tx.send(Cmd::SetFiles(paths));
+    pub fn set_files(&self, paths: Vec<String>) -> Result<(), String> {
+        self.write(|resp| Cmd::SetFiles(paths, resp))
     }
+
+    /// Run one clipboard write to completion. Receiving a clipboard `Close`
+    /// must not return while the OS write is merely queued: the remote paste
+    /// key follows it on the ordered media channel, and image decoding/file
+    /// list publication can take long enough for that key to otherwise paste
+    /// the previous clipboard contents.
+    fn write(&self, cmd: impl FnOnce(SyncSender<Result<(), String>>) -> Cmd) -> Result<(), String> {
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(cmd(resp_tx))
+            .map_err(|_| "clipboard service stopped".to_string())?;
+        resp_rx
+            .recv()
+            .map_err(|_| "clipboard service stopped".to_string())?
+    }
+}
+
+/// Resolve paths supplied by a native file-drop event into the same streaming
+/// descriptors used by an OS clipboard file list. Paths never cross a UI file
+/// input (which intentionally hides them); the Tauri webview gives these to the
+/// trusted backend directly.
+pub fn local_files(paths: Vec<String>) -> Result<Vec<LocalFile>, String> {
+    let mut files = Vec::with_capacity(paths.len());
+    let mut names = std::collections::HashSet::new();
+    for raw in paths {
+        let path = PathBuf::from(raw);
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("can't read {}: {e}", path.to_string_lossy()))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "folders aren't supported yet: {}",
+                path.to_string_lossy()
+            ));
+        }
+        let name = base_name(&path);
+        if !names.insert(name.clone()) {
+            return Err(format!("more than one dropped file is named {name}"));
+        }
+        files.push(LocalFile {
+            name,
+            path,
+            size: meta.len(),
+        });
+    }
+    if files.is_empty() {
+        return Err("no files were dropped".into());
+    }
+    Ok(files)
 }
 
 /// Query the clipboard, preferring files, then an image, then text — the
@@ -343,6 +394,30 @@ mod tests {
     #[test]
     fn base_name_is_the_final_component() {
         assert_eq!(base_name(Path::new("/a/b/c.png")), "c.png");
+    }
+
+    #[test]
+    fn native_drops_resolve_files_and_reject_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "allmystuff-clipboard-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let path = root.join("picture.png");
+        std::fs::write(&path, b"png").unwrap();
+
+        let files = local_files(vec![path.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "picture.png");
+        assert_eq!(files[0].size, 3);
+        assert!(local_files(vec![root.join("folder").to_string_lossy().into_owned()]).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The fingerprint is what stops a synced clipboard ping-ponging between

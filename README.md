@@ -27,7 +27,10 @@ It's free, open source, and runs on macOS, Linux, and Windows.
 
 - **Remote desktop.** View and control any machine's screen at up to 4K, with
   one tab per monitor. Keyboard and mouse pass through, so a remote machine
-  works as if you were sitting at it.
+  works as if you were sitting at it. Relative Mouse captures raw movement for
+  games and other fullscreen apps that recenter their own cursor; Esc releases
+  it. The console controls can slide away without leaving a dead strip over the
+  remote screen.
 - **Remote shell.** Open a real terminal on any of your machines. No SSH daemon,
   keys, or port forwarding to set up — it runs over the mesh. There's also a
   command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
@@ -38,7 +41,9 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   `-a <id>` joins one.
 - **Clipboard sync.** While controlling a machine, the clipboard follows you:
   paste sends yours to the remote, copy brings the remote's back — text,
-  images, and files.
+  images, and files. On desktop, you can also drag files straight onto the
+  remote screen; they transfer over the same authenticated clipboard route and
+  paste at the drop point.
 - **File access.** Browse, preview, and transfer files between machines.
   Downloads land straight on your disk; nothing routes through a third party.
 - **Automatic discovery.** Each machine reports its hardware and attached
@@ -60,7 +65,10 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   Only ports the host advertises are ever proxied.
 - **KVM appliances.** Point a NanoKVM-class device at a machine and you can
   reach its screen and keyboard even when its OS is down — BIOS included —
-  with power and reset a click away; the KVM's own web UI opens through the mesh.
+  with power and reset a click away; the KVM's own web UI opens through the
+  mesh. NanoKVM and NanoKVM-Pro can also present an ISO, IMG, or removable USB
+  disk from another authorized machine as
+  [boot/install media](docs/DRIVE-MAPPING.md#kvm-install-and-firmware-media).
 - **Peer-to-peer and encrypted.** Traffic flows directly between your machines
   over an end-to-end encrypted mesh. There is no central server holding your
   data.

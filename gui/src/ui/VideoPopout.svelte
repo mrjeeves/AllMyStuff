@@ -175,7 +175,10 @@
     // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
     // onblur); re-pin focus so keyboard forwarding resumes without a click back
     // into the picture.
-    if (controlActive) stageEl?.focus({ preventScroll: true });
+    if (controlActive) {
+      await focusThisWindow();
+      stageEl?.focus({ preventScroll: true });
+    }
   }
 
   // The OS can flip fullscreen without our ⛶ (Win+Up, a shell gesture) —
@@ -453,9 +456,31 @@
     if (!pointerLocked) relativeMouse = false;
   }
   const wantsCapture = $derived((fullscreen || relativeMouse) && controlActive && !kvmSource);
-  function maybePointerLock() {
-    if (wantsCapture && !pointerLocked) {
-      void stageEl?.requestPointerLock();
+  let pointerLockPending = false;
+  async function maybePointerLock() {
+    const target = stageEl;
+    if (!wantsCapture || pointerLocked || pointerLockPending || !target) return;
+
+    pointerLockPending = true;
+    try {
+      // A click can reach a secondary/fullscreen webview before its native
+      // window has focus. WebKit rejects requestPointerLock in that gap, so
+      // focus the Tauri window and the DOM surface before requesting capture.
+      target.focus({ preventScroll: true });
+      if (!document.hasFocus()) {
+        await focusThisWindow();
+        target.focus({ preventScroll: true });
+      }
+      if (!document.hasFocus() || target !== stageEl || !target.isConnected || !wantsCapture) {
+        return;
+      }
+      await target.requestPointerLock();
+    } catch (error) {
+      // Losing a focus race is recoverable: leave the mode armed for the next
+      // click and keep the browser rejection out of the global error boundary.
+      console.warn("pointer lock request failed:", error);
+    } finally {
+      pointerLockPending = false;
     }
   }
   function toggleRelativeMouse() {
@@ -466,7 +491,7 @@
     }
     relativeMouse = true;
     // The click is the user gesture pointer lock needs — grab on it.
-    maybePointerLock();
+    void maybePointerLock();
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
@@ -508,7 +533,7 @@
     // A click is the most reliable focus pin — land it on the stage so keys
     // forward even if the cursor was last over a hover-bar button.
     if (down) stageEl?.focus({ preventScroll: true });
-    if (down) maybePointerLock();
+    if (down) void maybePointerLock();
     if (pointerLocked && !kvmSource) {
       e.preventDefault();
       send({ kind: "mouse_button", button: e.button, down });

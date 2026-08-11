@@ -130,7 +130,10 @@
     // onblur), and claimFocus won't re-pin once the window itself holds focus —
     // so with control on, re-pin here or keyboard forwarding silently stops
     // until the user clicks back into the picture ("controls stopped mapping").
-    if (app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
+    if (app.consoleControl && !keysOpen) {
+      await focusThisWindow();
+      stageEl?.focus({ preventScroll: true });
+    }
   }
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
@@ -1572,9 +1575,33 @@
    *  explicit relative-mouse session. Control over a real desktop either way;
    *  a KVM source has no pointer to capture. */
   const wantsCapture = $derived((theater || relativeMouse) && stagePointerActive && !kvmSource);
-  function maybePointerLock() {
-    if (wantsCapture && !pointerLocked) {
-      void stageEl?.requestPointerLock();
+  let pointerLockPending = false;
+  async function maybePointerLock() {
+    const target = stageEl;
+    if (!wantsCapture || pointerLocked || pointerLockPending || !target) return;
+
+    pointerLockPending = true;
+    try {
+      // WebKit rejects pointer lock with WrongDocumentError when the native
+      // Tauri window has not finished taking focus. This is easy to hit when
+      // clicking into a fullscreen or secondary console. Focus both layers
+      // before asking; the user's click remains the activation for the lock.
+      target.focus({ preventScroll: true });
+      if (!document.hasFocus()) {
+        await focusThisWindow();
+        target.focus({ preventScroll: true });
+      }
+      if (!document.hasFocus() || target !== stageEl || !target.isConnected || !wantsCapture) {
+        return;
+      }
+      await target.requestPointerLock();
+    } catch (error) {
+      // A focus transition can still win the race on WebKit. Keep relative
+      // mode armed so the next click retries, but never turn that expected
+      // browser refusal into an unhandled-promise error screen.
+      console.warn("pointer lock request failed:", error);
+    } finally {
+      pointerLockPending = false;
     }
   }
   function toggleRelativeMouse() {
@@ -1586,7 +1613,7 @@
     relativeMouse = true;
     // This click IS the user gesture, so grab now rather than waiting for
     // the next one.
-    maybePointerLock();
+    void maybePointerLock();
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
@@ -1711,7 +1738,7 @@
     // Theater aiming: the click that lands in the picture captures the
     // mouse; while captured, buttons forward raw (no position re-seat —
     // the relative stream owns the cursor).
-    if (down) maybePointerLock();
+    if (down) void maybePointerLock();
     if (pointerLocked && !kvmSource) {
       e.preventDefault();
       app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });

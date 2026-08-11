@@ -334,7 +334,6 @@ impl AudioBridge {
             resample_linear(&mono, frame.sample_rate, out_rate)
         };
         let mut ring = pb.ring.lock();
-        ring.extend(samples);
         // Keep playout close behind the live edge. The ring is a jitter
         // buffer, not a reservoir: whatever piles up beyond MAX_DEPTH_MS —
         // the device-open transient at session start, a network burst,
@@ -342,14 +341,10 @@ impl AudioBridge {
         // behind the video stream (which drops stale frames) unless it's
         // cut. Trim the *oldest* samples back to TARGET_DEPTH_MS: one
         // small audible skip, and the audio is current again.
-        let max = (out_rate as usize / 1000) * MAX_DEPTH_MS;
-        let target = (out_rate as usize / 1000) * TARGET_DEPTH_MS;
-        if ring.len() > max.max(1) {
-            let excess = ring.len() - target;
-            ring.drain(..excess);
+        if let Some(held_ms) = buffer_playback_samples(&mut ring, samples, out_rate) {
             tracing::debug!(
                 "audio ring for {route_id} trimmed to {TARGET_DEPTH_MS} ms (held {} ms)",
-                (excess + target) / (out_rate as usize / 1000).max(1)
+                held_ms
             );
         }
     }
@@ -374,6 +369,31 @@ impl AudioBridge {
     pub fn is_running(&self, route_id: &str) -> bool {
         self.captures.lock().contains_key(route_id) || self.playbacks.lock().contains_key(route_id)
     }
+}
+
+/// Append one decoded buffer and keep playback close to the live edge.
+///
+/// The ring is a jitter buffer, not a reservoir: whatever piles up beyond
+/// `MAX_DEPTH_MS` becomes permanent lag behind video (which drops stale
+/// frames), so trim the oldest samples back to `TARGET_DEPTH_MS`. Keeping this
+/// operation independent of the OS output stream also lets its boundary
+/// behavior be tested without opening a real audio device.
+fn buffer_playback_samples(
+    ring: &mut VecDeque<i16>,
+    samples: impl IntoIterator<Item = i16>,
+    out_rate: u32,
+) -> Option<usize> {
+    ring.extend(samples);
+    let samples_per_ms = out_rate as usize / 1000;
+    let max = samples_per_ms * MAX_DEPTH_MS;
+    let target = samples_per_ms * TARGET_DEPTH_MS;
+    if ring.len() <= max.max(1) {
+        return None;
+    }
+    let held_ms = ring.len() / samples_per_ms.max(1);
+    let excess = ring.len().saturating_sub(target);
+    ring.drain(..excess);
+    Some(held_ms)
 }
 
 /// Route a dial-in line through the same switch as the video pipeline's:
@@ -976,25 +996,16 @@ mod tests {
     fn playback_ring_trims_back_to_the_target_depth() {
         // The ring is a jitter buffer: anything beyond MAX_DEPTH_MS is
         // cut back to TARGET_DEPTH_MS (oldest samples dropped) so audio
-        // can't fall permanently behind the video stream. (No audio
-        // device in CI: the playback thread bails instantly, the ring
-        // never drains — exactly what this needs to be deterministic.)
-        let bridge = AudioBridge::new();
-        bridge.start_playback("r".into());
+        // can't fall permanently behind the video stream. Exercise the
+        // buffer operation directly: opening a native output device would
+        // test CPAL/WASAPI instead and make this depend on CI hardware.
+        let mut ring = VecDeque::new();
         // Default device rate 48 kHz → target 3840 samples, max 9600.
-        let frame = AudioFrame::new("r", 0, 48_000, 1, vec![1i16; 4800]); // 100 ms
         for _ in 0..5 {
-            bridge.feed("r", &frame);
+            buffer_playback_samples(&mut ring, vec![1i16; 4800], 48_000); // 100 ms
         }
-        let depth = {
-            let routes = bridge.playbacks.lock();
-            let pb = routes.get("r").and_then(|r| r.playback.as_ref()).unwrap();
-            let len = pb.ring.lock().len();
-            len
-        };
         // 500 ms went in; the trims must have pulled it back to target.
-        assert_eq!(depth, (48_000 / 1000) * TARGET_DEPTH_MS);
-        bridge.stop("r");
+        assert_eq!(ring.len(), (48_000 / 1000) * TARGET_DEPTH_MS);
     }
 
     #[test]

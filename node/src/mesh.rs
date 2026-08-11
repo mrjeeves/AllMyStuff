@@ -17105,7 +17105,9 @@ mod tests {
         ]);
         let display = term_route("me:screen", "peer:display", MediaKind::Display);
         let input = term_route("peer:input", "me:control", MediaKind::Input);
-        assert!(room_members_authorize_route(&members, "me", "peer", &display));
+        assert!(room_members_authorize_route(
+            &members, "me", "peer", &display
+        ));
         assert!(room_members_authorize_route(&members, "me", "peer", &input));
 
         let third_party = term_route("me:screen", "third:display", MediaKind::Display);
@@ -17116,10 +17118,7 @@ mod tests {
             &third_party
         ));
         assert!(!room_members_authorize_route(
-            &members,
-            "me",
-            "stranger",
-            &display
+            &members, "me", "stranger", &display
         ));
 
         // A room is a call, never a shortcut to machine-wide planes.

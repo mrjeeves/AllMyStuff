@@ -167,6 +167,13 @@ pub const FEATURE_SITES: &str = "sites";
 /// waiting on a stream that will never start.
 pub const FEATURE_CAMERA: &str = "camera";
 
+/// Feature tag a node advertises when binary clipboard transfers (images and
+/// native file lists) finish with an explicit receiver receipt. A sender that
+/// sees this waits for the far OS to stage and publish the content before it
+/// follows with a paste keystroke; older peers keep the ordered, best-effort
+/// behavior they shipped with.
+pub const FEATURE_CLIPBOARD_RECEIPTS: &str = "clipboard-receipts";
+
 /// Feature tag a node advertises in [`NodeProfile::features`] when its local
 /// daemon provisions the **media lane pool** (myownmesh ≥ 0.2.7): several
 /// independent video/audio RTP tracks per peer, so a sender can fan several

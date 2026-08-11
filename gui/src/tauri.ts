@@ -638,8 +638,10 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
  *  clipboard before the paste keystroke (right behind it on the same ordered
  *  channel) lands. The read happens in the backend: it's the only side that
  *  can see file references on the OS clipboard. */
-export function clipboardPaste(routeId: string): Promise<null> {
-  return tryInvoke("clipboard_paste", { routeId });
+export async function clipboardPaste(routeId: string): Promise<void> {
+  if (!isTauri()) throw new Error("Clipboard passthrough needs the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clipboard_paste", { routeId });
 }
 
 /** Stream native local file paths down the active clipboard route. Unlike a

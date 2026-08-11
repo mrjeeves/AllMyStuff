@@ -44,7 +44,7 @@ pub enum LocalClip {
 }
 
 enum Cmd {
-    Read(SyncSender<Option<LocalClip>>),
+    Read(SyncSender<Result<Option<LocalClip>, String>>),
     SetText(String, SyncSender<Result<(), String>>),
     SetImage(Vec<u8>, SyncSender<Result<(), String>>), // PNG bytes
     SetFiles(Vec<String>, SyncSender<Result<(), String>>),
@@ -133,7 +133,7 @@ impl ClipboardService {
                     let Some(ctx) = ctx.as_ref() else {
                         match cmd {
                             Cmd::Read(resp) => {
-                                let _ = resp.send(None);
+                                let _ = resp.send(Err("OS clipboard is unavailable".into()));
                             }
                             Cmd::SetText(_, resp)
                             | Cmd::SetImage(_, resp)
@@ -201,12 +201,17 @@ impl ClipboardService {
     }
 
     /// Read this machine's clipboard. Blocking — call from a blocking
-    /// context (the mesh wraps it in `spawn_blocking`). `None` when the
-    /// clipboard is empty, unreadable, or unavailable.
-    pub fn read(&self) -> Option<LocalClip> {
+    /// context (the mesh wraps it in `spawn_blocking`). `Ok(None)` means the
+    /// clipboard is empty or contains no supported kind; real native read
+    /// failures stay errors so an explicit paste can tell the user.
+    pub fn read(&self) -> Result<Option<LocalClip>, String> {
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-        self.tx.send(Cmd::Read(resp_tx)).ok()?;
-        resp_rx.recv().ok().flatten()
+        self.tx
+            .send(Cmd::Read(resp_tx))
+            .map_err(|_| "clipboard service stopped".to_string())?;
+        resp_rx
+            .recv()
+            .map_err(|_| "clipboard service stopped".to_string())?
     }
 
     pub fn set_text(&self, text: String) -> Result<(), String> {
@@ -248,7 +253,9 @@ pub fn local_files(paths: Vec<String>) -> Result<Vec<LocalFile>, String> {
     let mut files = Vec::with_capacity(paths.len());
     let mut names = std::collections::HashSet::new();
     for raw in paths {
-        let path = PathBuf::from(raw);
+        // Tauri normally supplies a native path, but macOS can surface a
+        // file URL for some Finder/pasteboard drags. Accept both forms here.
+        let path = normalize_clip_path(&raw);
         let meta = std::fs::metadata(&path)
             .map_err(|e| format!("can't read {}: {e}", path.to_string_lossy()))?;
         if !meta.is_file() {
@@ -275,44 +282,97 @@ pub fn local_files(paths: Vec<String>) -> Result<Vec<LocalFile>, String> {
 
 /// Query the clipboard, preferring files, then an image, then text — the
 /// order that keeps a file copy from degrading to a text-path label.
-fn read_clipboard(ctx: &ClipboardContext) -> Option<LocalClip> {
+fn read_clipboard(ctx: &ClipboardContext) -> Result<Option<LocalClip>, String> {
+    let mut failures = Vec::new();
     if ctx.has(ContentFormat::Files) {
-        if let Ok(raw) = ctx.get_files() {
-            let files: Vec<LocalFile> = raw
-                .iter()
-                .filter_map(|entry| {
-                    let path = normalize_clip_path(entry);
-                    let meta = std::fs::metadata(&path).ok()?;
-                    if !meta.is_file() {
-                        return None; // directories are a follow-up
-                    }
-                    Some(LocalFile {
-                        name: base_name(&path),
-                        path,
-                        size: meta.len(),
+        match ctx.get_files() {
+            Ok(raw) => {
+                let files: Vec<LocalFile> = raw
+                    .iter()
+                    .filter_map(|entry| {
+                        let path = normalize_clip_path(entry);
+                        let meta = std::fs::metadata(&path).ok()?;
+                        if !meta.is_file() {
+                            return None; // directories are a follow-up
+                        }
+                        Some(LocalFile {
+                            name: base_name(&path),
+                            path,
+                            size: meta.len(),
+                        })
                     })
-                })
-                .collect();
-            if !files.is_empty() {
-                return Some(LocalClip::Files(files));
+                    .collect();
+                if !files.is_empty() {
+                    return Ok(Some(LocalClip::Files(files)));
+                }
+                if !raw.is_empty() {
+                    failures.push(
+                        "the clipboard named files, but none were readable regular files".into(),
+                    );
+                }
             }
+            Err(e) => failures.push(format!("native file list: {e}")),
         }
     }
     if ctx.has(ContentFormat::Image) {
-        if let Ok(img) = ctx.get_image() {
-            if let Ok(png) = img.to_png() {
-                return Some(LocalClip::Image(png.get_bytes().to_vec()));
+        match ctx.get_image() {
+            Ok(img) => match img.to_png() {
+                Ok(png) => return Ok(Some(LocalClip::Image(png.get_bytes().to_vec()))),
+                Err(e) => failures.push(format!("encode clipboard image: {e}")),
+            },
+            Err(e) => failures.push(format!("clipboard image: {e}")),
+        }
+    } else {
+        // clipboard-rs' AppKit image check covers PNG/TIFF. Some macOS
+        // applications publish JPEG/WebP (and browsers may expose MIME names
+        // instead of UTIs), so try those advertised byte representations too.
+        const RAW_IMAGE_FORMATS: &[&str] = &[
+            "public.png",
+            "public.tiff",
+            "public.jpeg",
+            "public.jpg",
+            "public.webp",
+            "image/png",
+            "image/tiff",
+            "image/jpeg",
+            "image/webp",
+        ];
+        if let Ok(formats) = ctx.available_formats() {
+            for format in formats
+                .iter()
+                .filter(|format| RAW_IMAGE_FORMATS.contains(&format.as_str()))
+            {
+                match ctx
+                    .get_buffer(format)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| RustImageData::from_bytes(&bytes).map_err(|e| e.to_string()))
+                    .and_then(|img| img.to_png().map_err(|e| e.to_string()))
+                {
+                    Ok(png) => return Ok(Some(LocalClip::Image(png.get_bytes().to_vec()))),
+                    Err(e) => failures.push(format!("clipboard {format}: {e}")),
+                }
             }
         }
     }
     if ctx.has(ContentFormat::Text) {
-        if let Ok(text) = ctx.get_text() {
-            if !text.is_empty() {
-                return Some(LocalClip::Text(text));
-            }
+        match ctx.get_text() {
+            Ok(text) if !text.is_empty() => return Ok(Some(LocalClip::Text(text))),
+            Ok(_) => {}
+            Err(e) => failures.push(format!("clipboard text: {e}")),
         }
     }
-    None
+    if failures.is_empty() {
+        Ok(None)
+    } else {
+        let formats = ctx
+            .available_formats()
+            .map(|formats| formats.join(", "))
+            .unwrap_or_else(|_| "unknown".into());
+        Err(format!(
+            "couldn't read clipboard content ({}) [formats: {formats}]",
+            failures.join("; ")
+        ))
+    }
 }
 
 /// Turn a clipboard file entry into a real path: a `file://` URL (Linux /

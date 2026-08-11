@@ -3009,8 +3009,7 @@ class AppStore {
    *  Terminal/Files/Sites ride a generic grant carrying a `<device>:<kind>`
    *  capability. */
   private shareCapGrants(person: string, cap: ShareCap, sender: string, senderLabel: string): Grant[] {
-    const mk = (media: MediaKind, role: GrantRole, suffix: string, what: string): Grant => {
-      const capability = `${sender}:${suffix}`;
+    const mkExact = (media: MediaKind, role: GrantRole, capability: string, what: string): Grant => {
       return {
         id: scopedGrantId(person, media, role, capability),
         media,
@@ -3019,11 +3018,15 @@ class AppStore {
         label: `${senderLabel} — ${what}`,
       };
     };
+    const mk = (media: MediaKind, role: GrantRole, suffix: string, what: string): Grant =>
+      mkExact(media, role, `${sender}:${suffix}`, what);
     switch (cap) {
       case "console":
-        // One visible share, four real grants — the console is useless
-        // without all of them, and each stays scoped to its own capability so
-        // the wire contract and per-grant revoke are unchanged.
+        // One visible share, but every display source is explicitly granted.
+        // Extra monitors are separate `<node>:screen:<id>` capabilities; a
+        // grant for only `<node>:screen` strands the viewer when focus moves
+        // to another monitor. Cameras are Video, not Display, and are omitted
+        // deliberately: they remain a separate permission.
         //
         // Each capability suffix must be the id `matchEndpoint` actually
         // resolves for that media, or the grant authorizes nothing and the
@@ -3035,7 +3038,22 @@ class AppStore {
         // `control` is an input *sink* on it (`consume`). Getting that
         // backwards is what silently denied every screen share.
         return [
-          mk("display", "provide", "screen", "see its screen"),
+          ...this.catalog.capabilities
+            .filter(
+              (candidate) =>
+                this.capNodeOf(candidate.id) === canonicalNodeId(sender) &&
+                candidate.media === "display" &&
+                canSource(candidate.flow),
+            )
+            .sort((a, b) => a.id.localeCompare(b.id))
+            .map((screen) =>
+              mkExact(
+                "display",
+                "provide",
+                screen.id,
+                `see ${screen.label || "its screen"}`,
+              ),
+            ),
           mk("audio", "provide", "system-audio", "hear its audio"),
           mk("input", "consume", "control", "control it"),
           mk("clipboard", "both", "clipboard", "share its clipboard"),
@@ -3048,13 +3066,34 @@ class AppStore {
         // in the grant, so a grant can't be read as "where their files are".
         const folder = this.shareFlowFolder;
         if (!folder) return [];
-        return [mk("storage", "both", `folder:${folder.id}`, `share ${folder.label}`)];
+        // Files move from this source folder TO the receiving fleet. A
+        // `provide` grant hosts that folder without implying the destination
+        // shares any storage back.
+        return [mk("storage", "provide", `folder:${folder.id}`, `share ${folder.label}`)];
       }
       case "terminal":
         return [mk("generic", "provide", "terminal", "use its terminal")];
       case "sites":
         return [mk("generic", "provide", "sites", "reach its sites")];
     }
+  }
+
+  /** Which Share Flow toggle owns an existing scoped grant. Reconciliation
+   *  uses the category rather than just today's generated ids, so legacy
+   *  one-screen grants, old bidirectional folders, unplugged monitors, and a
+   *  previously selected folder cannot survive as orphan permissions. */
+  private shareCapForGrant(grant: Grant, sender: string): ShareCap | null {
+    const capability = grant.capability;
+    if (!capability || this.capNodeOf(capability) !== canonicalNodeId(sender)) return null;
+    const suffix = capability.slice(capability.indexOf(":") + 1);
+    if (grant.media === "display") return "console";
+    if (grant.media === "audio" && suffix === "system-audio") return "console";
+    if (grant.media === "input" && suffix === "control") return "console";
+    if (grant.media === "clipboard" && suffix === "clipboard") return "console";
+    if (grant.media === "storage" && suffix.startsWith("folder:")) return "files";
+    if (grant.media === "generic" && suffix === "terminal") return "terminal";
+    if (grant.media === "generic" && suffix === "sites") return "sites";
+    return null;
   }
 
   /** Start the share: grant the receiving FLEET access to my sender device's
@@ -3112,13 +3151,37 @@ class AppStore {
       return 0;
     }
     const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
+    const desired = new Map<string, Grant>();
     for (const cap of ALL) {
-      const grants = this.shareCapGrants(person.id, cap, sender, senderLabel);
-      if (want.has(cap)) {
-        for (const g of grants) this.grant(receiver, g);
-      } else {
-        for (const g of grants) this.revokeGrant(receiver, g.id);
+      if (!want.has(cap)) continue;
+      for (const grant of this.shareCapGrants(person.id, cap, sender, senderLabel)) {
+        desired.set(grant.id, grant);
       }
+    }
+
+    // Grants are person-wide and may be stored on any one of that person's
+    // device relationships. Reconcile all of them, then add only genuinely
+    // missing grants to the currently selected receiver relationship.
+    const existing: { holder: string; grant: Grant }[] = [];
+    for (const node of this.catalog.nodes) {
+      if (
+        node.relationship.kind !== "shared" ||
+        node.relationship.person.id !== person.id
+      ) {
+        continue;
+      }
+      for (const grant of node.relationship.grants) {
+        if (this.shareCapForGrant(grant, sender)) existing.push({ holder: node.id, grant });
+      }
+    }
+    for (const { holder, grant } of existing) {
+      if (!desired.has(grant.id)) this.revokeGrant(holder, grant.id);
+    }
+    const retained = new Set(
+      existing.filter(({ grant }) => desired.has(grant.id)).map(({ grant }) => grant.id),
+    );
+    for (const grant of desired.values()) {
+      if (!retained.has(grant.id)) this.grant(receiver, grant);
     }
     // No toast — on success the builder closes and the share shows up inline:
     // the grant rows in the device drawer's "What X can do", the Sharing pane,
@@ -3140,13 +3203,25 @@ class AppStore {
       this.toast("warn", "Nothing to stop");
       return 0;
     }
+    const personId = recv.relationship.person.id;
     const senderCanon = sender ? canonicalNodeId(sender) : null;
-    const toRevoke = recv.relationship.grants.filter((g) => {
-      if (!g.capability) return false;
-      const gNode = canonicalNodeId(g.capability.slice(0, g.capability.indexOf(":")));
-      return senderCanon ? gNode === senderCanon : true;
-    });
-    for (const g of toRevoke) this.revokeGrant(receiver, g.id);
+    const toRevoke: { holder: string; grant: Grant }[] = [];
+    for (const node of this.catalog.nodes) {
+      if (
+        node.relationship.kind !== "shared" ||
+        node.relationship.person.id !== personId
+      ) {
+        continue;
+      }
+      for (const grant of node.relationship.grants) {
+        if (!grant.capability) continue;
+        const grantNode = this.capNodeOf(grant.capability);
+        if (!senderCanon || grantNode === senderCanon) {
+          toRevoke.push({ holder: node.id, grant });
+        }
+      }
+    }
+    for (const { holder, grant } of toRevoke) this.revokeGrant(holder, grant.id);
     if (!toRevoke.length) this.toast("warn", "Nothing to stop");
     return toRevoke.length;
   }
@@ -3777,7 +3852,12 @@ class AppStore {
     heldMeta: boolean,
   ): Promise<void> {
     if (!this.consoleControlLive || !this.consoleClipboardLive) return;
-    await this.sendConsoleClipboard();
+    try {
+      await this.sendConsoleClipboard();
+    } catch (error) {
+      this.toast("warn", `Couldn't send this clipboard to the remote computer: ${error}`);
+      return;
+    }
     await this.forwardClipboardChord(key, code, heldMeta);
   }
 

@@ -3,7 +3,7 @@
 //! `Cargo.toml`).
 //!
 //! `clipboard-rs` has no iOS backend (UIPasteboard is a webview/UIKit
-//! concern the mobile GUI can grow later), so reads answer `None` and
+//! concern the mobile GUI can grow later), so reads report unavailable and
 //! writes drop — the exact posture the desktop service already takes on a
 //! headless box whose OS clipboard won't open. [`staging_dir`] stays real:
 //! inbound file *transfers* still need somewhere to land.
@@ -31,7 +31,7 @@ pub enum LocalClip {
 impl LocalClip {
     /// Real twin's identity hash, kept here so the sync loop compiles
     /// unchanged. It is never reached in practice — [`ClipboardService::read`]
-    /// answers `None` on this build, so there is no clipboard content to
+    /// returns an error on this build, so there is no clipboard content to
     /// fingerprint — but it is a pure function of the value and costs nothing
     /// to keep honest rather than stubbing it to a constant.
     #[allow(dead_code)]
@@ -77,8 +77,8 @@ impl ClipboardService {
     }
 
     #[allow(dead_code)]
-    pub fn read(&self) -> Option<LocalClip> {
-        None
+    pub fn read(&self) -> Result<Option<LocalClip>, String> {
+        Err("OS clipboard is unavailable on this build".into())
     }
 
     /// A receiver that never fires. Keeping the sender alive on the struct is

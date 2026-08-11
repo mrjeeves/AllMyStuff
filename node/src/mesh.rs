@@ -279,6 +279,10 @@ pub struct Mesh {
     /// transfer id). Image bytes accumulate in memory; file bytes stream to
     /// a per-transfer staging dir.
     clip_inbound: Mutex<HashMap<(String, u64), ClipInbound>>,
+    /// Binary clipboard transfers waiting for the destination OS to confirm
+    /// that it actually published the image/native file list. Keyed by the
+    /// outbound route + transfer id; negotiated so older peers keep working.
+    clip_receipts: Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>,
     /// Fingerprint of the clipboard content this machine last *synced* —
     /// either applied from a peer or sent to one. The OS reports a clipboard
     /// we wrote ourselves exactly like one the user copied, so without this
@@ -1210,6 +1214,7 @@ impl Mesh {
             clipboard_transfer: AtomicU64::new(0),
             clipboard: ClipboardService::spawn(),
             clip_inbound: Mutex::new(HashMap::new()),
+            clip_receipts: Mutex::new(HashMap::new()),
             clip_synced: Mutex::new(None),
             boot_id: AtomicU64::new(fresh_boot_id()),
             video_in: Mutex::new(VideoAssembler::new()),
@@ -2524,6 +2529,7 @@ impl Mesh {
                 {
                     f.push(allmystuff_protocol::FEATURE_TERMINAL.to_string());
                     f.push(allmystuff_protocol::FEATURE_CAMERA.to_string());
+                    f.push(allmystuff_protocol::FEATURE_CLIPBOARD_RECEIPTS.to_string());
                 }
                 if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
                     f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
@@ -10911,11 +10917,19 @@ impl Mesh {
 
     /// Whether `peer` advertised the media-lane pool in its presence features.
     fn peer_supports_lanes(&self, peer: &str) -> bool {
+        self.peer_supports_feature(peer, allmystuff_protocol::FEATURE_MEDIA_LANES)
+    }
+
+    /// Presence-negotiated additive behavior. Unknown feature tags are
+    /// intentionally ignored by old peers, making this safe for rolling
+    /// upgrades across a fleet.
+    fn peer_supports_feature(&self, peer: &str, feature: &str) -> bool {
         let canon = pubkey_part(peer);
-        self.state.lock().peer_features.get(canon).is_some_and(|f| {
-            f.iter()
-                .any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES)
-        })
+        self.state
+            .lock()
+            .peer_features
+            .get(canon)
+            .is_some_and(|features| features.iter().any(|value| value == feature))
     }
 
     /// Pin (or look up) the RTP video track lane an outbound H.264 route to
@@ -13924,7 +13938,7 @@ impl Mesh {
         let svc = self.clipboard.clone();
         let clip = tokio::task::spawn_blocking(move || svc.read())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())??;
         let Some(clip) = clip else {
             return Ok(()); // empty / unreadable — nothing to sync
         };
@@ -13982,7 +13996,8 @@ impl Mesh {
                     continue;
                 }
                 let svc = mesh.clipboard.clone();
-                let Ok(Some(clip)) = tokio::task::spawn_blocking(move || svc.read()).await else {
+                let Ok(Ok(Some(clip))) = tokio::task::spawn_blocking(move || svc.read()).await
+                else {
                     continue;
                 };
                 let fingerprint = clip.fingerprint();
@@ -14014,9 +14029,9 @@ impl Mesh {
         let svc = self.clipboard.clone();
         let clip = tokio::task::spawn_blocking(move || svc.read())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())??;
         let Some(clip) = clip else {
-            return Ok(()); // empty / unreadable clipboard — nothing to send
+            return Err("clipboard has no supported text, image, or files".into());
         };
         match clip {
             LocalClip::Text(text) => {
@@ -14025,33 +14040,43 @@ impl Mesh {
             }
             LocalClip::Image(png) => {
                 let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
+                let receipt = self.begin_clipboard_receipt(peer, route_id, transfer);
                 let items = vec![ClipboardItem {
                     name: "image.png".into(),
                     size: png.len() as u64,
                 }];
-                self.send_clip_frame(
-                    peer,
-                    route_id,
-                    ClipboardEvent::Open {
-                        transfer,
-                        content: ClipboardContentKind::Image,
-                        items,
-                    },
-                )
-                .await?;
-                for piece in png.chunks(CLIPBOARD_CHUNK_BYTES) {
+                let sent = async {
                     self.send_clip_frame(
                         peer,
                         route_id,
-                        ClipboardEvent::Chunk {
+                        ClipboardEvent::Open {
                             transfer,
-                            item: 0,
-                            data: piece.to_vec(),
+                            content: ClipboardContentKind::Image,
+                            items,
                         },
                     )
                     .await?;
+                    for piece in png.chunks(CLIPBOARD_CHUNK_BYTES) {
+                        self.send_clip_frame(
+                            peer,
+                            route_id,
+                            ClipboardEvent::Chunk {
+                                transfer,
+                                item: 0,
+                                data: piece.to_vec(),
+                            },
+                        )
+                        .await?;
+                    }
+                    self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
+                        .await
                 }
-                self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
+                .await;
+                if let Err(error) = sent {
+                    self.cancel_clipboard_receipt(route_id, transfer);
+                    return Err(error);
+                }
+                self.await_clipboard_receipt(route_id, transfer, receipt)
                     .await
             }
             LocalClip::Files(files) => self.send_clipboard_files(peer, route_id, files).await,
@@ -14071,6 +14096,7 @@ impl Mesh {
             ));
         }
         let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
+        let receipt = self.begin_clipboard_receipt(peer, route_id, transfer);
         let items = files
             .iter()
             .map(|f| ClipboardItem {
@@ -14078,40 +14104,96 @@ impl Mesh {
                 size: f.size,
             })
             .collect();
-        self.send_clip_frame(
-            peer,
-            route_id,
-            ClipboardEvent::Open {
-                transfer,
-                content: ClipboardContentKind::Files,
-                items,
-            },
-        )
-        .await?;
-        for (i, f) in files.iter().enumerate() {
-            // Stream each file from disk in channel-sized pieces, so a
-            // big paste never loads the whole file into memory.
-            let mut file = std::fs::File::open(&f.path).map_err(|e| e.to_string())?;
-            let mut buf = vec![0u8; CLIPBOARD_CHUNK_BYTES];
-            loop {
-                let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
+        let sent = async {
+            self.send_clip_frame(
+                peer,
+                route_id,
+                ClipboardEvent::Open {
+                    transfer,
+                    content: ClipboardContentKind::Files,
+                    items,
+                },
+            )
+            .await?;
+            for (i, f) in files.iter().enumerate() {
+                // Stream each file from disk in channel-sized pieces, so a
+                // big paste never loads the whole file into memory.
+                let mut file = std::fs::File::open(&f.path).map_err(|e| e.to_string())?;
+                let mut buf = vec![0u8; CLIPBOARD_CHUNK_BYTES];
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.send_clip_frame(
+                        peer,
+                        route_id,
+                        ClipboardEvent::Chunk {
+                            transfer,
+                            item: i as u32,
+                            data: buf[..n].to_vec(),
+                        },
+                    )
+                    .await?;
                 }
-                self.send_clip_frame(
-                    peer,
-                    route_id,
-                    ClipboardEvent::Chunk {
-                        transfer,
-                        item: i as u32,
-                        data: buf[..n].to_vec(),
-                    },
-                )
-                .await?;
+            }
+            self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
+                .await
+        }
+        .await;
+        if let Err(error) = sent {
+            self.cancel_clipboard_receipt(route_id, transfer);
+            return Err(error);
+        }
+        self.await_clipboard_receipt(route_id, transfer, receipt)
+            .await
+    }
+
+    /// Register a receipt only when the peer advertised the additive protocol.
+    /// An older peer receives the same Open/Chunk/Close stream and the caller
+    /// keeps the historical ordered behavior without waiting for a message it
+    /// cannot send.
+    fn begin_clipboard_receipt(
+        &self,
+        peer: &str,
+        route_id: &str,
+        transfer: u64,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        if !self.peer_supports_feature(peer, allmystuff_protocol::FEATURE_CLIPBOARD_RECEIPTS) {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.clip_receipts
+            .lock()
+            .insert((route_id.to_string(), transfer), tx);
+        Some(rx)
+    }
+
+    fn cancel_clipboard_receipt(&self, route_id: &str, transfer: u64) {
+        self.clip_receipts
+            .lock()
+            .remove(&(route_id.to_string(), transfer));
+    }
+
+    async fn await_clipboard_receipt(
+        &self,
+        route_id: &str,
+        transfer: u64,
+        receipt: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    ) -> Result<(), String> {
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
+        match tokio::time::timeout(CLIPBOARD_RECEIPT_TIMEOUT, receipt).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Err("destination stopped before confirming the clipboard transfer".into())
+            }
+            Err(_) => {
+                self.cancel_clipboard_receipt(route_id, transfer);
+                Err("destination did not confirm the clipboard transfer".into())
             }
         }
-        self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
-            .await
     }
 
     /// Send one clipboard frame to `peer` on `route_id`, fire-and-forget over
@@ -14165,6 +14247,23 @@ impl Mesh {
             )
         };
 
+        // A receipt is meaningful only to the side that originated this
+        // transfer. Route + authenticated peer checks above make it impossible
+        // for another node to complete somebody else's pending operation.
+        if let ClipboardEvent::Applied { transfer, error } = &frame.event {
+            if let Some(waiter) = self
+                .clip_receipts
+                .lock()
+                .remove(&(frame.route.clone(), *transfer))
+            {
+                let _ = waiter.send(match error.clone() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                });
+            }
+            return;
+        }
+
         if sinks_here {
             if !self.sender_may_drive(from, DrivePlane::Clipboard) {
                 // Same loud refusal as input: the route was live (checked
@@ -14191,7 +14290,7 @@ impl Mesh {
                 });
                 return;
             }
-            self.apply_clipboard_event(frame.route, frame.event);
+            self.apply_clipboard_event(from, frame.route, frame.event);
         } else if sources_here {
             // Accept a reply only inside the window our own pull opened; a
             // transfer's opening frame consumes that window (one reply per
@@ -14209,10 +14308,12 @@ impl Mesh {
                 // (all checked above).
                 ClipboardEvent::Text { .. } | ClipboardEvent::Open { .. } => true,
                 ClipboardEvent::Chunk { .. } | ClipboardEvent::Close { .. } => true,
-                ClipboardEvent::Pull | ClipboardEvent::Unknown => false,
+                ClipboardEvent::Applied { .. } | ClipboardEvent::Pull | ClipboardEvent::Unknown => {
+                    false
+                }
             };
             if accept {
-                self.apply_clipboard_event(frame.route, frame.event);
+                self.apply_clipboard_event(from, frame.route, frame.event);
             }
         }
     }
@@ -14222,16 +14323,13 @@ impl Mesh {
     /// Text commits at once; an image or files reassemble across a transfer
     /// and commit on `Close`. File bytes stream to a per-transfer staging dir
     /// the OS clipboard is then pointed at.
-    fn apply_clipboard_event(&self, route: String, event: ClipboardEvent) {
+    fn apply_clipboard_event(self: &Arc<Self>, peer: &str, route: String, event: ClipboardEvent) {
         match event {
             ClipboardEvent::Text { text } => {
-                // Stamp before writing: the OS reports a clipboard we wrote
-                // exactly like one the user copied, and the sync loop must be
-                // able to tell that change is our own doing.
                 *self.clip_synced.lock() =
                     Some(crate::clipboard::LocalClip::Text(text.clone()).fingerprint());
-                if let Err(e) = self.clipboard.set_text(text) {
-                    tracing::warn!("clipboard set_text failed: {e}");
+                if let Err(error) = self.clipboard.set_text(text) {
+                    tracing::warn!("clipboard set_text failed: {error}");
                 }
             }
             ClipboardEvent::Open {
@@ -14239,9 +14337,11 @@ impl Mesh {
                 content,
                 items,
             } => {
-                let total: u64 = items.iter().map(|i| i.size).sum();
+                let total: u64 = items.iter().map(|item| item.size).sum();
                 if total > MAX_CLIPBOARD_BYTES {
-                    tracing::warn!("clipboard transfer too large ({total} bytes) — refused");
+                    let error = format!("clipboard transfer is too large ({total} bytes)");
+                    tracing::warn!("{error}");
+                    self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                     return;
                 }
                 let names_are_unique = {
@@ -14254,14 +14354,19 @@ impl Mesh {
                     ClipboardContentKind::Unknown => false,
                 };
                 if !manifest_ok {
-                    tracing::warn!("invalid clipboard transfer manifest — refused");
+                    let error = "invalid clipboard transfer manifest".to_string();
+                    tracing::warn!("{error}");
+                    self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                     return;
                 }
                 if content == ClipboardContentKind::Files {
                     let dir = crate::clipboard::staging_dir(transfer);
                     let _ = std::fs::remove_dir_all(&dir);
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        tracing::warn!("clipboard staging dir failed: {e}");
+                    if let Err(cause) = std::fs::create_dir_all(&dir) {
+                        let error =
+                            format!("could not create clipboard staging directory: {cause}");
+                        tracing::warn!("{error}");
+                        self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                         return;
                     }
                 }
@@ -14274,111 +14379,159 @@ impl Mesh {
                 item,
                 data,
             } => {
-                let key = (route, transfer);
+                let key = (route.clone(), transfer);
                 let mut inbound = self.clip_inbound.lock();
-                let Some(t) = inbound.get_mut(&key) else {
-                    return; // unknown / already-dropped transfer
-                };
-                let Some(expected) = t.items.get(item as usize).map(|i| i.size) else {
-                    inbound.remove(&key);
-                    tracing::warn!("clipboard chunk named an unknown item — dropped");
+                let Some(current) = inbound.get_mut(&key) else {
                     return;
                 };
-                let next_item = t.received_by[item as usize].saturating_add(data.len() as u64);
-                t.received += data.len() as u64;
-                let over = t.received > MAX_CLIPBOARD_BYTES || next_item > expected;
+                let Some(expected) = current.items.get(item as usize).map(|entry| entry.size)
+                else {
+                    inbound.remove(&key);
+                    drop(inbound);
+                    let error = "clipboard transfer named an unknown item".to_string();
+                    tracing::warn!("{error}");
+                    self.send_clipboard_receipt(peer, &route, transfer, Some(error));
+                    return;
+                };
+                let next_item =
+                    current.received_by[item as usize].saturating_add(data.len() as u64);
+                current.received = current.received.saturating_add(data.len() as u64);
+                let over = current.received > MAX_CLIPBOARD_BYTES || next_item > expected;
+                let mut write_error = None;
                 if !over {
-                    t.received_by[item as usize] = next_item;
-                    match t.content {
-                        ClipboardContentKind::Image => t.image.extend_from_slice(&data),
+                    current.received_by[item as usize] = next_item;
+                    match current.content {
+                        ClipboardContentKind::Image => current.image.extend_from_slice(&data),
                         ClipboardContentKind::Files => {
-                            if let Some(name) = t.items.get(item as usize).map(|i| i.name.clone()) {
-                                let first = !t.started[item as usize];
-                                t.started[item as usize] = true;
+                            if let Some(name) = current
+                                .items
+                                .get(item as usize)
+                                .map(|entry| entry.name.clone())
+                            {
+                                let first = !current.started[item as usize];
+                                current.started[item as usize] = true;
                                 let path =
                                     crate::clipboard::staging_dir(transfer).join(safe_name(&name));
-                                if let Err(e) = append_chunk(&path, &data, first) {
-                                    tracing::warn!("clipboard stage write failed: {e}");
+                                if let Err(cause) = append_chunk(&path, &data, first) {
+                                    write_error =
+                                        Some(format!("clipboard stage write failed: {cause}"));
                                 }
                             }
                         }
-                        // A content kind a newer build introduced — drop the
-                        // bytes (we've nowhere to put them).
                         ClipboardContentKind::Unknown => {}
                     }
                 }
-                // `t`'s borrow ends above; only now can the map be mutated.
-                if over {
+                if over || write_error.is_some() {
                     inbound.remove(&key);
-                    tracing::warn!("clipboard transfer exceeded cap — dropped");
+                    drop(inbound);
+                    let error = write_error.unwrap_or_else(|| {
+                        "clipboard transfer exceeded its advertised size".into()
+                    });
+                    tracing::warn!("{error}");
+                    self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                 }
             }
             ClipboardEvent::Close { transfer } => {
-                let entry = self.clip_inbound.lock().remove(&(route, transfer));
-                let Some(t) = entry else {
+                let entry = self.clip_inbound.lock().remove(&(route.clone(), transfer));
+                let Some(current) = entry else {
                     return;
                 };
-                if t.items
+                if current
+                    .items
                     .iter()
-                    .zip(&t.received_by)
+                    .zip(&current.received_by)
                     .any(|(item, received)| item.size != *received)
                 {
-                    tracing::warn!("clipboard transfer closed before every item arrived — dropped");
-                    if t.content == ClipboardContentKind::Files {
+                    let error = "clipboard transfer closed before every item arrived".to_string();
+                    tracing::warn!("{error}");
+                    if current.content == ClipboardContentKind::Files {
                         let _ = std::fs::remove_dir_all(crate::clipboard::staging_dir(transfer));
                     }
+                    self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                     return;
                 }
-                match t.content {
+                let applied = match current.content {
                     ClipboardContentKind::Image => {
-                        // Stamped for the same reason as text above — this
-                        // write is about to look like a fresh user copy.
-                        *self.clip_synced.lock() =
-                            Some(crate::clipboard::LocalClip::Image(t.image.clone()).fingerprint());
-                        if let Err(e) = self.clipboard.set_image(t.image) {
-                            tracing::warn!("clipboard set_image failed: {e}");
-                        }
+                        *self.clip_synced.lock() = Some(
+                            crate::clipboard::LocalClip::Image(current.image.clone()).fingerprint(),
+                        );
+                        self.clipboard.set_image(current.image).map_err(|cause| {
+                            format!("destination could not publish the image: {cause}")
+                        })
                     }
                     ClipboardContentKind::Files => {
                         let dir = crate::clipboard::staging_dir(transfer);
-                        for item in t.items.iter().filter(|item| item.size == 0) {
-                            if let Err(e) = std::fs::File::create(dir.join(safe_name(&item.name))) {
-                                tracing::warn!("clipboard empty-file stage failed: {e}");
+                        for item in current.items.iter().filter(|item| item.size == 0) {
+                            if let Err(cause) =
+                                std::fs::File::create(dir.join(safe_name(&item.name)))
+                            {
+                                let error = format!("clipboard empty-file stage failed: {cause}");
+                                tracing::warn!("{error}");
+                                self.send_clipboard_receipt(peer, &route, transfer, Some(error));
                                 return;
                             }
                         }
-                        let paths: Vec<String> = t
+                        let paths: Vec<String> = current
                             .items
                             .iter()
-                            .map(|i| dir.join(safe_name(&i.name)).to_string_lossy().into_owned())
+                            .map(|item| {
+                                dir.join(safe_name(&item.name))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
                             .collect();
-                        // Fingerprinted over the staged paths — which is what
-                        // the OS clipboard will now hold, and so what the
-                        // watcher will read back.
-                        let staged: Vec<crate::clipboard::LocalFile> = t
+                        let staged: Vec<crate::clipboard::LocalFile> = current
                             .items
                             .iter()
-                            .map(|i| crate::clipboard::LocalFile {
-                                name: i.name.clone(),
-                                path: dir.join(safe_name(&i.name)),
-                                size: i.size,
+                            .map(|item| crate::clipboard::LocalFile {
+                                name: item.name.clone(),
+                                path: dir.join(safe_name(&item.name)),
+                                size: item.size,
                             })
                             .collect();
                         *self.clip_synced.lock() =
                             Some(crate::clipboard::LocalClip::Files(staged).fingerprint());
-                        if let Err(e) = self.clipboard.set_files(paths) {
-                            tracing::warn!("clipboard set_files failed: {e}");
-                        }
+                        self.clipboard.set_files(paths).map_err(|cause| {
+                            format!("destination could not publish the native file list: {cause}")
+                        })
                     }
-                    // A content kind a newer build introduced — nothing to
-                    // commit to the OS clipboard.
-                    ClipboardContentKind::Unknown => {}
+                    ClipboardContentKind::Unknown => {
+                        Err("destination does not support this clipboard content".into())
+                    }
+                };
+                if let Err(error) = &applied {
+                    tracing::warn!("clipboard apply failed: {error}");
                 }
+                self.send_clipboard_receipt(peer, &route, transfer, applied.err());
             }
-            // Pull is handled by the caller (sink side only); a newer build's
-            // event is ignored rather than failing the frame.
-            ClipboardEvent::Pull | ClipboardEvent::Unknown => {}
+            ClipboardEvent::Applied { .. } | ClipboardEvent::Pull | ClipboardEvent::Unknown => {}
         }
+    }
+
+    /// Confirm a binary transfer after the destination OS accepted it. The
+    /// feature is presence-negotiated, so old senders never receive a frame
+    /// they do not understand and new senders do not wait on old receivers.
+    fn send_clipboard_receipt(
+        self: &Arc<Self>,
+        peer: &str,
+        route: &str,
+        transfer: u64,
+        error: Option<String>,
+    ) {
+        if !self.peer_supports_feature(peer, allmystuff_protocol::FEATURE_CLIPBOARD_RECEIPTS) {
+            return;
+        }
+        let mesh = self.clone();
+        let peer = peer.to_string();
+        let route = route.to_string();
+        crate::spawn(async move {
+            if let Err(send_error) = mesh
+                .send_clip_frame(&peer, &route, ClipboardEvent::Applied { transfer, error })
+                .await
+            {
+                tracing::debug!("clipboard receipt send failed: {send_error}");
+            }
+        });
     }
 
     /// Fan one room-plane message out to the given members — the rooms
@@ -15486,6 +15639,11 @@ const MAX_CLIPBOARD_BYTES: u64 = 256 * 1024 * 1024;
 /// clipboard. The keystroke arrives just ahead of the pull on the same
 /// ordered channel; this covers the asynchronous gap after injection.
 const CLIPBOARD_COPY_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Once `Close` has reached a receipt-capable peer, native clipboard publish
+/// should be quick. Keep enough room for a busy desktop/session transition,
+/// but never let an invoke (and its console UI) hang forever.
+const CLIPBOARD_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// An inbound clipboard transfer being reassembled (see
 /// [`Mesh::handle_clipboard_frame`]).

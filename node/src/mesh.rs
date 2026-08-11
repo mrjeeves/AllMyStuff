@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -209,6 +209,11 @@ pub struct Mesh {
     /// raised — latched so it fires once per episode (and clears once), not
     /// on every presence advert while the clock stays wrong.
     clock_skew_warned: std::sync::atomic::AtomicBool,
+    /// One local dependency/update request at a time. Both AllMyStuff and CEC
+    /// Support may attach to this node during startup and independently notice
+    /// the same version skew; collapsing those asks here keeps them from racing
+    /// two downloads and two relaunches of the shared backend.
+    self_update_inflight: AtomicBool,
     /// When each outbound route offer was first seen still-unanswered by the
     /// reaper sweep ([`Mesh::spawn_offer_reaper`]). An offer has no deadline
     /// in the wire protocol and the session is clock-free, so this is where
@@ -1189,6 +1194,7 @@ impl Mesh {
             pending_claims: Mutex::new(std::collections::HashSet::new()),
             peer_clock_skew: Mutex::new(HashMap::new()),
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
+            self_update_inflight: AtomicBool::new(false),
             offer_first_seen: Mutex::new(HashMap::new()),
             last_status: Mutex::new(("unknown".into(), None)),
             fleet_roster_cache: Mutex::new(Vec::new()),
@@ -8502,6 +8508,93 @@ impl Mesh {
         crate::spawn(async move {
             sink.restart();
         });
+    }
+
+    /// Bring the installation that is **actually running this node** forward,
+    /// then relaunch it. This is the local dependency contract shared by the
+    /// AllMyStuff GUI and CEC Support: callers name the minimum AllMyStuff
+    /// version they were built against; the node resolves and updates its own
+    /// executable instead of the caller guessing which sidecar or protected
+    /// service copy owns the control socket.
+    ///
+    /// The reply is written before the delayed relaunch. A caller can therefore
+    /// wait for the socket to return and verify `node_version >= minimum`.
+    pub async fn request_self_update(self: &Arc<Self>, minimum: String) -> Result<Value, String> {
+        let want = crate::daemon_spawn::parse_semverish(&minimum)
+            .ok_or_else(|| format!("invalid minimum AllMyStuff version `{minimum}`"))?;
+        let running = crate::daemon_spawn::parse_semverish(env!("CARGO_PKG_VERSION"))
+            .ok_or_else(|| "this node has an invalid build version".to_string())?;
+        if running >= want {
+            return Ok(json!({
+                "accepted": false,
+                "current": env!("CARGO_PKG_VERSION"),
+                "minimum": minimum,
+                "reason": "current",
+            }));
+        }
+        if self.self_update_inflight.swap(true, Ordering::SeqCst) {
+            return Ok(json!({
+                "accepted": false,
+                "current": env!("CARGO_PKG_VERSION"),
+                "minimum": minimum,
+                "reason": "in_progress",
+            }));
+        }
+
+        tracing::info!(
+            current = env!("CARGO_PKG_VERSION"),
+            minimum = %minimum,
+            "local dependency requested an AllMyStuff update"
+        );
+        let outcome = allmystuff_updater::update_now().await;
+        match outcome {
+            Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
+                let Some(to_version) = crate::daemon_spawn::parse_semverish(&to) else {
+                    self.self_update_inflight.store(false, Ordering::SeqCst);
+                    return Err(format!("the update feed returned invalid version `{to}`"));
+                };
+                if to_version < want {
+                    self.self_update_inflight.store(false, Ordering::SeqCst);
+                    return Err(format!(
+                        "latest AllMyStuff {to} does not satisfy required {minimum}"
+                    ));
+                }
+                tracing::info!(
+                    to = %to,
+                    components = %components.join("+"),
+                    "dependency update applied; relaunching the shared node"
+                );
+                let sink = self.sink.clone();
+                crate::spawn(async move {
+                    // Let node_control serialize the accepted reply before the
+                    // service/session-agent releases its socket and executable.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    sink.restart();
+                });
+                Ok(json!({
+                    "accepted": true,
+                    "current": env!("CARGO_PKG_VERSION"),
+                    "minimum": minimum,
+                    "to": to,
+                    "components": components,
+                }))
+            }
+            Ok(allmystuff_updater::UpdateNowOutcome::UpToDate { current, latest }) => {
+                self.self_update_inflight.store(false, Ordering::SeqCst);
+                Err(format!(
+                    "updater reported current {current} / latest {latest}, but the running node {} is below required {minimum}",
+                    env!("CARGO_PKG_VERSION")
+                ))
+            }
+            Ok(allmystuff_updater::UpdateNowOutcome::PackageManager) => {
+                self.self_update_inflight.store(false, Ordering::SeqCst);
+                Err("this AllMyStuff installation must be updated by its installer".into())
+            }
+            Err(error) => {
+                self.self_update_inflight.store(false, Ordering::SeqCst);
+                Err(format!("AllMyStuff update failed: {error}"))
+            }
+        }
     }
 
     /// Front-end command: reboot a machine's whole OS — the recovery step

@@ -35,6 +35,8 @@ use std::{sync::Arc, time::Duration};
 // client of the per-machine node's control socket (see
 // `allmystuff_node::node_control`), driving it rather than linking it in.
 use allmystuff_graph::{Grant, Person};
+#[cfg(all(windows, not(debug_assertions)))]
+use allmystuff_node::node_control::running_node_satisfies;
 use allmystuff_node::node_control::{ensure_node_running, NodeChild, NodeClient, NodeEvent};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -3010,10 +3012,16 @@ fn main() {
             #[cfg(not(all(windows, not(debug_assertions))))]
             let migrate_privileged_host = false;
             tauri::async_runtime::spawn(async move {
+                #[cfg(all(windows, not(debug_assertions)))]
+                let mut service_repair_attempted = false;
                 // Migrate first. Starting a temporary GUI node concurrently
                 // made older installs race the old service and replacement
                 // service for the machine control pipe.
                 if migrate_privileged_host {
+                    #[cfg(all(windows, not(debug_assertions)))]
+                    {
+                        service_repair_attempted = true;
+                    }
                     let migrated =
                         match tokio::task::spawn_blocking(|| service_mutate_blocking("install"))
                             .await
@@ -3060,6 +3068,65 @@ fn main() {
                         }
                     }
                     Err(e) => tracing::error!("couldn't bring up the allmystuff node: {e:#}"),
+                }
+
+                // `ensure_node_running` first asks the process that owns the
+                // socket to update its own installation. That is the normal,
+                // no-UAC path and correctly reaches a protected service copy.
+                // A service from before the request-update contract cannot do
+                // that once; repair it from the current bundle, then every
+                // later release converges through the node request above.
+                #[cfg(all(windows, not(debug_assertions)))]
+                {
+                    let running_current =
+                        running_node_satisfies(env!("CARGO_PKG_VERSION")).await;
+                    let service_status =
+                        allmystuff_service::status_value(false).unwrap_or_default();
+                    let installed =
+                        service_status.get("installed").and_then(Value::as_bool) == Some(true);
+                    let service_payload_current = service_status
+                        .get("payload_current")
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    if installed
+                        && (!running_current || !service_payload_current)
+                        && !service_repair_attempted
+                    {
+                        tracing::warn!(
+                            running_current,
+                            service_payload_current,
+                            "the installed Windows node did not converge through dependency update requests; repairing the service payload once"
+                        );
+                        // A transient GUI-owned fallback must release the one
+                        // node pipe before the elevated replacement starts.
+                        handle.state::<AppState>().node_child.lock().take();
+                        match tokio::task::spawn_blocking(|| service_mutate_blocking("install"))
+                            .await
+                        {
+                            Ok(Ok(value))
+                                if value.get("ok").and_then(Value::as_bool) == Some(true) =>
+                            {
+                                if wait_for_node_ready().await
+                                    && running_node_satisfies(env!("CARGO_PKG_VERSION")).await
+                                {
+                                    tracing::info!(
+                                        "legacy Windows service repaired and verified at the current AllMyStuff version"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "the repaired Windows service did not return at the required AllMyStuff version"
+                                    );
+                                }
+                            }
+                            Ok(Ok(_)) => tracing::warn!("legacy Windows service repair failed"),
+                            Ok(Err(error)) => {
+                                tracing::warn!("legacy Windows service repair failed: {error}")
+                            }
+                            Err(error) => {
+                                tracing::warn!("legacy Windows service repair task failed: {error}")
+                            }
+                        }
+                    }
                 }
                 run_event_pump(handle, node).await;
             });

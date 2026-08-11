@@ -1500,6 +1500,10 @@ fn win_status_value() -> Value {
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("AllMyStuff")
         .join("service");
+    let payload_version = win_binary_version(&service_dir.join("allmystuff-serve.exe"));
+    let payload_current = payload_version
+        .as_deref()
+        .is_some_and(|version| version_at_least(version, env!("CARGO_PKG_VERSION")));
     // A responsive SCM parent is not enough: without the staged mesh daemon
     // the console-session node binds its local pipe but remains invisible to
     // every peer.  Older builds only checked `--state-home`, accepting exactly
@@ -1518,8 +1522,44 @@ fn win_status_value() -> Value {
         "enabled": enabled,
         "running": running,
         "privileged_host_current": privileged_host_current,
+        "payload_version": payload_version,
+        "payload_current": payload_current,
         "needs_privilege": true,
     })
+}
+
+fn win_binary_version(path: &Path) -> Option<String> {
+    if !runnable(path) {
+        return None;
+    }
+    let argv = vec![path.to_string_lossy().into_owned(), "--version".into()];
+    let output = command(&argv).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .last()
+        .map(|version| version.trim_start_matches('v').to_string())
+}
+
+fn version_at_least(have: &str, want: &str) -> bool {
+    fn tuple(version: &str) -> Option<(u64, u64, u64)> {
+        let core = version
+            .trim()
+            .trim_start_matches('v')
+            .split(['-', '+'])
+            .next()?;
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().unwrap_or("0").parse().ok()?;
+        let patch = parts.next().unwrap_or("0").parse().ok()?;
+        Some((major, minor, patch))
+    }
+
+    matches!((tuple(have), tuple(want)), (Some(have), Some(want)) if have >= want)
 }
 
 fn win_privileged_host_config_current(config: &str) -> bool {
@@ -2219,6 +2259,14 @@ mod tests {
         assert!(!win_privileged_host_config_current(
             r#"BINARY_PATH_NAME : "C:\old\allmystuff-serve.exe" --service"#
         ));
+    }
+
+    #[test]
+    fn service_payload_version_comparison_accepts_current_or_newer() {
+        assert!(version_at_least("0.2.67", "0.2.67"));
+        assert!(version_at_least("v0.2.68", "0.2.67"));
+        assert!(!version_at_least("0.2.61", "0.2.67"));
+        assert!(!version_at_least("unknown", "0.2.67"));
     }
 
     #[test]

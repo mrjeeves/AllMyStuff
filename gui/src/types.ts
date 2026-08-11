@@ -588,6 +588,20 @@ export interface UpdateStatus {
   release_url_overridden: boolean;
 }
 
+export interface ComponentVersionRow {
+  id: string;
+  label: string;
+  current: string | null;
+  pinned: string | null;
+  /** Optional on-disk version when it differs from the live process. */
+  installed?: string | null;
+  detail: string;
+}
+
+export interface ComponentStatus {
+  rows: ComponentVersionRow[];
+}
+
 /** Result of a manual check (from `update_check`). Tagged on `outcome`. */
 export interface CheckOutcome {
   outcome:

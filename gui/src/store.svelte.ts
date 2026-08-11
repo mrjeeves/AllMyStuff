@@ -173,6 +173,8 @@ import {
   updateRelaunch,
   updateSetPrefs,
   updateStatus,
+  componentStatus,
+  componentRepair,
   upgradeNode,
   windowBehaviorGet,
   windowBehaviorSet,
@@ -228,6 +230,7 @@ import {
   type Capability,
   type Catalog,
   type CheckOutcome,
+  type ComponentVersionRow,
   type ExposedSite,
   type Grant,
   type GrantRole,
@@ -296,6 +299,7 @@ export type SettingsTab =
   | "sharing"
   | "always_on"
   | "updates"
+  | "danger"
   // The secret CEC Support tab — shown only when a technician reveals it with
   // the hidden keyboard gesture (see `App.cecRevealed`).
   | "cec";
@@ -1364,6 +1368,8 @@ class AppStore {
    *  awaiting a relaunch to actually run. Drives the Updates pane's
    *  "Relaunch now" prompt. */
   updateApplied = $state<string | null>(null);
+  componentVersions = $state<ComponentVersionRow[]>([]);
+  componentBusy = $state<string | null>(null);
   /** The channel's latest release version, learned once (read-only) so the
    *  drawer can tell which of your fleet machines are behind it. Null until
    *  loaded; stays null in web mode / if the feed can't be reached. */
@@ -8856,8 +8862,25 @@ class AppStore {
     if (!isTauri() || isMobile()) return;
     try {
       this.updateInfo = await updateStatus();
+      this.componentVersions = (await componentStatus())?.rows ?? [];
     } catch (e) {
       this.toast("warn", `Couldn't read update status: ${errMsg(e)}`);
+    }
+  }
+
+  async repairComponent(component: string) {
+    if (!isTauri()) return;
+    this.componentBusy = component;
+    try {
+      await componentRepair(component);
+      this.toast("info", "Repair finished. Rechecking installed versions…");
+      // A backend/daemon repair may briefly restart the node socket.
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await this.loadUpdateStatus();
+    } catch (e) {
+      this.toast("warn", `Couldn't repair component: ${errMsg(e)}`);
+    } finally {
+      this.componentBusy = null;
     }
   }
 

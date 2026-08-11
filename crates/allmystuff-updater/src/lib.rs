@@ -537,12 +537,12 @@ fn apply_pending() -> Result<Option<String>> {
     Ok(Some(target_version))
 }
 
-/// Per-artifact downgrade guard. Every installed binary is paired with a
-/// version + content-hash marker. A missing, legacy, or mismatched marker is
-/// "unknown" and therefore repaired on the next check instead of trusting a
-/// version string that may no longer describe the file on disk.
+/// Per-artifact downgrade guard. Prefer the updater's hash-bound marker, but
+/// reconcile a missing/legacy marker with the version reported by the actual
+/// executable. Package installs commonly have no marker; treating that as
+/// stale manufactured a same-version apply + restart on every launch.
 fn artifact_needs_apply(kind: ArtifactKind, target_version: &str) -> bool {
-    version_is_newer(target_version, installed_artifact_version(kind).as_deref())
+    version_is_newer(target_version, effective_artifact_version(kind).as_deref())
 }
 
 /// Swap one staged artifact over its installed counterpart. `Ok(false)`
@@ -760,6 +760,90 @@ fn installed_artifact_version(kind: ArtifactKind) -> Option<String> {
         return Some(marker.version);
     }
     None
+}
+
+/// Version reported by the binary itself. The running artifact is known from
+/// this crate's build version; the CLI, node, and AMSTerm all have cheap
+/// `--version` verbs. A GUI sibling is not spawned because older GUI builds did
+/// not have a version-only verb and would open a second app instead.
+fn reported_artifact_version(kind: ArtifactKind) -> Option<String> {
+    let installed = installed_path(kind)?;
+    let current = std::env::current_exe().ok();
+    let same_as_running = current
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok())
+        .zip(installed.canonicalize().ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or_else(|| current.as_ref() == Some(&installed));
+    if same_as_running {
+        return Some(current_version().to_string());
+    }
+    if kind == ArtifactKind::Gui {
+        return None;
+    }
+
+    let mut command = std::process::Command::new(installed);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .last()
+        .map(str::to_string)
+}
+
+/// Version truth for reconciliation: prefer the hash-bound updater marker,
+/// then ask the actual executable. This keeps integrity repair for siblings
+/// while preventing a missing marker on an already-current running binary from
+/// manufacturing another same-version restart cycle.
+fn effective_artifact_version(kind: ArtifactKind) -> Option<String> {
+    reconcile_artifact_version(
+        installed_artifact_version(kind),
+        reported_artifact_version(kind),
+    )
+}
+
+fn reconcile_artifact_version(
+    verified_marker: Option<String>,
+    reported_binary: Option<String>,
+) -> Option<String> {
+    verified_marker.or(reported_binary)
+}
+
+/// A locally installed release binary and its reconciled version. A valid
+/// hash-bound updater marker wins; otherwise the executable is asked directly.
+/// `version == None` means neither source could establish a version.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledArtifactStatus {
+    pub component: String,
+    pub installed: bool,
+    pub version: Option<String>,
+}
+
+/// Read-only inventory for Settings -> Updates. This uses the exact same
+/// reconciled version truth as the updater decision, so the UI and update
+/// engine cannot disagree and send users through repeated restarts.
+pub fn installed_artifact_statuses() -> Vec<InstalledArtifactStatus> {
+    ALL_ARTIFACTS
+        .into_iter()
+        .map(|kind| InstalledArtifactStatus {
+            component: kind.as_str().to_string(),
+            installed: installed_path(kind).is_some(),
+            version: effective_artifact_version(kind),
+        })
+        .collect()
 }
 
 fn record_artifact_version(kind: ArtifactKind, version: &str) {
@@ -1953,6 +2037,24 @@ mod tests {
         // sibling installed out of band by the shell installer is brought
         // into lockstep on the first update.
         assert!(version_is_newer("0.1.15", None));
+    }
+
+    #[test]
+    fn current_binary_without_marker_does_not_restart_for_same_release() {
+        // Fresh package installs and older installs upgraded by an installer
+        // may have the right executable but no updater-owned hash marker. The
+        // executable's own version is authoritative enough to stop the same
+        // release from being staged and restarted again.
+        let installed = reconcile_artifact_version(None, Some("0.2.67".into()));
+        assert_eq!(installed.as_deref(), Some("0.2.67"));
+        assert!(!version_is_newer("0.2.67", installed.as_deref()));
+        assert!(version_is_newer("0.2.68", installed.as_deref()));
+
+        // A verified marker remains preferred if the two sources ever differ.
+        assert_eq!(
+            reconcile_artifact_version(Some("0.2.67".into()), Some("0.2.66".into())).as_deref(),
+            Some("0.2.67")
+        );
     }
 
     #[test]

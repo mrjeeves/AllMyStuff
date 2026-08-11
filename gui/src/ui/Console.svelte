@@ -2870,6 +2870,15 @@
   .bar-anchor {
     position: absolute;
     z-index: 10;
+    /* The anchor keeps the tray's full layout box even after the tray slides
+       away. Never let that transparent box steal input from the remote video;
+       only the visible controls below opt back into hit-testing. */
+    pointer-events: none;
+  }
+  .kvmbar,
+  .bar-tab,
+  .kvmenu {
+    pointer-events: auto;
   }
   /* Hugging the screen edge — the bar is a tray in the bezel, spending
      the least picture real estate a bar can. */

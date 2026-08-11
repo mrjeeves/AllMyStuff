@@ -14,17 +14,19 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 #[cfg(target_os = "macos")]
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_tungstenite::tungstenite::Message;
 
 const PRO_CHUNK: usize = 8 * 1024 * 1024;
 const REMOTE_MEDIA_MAX_READ: usize = 1024 * 1024;
 
-static REMOTE_MEDIA_PROVIDERS: LazyLock<
-    Mutex<HashMap<u16, (String, tokio::sync::watch::Sender<bool>)>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type RemoteMediaProvider = (String, tokio::sync::watch::Sender<bool>);
+type RemoteMediaProviders = Mutex<HashMap<u16, RemoteMediaProvider>>;
+
+static REMOTE_MEDIA_PROVIDERS: LazyLock<RemoteMediaProviders> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn cancel_remote_provider(local_port: u16) {
     if let Some((_, stop)) = REMOTE_MEDIA_PROVIDERS
@@ -748,7 +750,10 @@ async fn stream_remote_http(
                     retry = std::time::Duration::from_millis(300);
                 }
                 Ok(response) => {
-                    tracing::warn!("KVM remote-media fallback open returned {}", response.status());
+                    tracing::warn!(
+                        "KVM remote-media fallback open returned {}",
+                        response.status()
+                    );
                 }
                 Err(error) => tracing::warn!("KVM remote-media fallback open failed: {error}"),
             }

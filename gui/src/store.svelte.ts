@@ -4968,8 +4968,9 @@ class AppStore {
   }
 
   /** Map a peer's site to a local port — sets up the reverse-proxy and binds
-   *  a local listener, then records the mapping. Re-mapping an already-mapped
-   *  site just returns its mapping. */
+   *  a local listener, then records the mapping. Re-mapping asks the backend
+   *  to validate the listener before reusing it: the UI's mapping row is not
+   *  proof that its localhost tunnel survived a rejected route or reconnect. */
   async mapSite(nodeId: string, site: SiteAdvert) {
     const node = this.node(nodeId);
     if (!node) return;
@@ -4984,8 +4985,8 @@ class AppStore {
       return;
     }
     const existing = this.siteMappingFor(nodeId, site.id);
-    if (existing) return;
     if (!this.backendConnected) {
+      if (existing) return;
       // Web preview: simulate a mapping so the flow is demoable.
       const localPort = this.demoLocalPort(site.port);
       this.siteMappings = [
@@ -5000,9 +5001,17 @@ class AppStore {
       this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
       return;
     }
+    const mapping: SiteMapping = {
+      node: nodeId,
+      site: site.id,
+      port: site.port,
+      localPort: r.localPort,
+      scheme: site.scheme ?? "",
+      label: site.label,
+    };
     this.siteMappings = [
-      ...this.siteMappings,
-      { node: nodeId, site: site.id, port: site.port, localPort: r.localPort, scheme: site.scheme ?? "", label: site.label },
+      ...this.siteMappings.filter((m) => !(sameMachine(m.node, nodeId) && m.site === site.id)),
+      mapping,
     ];
     // No toast — the row now shows its localhost:<port> address inline.
   }
@@ -5176,6 +5185,7 @@ class AppStore {
 
   /** Call one KVM JSON endpoint outside the webview's CORS boundary. */
   private async kvmApi<T>(
+    nodeId: string,
     port: number,
     path: string,
     init?: { method?: string; body?: unknown; timeoutMs?: number },
@@ -5185,6 +5195,21 @@ class AppStore {
       out = await kvmApiCall(port, path, init);
     } catch (error) {
       return { rsp: null, timedOut: false, reason: errMsg(error) };
+    }
+    // A dead localhost listener is stale mapping state, not a KVM error. This
+    // also repairs machines whose older backend predates site_map's listener
+    // validation: explicitly unmap, rebuild once, and replay only a request
+    // that reqwest confirms never connected (timeouts are deliberately not
+    // replayed because the KVM may already have performed the action).
+    if (out.error?.kind === "connect") {
+      const repairedPort = await this.repairKvmConsoleMapping(nodeId, port);
+      if (repairedPort !== null) {
+        try {
+          out = await kvmApiCall(repairedPort, path, init);
+        } catch (error) {
+          return { rsp: null, timedOut: false, reason: errMsg(error) };
+        }
+      }
     }
     if (out.error) {
       return { rsp: null, timedOut: out.error.kind === "timeout", reason: out.error.message };
@@ -5205,6 +5230,25 @@ class AppStore {
       return { rsp: null, timedOut: false, reason: "The KVM sent an unexpected reply." };
     }
     return { rsp: body as KvmApiRsp<T>, timedOut: false, reason: null };
+  }
+
+  /** Drop one refused localhost tunnel and ask the mesh service to recreate it. */
+  private async repairKvmConsoleMapping(nodeId: string, failedPort: number): Promise<number | null> {
+    const node = this.node(nodeId);
+    const site = this.kvmWebSite(node);
+    if (!node || !site || !this.backendConnected) return null;
+
+    const existing = this.siteMappingFor(nodeId, site.id);
+    if (existing && existing.localPort !== failedPort) return existing.localPort;
+
+    this.siteMappings = this.siteMappings.filter(
+      (m) => !(sameMachine(m.node, nodeId) && m.site === site.id),
+    );
+    await siteUnmap(existing?.node ?? nodeId, existing?.port ?? site.port);
+    await this.mapSite(nodeId, site);
+    const repairedPort = this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
+    if (this.wifiFor && sameMachine(this.wifiFor, nodeId)) this.wifiPort = repairedPort;
+    return repairedPort;
   }
 
   private kvmMsg(rsp: KvmApiRsp, fallback: string): string {
@@ -5306,7 +5350,7 @@ class AppStore {
     }
     const type = action === "reset" ? "reset" : "power";
     const duration = action === "long" ? 12_000 : 800;
-    const { rsp, reason } = await this.kvmApi(port, "/api/vm/gpio", {
+    const { rsp, reason } = await this.kvmApi(nodeId, port, "/api/vm/gpio", {
       method: "POST",
       body: { type, duration },
     });
@@ -5339,7 +5383,7 @@ class AppStore {
         this.toast("warn", `${node.label} hasn't published a console yet`);
         return;
       }
-      const version = await this.kvmApi<KvmVersion>(port, "/api/application/version");
+      const version = await this.kvmApi<KvmVersion>(nodeId, port, "/api/application/version");
       if (!version.rsp || version.rsp.code !== 0) {
         const detail = version.rsp
           ? this.kvmMsg(version.rsp, "the KVM declined")
@@ -5351,7 +5395,7 @@ class AppStore {
       const latest = (version.rsp.data?.latest ?? "").trim();
       if (latest && latest !== current) {
         this.toast("info", `Installing ${latest} on the KVM — this takes a few minutes`);
-        const update = await this.kvmApi(port, "/api/application/update", {
+        const update = await this.kvmApi(nodeId, port, "/api/application/update", {
           method: "POST",
           body: {},
           timeoutMs: 300_000,
@@ -5368,7 +5412,7 @@ class AppStore {
         }
         return;
       }
-      const reboot = await this.kvmApi(port, "/api/vm/system/reboot", {
+      const reboot = await this.kvmApi(nodeId, port, "/api/vm/system/reboot", {
         method: "POST",
         body: {},
       });
@@ -5434,7 +5478,7 @@ class AppStore {
         return;
       }
       this.wifiPort = port;
-      const { rsp, reason } = await this.kvmApi<KvmWifiStatusRaw>(port, "/api/network/wifi");
+      const { rsp, reason } = await this.kvmApi<KvmWifiStatusRaw>(nodeId, port, "/api/network/wifi");
       if (!rsp || rsp.code !== 0 || !rsp.data) {
         this.wifiPort = null;
         this.wifiError = rsp
@@ -5461,6 +5505,7 @@ class AppStore {
     this.wifiScanning = true;
     try {
       const { rsp } = await this.kvmApi<{ wifiList?: KvmWifiNetwork[] }>(
+        nodeId,
         port,
         "/api/network/wifi/scan",
         { timeoutMs: 20_000 },
@@ -5521,7 +5566,7 @@ class AppStore {
     this.wifiPort = port;
     this.wifiBusy = true;
     try {
-      const { rsp, timedOut, reason } = await this.kvmApi(port, "/api/network/wifi/connect", {
+      const { rsp, timedOut, reason } = await this.kvmApi(nodeId, port, "/api/network/wifi/connect", {
         method: "POST",
         body: { ssid: name, password },
         timeoutMs: 40_000,
@@ -5567,7 +5612,7 @@ class AppStore {
     this.wifiPort = port;
     this.wifiBusy = true;
     try {
-      const { rsp, timedOut, reason } = await this.kvmApi(port, "/api/network/wifi/disconnect", {
+      const { rsp, timedOut, reason } = await this.kvmApi(nodeId, port, "/api/network/wifi/disconnect", {
         method: "POST",
         timeoutMs: 20_000,
       });

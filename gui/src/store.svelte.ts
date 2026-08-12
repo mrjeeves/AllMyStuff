@@ -790,6 +790,9 @@ class AppStore {
    *  opaque outside the source machine; paths are kept only for the local
    *  builder display and never enter a grant. */
   shareFlowFolders = $state<SharedFolderMount[]>([]);
+  /** The individually curated exposed services this share grants. A Sites
+   *  share never means every listener (or even every fleet-exposed site). */
+  shareFlowSites = $state<SiteAdvert[]>([]);
   /** Set while the pick is being minted on the device that holds the folder,
    *  so the builder can say it's working rather than look stuck. */
   shareFlowFolderPending = $state(false);
@@ -1633,13 +1636,13 @@ class AppStore {
       const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
       if (e.error) {
         delete this.driveMounts[e.route];
-        this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
+        if (!e.requested) this.toast("warn", `Couldn't map the drive from ${who}: ${e.error}`);
       } else {
         this.driveMounts[e.route] = {
           label: e.label || "Remote drive",
           mount: e.mount!,
         };
-        this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
+        if (!e.requested) this.toast("ok", `${e.label || "Remote drive"} mounted as ${e.mount}`);
       }
     });
     await onKvmMedia((e) => {
@@ -2839,6 +2842,10 @@ class AppStore {
       this.shareFlowSender,
       this.shareFlowReceiver,
     );
+    this.shareFlowSites = this.existingShareSites(
+      this.shareFlowSender,
+      this.shareFlowReceiver,
+    );
     this.shareFlowOpen = true;
   }
   closeShareFlow() {
@@ -2911,7 +2918,7 @@ class AppStore {
     if (grants.some((g) => forSender(g) && g.media === "display")) out.push("console");
     if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
-    if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
+    if (grants.some((g) => forSender(g) && g.media === "generic" && (!!g.capability?.endsWith(":sites") || !!g.capability?.includes(":site:")))) out.push("sites");
     return out;
   }
 
@@ -2953,6 +2960,67 @@ class AppStore {
     const marker = " — share ";
     const at = label.indexOf(marker);
     return at >= 0 ? label.slice(at + marker.length) || "Shared folder" : label;
+  }
+
+  /** The exact sites already granted from `sender` to this receiving fleet.
+   *  Legacy broad `:sites` grants hydrate as every currently exposed site so
+   *  the next Save transparently narrows them to explicit per-site grants. */
+  existingShareSites(senderId: string | null, receiverNodeId: string | null): SiteAdvert[] {
+    if (!senderId || !receiverNodeId) return [];
+    const recv = this.node(receiverNodeId);
+    const source = this.node(senderId);
+    if (!source || !recv || recv.relationship.kind !== "shared") return [];
+    const personId = recv.relationship.person.id;
+    const sender = canonicalNodeId(senderId);
+    const advertised = new Map((source.sites ?? []).map((site) => [site.id, site]));
+    const selected = new Map<string, SiteAdvert>();
+    let legacyAll = false;
+    for (const node of this.catalog.nodes) {
+      if (node.relationship.kind !== "shared" || node.relationship.person.id !== personId) continue;
+      for (const grant of node.relationship.grants) {
+        if (grant.media !== "generic" || !grant.capability || this.capNodeOf(grant.capability) !== sender) continue;
+        if (grant.capability.endsWith(":sites")) {
+          legacyAll = true;
+          continue;
+        }
+        const marker = ":site:";
+        const at = grant.capability.indexOf(marker);
+        if (at < 0) continue;
+        const id = grant.capability.slice(at + marker.length);
+        if (!id) continue;
+        const known = advertised.get(id);
+        selected.set(id, known ?? {
+          id,
+          label: this.sharedSiteLabel(grant),
+          port: sitePort(id),
+          scheme: "",
+        });
+      }
+    }
+    if (legacyAll) return [...advertised.values()].sort((a, b) => a.port - b.port);
+    return [...selected.values()].sort((a, b) => a.port - b.port);
+  }
+
+  private sharedSiteLabel(grant: Grant): string {
+    const label = grant.label?.trim() || "Shared site";
+    const marker = " — share ";
+    const at = label.indexOf(marker);
+    return at >= 0 ? label.slice(at + marker.length) || "Shared site" : label;
+  }
+
+  availableShareSites(senderId = this.shareFlowSender): SiteAdvert[] {
+    return [...(senderId ? this.node(senderId)?.sites ?? [] : [])].sort((a, b) => a.port - b.port);
+  }
+
+  toggleShareSite(site: SiteAdvert) {
+    const exists = this.shareFlowSites.some((selected) => selected.id === site.id);
+    this.shareFlowSites = exists
+      ? this.shareFlowSites.filter((selected) => selected.id !== site.id)
+      : [...this.shareFlowSites, site].sort((a, b) => a.port - b.port);
+  }
+
+  clearShareSites() {
+    this.shareFlowSites = [];
   }
 
   /** Whether the sender can actually offer a given capability — drives which
@@ -3134,7 +3202,9 @@ class AppStore {
       case "terminal":
         return [mk("generic", "provide", "terminal", "use its terminal")];
       case "sites":
-        return [mk("generic", "provide", "sites", "reach its sites")];
+        return this.shareFlowSites.map((site) =>
+          mk("generic", "provide", `site:${site.id}`, `share ${site.label}`),
+        );
     }
   }
 
@@ -3152,7 +3222,7 @@ class AppStore {
     if (grant.media === "clipboard" && suffix === "clipboard") return "console";
     if (grant.media === "storage" && suffix.startsWith("folder:")) return "files";
     if (grant.media === "generic" && suffix === "terminal") return "terminal";
-    if (grant.media === "generic" && suffix === "sites") return "sites";
+    if (grant.media === "generic" && (suffix === "sites" || suffix.startsWith("site:"))) return "sites";
     return null;
   }
 
@@ -3208,6 +3278,10 @@ class AppStore {
     // instead — a share nobody can open is worse than a refused one.
     if (want.has("files") && this.shareFlowFolders.length === 0) {
       this.toast("warn", "Add at least one folder or drive to share first");
+      return 0;
+    }
+    if (want.has("sites") && this.shareFlowSites.length === 0) {
+      this.toast("warn", "Choose at least one exposed site to share first");
       return 0;
     }
     const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
@@ -4654,7 +4728,42 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.sitesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
+    return ownerIsMe || coFleet || this.sharedSitesFrom(node).length > 0;
+  }
+
+  /** Exact services another fleet shared from `node`. A legacy broad Sites
+   *  grant remains readable during rolling upgrades; saving it in the new
+   *  Share Flow replaces it with one grant per selected service. */
+  sharedSitesFrom(node: MeshNode | undefined): SiteAdvert[] {
+    if (!node || node.relationship.kind !== "shared") return [];
+    const sites = node.sites ?? [];
+    const allowed = new Set<string>();
+    let legacyAll = false;
+    const canon = canonicalNodeId(node.id);
+    for (const grant of this.shareInGrantsFor(node)) {
+      if (grant.media !== "generic" || !grant.capability || this.capNodeOf(grant.capability) !== canon) continue;
+      if (grant.capability.endsWith(":sites")) {
+        legacyAll = true;
+        continue;
+      }
+      const marker = ":site:";
+      const at = grant.capability.indexOf(marker);
+      if (at >= 0) allowed.add(grant.capability.slice(at + marker.length));
+    }
+    return sites.filter((site) => legacyAll || allowed.has(site.id));
+  }
+
+  siteAllowed(node: MeshNode | undefined, site: SiteAdvert): boolean {
+    if (!node || this.isMe(node.id) || !this.sitesSupported(node)) return false;
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet || this.sharedSitesFrom(node).some((shared) => shared.id === site.id);
+  }
+
+  visibleSitesFrom(node: MeshNode): SiteAdvert[] {
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet ? node.sites ?? [] : this.sharedSitesFrom(node);
   }
 
   // ---- cross-fleet console access (the share-enforcement the gates above
@@ -4767,7 +4876,7 @@ class AppStore {
       case "terminal":
         return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal") && forNode(g));
       case "sites":
-        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":sites") && forNode(g));
+        return gs.some((g) => g.media === "generic" && (!!g.capability?.endsWith(":sites") || !!g.capability?.includes(":site:")) && forNode(g));
     }
   }
 
@@ -4923,7 +5032,7 @@ class AppStore {
     const out: { node: MeshNode; sites: SiteAdvert[] }[] = [];
     for (const n of this.catalog.nodes) {
       if (this.isMe(n.id)) continue;
-      const sites = n.sites ?? [];
+      const sites = this.visibleSitesFrom(n);
       if (sites.length === 0 || !this.sitesAllowed(n)) continue;
       out.push({ node: n, sites });
     }
@@ -5091,8 +5200,8 @@ class AppStore {
     // and not the FEATURE_SITES tag. The door showing but this gate refusing
     // was the "Sites are owner/fleet only" a standing tech used to hit: the
     // KVM itself admits the session's tech, the GUI must not refuse first.
-    if (!this.sitesAllowed(node) && !this.kvmDoors(node)) {
-      this.toast("warn", `Sites are owner/fleet only — ${node.label} isn't yours`);
+    if (!this.siteAllowed(node, site) && !this.kvmDoors(node)) {
+      this.toast("warn", `${site.label} hasn't been shared with your fleet`);
       return;
     }
     const existing = this.siteMappingFor(nodeId, site.id);

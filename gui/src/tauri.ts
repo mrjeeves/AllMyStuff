@@ -1160,6 +1160,7 @@ export interface DriveMountEvent {
   from: string;
   mount?: string;
   label?: string;
+  requested?: boolean;
   error?: string | null;
 }
 export async function onDriveMount(

@@ -69,11 +69,13 @@
     // sender invalidates the pick rather than silently re-aiming it at a
     // folder on a different disk.
     app.clearShareFolders();
-    chosen = new Set([...chosen].filter((c) => c !== "files" && app.shareFlowCapAvailable(id, c)));
+    app.clearShareSites();
+    chosen = new Set([...chosen].filter((c) => c !== "files" && c !== "sites" && app.shareFlowCapAvailable(id, c)));
   }
   function pickFleet(nodeId: string) {
     app.shareFlowReceiver = nodeId;
     app.shareFlowFolders = app.existingShareFolders(sender, nodeId);
+    app.shareFlowSites = app.existingShareSites(sender, nodeId);
     chosen = new Set(app.existingShareCaps(sender, nodeId));
     picking = null;
   }
@@ -97,6 +99,7 @@
     if (next.has(c)) {
       next.delete(c);
       if (c === "files") app.clearShareFolders();
+      if (c === "sites") app.clearShareSites();
       // Turning off Video turns off anything that depends on it (Control).
       for (const dep of CAPS) if (dep.requires === c) next.delete(dep.key);
     } else {
@@ -109,7 +112,14 @@
   }
 
   const selectedLabels = $derived(CAPS.filter((c) => chosen.has(c.key)).map((c) => c.label));
-  const canStart = $derived(!!sender && !!receiver && sender !== receiver && chosen.size > 0);
+  const canStart = $derived(
+    !!sender &&
+      !!receiver &&
+      sender !== receiver &&
+      chosen.size > 0 &&
+      (!chosen.has("files") || app.shareFlowFolders.length > 0) &&
+      (!chosen.has("sites") || app.shareFlowSites.length > 0),
+  );
 
   function start() {
     const n = app.startShareFlow([...chosen]);
@@ -175,6 +185,8 @@
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
                 {c.label}{#if c.key === "files" && app.shareFlowFolders.length > 0}<span class="cap-note">
                     · {app.shareFlowFolders.length} mount{app.shareFlowFolders.length === 1 ? "" : "s"}</span
+                  >{:else if c.key === "sites" && app.shareFlowSites.length > 0}<span class="cap-note">
+                    · {app.shareFlowSites.length} site{app.shareFlowSites.length === 1 ? "" : "s"}</span
                   >{:else if c.note}<span class="cap-note"> · {c.note}</span>{/if}
                 {#if needs}<span class="cap-req">needs Video</span>
                 {:else if c.popout}<span class="cap-pop">popout</span>{/if}
@@ -211,6 +223,26 @@
           {/if}
           {#if app.shareFlowFolderPending}
             <div class="folder-line pending">Sharing that folder…</div>
+          {/if}
+          {#if chosen.has("sites")}
+            <div class="folder-mounts" aria-label="Shared sites">
+              {#each app.availableShareSites() as site (site.id)}
+                {@const selected = app.shareFlowSites.some((item) => item.id === site.id)}
+                <button
+                  class="site-line"
+                  class:selected
+                  aria-pressed={selected}
+                  onclick={() => app.toggleShareSite(site)}
+                >
+                  <span class="site-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                  <span class="fl-v">
+                    <strong>{site.label}</strong>
+                    <small>{site.scheme || "tcp"} · port {site.port}</small>
+                  </span>
+                </button>
+              {/each}
+              <p class="folder-privacy">Only the checked services are visible and reachable to the receiving fleet.</p>
+            </div>
           {/if}
         </section>
 
@@ -665,6 +697,38 @@
     display: grid;
     gap: 0.05rem;
   }
+  .site-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .site-line:hover { border-color: var(--c-share); }
+  .site-line.selected {
+    border-color: var(--c-share);
+    background: var(--c-share-soft);
+  }
+  .site-check {
+    display: grid;
+    place-items: center;
+    width: 1.15rem;
+    height: 1.15rem;
+    flex: 0 0 auto;
+    border: 1px solid var(--line-strong);
+    border-radius: 0.3rem;
+    color: var(--c-share-ink);
+    font-size: 0.72rem;
+    font-weight: 900;
+  }
+  .site-line.selected .site-check { border-color: var(--c-share); }
   .fl-v strong,
   .fl-v small {
     overflow: hidden;

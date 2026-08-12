@@ -126,6 +126,10 @@ pub struct Mesh {
     /// trust or a live CEC Control grant; this token is what lets a Files
     /// share/support source answer a pull in the opposite direction.
     drive_pull_tokens: Mutex<HashMap<String, DrivePullRequest>>,
+    /// Actual OS-mount completion for receiver-initiated pulls. An accepted
+    /// route offer is not success: Windows still has to claim the drive
+    /// letter and bring up its loopback WebDAV redirector.
+    drive_pull_waiters: Mutex<HashMap<String, DrivePullWaiter>>,
     /// Successful receiver-initiated mappings, keyed by their current route.
     /// The route is one connection incarnation; this is the user's intent and
     /// survives either app restarting and a source laptop sleeping.
@@ -469,6 +473,11 @@ struct DrivePullRequest {
     /// A folder pull carries no root — reconnect re-sends this opaque id.
     folder: Option<String>,
     made: Instant,
+}
+
+struct DrivePullWaiter {
+    made: Instant,
+    reply: oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1192,6 +1201,7 @@ impl Mesh {
             files: FilesPlane::new(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
+            drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
             drive_reconnect_path,
             drive_reconnect_inflight: Mutex::new(std::collections::HashSet::new()),
@@ -3264,7 +3274,10 @@ impl Mesh {
                                     source: pull.source,
                                     root: pull.root,
                                     label: if pull.label.is_empty() {
-                                        drive.as_ref().map(|offer| offer.label.clone()).unwrap_or_default()
+                                        drive
+                                            .as_ref()
+                                            .map(|offer| offer.label.clone())
+                                            .unwrap_or_default()
                                     } else {
                                         pull.label
                                     },
@@ -4724,6 +4737,42 @@ impl Mesh {
     /// Ask another authorized machine to expose `root` back to us. This is
     /// the inbound-map twin of `drive_map`; the source re-checks Files access
     /// and canonicalizes the path on its own filesystem before offering.
+    fn register_drive_pull_waiter(&self, request: &str) -> oneshot::Receiver<Result<(), String>> {
+        let (reply, receiver) = oneshot::channel();
+        let now = Instant::now();
+        self.drive_pull_waiters
+            .lock()
+            .retain(|_, waiter| now.duration_since(waiter.made) < Duration::from_secs(120));
+        self.drive_pull_waiters
+            .lock()
+            .insert(request.to_string(), DrivePullWaiter { made: now, reply });
+        receiver
+    }
+
+    fn finish_drive_pull(&self, request: Option<&str>, result: Result<(), String>) {
+        let Some(request) = request else { return };
+        if let Some(waiter) = self.drive_pull_waiters.lock().remove(request) {
+            let _ = waiter.reply.send(result);
+        }
+    }
+
+    async fn await_drive_pull(
+        &self,
+        request: &str,
+        receiver: oneshot::Receiver<Result<(), String>>,
+        no_offer: &str,
+    ) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(35), receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("the native drive request ended before Windows mounted it".into()),
+            Err(_) => {
+                self.drive_pull_tokens.lock().remove(request);
+                self.drive_pull_waiters.lock().remove(request);
+                Err(no_offer.into())
+            }
+        }
+    }
+
     pub async fn drive_map_from(
         self: &Arc<Self>,
         source: String,
@@ -4746,6 +4795,7 @@ impl Mesh {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let mounted = self.register_drive_pull_waiter(&request);
         self.drive_pull_tokens
             .lock()
             .retain(|_, pull| pull.made.elapsed() < Duration::from_secs(120));
@@ -4773,17 +4823,15 @@ impl Mesh {
             .await
         {
             self.drive_pull_tokens.lock().remove(&request);
+            self.drive_pull_waiters.lock().remove(&request);
             return Err(error);
         }
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if !self.drive_pull_tokens.lock().contains_key(&request) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        self.drive_pull_tokens.lock().remove(&request);
-        Err("the source didn't offer that drive (it may need an AllMyStuff update, or the selected path is unavailable)".into())
+        self.await_drive_pull(
+            &request,
+            mounted,
+            "the source didn't mount that drive (it may need an AllMyStuff update, or the selected path is unavailable)",
+        )
+        .await
     }
 
     /// Open a folder someone shared with us, as a native drive on this
@@ -4823,6 +4871,7 @@ impl Mesh {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let mounted = self.register_drive_pull_waiter(&request);
         self.drive_pull_tokens
             .lock()
             .retain(|_, pull| pull.made.elapsed() < Duration::from_secs(120));
@@ -4849,20 +4898,18 @@ impl Mesh {
             .await
         {
             self.drive_pull_tokens.lock().remove(&request);
+            self.drive_pull_waiters.lock().remove(&request);
             return Err(error);
         }
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if !self.drive_pull_tokens.lock().contains_key(&request) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        self.drive_pull_tokens.lock().remove(&request);
         // Deliberately vague about *why*. The source refuses an unshared
         // folder and an uncovered one identically and silently, so this can't
         // become a way to probe which folder ids exist.
-        Err("the source didn't offer that folder — the share may have been withdrawn".into())
+        self.await_drive_pull(
+            &request,
+            mounted,
+            "the source didn't mount that folder — the share may have been withdrawn",
+        )
+        .await
     }
 
     /// Ask another machine in this fleet to mount a folder shared with the
@@ -5167,12 +5214,8 @@ impl Mesh {
                         tokio::time::sleep(Duration::from_millis(retry_delay)).await;
                     }
                     let result = if let Some(folder) = intent.folder.clone() {
-                        mesh.folder_open(
-                            intent.source.clone(),
-                            folder,
-                            intent.mount.clone(),
-                        )
-                        .await
+                        mesh.folder_open(intent.source.clone(), folder, intent.mount.clone())
+                            .await
                     } else {
                         mesh.drive_map_from(
                             intent.source.clone(),
@@ -10868,6 +10911,7 @@ impl Mesh {
                     let mesh = self.clone();
                     let mounts = self.drive_mounts.clone();
                     let route_id = route.id.clone();
+                    let request = drive.request.clone();
                     crate::spawn(async move {
                         match mounts
                             .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
@@ -10896,9 +10940,11 @@ impl Mesh {
                                         "from": from_node,
                                         "mount": info.mount,
                                         "label": info.label,
+                                        "requested": request.is_some(),
                                         "error": null,
                                     }),
                                 );
+                                mesh.finish_drive_pull(request.as_deref(), Ok(()));
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -10910,9 +10956,11 @@ impl Mesh {
                                     json!({
                                         "route": route_id,
                                         "from": from_node,
+                                        "requested": request.is_some(),
                                         "error": error,
                                     }),
                                 );
+                                mesh.finish_drive_pull(request.as_deref(), Err(error.clone()));
                                 let _ = mesh.disconnect(route_id).await;
                             }
                         }
@@ -12471,7 +12519,10 @@ impl Mesh {
     async fn handle_site_control(self: &Arc<Self>, from: &str, sc: SiteControl) {
         match sc {
             SiteControl::List => {
-                if !self.sender_may_drive(from, DrivePlane::Sites) {
+                // The full service inventory is management data for a
+                // co-owned machine. A curated cross-fleet site grant must not
+                // widen into permission to enumerate every local listener.
+                if !self.sender_may_control(from) {
                     tracing::warn!("site list from {} refused: not owner/fleet", short_id(from));
                     return;
                 }
@@ -12600,7 +12651,10 @@ impl Mesh {
         // per-mapping viewer endpoint (never a catalog capability — shape is
         // the contract, like terminal/files).
         let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
-        let from = format!("{node}:site");
+        // Name the exact service in the route. Owner/fleet can still reach
+        // every exposed port; a cross-fleet share is admitted only when its
+        // standing grant names this same `tcp:<port>` capability.
+        let from = format!("{node}:site:tcp:{host_port}");
         let to = format!("{me}:site-view:{}-{seq}", host_port);
         let route_id = format!("route:{from}→{to}");
         // Offer the route through the session (drives offer→accept→active).
@@ -12970,12 +13024,13 @@ impl Mesh {
                     Some((
                         route_sources_on(&r.route, &me),
                         route_sinks_on(&r.route, &me),
+                        site_route_port(&r.route),
                     ))
                 }
                 _ => None,
             }
         };
-        let Some((hosts_here, views_here)) = placement else {
+        let Some((hosts_here, views_here, route_port)) = placement else {
             tracing::debug!(
                 "site frame for {} refused (route not live here)",
                 frame.route
@@ -12990,7 +13045,7 @@ impl Mesh {
         if hosts_here {
             // The proxy *into* this machine — as privileged as the terminal,
             // so the same owner/fleet gate, re-cleared per frame.
-            if !self.sender_may_drive(from, DrivePlane::Sites) {
+            if !self.sender_may_drive(from, DrivePlane::Sites(route_port)) {
                 tracing::warn!(
                     "dropped site frame from {}: not an authorized controller",
                     short_id(from)
@@ -13002,7 +13057,9 @@ impl Mesh {
                     // The load-bearing control: dial only a port *we* expose,
                     // never the client's free choice. Over the per-route cap,
                     // or unexposed → refuse with a `Close`.
-                    let rx = if self.sites.is_port_exposed(port) {
+                    let rx = if route_port.is_none_or(|granted| granted == port)
+                        && self.sites.is_port_exposed(port)
+                    {
                         self.sites.open_conn(&frame.route, conn)
                     } else {
                         tracing::warn!(
@@ -15419,7 +15476,18 @@ fn is_shared_route(route: &Route) -> bool {
 /// source endpoint is a machine's `…:site` handle — the same shape-as-
 /// contract scheme the terminal and files use.
 fn is_site_route(route: &Route) -> bool {
-    route.media == MediaKind::Generic && route.from.as_str().ends_with(":site")
+    route.media == MediaKind::Generic
+        && (route.from.as_str().ends_with(":site") || site_route_port(route).is_some())
+}
+
+fn site_route_port(route: &Route) -> Option<u16> {
+    if route.media != MediaKind::Generic {
+        return None;
+    }
+    let (_, port) = route.from.as_str().rsplit_once(":site:tcp:")?;
+    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| port.parse().ok())
+        .flatten()
 }
 
 /// What an audio route this machine sources should capture: the synthetic
@@ -15446,7 +15514,7 @@ enum DrivePlane {
     /// This machine's disk.
     Files,
     /// Reverse-proxying a service this machine exposes.
-    Sites,
+    Sites(Option<u16>),
     /// Writing this machine's clipboard (rides with the control grant).
     Clipboard,
 }
@@ -15465,7 +15533,7 @@ fn route_drive_plane(route: &Route) -> Option<DrivePlane> {
         // through the inbound-offer gate there.
         Some(DrivePlane::Files)
     } else if is_site_route(route) {
-        Some(DrivePlane::Sites)
+        Some(DrivePlane::Sites(site_route_port(route)))
     } else {
         None
     }
@@ -15487,7 +15555,12 @@ fn grant_authorizes_plane(grant: &Grant, plane: DrivePlane) -> bool {
         DrivePlane::Input => grant.media == MediaKind::Input && grant.role.allows_sink(),
         DrivePlane::Terminal => grant.media == MediaKind::Generic && cap_ends(":terminal"),
         DrivePlane::Files => grant.media == MediaKind::Storage && cap_ends(":files"),
-        DrivePlane::Sites => grant.media == MediaKind::Generic && cap_ends(":sites"),
+        DrivePlane::Sites(port) => {
+            grant.media == MediaKind::Generic
+                && grant.role.allows_source()
+                && (cap_ends(":sites")
+                    || port.is_some_and(|port| cap_ends(&format!(":site:tcp:{port}"))))
+        }
         DrivePlane::Clipboard => grant.media == MediaKind::Clipboard,
     }
 }
@@ -17300,7 +17373,7 @@ mod tests {
         for p in [
             DrivePlane::Terminal,
             DrivePlane::Files,
-            DrivePlane::Sites,
+            DrivePlane::Sites(Some(8080)),
             DrivePlane::Clipboard,
         ] {
             assert!(
@@ -17313,9 +17386,25 @@ mod tests {
         // what tells them apart, so neither is mistaken for the other.
         let terminal = g(MediaKind::Generic, GrantRole::Provide, "me:terminal");
         assert!(grant_authorizes_plane(&terminal, DrivePlane::Terminal));
-        assert!(!grant_authorizes_plane(&terminal, DrivePlane::Sites));
+        assert!(!grant_authorizes_plane(
+            &terminal,
+            DrivePlane::Sites(Some(8080))
+        ));
         let sites = g(MediaKind::Generic, GrantRole::Provide, "me:sites");
-        assert!(grant_authorizes_plane(&sites, DrivePlane::Sites));
+        assert!(grant_authorizes_plane(
+            &sites,
+            DrivePlane::Sites(Some(8080))
+        ));
+        let one_site = g(MediaKind::Generic, GrantRole::Provide, "me:site:tcp:8080");
+        assert!(grant_authorizes_plane(
+            &one_site,
+            DrivePlane::Sites(Some(8080))
+        ));
+        assert!(!grant_authorizes_plane(
+            &one_site,
+            DrivePlane::Sites(Some(3000))
+        ));
+        assert!(!grant_authorizes_plane(&one_site, DrivePlane::Sites(None)));
         assert!(!grant_authorizes_plane(&sites, DrivePlane::Terminal));
 
         // Files is a storage grant; clipboard its own kind.
@@ -17333,7 +17422,7 @@ mod tests {
             DrivePlane::Input,
             DrivePlane::Terminal,
             DrivePlane::Files,
-            DrivePlane::Sites,
+            DrivePlane::Sites(Some(8080)),
             DrivePlane::Clipboard,
         ] {
             assert!(
@@ -17353,7 +17442,15 @@ mod tests {
         );
         assert_eq!(
             route_drive_plane(&term_route("me:site", "them:sv:1", MediaKind::Generic)),
-            Some(DrivePlane::Sites)
+            Some(DrivePlane::Sites(None))
+        );
+        assert_eq!(
+            route_drive_plane(&term_route(
+                "me:site:tcp:8080",
+                "them:sv:1",
+                MediaKind::Generic
+            )),
+            Some(DrivePlane::Sites(Some(8080)))
         );
         assert_eq!(
             route_drive_plane(&term_route("me:mic", "them:speaker", MediaKind::Audio)),
@@ -17523,7 +17620,10 @@ mod tests {
         assert!(super::persist_drive_reconnects(&path, &mappings));
         let json = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
         assert!(json.contains("opaque-folder-id"));
-        assert!(!json.contains("Family photos/"), "no source path is persisted");
+        assert!(
+            !json.contains("Family photos/"),
+            "no source path is persisted"
+        );
         let loaded = super::load_drive_reconnects(&path);
         assert_eq!(loaded.values().next(), Some(&intent));
 
@@ -17531,7 +17631,10 @@ mod tests {
             r#"{"source":"old-source","root":"C:\\Work","label":"Work","mount":"W:"}"#,
         )
         .unwrap();
-        assert_eq!(legacy.folder, None, "pre-folder reconnect records still load");
+        assert_eq!(
+            legacy.folder, None,
+            "pre-folder reconnect records still load"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

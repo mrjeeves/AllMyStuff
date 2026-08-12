@@ -75,7 +75,21 @@ impl DriveMounts {
         if let Some(existing) = self.active.lock().get(&route) {
             return Ok(existing.info.clone());
         }
-        let mount = choose_mount(&requested_mount, &self.list()).await?;
+        let active = self.list();
+        #[cfg(windows)]
+        if let Some(requested) = normalize_requested_mount(&requested_mount)? {
+            // A reconnect is allowed to reclaim only a letter carrying our
+            // private lease marker. This is the half-open state produced when
+            // Windows remembers a dead WebDAV mapping after the old route and
+            // listener are gone. Never touch a user's unrelated mapping.
+            if !active
+                .iter()
+                .any(|entry| entry.mount.eq_ignore_ascii_case(&requested))
+            {
+                reclaim_stale_owned_mount(&requested).await?;
+            }
+        }
+        let mount = choose_mount(&requested_mount, &active).await?;
         wait_for_route(&mesh, &route).await?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -124,6 +138,11 @@ impl DriveMounts {
         }
         if let Err(error) = mount_native(&mount, &url).await {
             server_task.abort();
+            // `net use` can create a reconnecting/remembered entry before it
+            // reports failure. Remove that partial mapping now; otherwise the
+            // next retry sees its own letter as occupied and Explorer keeps a
+            // ghost drive around.
+            let _ = unmount_native(&mount).await;
             // `label_native` may have written only part of its registry state
             // before failing; cleanup is deliberately unconditional.
             let _ = clear_native_label(&mount, Some(port)).await;
@@ -173,19 +192,7 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
-        let requested = requested.trim().trim_end_matches(['\\', '/']);
-        if !requested.is_empty() {
-            let mut chars = requested.chars();
-            let Some(letter) = chars.next().map(|letter| letter.to_ascii_uppercase()) else {
-                return Err("choose a drive letter".into());
-            };
-            if !letter.is_ascii_alphabetic()
-                || !matches!(chars.next(), Some(':'))
-                || chars.next().is_some()
-            {
-                return Err("drive letter must look like X:".into());
-            }
-            let mount = format!("{letter}:");
+        if let Some(mount) = normalize_requested_mount(requested)? {
             if !mount_available(&mount, active, &remembered) {
                 return Err(format!("{mount} is already in use"));
             }
@@ -204,6 +211,22 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
         let _ = (requested, active);
         Err("native drive mounting is currently available on Windows".into())
     }
+}
+
+fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> {
+    let requested = requested.trim().trim_end_matches(['\\', '/']);
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let mut chars = requested.chars();
+    let Some(letter) = chars.next().map(|letter| letter.to_ascii_uppercase()) else {
+        return Err("choose a drive letter".into());
+    };
+    if !letter.is_ascii_alphabetic() || !matches!(chars.next(), Some(':')) || chars.next().is_some()
+    {
+        return Err("drive letter must look like X:".into());
+    }
+    Ok(Some(format!("{letter}:")))
 }
 
 #[cfg(windows)]
@@ -247,6 +270,40 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
         })
         .map(str::to_ascii_uppercase)
         .collect())
+}
+
+#[cfg(windows)]
+async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
+    let letter = mount.trim_end_matches(':');
+    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
+    let marker_query = tokio::process::Command::new("reg.exe")
+        .args(["query", &marker])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect the AllMyStuff drive lease: {error}"))?;
+    if !marker_query.status.success() {
+        return Ok(()); // not ours: ordinary availability checks decide
+    }
+    let port = parse_registry_dword(&marker_query.stdout).and_then(|p| u16::try_from(p).ok());
+    tracing::info!("reclaiming stale AllMyStuff drive mapping {mount}");
+    let _ = unmount_native(mount).await;
+    clear_native_label(mount, port).await?;
+
+    // The Windows redirector may release a disconnected mapping slightly
+    // after `net use /delete` returns. Wait for the provider's own listing,
+    // not a fixed sleep, so reconnects are both fast and deterministic.
+    for _ in 0..30 {
+        if !remembered_network_mounts()
+            .await?
+            .contains(&mount.to_ascii_uppercase())
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "Windows is still releasing {mount}; AllMyStuff will retry"
+    ))
 }
 
 async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
@@ -415,6 +472,14 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
     let drive_icon_key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
+    // `/persistent:no` should avoid this key, but a failed or interrupted
+    // WebDAV redirector can still leave one behind. This function is called
+    // only for a letter carrying our private lease marker.
+    let network_key = format!(r"HKCU\Network\{letter}");
+    let _ = tokio::process::Command::new("reg.exe")
+        .args(["delete", &network_key, "/f"])
+        .output()
+        .await;
     // A missing key is already the desired state, so deletion is best-effort.
     let _ = tokio::process::Command::new("reg.exe")
         .args(["delete", &drive_icon_key, "/f"])
@@ -807,11 +872,22 @@ fn map_remote_error(reason: &str) -> FsError {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::parse_registry_dword;
+    use super::{normalize_requested_mount, parse_registry_dword};
 
     #[test]
     fn parses_allmystuff_drive_marker_port() {
         let output = b"    Port    REG_DWORD    0xf05d\r\n";
         assert_eq!(parse_registry_dword(output), Some(61_533));
+    }
+
+    #[test]
+    fn requested_drive_letters_are_canonical_and_strict() {
+        assert_eq!(
+            normalize_requested_mount(" x:\\").unwrap(),
+            Some("X:".into())
+        );
+        assert_eq!(normalize_requested_mount("").unwrap(), None);
+        assert!(normalize_requested_mount("XX:").is_err());
+        assert!(normalize_requested_mount("1:").is_err());
     }
 }

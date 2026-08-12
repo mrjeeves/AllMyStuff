@@ -947,10 +947,7 @@ pub async fn dispatch(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            json_result(
-                mesh.folder_open_on(target, source, folder, mount)
-                    .await,
-            )
+            json_result(mesh.folder_open_on(target, source, folder, mount).await)
         }
         "kvm_media_stage" => {
             let source: String = try_arg!(arg(a, "source"));

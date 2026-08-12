@@ -382,10 +382,25 @@ Tauri 2 + Svelte 5, a client of the daemon.
   nothing to do with whether the far app captures its cursor, and tying
   the two meant the only way to drive such an app was to give up your own
   screen. Esc releases the lock and the mode drops with it, so one press
-  hands the cursor back for good. The top bar's gear
-  opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
-  Fleet (the owned roster's shared key + members), and Updates (the
-  `allmystuff-updater` controls). The **Networks** tab is itself split into
+  hands the cursor back for good. A lock request first focuses both the native
+  Tauri window and the stage element; WebKit focus races are caught and leave
+  the mode armed for the next click rather than raising an unhandled rejection.
+  Fullscreen transitions re-pin that same two-layer focus. Hiding the console's
+  control tray disables hit-testing on its transparent layout anchor while the
+  visible tray, tab, and menus opt back in, so the hidden tray never leaves an
+  unclickable strip over the remote picture.
+
+  The top bar's gear opens a unified **Settings panel**
+  (`SettingsPanel.svelte`) with Venues, Meshes, Fleet, Sharing, Devices,
+  Always On, Updates, and a separate Danger Zone (plus the technician-only CEC
+  pane when unlocked). Updates owns the `allmystuff-updater` controls, shows
+  the running GUI version, and carries an installed-component matrix: the node,
+  mesh daemon, AMSTerm, and installed service copy each show Current and Pinned
+  versions with an Update/Repair action. This makes a partial update visible
+  instead of letting the GUI version hide a stale backend. Destructive
+  fleet/network reset actions
+  live in Danger Zone rather than alongside routine update repair. The
+  **Networks** tab is itself split into
   sub-tabs: **Status** (identity, create/join, approvals,
   add-a-device), **Servers** (per-network signaling / STUN / TURN, defaulting
   to MyOwnMesh's reference servers), and **Devices** (every machine and which
@@ -659,7 +674,13 @@ Tauri 2 + Svelte 5, a client of the daemon.
    the bundled clipboard-manager plugin can't touch) is `clipboard-rs`,
    driven on one dedicated thread (`clipboard.rs`) that owns the single
    clipboard context for the app's life, which is what keeps an X11
-   selection served after the paste.
+   selection served after the paste. A desktop drag onto the remote canvas uses
+   Tauri's native file-drop event so trusted local paths never pass through a
+   browser file input: `clipboard_drop` accepts files (not folders), rejects
+   duplicate destination names, and streams them over that existing
+   authenticated route. Once the far OS clipboard points at the staged files,
+   the console sends its normal paste chord at the drop point. Copy/paste and
+   drag/drop therefore share one authorization and transfer implementation.
 
 **A terminal session** is one more route on the same plumbing — and no sshd
 anywhere. A node that can host shells advertises `"terminal"` in its

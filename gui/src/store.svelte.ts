@@ -739,6 +739,7 @@ class AppStore {
   wifiBusy = $state(false);
   wifiError = $state<string | null>(null);
   private wifiPort: number | null = null;
+  private kvmTunnelRepairs = new Map<string, Promise<number | null>>();
   private kvmUpdating = $state<Record<string, boolean>>({});
   /** The latched clock-skew warning: this machine's wall clock is well out
    *  of line with its peers' (estimated passively — no extra calls to any
@@ -5190,18 +5191,29 @@ class AppStore {
     path: string,
     init?: { method?: string; body?: unknown; timeoutMs?: number },
   ): Promise<KvmApiOutcome<T>> {
+    const verb = (init?.method ?? "GET").toUpperCase();
+    // Never discover a stale tunnel by sending a state-changing request. A
+    // harmless version read first exercises (and, below, repairs) the whole
+    // route; only then do we send power, Wi-Fi, update, or reboot commands.
+    if (verb !== "GET") {
+      const probe = await this.kvmApi(nodeId, port, "/api/application/version");
+      if (!probe.rsp) return { rsp: null, timedOut: probe.timedOut, reason: probe.reason };
+      const node = this.node(nodeId);
+      const site = this.kvmWebSite(node);
+      port = (site && this.siteMappingFor(nodeId, site.id)?.localPort) ?? port;
+    }
+
     let out: KvmApiCallResult;
     try {
       out = await kvmApiCall(port, path, init);
     } catch (error) {
       return { rsp: null, timedOut: false, reason: errMsg(error) };
     }
-    // A dead localhost listener is stale mapping state, not a KVM error. This
-    // also repairs machines whose older backend predates site_map's listener
-    // validation: explicitly unmap, rebuild once, and replay only a request
-    // that reqwest confirms never connected (timeouts are deliberately not
-    // replayed because the KVM may already have performed the action).
-    if (out.error?.kind === "connect") {
+    // A stale route can leave localhost listening while every accepted socket
+    // immediately closes, which reqwest reports as `other`, not `connect`.
+    // Any transport failure on this safe GET therefore rebuilds the mapping
+    // once. Mutating requests never enter this replay path.
+    if (out.error && verb === "GET") {
       const repairedPort = await this.repairKvmConsoleMapping(nodeId, port);
       if (repairedPort !== null) {
         try {
@@ -5232,8 +5244,20 @@ class AppStore {
     return { rsp: body as KvmApiRsp<T>, timedOut: false, reason: null };
   }
 
-  /** Drop one refused localhost tunnel and ask the mesh service to recreate it. */
+  /** Drop one stale localhost tunnel and ask the mesh service to recreate it. */
   private async repairKvmConsoleMapping(nodeId: string, failedPort: number): Promise<number | null> {
+    const inflight = this.kvmTunnelRepairs.get(nodeId);
+    if (inflight) return inflight;
+    const repair = this.performKvmConsoleRepair(nodeId, failedPort);
+    this.kvmTunnelRepairs.set(nodeId, repair);
+    try {
+      return await repair;
+    } finally {
+      if (this.kvmTunnelRepairs.get(nodeId) === repair) this.kvmTunnelRepairs.delete(nodeId);
+    }
+  }
+
+  private async performKvmConsoleRepair(nodeId: string, failedPort: number): Promise<number | null> {
     const node = this.node(nodeId);
     const site = this.kvmWebSite(node);
     if (!node || !site || !this.backendConnected) return null;

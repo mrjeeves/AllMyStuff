@@ -421,12 +421,19 @@ pub(crate) fn game_mode() -> bool {
 /// sustains it (damage-driven backends produce less on quiet screens);
 /// the one-shot fallback runs at whatever the platform's screenshot path
 /// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
-/// The automatic fps target with an explicit game posture — the per-route
-/// dial (already OR'd with the env override by [`Tune::game`]).
-pub(crate) fn target_fps_for(link: LinkClass, game: bool) -> u32 {
+/// The automatic fps target for a posture. Balanced deliberately starts at
+/// 30 fps on every link; Game and Studio keep their existing link-aware
+/// cadence. An explicit viewer Tune bypasses this, and the process-wide env
+/// override still wins over every posture.
+pub(crate) fn target_fps_for(link: LinkClass, posture: Posture) -> u32 {
     static FPS: std::sync::LazyLock<Option<u32>> =
         std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
-    FPS.unwrap_or(auto_fps(link, game)).clamp(1, 240)
+    FPS.unwrap_or_else(|| match posture {
+        Posture::Balanced => 30,
+        Posture::Game => auto_fps(link, true),
+        Posture::Studio | Posture::StudioLossless => auto_fps(link, false),
+    })
+    .clamp(1, 240)
 }
 
 /// The automatic cadence: 60 on a LAN — this is a Parsec-tier 4K60 stream;
@@ -473,10 +480,10 @@ fn h264_max_edge() -> u32 {
     *EDGE
 }
 
-/// Target bitrate for one stream's encode, budgeted from what it actually
-/// carries: ~0.16 bits per pixel per frame — the density 1080p30 was
-/// tuned crisp at (10 Mbps) — clamped to 8 Mbps up to a cap the link
-/// class earns. On a LAN pair the cap is 80 Mbps, so a 4K60 desktop
+/// Target bitrate for one stream's encode. Balanced starts at 4 Mbps; the
+/// higher-throughput postures retain the existing pixel budget of ~0.16 bits
+/// per pixel per frame, clamped to 8 Mbps up to a cap the link class earns.
+/// On a LAN pair the cap is 80 Mbps, so a 4K60 desktop
 /// (~80 Mbps at this density) and a 3440×1440@60 ultrawide (~48 Mbps)
 /// reach their budget instead of being pinned at the old 40 Mbps
 /// ceiling, which was *itself* the QP wall that blocked fast motion.
@@ -485,11 +492,14 @@ fn h264_max_edge() -> u32 {
 /// the raised cap WAN-wide without BWE. Explicit viewer Tune bitrates
 /// bypass this entirely.
 /// Override (a fixed bps for every stream): `ALLMYSTUFF_VIDEO_BITRATE`.
-fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass) -> u32 {
+fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass, posture: Posture) -> u32 {
     static OVERRIDE: std::sync::LazyLock<u32> =
         std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_BITRATE", 0));
     if *OVERRIDE > 0 {
         return *OVERRIDE;
+    }
+    if posture == Posture::Balanced {
+        return 4_000_000;
     }
     let cap = match link {
         LinkClass::Lan => 80_000_000,
@@ -639,7 +649,7 @@ impl Tune {
 
     fn fps(&self) -> u32 {
         self.fps
-            .unwrap_or_else(|| target_fps_for(self.link, self.game()))
+            .unwrap_or_else(|| target_fps_for(self.link, self.posture()))
             .clamp(1, 240)
     }
     fn h264_edge(&self) -> u32 {
@@ -4788,7 +4798,7 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
 /// spend up to 250 Mbps on the LAN it's gated to; every other posture
 /// stays under the 80 Mbps stability ceiling.
 fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
-    let auto = h264_bitrate_for(w, h, fps, tune.link);
+    let auto = h264_bitrate_for(w, h, fps, tune.link, tune.posture());
     // Posture sets the auto budget's floor and the ceiling the viewer's
     // Rate pill can reach. Both Studio and Game uncork well past the
     // Balanced stability ceiling:
@@ -5903,7 +5913,7 @@ mod tests {
         assert_eq!(big.h264_edge(), 3840);
         assert_eq!(big.mjpeg_edge(), 3840);
         let auto = Tune::default();
-        assert_eq!(auto.fps(), target_fps_for(LinkClass::Unknown, false));
+        assert_eq!(auto.fps(), 30);
         assert_eq!(auto.h264_edge(), h264_max_edge());
         // Untuned MJPEG defaults to HD, and untuned quality is neutral.
         assert_eq!(auto.mjpeg_edge(), mjpeg_max_edge());
@@ -5911,23 +5921,30 @@ mod tests {
     }
 
     #[test]
-    fn lan_gate_raises_only_the_automatic_dials() {
-        // A LAN link earns the 60 fps / 80 Mbps automatic dials; off-LAN
-        // (and unknown, i.e. ICE not settled or an old daemon) stays at
-        // the conservative 30 / 40 M — the open-loop-transport rule.
-        let lan = Tune {
+    fn balanced_starts_at_four_mbps_and_thirty_fps() {
+        // Balanced is the safe starting point regardless of link or pixels.
+        let balanced_lan = Tune {
             link: LinkClass::Lan,
             ..Tune::default()
         };
-        assert_eq!(lan.fps(), 60);
+        assert_eq!(balanced_lan.fps(), 30);
         assert_eq!(Tune::default().fps(), 30);
-        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Lan), 79_626_240);
+        assert_eq!(tuned_bitrate(balanced_lan, 3840, 2160, 30), 4_000_000);
+        assert_eq!(tuned_bitrate(Tune::default(), 1920, 1080, 30), 4_000_000);
+
+        // Game and Studio retain the existing high-throughput defaults.
+        let game_lan = Tune {
+            mode: Some(Posture::Game),
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        assert_eq!(game_lan.fps(), 60);
         assert_eq!(
-            h264_bitrate_for(3840, 2160, 60, LinkClass::Unknown),
-            40_000_000
+            h264_bitrate_for(3840, 2160, 60, LinkClass::Lan, Posture::Game),
+            79_626_240
         );
-        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Wan), 40_000_000);
-        // An explicit viewer Tune bypasses the gate on any link.
+
+        // Explicit viewer dials still bypass the posture defaults on any link.
         let pinned = Tune {
             fps: Some(48),
             bitrate: Some(60_000_000),
@@ -5935,7 +5952,7 @@ mod tests {
             ..Tune::default()
         };
         assert_eq!(pinned.fps(), 48);
-        assert_eq!(pinned.bitrate, Some(60_000_000));
+        assert_eq!(tuned_bitrate(pinned, 1920, 1080, 48), 60_000_000);
     }
 
     #[test]

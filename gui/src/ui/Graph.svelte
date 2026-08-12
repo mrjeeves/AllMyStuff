@@ -1411,7 +1411,10 @@
   {@const kvmDestination = app.isKvm(n) ? app.kvmTargetNode(n) : undefined}
   {@const driveAllowed = app.isKvm(n)
     ? app.kvmAllowed(n)
-    : app.isMe(n.id) || app.isFleetMember(n.id) || app.filesAllowed(n)}
+    : app.isMe(n.id) ||
+      app.isFleetMember(n.id) ||
+      app.filesAllowed(n) ||
+      app.sharedFoldersFrom(n).length > 0}
   {@const externalInteraction =
     st.app &&
     !st.self &&

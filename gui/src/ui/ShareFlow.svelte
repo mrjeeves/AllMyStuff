@@ -68,25 +68,38 @@
     // A folder id belongs to the machine that minted it, so changing the
     // sender invalidates the pick rather than silently re-aiming it at a
     // folder on a different disk.
-    app.clearShareFolder();
-    chosen = new Set([...chosen].filter((c) => c !== "files" && app.shareFlowCapAvailable(id, c)));
+    app.clearShareFolders();
+    app.clearShareSites();
+    chosen = new Set([...chosen].filter((c) => c !== "files" && c !== "sites" && app.shareFlowCapAvailable(id, c)));
   }
   function pickFleet(nodeId: string) {
     app.shareFlowReceiver = nodeId;
+    app.shareFlowFolders = app.existingShareFolders(sender, nodeId);
+    app.shareFlowSites = app.existingShareSites(sender, nodeId);
+    chosen = new Set(app.existingShareCaps(sender, nodeId));
     picking = null;
+  }
+  async function addFolder() {
+    if (!sender) return;
+    if (app.isMe(sender)) {
+      if (await app.pickLocalShareFolder()) chosen = new Set([...chosen, "files"]);
+    } else {
+      pickingFolder = true;
+    }
   }
   function toggleCap(c: ShareCap) {
     if (!app.shareFlowCapAvailable(sender, c)) return;
     // Sharing a folder means choosing *which* folder — there is no sensible
     // default, and the old toggle's default was the whole disk.
     if (c === "files" && !chosen.has(c)) {
-      pickingFolder = true;
+      void addFolder();
       return;
     }
     const next = new Set(chosen);
     if (next.has(c)) {
       next.delete(c);
-      if (c === "files") app.clearShareFolder();
+      if (c === "files") app.clearShareFolders();
+      if (c === "sites") app.clearShareSites();
       // Turning off Video turns off anything that depends on it (Control).
       for (const dep of CAPS) if (dep.requires === c) next.delete(dep.key);
     } else {
@@ -99,7 +112,14 @@
   }
 
   const selectedLabels = $derived(CAPS.filter((c) => chosen.has(c.key)).map((c) => c.label));
-  const canStart = $derived(!!sender && !!receiver && sender !== receiver && chosen.size > 0);
+  const canStart = $derived(
+    !!sender &&
+      !!receiver &&
+      sender !== receiver &&
+      chosen.size > 0 &&
+      (!chosen.has("files") || app.shareFlowFolders.length > 0) &&
+      (!chosen.has("sites") || app.shareFlowSites.length > 0),
+  );
 
   function start() {
     const n = app.startShareFlow([...chosen]);
@@ -163,29 +183,66 @@
                 onclick={() => toggleCap(c.key)}
               >
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
-                {c.label}{#if c.key === "files" && app.shareFlowFolder}<span class="cap-note">
-                    · {app.shareFlowFolder.label}</span
+                {c.label}{#if c.key === "files" && app.shareFlowFolders.length > 0}<span class="cap-note">
+                    · {app.shareFlowFolders.length} mount{app.shareFlowFolders.length === 1 ? "" : "s"}</span
+                  >{:else if c.key === "sites" && app.shareFlowSites.length > 0}<span class="cap-note">
+                    · {app.shareFlowSites.length} site{app.shareFlowSites.length === 1 ? "" : "s"}</span
                   >{:else if c.note}<span class="cap-note"> · {c.note}</span>{/if}
                 {#if needs}<span class="cap-req">needs Video</span>
                 {:else if c.popout}<span class="cap-pop">popout</span>{/if}
               </button>
             {/each}
           </div>
-          {#if chosen.has("files") && app.shareFlowFolder}
-            <!-- Which folder, spelled out. A grant that says only "Folder"
-                 is one nobody can audit later. -->
-            <button
-              class="folder-line"
-              title="Choose a different folder"
-              onclick={() => (pickingFolder = true)}
-            >
-              <span class="fl-k">Folder</span>
-              <span class="fl-v">{app.shareFlowFolder.label}</span>
-              <span class="fl-change">change</span>
-            </button>
+          {#if chosen.has("files")}
+            <div class="folder-mounts" aria-label="Shared folder mounts">
+              {#each app.shareFlowFolders as folder (folder.id)}
+                <div class="folder-line">
+                  <span class="fl-k" aria-hidden="true">🗂</span>
+                  <span class="fl-v">
+                    <strong>{folder.label}</strong>
+                    <small>{folder.path || "Source path stays private"}</small>
+                  </span>
+                  <button
+                    class="fl-remove"
+                    title={`Remove ${folder.label} from this share`}
+                    aria-label={`Remove ${folder.label} from this share`}
+                    onclick={() => {
+                      app.removeShareFolder(folder.id);
+                      if (app.shareFlowFolders.length === 0) {
+                        chosen = new Set([...chosen].filter((cap) => cap !== "files"));
+                      }
+                    }}
+                  >×</button>
+                </div>
+              {/each}
+              <button class="folder-add" onclick={() => void addFolder()}>
+                <span aria-hidden="true">＋</span> Add folder or drive
+              </button>
+              <p class="folder-privacy">The receiving fleet sees only these mount names, never the source paths.</p>
+            </div>
           {/if}
           {#if app.shareFlowFolderPending}
             <div class="folder-line pending">Sharing that folder…</div>
+          {/if}
+          {#if chosen.has("sites")}
+            <div class="folder-mounts" aria-label="Shared sites">
+              {#each app.availableShareSites() as site (site.id)}
+                {@const selected = app.shareFlowSites.some((item) => item.id === site.id)}
+                <button
+                  class="site-line"
+                  class:selected
+                  aria-pressed={selected}
+                  onclick={() => app.toggleShareSite(site)}
+                >
+                  <span class="site-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                  <span class="fl-v">
+                    <strong>{site.label}</strong>
+                    <small>{site.scheme || "tcp"} · port {site.port}</small>
+                  </span>
+                </button>
+              {/each}
+              <p class="folder-privacy">Only the checked services are visible and reachable to the receiving fleet.</p>
+            </div>
           {/if}
         </section>
 
@@ -215,9 +272,8 @@
         </section>
       </div>
       {#if pickingFolder && sender}
-        <!-- The picker the drive panel already uses: it walks the sender's
-             disk over the ordinary files plane and hands back a path, which
-             we send inward to be minted into an id. -->
+        <!-- A non-local source is browsed over its owner/fleet files plane.
+             This-device sources use the native OS picker instead. -->
         <RemoteFolderPicker
           source={sender}
           onpick={async (path, label) => {
@@ -608,14 +664,16 @@
   .cap-i {
     font-size: 0.95rem;
   }
-  /* Which folder is being shared, under the toggles — a grant that says only
-     "Folder" is one nobody can audit later. */
+  .folder-mounts {
+    display: grid;
+    gap: 0.45rem;
+    margin-top: 0.55rem;
+  }
   .folder-line {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 0.5rem;
     width: 100%;
-    margin-top: 0.5rem;
     padding: 0.4rem 0.6rem;
     border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
     border-radius: var(--r-sm);
@@ -623,7 +681,7 @@
     color: inherit;
     font: inherit;
     text-align: left;
-    cursor: pointer;
+    cursor: default;
   }
   .folder-line.pending {
     cursor: default;
@@ -635,13 +693,78 @@
   }
   .fl-v {
     flex: 1;
+    min-width: 0;
+    display: grid;
+    gap: 0.05rem;
+  }
+  .site-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--line, rgba(255, 255, 255, 0.14));
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .site-line:hover { border-color: var(--c-share); }
+  .site-line.selected {
+    border-color: var(--c-share);
+    background: var(--c-share-soft);
+  }
+  .site-check {
+    display: grid;
+    place-items: center;
+    width: 1.15rem;
+    height: 1.15rem;
+    flex: 0 0 auto;
+    border: 1px solid var(--line-strong);
+    border-radius: 0.3rem;
+    color: var(--c-share-ink);
+    font-size: 0.72rem;
+    font-weight: 900;
+  }
+  .site-line.selected .site-check { border-color: var(--c-share); }
+  .fl-v strong,
+  .fl-v small {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .fl-change {
-    opacity: 0.65;
-    font-size: 0.82em;
+  .fl-v strong { font-size: 0.82rem; }
+  .fl-v small { color: var(--ink-faint); font-size: 0.68rem; }
+  .fl-remove {
+    width: 1.7rem;
+    height: 1.7rem;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--danger, #d85468);
+    font-size: 1.05rem;
+    cursor: pointer;
+  }
+  .fl-remove:hover { background: var(--surface-2); }
+  .folder-add {
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    border: 1px dashed var(--c-share);
+    border-radius: var(--r-sm);
+    background: var(--c-share-soft);
+    color: var(--c-share-ink);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .folder-privacy {
+    margin: 0;
+    color: var(--ink-faint);
+    font-size: 0.68rem;
+    line-height: 1.35;
   }
   .cap-note {
     color: var(--ink-faint);

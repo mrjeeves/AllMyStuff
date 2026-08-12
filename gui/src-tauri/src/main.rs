@@ -229,6 +229,28 @@ async fn folder_open(
     Ok(())
 }
 
+/// Ask one of our own fleet machines to open an opaque folder share directly
+/// from its original source. The GUI coordinates the endpoints; it never
+/// learns the source path or proxies the drive's bytes.
+#[tauri::command]
+async fn folder_open_on(
+    state: State<'_, AppState>,
+    target: String,
+    source: String,
+    folder: String,
+    mount: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "folder_open_on",
+            json!({ "target": target, "source": source, "folder": folder, "mount": mount }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn kvm_media_stage(
     state: State<'_, AppState>,
@@ -2986,6 +3008,7 @@ fn main() {
             drive_map_from,
             folder_share_from,
             folder_open,
+            folder_open_on,
             kvm_media_stage,
             kvm_media_unmount,
             disconnect_route,

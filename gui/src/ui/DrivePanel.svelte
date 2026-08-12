@@ -5,6 +5,7 @@
 
   let { target, supportSession = false }: { target: string; supportSession?: boolean } = $props();
   let pending = $state<{ root: string; label: string; mount: string; source?: string } | null>(null);
+  let pendingShared = $state<{ source: string; folder: { id: string; label: string; path: string }; mount: string; target: string } | null>(null);
   let choosingSource = $state(false);
   let choosingDirection = $state(false);
   let remoteSource = $state<string | null>(null);
@@ -13,6 +14,8 @@
 
   const targetNode = $derived(app.machineByAnyId(target));
   const targetLabel = $derived(targetNode?.label || "that computer");
+  const sharedFolders = $derived(app.sharedFoldersFrom(targetNode));
+  const sharedDestinations = $derived(app.driveTargets.filter((node) => app.isFleetMember(node.id)));
   const mappings = $derived(
     app.driveMappings.filter(
       (mapping) =>
@@ -41,6 +44,27 @@
     requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
   }
 
+  function chooseShared(source: string, folder: { id: string; label: string; path: string }) {
+    const destination = app.isFleetMember(target) ? target : app.localId;
+    pendingShared = { source, folder, mount: "", target: destination };
+    remoteSource = null;
+    requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
+  }
+
+  async function saveShared() {
+    if (!pendingShared || saving) return;
+    saving = true;
+    const draft = pendingShared;
+    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, draft.mount, draft.target);
+    if (done) {
+      pendingShared = null;
+      choosingSource = false;
+      choosingDirection = false;
+      remoteSource = null;
+    }
+    saving = false;
+  }
+
   async function save() {
     if (!pending || saving) return;
     saving = true;
@@ -60,16 +84,16 @@
   function leaveForm(event: FocusEvent) {
     const next = event.relatedTarget as Node | null;
     if (next && formEl?.contains(next)) return;
-    queueMicrotask(() => void save());
+    queueMicrotask(() => void (pendingShared ? saveShared() : save()));
   }
 
 
   $effect(() => {
-    if (!pending) return;
+    if (!pending && !pendingShared) return;
     function saveOnOutside(event: PointerEvent) {
       const element = event.target as Element | null;
       if (element?.closest?.(".drive-menu")) return;
-      void save();
+      void (pendingShared ? saveShared() : save());
     }
     window.addEventListener("pointerdown", saveOnOutside, true);
     return () => window.removeEventListener("pointerdown", saveOnOutside, true);
@@ -109,17 +133,63 @@
     <div class="empty">No drives mapped with this machine.</div>
   {/if}
 
-  {#if remoteSource && !pending}
-    <RemoteFolderPicker
-      source={remoteSource}
-      oncancel={() => (remoteSource = null)}
-      onpick={(root, label) => {
-        pending = { root, label, mount: "", source: remoteSource ?? undefined };
-        remoteSource = null;
-      }}
-    />
+  {#if pendingShared}
+    <form bind:this={formEl} class="map-form" onsubmit={(event) => { event.preventDefault(); void saveShared(); }} onfocusout={leaveForm}>
+      <span class="path">Shared by {app.machineByAnyId(pendingShared.source)?.label || "the other machine"} · source path private</span>
+      <div class="readonly-field">
+        <span>Name</span>
+        <strong class="shared-name">{pendingShared.folder.label}</strong>
+      </div>
+      <label>
+        Mount on
+        <select bind:value={pendingShared.target} aria-label="Fleet machine to receive this drive">
+          <option value={app.localId}>{app.machineByAnyId(app.localId)?.label || "This device"} (this device)</option>
+          {#each sharedDestinations as destination (destination.id)}
+            <option value={destination.id}>{destination.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label>
+        Drive letter
+        <input bind:value={pendingShared.mount} placeholder="Auto — next available" aria-label="Drive letter or mount point" />
+      </label>
+      <div class="form-actions">
+        <button type="button" class="quiet" onclick={() => (pendingShared = null)}>Cancel</button>
+        <button type="submit" class="save" disabled={saving}>{saving ? "Mounting…" : "Mount drive"}</button>
+      </div>
+    </form>
+  {:else if remoteSource && !pending}
+    {@const remoteMounts = app.sharedFoldersFrom(remoteSource)}
+    {#if remoteMounts.length > 0 && !app.isFleetMember(remoteSource)}
+      <div class="source-list">
+        <div class="source-head">Shared drives from {app.machineByAnyId(remoteSource)?.label || "this machine"}</div>
+        {#each remoteMounts as folder (folder.id)}
+          <button disabled={saving} onclick={() => chooseShared(remoteSource!, folder)}>
+            <span aria-hidden="true">🗂</span>
+            <span><strong>{folder.label}</strong><small>Mount on this computer · source path private</small></span>
+            <b>＋</b>
+          </button>
+        {/each}
+        <button class="source-cancel" onclick={() => (remoteSource = null)}>Back</button>
+      </div>
+    {:else}
+      <RemoteFolderPicker
+        source={remoteSource}
+        oncancel={() => (remoteSource = null)}
+        onpick={(root, label) => {
+          pending = { root, label, mount: "", source: remoteSource ?? undefined };
+          remoteSource = null;
+        }}
+      />
+    {/if}
   {:else if choosingDirection && !pending}
     <div class="direction-list">
+      {#each sharedFolders as folder (folder.id)}
+        <button disabled={saving} onclick={() => chooseShared(target, folder)}>
+          <span aria-hidden="true">🗂</span>
+          <span><strong>Mount {folder.label}</strong><small>Shared by {targetLabel} · source path private</small></span>
+        </button>
+      {/each}
       {#if app.filesAllowed(app.machineByAnyId(target) ?? undefined) || supportSession}
         <button onclick={() => { choosingDirection = false; remoteSource = target; }}>
           <span aria-hidden="true">⇣</span>
@@ -132,8 +202,8 @@
           <span><strong>Map a folder onto {targetLabel}</strong><small>Choose a folder from this computer · {supportSession ? "live support session" : "fleet only"}</small></span>
         </button>
       {/if}
-      {#if !app.filesAllowed(app.machineByAnyId(target) ?? undefined) && !app.isFleetMember(target) && !supportSession}
-        <div class="empty">You need Fleet access to map a folder onto {targetLabel}, or Files access to use a folder from it here.</div>
+      {#if sharedFolders.length === 0 && !app.filesAllowed(app.machineByAnyId(target) ?? undefined) && !app.isFleetMember(target) && !supportSession}
+        <div class="empty">No folder or drive has been shared from {targetLabel}.</div>
       {/if}
       <button class="source-cancel" onclick={() => (choosingDirection = false)}>Cancel</button>
     </div>
@@ -143,7 +213,7 @@
       {#each app.driveSources as source (source.id)}
         <button onclick={() => (remoteSource = source.id)}>
           <span aria-hidden="true">🖥</span>
-          <span><strong>{source.label}</strong><small>{app.standingOf(source).kind === "shared" ? "Shared with you" : "Fleet / support access"}</small></span>
+          <span><strong>{source.label}</strong><small>{app.sharedFoldersFrom(source).length > 0 && !app.isFleetMember(source.id) ? `${app.sharedFoldersFrom(source).length} shared mount${app.sharedFoldersFrom(source).length === 1 ? "" : "s"}` : "Fleet / support access"}</small></span>
           <b>›</b>
         </button>
       {/each}
@@ -207,9 +277,11 @@
   .direction-list small { color: #8f94a7; font-size: 10px; }
   .source-cancel { margin-top: 4px; padding: 7px; border: 0; color: #9da2b5; background: transparent; cursor: pointer; }
   .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shared-name { color: #eef0fa; font-size: 12px; text-transform: none; letter-spacing: normal; }
+  .readonly-field { display: grid; gap: 4px; color: var(--muted, #9297aa); font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
   label { display: grid; gap: 4px; color: var(--muted, #9297aa); font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
-  input { min-width: 0; padding: 8px 9px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; outline: none; color: #eef0fa; background: rgba(255,255,255,.055); font: 12px inherit; text-transform: none; letter-spacing: normal; }
-  input:focus { border-color: rgba(86,210,139,.62); box-shadow: 0 0 0 2px rgba(86,210,139,.1); }
+  input, select { min-width: 0; padding: 8px 9px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; outline: none; color: #eef0fa; background: #171925; font: 12px inherit; text-transform: none; letter-spacing: normal; }
+  input:focus, select:focus { border-color: rgba(86,210,139,.62); box-shadow: 0 0 0 2px rgba(86,210,139,.1); }
   .form-actions { display: flex; justify-content: flex-end; gap: 6px; }
   .save, .quiet { padding: 7px 10px; color: #eef0fa; background: rgba(255,255,255,.06); }
   .save { background: rgba(58,178,108,.25); border-color: rgba(86,210,139,.38); }

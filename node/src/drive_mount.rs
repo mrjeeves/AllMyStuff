@@ -213,6 +213,7 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
     }
 }
 
+#[cfg(windows)]
 fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> {
     let requested = requested.trim().trim_end_matches(['\\', '/']);
     if requested.is_empty() {

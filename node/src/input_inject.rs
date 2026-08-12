@@ -133,7 +133,7 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
     // Inbound control is what the user *feels* — keep the injector
     // responsive under exactly the load that made them reach for it.
     crate::os_perf::boost_media_thread();
-    let mut enigo = match Enigo::new(&Settings::default()) {
+    let mut enigo = match Enigo::new(&injector_settings()) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("input injection unavailable on this machine: {e}");
@@ -204,9 +204,13 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 let (gx, gy) = rect.denorm(x, y);
                 move_mouse_global(&mut enigo, gx, gy)
             }
-            // Pointer-lock deltas: raw relative motion, straight through —
+            // Pointer-lock deltas: native relative motion, straight through —
             // games read this as camera movement, so no screen resolve, no
             // clamping, no coalescing beyond what the sender already did.
+            // `injector_settings` is critical on Windows: Enigo otherwise
+            // implements Coordinate::Rel as GetCursorPos + an ABSOLUTE move.
+            // A captured game continually recentres that cursor, so the two
+            // absolute writers fight and aiming only wiggles near centre.
             InputAction::MouseMoveRel { dx, dy } => enigo
                 .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
                 .map_err(|e| e.to_string()),
@@ -252,6 +256,28 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
         if let Err(e) = result {
             tracing::debug!("input injection event failed: {e}");
         }
+    }
+}
+
+/// Configure the OS input backend for both desktop and captured-game motion.
+///
+/// Enigo's Windows default deliberately turns a relative request into an
+/// absolute cursor position so ordinary automation ignores Control Panel mouse
+/// acceleration. That is the opposite of a physical mouse and breaks games
+/// that capture/recentre the cursor. Opt into its real `MOUSEEVENTF_MOVE`
+/// SendInput path; our ordinary console motion remains absolute through
+/// `move_mouse_global`, so this changes only `MouseMoveRel`.
+fn injector_settings() -> Settings {
+    #[cfg(windows)]
+    {
+        Settings {
+            windows_subject_to_mouse_speed_and_acceleration_level: true,
+            ..Settings::default()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Settings::default()
     }
 }
 
@@ -641,6 +667,15 @@ fn map_named(key: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_mouse_uses_native_windows_relative_motion() {
+        assert_eq!(
+            injector_settings().windows_subject_to_mouse_speed_and_acceleration_level,
+            cfg!(windows),
+            "Windows relative input must stay on MOUSEEVENTF_MOVE, never cursor-position emulation",
+        );
+    }
 
     #[test]
     fn printable_keys_inject_as_unicode() {

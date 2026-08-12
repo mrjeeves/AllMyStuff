@@ -23,6 +23,7 @@
   import ModePill from "./ModePill.svelte";
   import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { makeRelativeMotionForwarder } from "../relative-motion";
   import { app } from "../store.svelte";
   import {
     focusThisWindow,
@@ -453,6 +454,7 @@
   let relativeMouse = $state(false);
   function lockChanged() {
     pointerLocked = document.pointerLockElement === stageEl;
+    lockedMotion.reset();
     if (!pointerLocked) relativeMouse = false;
   }
   const wantsCapture = $derived((fullscreen || relativeMouse) && controlActive && !kvmSource);
@@ -509,21 +511,17 @@
   });
 
   let lastMoveAt = 0;
-  /** Pointer Lock's cross-browser contract is the locked element's
-   *  `mousemove` stream. It remains unbounded after the hidden OS cursor would
-   *  have reached a desktop edge; `pointermove` is retained for absolute and
-   *  touch control only. */
+  const lockedMotion = makeRelativeMotionForwarder((dx, dy) => {
+    send({ kind: "mouse_move_rel", dx, dy });
+  });
   function onLockedMouseMove(e: MouseEvent) {
     if (!pointerLocked || !controlActive || kvmSource) return;
-    if (e.movementX !== 0 || e.movementY !== 0) {
-      send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
-    }
+    lockedMotion.forward(e, "mouse");
   }
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
     if (pointerLocked && !kvmSource) {
-      // The paired MouseEvent owns relative motion so engines that dispatch
-      // both event families never duplicate a delta.
+      lockedMotion.forward(e, "pointer");
       return;
     }
     // Only a drag carries focus — see the console's pointer-move note. A

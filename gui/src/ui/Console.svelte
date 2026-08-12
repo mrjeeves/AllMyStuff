@@ -1678,6 +1678,16 @@
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
+  /** Pointer Lock guarantees its unbounded deltas on `mousemove`. Keep that
+   *  path separate from `pointermove`: the latter is not Pointer Lock's
+   *  delivery contract and may retain bounded cursor semantics in an embedded
+   *  engine, while locked MouseEvents keep reporting movement indefinitely. */
+  function onLockedMouseMove(e: MouseEvent) {
+    if (!pointerLocked || !stagePointerActive || kvmSource) return;
+    if (e.movementX !== 0 || e.movementY !== 0) {
+      app.sendConsoleInput({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+    }
+  }
   // Mouse-drag panning of a zoomed picture while control is off — the
   // only time a mouse drag means the VIEW and not the remote.
   let panFrom: { x: number; y: number; vx: number; vy: number } | null = null;
@@ -1687,10 +1697,8 @@
       return;
     }
     if (pointerLocked && stagePointerActive && !kvmSource) {
-      // Raw deltas, no throttle — the aiming path.
-      if (e.movementX !== 0 || e.movementY !== 0) {
-        app.sendConsoleInput({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
-      }
+      // The paired MouseEvent owns locked relative motion. Returning here is
+      // important: engines that emit both event families must send one delta.
       return;
     }
     // Keep keyboard focus on the stage whenever control is on (even over a
@@ -2024,6 +2032,7 @@
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
         use:touchGuard
+        onmousemove={onLockedMouseMove}
         onpointermove={onPointerMove}
         onpointerdown={(e) => onPointerButton(e, true)}
         onpointerup={(e) => onPointerButton(e, false)}

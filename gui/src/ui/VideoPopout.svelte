@@ -506,14 +506,21 @@
   });
 
   let lastMoveAt = 0;
+  /** Pointer Lock's cross-browser contract is the locked element's
+   *  `mousemove` stream. It remains unbounded after the hidden OS cursor would
+   *  have reached a desktop edge; `pointermove` is retained for absolute and
+   *  touch control only. */
+  function onLockedMouseMove(e: MouseEvent) {
+    if (!pointerLocked || !controlActive || kvmSource) return;
+    if (e.movementX !== 0 || e.movementY !== 0) {
+      send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+    }
+  }
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
     if (pointerLocked && !kvmSource) {
-      // Raw deltas, uncoalesced beyond the browser's own batching — this
-      // is the aim path; the 16 ms absolute-move throttle doesn't apply.
-      if (e.movementX !== 0 || e.movementY !== 0) {
-        send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
-      }
+      // The paired MouseEvent owns relative motion so engines that dispatch
+      // both event families never duplicate a delta.
       return;
     }
     // Only a drag carries focus — see the console's pointer-move note. A
@@ -588,6 +595,7 @@
   role="application"
   aria-label="Popped-out video{sourceCap ? ` — ${sourceCap.label}` : ''}"
   tabindex={controlActive ? 0 : -1}
+  onmousemove={onLockedMouseMove}
   onpointermove={onPointerMove}
   onpointerdown={(e) => onPointerButton(e, true)}
   onpointerup={(e) => onPointerButton(e, false)}

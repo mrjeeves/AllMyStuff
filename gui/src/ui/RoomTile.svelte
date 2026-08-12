@@ -57,6 +57,57 @@
   const controlRoute = $derived(app.controlRouteTo(member.id));
   const controlActive = $derived(!!controlRoute && route.media === "display" && !popped);
 
+  // Room screen sharing is a real remote-control surface when the sharer also
+  // opened control. Give it the same explicit relative-input mode as the main
+  // console and its popout so shared gameplay is not forced through absolute
+  // pointer coordinates.
+  let pointerLocked = $state(false);
+  let relativeMouse = $state(false);
+  let pointerLockPending = false;
+  function lockChanged() {
+    pointerLocked = document.pointerLockElement === tileEl;
+    if (!pointerLocked) relativeMouse = false;
+  }
+  async function maybePointerLock(relativeIntent = relativeMouse) {
+    const target = tileEl;
+    if (
+      !relativeIntent ||
+      !controlActive ||
+      pointerLocked ||
+      pointerLockPending ||
+      !target
+    ) return;
+    pointerLockPending = true;
+    try {
+      target.focus({ preventScroll: true });
+      if (!document.hasFocus()) void focusThisWindow();
+      if (target !== tileEl || !target.isConnected || !controlActive) return;
+      await target.requestPointerLock();
+    } catch (error) {
+      // Keep the mode armed. A native focus transition can reject the first
+      // request; the next click on the shared screen retries it.
+      console.warn("pointer lock request failed:", error);
+    } finally {
+      pointerLockPending = false;
+    }
+  }
+  function toggleRelativeMouse() {
+    if (pointerLocked) {
+      relativeMouse = false;
+      document.exitPointerLock();
+      return;
+    }
+    relativeMouse = true;
+    void maybePointerLock(true);
+  }
+  $effect(() => {
+    document.addEventListener("pointerlockchange", lockChanged);
+    return () => document.removeEventListener("pointerlockchange", lockChanged);
+  });
+  $effect(() => {
+    if (pointerLocked && !controlActive) document.exitPointerLock();
+  });
+
   async function flipTheater() {
     theater = !theater;
     if (windowed) await toggleWindowFullscreen();
@@ -191,13 +242,26 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
+    if (pointerLocked) return;
     claimFocus();
     const p = norm(e);
     if (p) send({ kind: "mouse_move", x: p.x, y: p.y });
   }
+  function onLockedMouseMove(e: MouseEvent) {
+    if (!controlActive || !pointerLocked) return;
+    if (e.movementX !== 0 || e.movementY !== 0) {
+      send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+    }
+  }
   function onPointerDown(e: PointerEvent) {
     if (!controlActive) return;
     (e.currentTarget as HTMLElement).focus();
+    if (relativeMouse) void maybePointerLock(true);
+    if (pointerLocked) {
+      e.preventDefault();
+      send({ kind: "mouse_button", button: e.button, down: true });
+      return;
+    }
     const p = norm(e);
     if (!p) return;
     send({ kind: "mouse_move", x: p.x, y: p.y });
@@ -205,6 +269,7 @@
   }
   function onPointerUp(e: PointerEvent) {
     if (!controlActive) return;
+    if (pointerLocked) e.preventDefault();
     send({ kind: "mouse_button", button: e.button, down: false });
   }
   function onWheel(e: WheelEvent) {
@@ -241,6 +306,7 @@
   role="application"
   aria-label="{who.who}'s {isCamera ? 'camera' : 'screen'}{who.machine ? ` (${who.machine})` : ''}"
   tabindex={controlActive ? 0 : -1}
+  onmousemove={onLockedMouseMove}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
@@ -275,6 +341,25 @@
          it, popout beside it. Hover-revealed; pointer events stop here so
          a granted control route never sees these clicks. -->
     <div class="corner">
+      {#if controlActive}
+        <button
+          class="corner-btn"
+          class:on={relativeMouse || pointerLocked}
+          title={pointerLocked
+            ? "Release the mouse (Esc)"
+            : relativeMouse
+              ? "Relative mouse is armed — click the screen to capture"
+              : "Capture the mouse — relative motion for a fullscreen app or game"}
+          aria-label="Relative mouse"
+          aria-pressed={relativeMouse || pointerLocked}
+          onpointerdown={(e) => e.stopPropagation()}
+          onpointerup={(e) => e.stopPropagation()}
+          onclick={(e) => {
+            e.stopPropagation();
+            toggleRelativeMouse();
+          }}>🎯</button
+        >
+      {/if}
       {#if isTauri() && !theater}
         <button
           class="corner-btn"
@@ -425,6 +510,10 @@
   }
   .corner-btn:hover {
     background: rgba(0, 0, 0, 0.8);
+  }
+  .corner-btn.on {
+    border-color: var(--accent, #4ade80);
+    background: color-mix(in srgb, var(--accent, #4ade80) 28%, rgba(0, 0, 0, 0.75));
   }
 
   /* The way home for a popped-out stream. */

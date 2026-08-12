@@ -457,21 +457,24 @@
   }
   const wantsCapture = $derived((fullscreen || relativeMouse) && controlActive && !kvmSource);
   let pointerLockPending = false;
-  async function maybePointerLock() {
+  async function maybePointerLock(relativeIntent = relativeMouse) {
     const target = stageEl;
-    if (!wantsCapture || pointerLocked || pointerLockPending || !target) return;
+    const captureWanted =
+      (fullscreen || relativeIntent) && controlActive && !kvmSource;
+    if (!captureWanted || pointerLocked || pointerLockPending || !target) return;
 
     pointerLockPending = true;
     try {
       // A click can reach a secondary/fullscreen webview before its native
-      // window has focus. WebKit rejects requestPointerLock in that gap, so
-      // focus the Tauri window and the DOM surface before requesting capture.
+      // window has focus. Ask native focus without awaiting its IPC promise:
+      // awaiting here consumes the click's transient user activation before
+      // WebKit sees requestPointerLock.
       target.focus({ preventScroll: true });
       if (!document.hasFocus()) {
-        await focusThisWindow();
+        void focusThisWindow();
         target.focus({ preventScroll: true });
       }
-      if (!document.hasFocus() || target !== stageEl || !target.isConnected || !wantsCapture) {
+      if (target !== stageEl || !target.isConnected) {
         return;
       }
       await target.requestPointerLock();
@@ -491,7 +494,7 @@
     }
     relativeMouse = true;
     // The click is the user gesture pointer lock needs — grab on it.
-    void maybePointerLock();
+    void maybePointerLock(true);
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
@@ -742,12 +745,14 @@
            cursor. Esc gives the pointer back. -->
       <button
         class="corner-btn"
-        class:on={pointerLocked}
+        class:on={relativeMouse || pointerLocked}
         title={pointerLocked
           ? "Release the mouse (Esc)"
+          : relativeMouse
+            ? "Relative mouse is armed — click the screen to capture"
           : "Capture the mouse — relative motion for a fullscreen app or game"}
         aria-label="Relative mouse"
-        aria-pressed={pointerLocked}
+        aria-pressed={relativeMouse || pointerLocked}
         onpointerdown={(e) => e.stopPropagation()}
         onpointerup={(e) => e.stopPropagation()}
         onclick={(e) => {

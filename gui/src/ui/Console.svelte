@@ -114,6 +114,12 @@
   // (Keys keep the session rule: with control on they always belong to
   // the remote, whichever tab is showing.)
   const stagePointerActive = $derived(app.consoleControl && selected?.media === "display");
+  // Availability is authorization, not current route state. A shared console
+  // may open before its granted control leg has come up; keep relative mode
+  // visible there and let its click turn that leg on.
+  const relativeMouseAvailable = $derived(
+    access.control && selected?.media === "display" && !kvmSource,
+  );
   // Fullscreen ("theater"): the stage takes the whole window over and —
   // windowed — the OS window goes fullscreen too, so exactly this video
   // fills the screen. The bar's ⛶ flips it both ways (no hover-only
@@ -629,9 +635,21 @@
     const p0y = (cy - c.y - view.y) / view.scale;
     setView({ scale: sc, x: cx - c.x - p0x * sc, y: cy - c.y - p0y * sc });
   }
+  const ZOOM_STEP = 0.125;
   function zoomStep(dir: 1 | -1) {
     const c = stageCenter();
-    zoomAt(view.scale * (dir > 0 ? 1.5 : 1 / 1.5), c.x, c.y);
+    // Buttons land on a stable 12.5-point grid: 100, 112.5, 125… If a
+    // freeform pinch/trackpad gesture left the view between ticks, the next
+    // button press moves to the nearest tick in that direction.
+    const ticks = (view.scale - 1) / ZOOM_STEP;
+    const nextTick = dir > 0
+      ? Math.floor(ticks + 1e-6) + 1
+      : Math.ceil(ticks - 1e-6) - 1;
+    zoomAt(1 + nextTick * ZOOM_STEP, c.x, c.y);
+  }
+  function zoomPercent(scale: number): string {
+    const value = Math.round(scale * 1000) / 10;
+    return Number.isInteger(value) ? `${value}%` : `${value.toFixed(1)}%`;
   }
   function resetView() {
     view = { scale: 1, x: 0, y: 0 };
@@ -1624,22 +1642,33 @@
    *  a KVM source has no pointer to capture. */
   const wantsCapture = $derived((theater || relativeMouse) && stagePointerActive && !kvmSource);
   let pointerLockPending = false;
-  async function maybePointerLock() {
+  async function maybePointerLock(relativeIntent = relativeMouse) {
     const target = stageEl;
-    if (!wantsCapture || pointerLocked || pointerLockPending || !target) return;
+    // Read the click's intent directly. Svelte derives flush after the event;
+    // gating this user-activation call only through `wantsCapture` could still
+    // see the pre-click false value and silently spend the one valid gesture.
+    const captureWanted =
+      (theater || relativeIntent) &&
+      app.consoleControl &&
+      selected?.media === "display" &&
+      !kvmSource;
+    if (!captureWanted || pointerLocked || pointerLockPending || !target) return;
 
     pointerLockPending = true;
     try {
       // WebKit rejects pointer lock with WrongDocumentError when the native
       // Tauri window has not finished taking focus. This is easy to hit when
       // clicking into a fullscreen or secondary console. Focus both layers
-      // before asking; the user's click remains the activation for the lock.
+      // before asking. Do not await native focus here: crossing an async IPC
+      // boundary consumes WebKit's transient user activation before
+      // requestPointerLock gets it. The browser remains the final focus gate;
+      // a refusal leaves the mode armed so a click on the stage retries.
       target.focus({ preventScroll: true });
       if (!document.hasFocus()) {
-        await focusThisWindow();
+        void focusThisWindow();
         target.focus({ preventScroll: true });
       }
-      if (!document.hasFocus() || target !== stageEl || !target.isConnected || !wantsCapture) {
+      if (target !== stageEl || !target.isConnected) {
         return;
       }
       await target.requestPointerLock();
@@ -1658,10 +1687,15 @@
       document.exitPointerLock();
       return;
     }
+    // A standing share can authorize control before its route is live. The
+    // relative button is the user's intent to drive, so bring up that already-
+    // granted leg just like the Keyboard & mouse toggle does.
+    if (!app.consoleControl) app.toggleConsoleControl();
+    if (!app.consoleControl) return;
     relativeMouse = true;
     // This click IS the user gesture, so grab now rather than waiting for
     // the next one.
-    void maybePointerLock();
+    void maybePointerLock(true);
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
@@ -2127,7 +2161,7 @@
                   resetView();
                 }}
               >
-                {Math.round(view.scale * 100)}% ✕
+                {zoomPercent(view.scale)} ✕
               </button>
             {/if}
           {:else if selected}
@@ -2346,18 +2380,20 @@
             aria-label="Video menu"
             onclick={() => toggleMenu("video")}>🎚</button
           >
-          {#if stagePointerActive && !kvmSource}
+          {#if relativeMouseAvailable}
             <!-- Relative mouse. Only meaningful over a desktop we're driving:
                  a game on the far side captures its own cursor and wants
                  deltas, not coordinates. Esc gives the pointer back. -->
             <button
               class="kbtn"
-              class:on={pointerLocked}
+              class:on={relativeMouse || pointerLocked}
               title={pointerLocked
                 ? "Release the mouse (Esc)"
+                : relativeMouse
+                  ? "Relative mouse is armed — click the screen to capture"
                 : "Capture the mouse — relative motion for a fullscreen app or game"}
               aria-label="Relative mouse"
-              aria-pressed={pointerLocked}
+              aria-pressed={relativeMouse || pointerLocked}
               onclick={toggleRelativeMouse}>🎯</button
             >
           {/if}
@@ -2659,7 +2695,7 @@
               <div class="zoom-row" role="group" aria-label="Zoom">
                 <span class="zlabel">Zoom</span>
                 <button class="zbtn" aria-label="Zoom out" onclick={() => zoomStep(-1)}>−</button>
-                <span class="znow">{Math.round(view.scale * 100)}%</span>
+                <span class="znow">{zoomPercent(view.scale)}</span>
                 <button class="zbtn" aria-label="Zoom in" onclick={() => zoomStep(1)}>+</button>
                 {#if view.scale > 1.001}
                   <button class="zreset" onclick={resetView}>Reset</button>

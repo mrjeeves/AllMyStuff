@@ -4865,6 +4865,46 @@ impl Mesh {
         Err("the source didn't offer that folder — the share may have been withdrawn".into())
     }
 
+    /// Ask another machine in this fleet to mount a folder shared with the
+    /// fleet by an outside peer.
+    ///
+    /// This is deliberately orchestration, not proxying: the destination
+    /// contacts `source` itself and opens the opaque folder capability there.
+    /// Consequently the controller never learns the source path and never
+    /// sits in the data path. The destination accepts this command only from
+    /// its owner/fleet, while the source independently checks that the
+    /// destination is covered by the standing folder grant.
+    pub async fn folder_open_on(
+        self: &Arc<Self>,
+        target: String,
+        source: String,
+        folder: String,
+        mount: String,
+    ) -> Result<(), String> {
+        let target = pubkey_part(&node_of(&target)).to_string();
+        if target.is_empty() {
+            return Err("choose a fleet machine to receive the drive".into());
+        }
+        if folder.trim().is_empty() {
+            return Err("no folder named".into());
+        }
+        if self
+            .local_node_id()
+            .is_some_and(|me| same_node(&target, &me))
+        {
+            return self.folder_open(source, folder, mount).await;
+        }
+        self.send_control(
+            &target,
+            &ControlMessage::App(AppControl::MountSharedFolder {
+                source,
+                folder,
+                mount,
+            }),
+        )
+        .await
+    }
+
     /// Share one of this machine's folders, returning its minted record. The
     /// id is what a grant gets pinned to; the path stays here.
     pub fn folder_share(&self, path: String, label: String) -> Result<Value, String> {
@@ -7570,6 +7610,26 @@ impl Mesh {
                         // purpose: a peer learns nothing about which folder
                         // ids exist from a request that goes unanswered.
                         tracing::warn!("shared folder request refused: {error}");
+                    }
+                });
+            }
+            AppControl::MountSharedFolder {
+                source,
+                folder,
+                mount,
+            } => {
+                // Owner/fleet only via the default app-control gate. This
+                // machine now asks the original source directly; the source
+                // applies the narrower standing-folder grant to our
+                // authenticated node id before offering any bytes.
+                tracing::info!(
+                    "fleet peer {} asked this machine to mount shared folder {folder}",
+                    short_id(from.as_str())
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    if let Err(error) = mesh.folder_open(source, folder, mount).await {
+                        tracing::warn!("fleet shared-folder mount failed: {error}");
                     }
                 });
             }

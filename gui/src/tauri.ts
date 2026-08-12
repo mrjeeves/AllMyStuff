@@ -394,6 +394,20 @@ export async function openSharedFolder(
   await invoke("folder_open", { source, folder, mount });
 }
 
+/** Ask `target`, one of our own fleet machines, to mount an opaque folder
+ *  share directly from its original `source`. No source path crosses either
+ *  fleet boundary and this computer does not proxy the drive. */
+export async function openSharedFolderOn(
+  target: string,
+  source: string,
+  folder: string,
+  mount: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("folder_open_on", { target, source, folder, mount });
+}
+
 export async function stageKvmMedia(
   source: string,
   kvm: string,

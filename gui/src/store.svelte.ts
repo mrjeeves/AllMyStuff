@@ -152,6 +152,7 @@ import {
   clipboardPull,
   shareFolderFrom,
   openSharedFolder,
+  openSharedFolderOn,
   sendInput,
   debugLoggingGet,
   debugLoggingSet,
@@ -4708,10 +4709,22 @@ class AppStore {
     source: string,
     folder: SharedFolderMount,
     mount = "",
+    target = this.localId,
   ): Promise<boolean> {
+    const destination = this.machineByAnyId(target);
+    const local = this.isMe(target);
+    if (!local && (!destination?.online || !this.isFleetMember(destination.id))) {
+      this.toast("warn", "A shared drive can only be mounted on an online machine in your fleet");
+      return false;
+    }
     try {
-      await openSharedFolder(source, folder.id, mount);
-      this.toast("ok", `${folder.label} is connecting to this computer`);
+      if (local) {
+        await openSharedFolder(source, folder.id, mount);
+      } else {
+        await openSharedFolderOn(destination!.id, source, folder.id, mount);
+      }
+      const targetLabel = local ? "this computer" : destination!.label;
+      this.toast("ok", `${folder.label} is connecting to ${targetLabel}`);
       return true;
     } catch (error) {
       this.toast("warn", `Couldn't mount ${folder.label}: ${error}`);

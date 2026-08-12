@@ -938,6 +938,20 @@ pub async fn dispatch(
                 .to_string();
             json_result(mesh.folder_open(source, folder, mount).await)
         }
+        "folder_open_on" => {
+            let target: String = try_arg!(arg(a, "target"));
+            let source: String = try_arg!(arg(a, "source"));
+            let folder: String = try_arg!(arg(a, "folder"));
+            let mount: String = a
+                .get("mount")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            json_result(
+                mesh.folder_open_on(target, source, folder, mount)
+                    .await,
+            )
+        }
         "kvm_media_stage" => {
             let source: String = try_arg!(arg(a, "source"));
             let kvm: String = try_arg!(arg(a, "kvm"));

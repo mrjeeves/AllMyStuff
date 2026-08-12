@@ -733,6 +733,19 @@ pub enum AppControl {
         mount: String,
         request: String,
     },
+    /// Ask one of the requester's own fleet machines to mount a folder that a
+    /// third-party fleet shared with the requester. The destination asks the
+    /// original source directly by opaque folder id, so the controller never
+    /// proxies bytes and no source path appears at either fleet boundary.
+    /// The normal owner/fleet app-control gate protects this command; the
+    /// source independently verifies that the destination belongs to the
+    /// fleet covered by the standing folder grant.
+    MountSharedFolder {
+        source: String,
+        folder: String,
+        #[serde(default)]
+        mount: String,
+    },
     /// Ask one of *my own* machines to start sharing one of its folders, and
     /// report back the id it minted.
     ///
@@ -1498,6 +1511,22 @@ mod tests {
         assert!(s.contains("\"kind\":\"upgrade\""));
         let back: ControlMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn fleet_shared_folder_mount_round_trips_without_a_source_path() {
+        let msg = ControlMessage::App(AppControl::MountSharedFolder {
+            source: "outside-fleet-node".into(),
+            folder: "opaque-folder-id".into(),
+            mount: "X:".into(),
+        });
+        let encoded = serde_json::to_string(&msg).unwrap();
+        assert!(encoded.contains("\"kind\":\"mount_shared_folder\""));
+        assert!(!encoded.contains("source_path"));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            msg
+        );
     }
 
     #[test]

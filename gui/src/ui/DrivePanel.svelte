@@ -5,7 +5,7 @@
 
   let { target, supportSession = false }: { target: string; supportSession?: boolean } = $props();
   let pending = $state<{ root: string; label: string; mount: string; source?: string } | null>(null);
-  let pendingShared = $state<{ source: string; folder: { id: string; label: string; path: string }; mount: string } | null>(null);
+  let pendingShared = $state<{ source: string; folder: { id: string; label: string; path: string }; mount: string; target: string } | null>(null);
   let choosingSource = $state(false);
   let choosingDirection = $state(false);
   let remoteSource = $state<string | null>(null);
@@ -15,6 +15,7 @@
   const targetNode = $derived(app.machineByAnyId(target));
   const targetLabel = $derived(targetNode?.label || "that computer");
   const sharedFolders = $derived(app.sharedFoldersFrom(targetNode));
+  const sharedDestinations = $derived(app.driveTargets.filter((node) => app.isFleetMember(node.id)));
   const mappings = $derived(
     app.driveMappings.filter(
       (mapping) =>
@@ -44,7 +45,8 @@
   }
 
   function chooseShared(source: string, folder: { id: string; label: string; path: string }) {
-    pendingShared = { source, folder, mount: "" };
+    const destination = app.isFleetMember(target) ? target : app.localId;
+    pendingShared = { source, folder, mount: "", target: destination };
     remoteSource = null;
     requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
   }
@@ -53,7 +55,7 @@
     if (!pendingShared || saving) return;
     saving = true;
     const draft = pendingShared;
-    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, draft.mount);
+    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, draft.mount, draft.target);
     if (done) {
       pendingShared = null;
       choosingSource = false;
@@ -138,6 +140,15 @@
         <span>Name</span>
         <strong class="shared-name">{pendingShared.folder.label}</strong>
       </div>
+      <label>
+        Mount on
+        <select bind:value={pendingShared.target} aria-label="Fleet machine to receive this drive">
+          <option value={app.localId}>{app.machineByAnyId(app.localId)?.label || "This device"} (this device)</option>
+          {#each sharedDestinations as destination (destination.id)}
+            <option value={destination.id}>{destination.label}</option>
+          {/each}
+        </select>
+      </label>
       <label>
         Drive letter
         <input bind:value={pendingShared.mount} placeholder="Auto — next available" aria-label="Drive letter or mount point" />
@@ -269,8 +280,8 @@
   .shared-name { color: #eef0fa; font-size: 12px; text-transform: none; letter-spacing: normal; }
   .readonly-field { display: grid; gap: 4px; color: var(--muted, #9297aa); font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
   label { display: grid; gap: 4px; color: var(--muted, #9297aa); font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
-  input { min-width: 0; padding: 8px 9px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; outline: none; color: #eef0fa; background: rgba(255,255,255,.055); font: 12px inherit; text-transform: none; letter-spacing: normal; }
-  input:focus { border-color: rgba(86,210,139,.62); box-shadow: 0 0 0 2px rgba(86,210,139,.1); }
+  input, select { min-width: 0; padding: 8px 9px; border: 1px solid rgba(255,255,255,.13); border-radius: 8px; outline: none; color: #eef0fa; background: #171925; font: 12px inherit; text-transform: none; letter-spacing: normal; }
+  input:focus, select:focus { border-color: rgba(86,210,139,.62); box-shadow: 0 0 0 2px rgba(86,210,139,.1); }
   .form-actions { display: flex; justify-content: flex-end; gap: 6px; }
   .save, .quiet { padding: 7px 10px; color: #eef0fa; background: rgba(255,255,255,.06); }
   .save { background: rgba(58,178,108,.25); border-color: rgba(86,210,139,.38); }

@@ -472,6 +472,16 @@ pub enum ClipboardEvent {
     },
     /// Every chunk delivered — assemble and write to the OS clipboard.
     Close { transfer: u64 },
+    /// Receiver -> sender confirmation for a binary transfer. Sent only by
+    /// peers advertising `clipboard-receipts`; `error = None` means the far
+    /// OS accepted the image/native file list, while `Some` explains why it
+    /// did not. This lets a console wait to inject paste until the destination
+    /// clipboard is genuinely ready.
+    Applied {
+        transfer: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Controller → controlled: read your clipboard *now* and send it back
     /// down this same route. The mirror of the everyday paste flow, for when
     /// someone driving the console copies or cuts **from** the remote
@@ -1273,6 +1283,10 @@ mod tests {
                 data: vec![0xFF, 0x00, 0x10],
             },
             ClipboardEvent::Close { transfer: 7 },
+            ClipboardEvent::Applied {
+                transfer: 7,
+                error: None,
+            },
             // Copy/cut-from-remote request — a fieldless variant.
             ClipboardEvent::Pull,
         ];

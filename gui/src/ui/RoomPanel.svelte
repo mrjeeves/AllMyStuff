@@ -16,7 +16,7 @@
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import { clipboardWrite, toggleWindowFullscreen } from "../tauri";
-  import { humanBytes, isAppNode, type MeshNode } from "../types";
+  import { humanBytes, type MeshNode } from "../types";
   import RoomTile from "./RoomTile.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
@@ -152,8 +152,6 @@
   function memberNote(n: MeshNode | undefined): string | null {
     if (!n) return null;
     if (!app.roomsSupported(n)) return "runs an older AllMyStuff — they won't see invites or chat";
-    if (isAppNode(n) && n.relationship.kind === "unclaimed")
-      return "claim it (or mark it shared) before media can route there";
     return null;
   }
 

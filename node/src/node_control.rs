@@ -879,8 +879,9 @@ pub async fn dispatch(
             let media: String = try_arg!(arg(a, "media"));
             let video: Option<Vec<String>> = try_arg!(opt(a, "video"));
             let session: Option<String> = try_arg!(opt(a, "session"));
+            let room: Option<String> = try_arg!(opt(a, "room"));
             json_result(
-                mesh.connect_term(from, to, media, video.unwrap_or_default(), session)
+                mesh.connect_term_scoped(from, to, media, video.unwrap_or_default(), session, room)
                     .await,
             )
         }
@@ -1271,6 +1272,15 @@ pub async fn dispatch(
             let members: Vec<String> = try_arg!(arg(a, "members"));
             let message: allmystuff_protocol::RoomMessage = try_arg!(arg(a, "message"));
             json_result(mesh.room_send(members, message).await)
+        }
+        "room_scope_set" => {
+            let room: String = try_arg!(arg(a, "room"));
+            let members: Vec<String> = try_arg!(arg(a, "members"));
+            json_result(mesh.room_scope_set(room, members).await)
+        }
+        "room_scope_leave" => {
+            let room: String = try_arg!(arg(a, "room"));
+            json_result(mesh.room_scope_leave(room).await)
         }
         "room_share_files" => {
             let members: Vec<String> = try_arg!(arg(a, "members"));

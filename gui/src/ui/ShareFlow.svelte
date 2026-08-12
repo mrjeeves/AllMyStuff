@@ -24,9 +24,9 @@
     // are still four separate grants underneath — but they were never four
     // separate *decisions*, and offering them separately only ever produced a
     // console that came up half-dead.
-    { key: "console", label: "Remote control", icon: "🕹", note: "screen, sound, keyboard & mouse" },
+    { key: "console", label: "Remote control", icon: "🕹", note: "all screens, sound, keyboard & mouse · camera separate" },
     { key: "terminal", label: "Terminal", icon: "📟", popout: true },
-    { key: "files", label: "Folder", icon: "🗂", popout: true, note: "one folder, not the disk" },
+    { key: "files", label: "Folder", icon: "🗂", popout: true, note: "from this device to their fleet" },
     { key: "sites", label: "Sites", icon: "🌐", popout: true },
   ];
 
@@ -131,8 +131,8 @@
         <!-- Sender (left) — the device making things available, plus the
              capability switches. -->
         <section class="col sender">
-          <div class="col-kicker">Sender</div>
-          <div class="col-sub">Your device sharing its stuff</div>
+          <div class="col-kicker">Source device</div>
+          <div class="col-sub">Choose what this device sends</div>
           {@render senderPicker()}
 
           <div class="sharing-line">
@@ -199,13 +199,13 @@
               if (app.stopShareFlow() > 0) app.closeShareFlow();
             }}
           >⤓ Stop Share</button>
-          <div class="dir">SENDER → RECEIVER</div>
+          <div class="dir">SOURCE → SHARE TO</div>
         </div>
 
         <!-- Receiver (right) -->
         <section class="col receiver">
-          <div class="col-kicker">Receiver fleet</div>
-          <div class="col-sub">The fleet you're granting access to</div>
+          <div class="col-kicker">Share to fleet</div>
+          <div class="col-sub">The people and devices receiving access</div>
           {@render fleetPicker()}
           <p class="note">
             ⓘ This grants the receiving fleet's machines the buttons to open the

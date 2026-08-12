@@ -180,6 +180,7 @@ fn main() {
             audio: Vec::new(),
             session: None,
             drive: None,
+            room: None,
         })),
     );
     fixtures.insert(

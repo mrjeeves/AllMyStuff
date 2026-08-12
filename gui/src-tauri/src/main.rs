@@ -128,12 +128,13 @@ async fn connect_route(
     media: String,
     video: Option<Vec<String>>,
     session: Option<String>,
+    room: Option<String>,
 ) -> Result<String, String> {
     let v = state
         .node
         .request(
             "connect_route",
-            json!({ "from": from, "to": to, "media": media, "video": video, "session": session }),
+            json!({ "from": from, "to": to, "media": media, "video": video, "session": session, "room": room }),
         )
         .await
         .map_err(|e| e.to_string())?;

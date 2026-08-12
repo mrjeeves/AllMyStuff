@@ -151,6 +151,7 @@ import {
   clipboardDrop,
   clipboardPull,
   shareFolderFrom,
+  openSharedFolder,
   sendInput,
   debugLoggingGet,
   debugLoggingSet,
@@ -326,6 +327,7 @@ export type NetworksSubtab = "status" | "servers";
  *  purpose: picking them apart only ever produced a console that came up
  *  half-dead. One toggle, four grants. */
 export type ShareCap = "console" | "terminal" | "files" | "sites";
+export type SharedFolderMount = { id: string; label: string; path: string };
 
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
@@ -783,11 +785,10 @@ class AppStore {
   /** Consoles to pre-toggle when the builder opens — used by "Manage share" to
    *  show what's already granted to that fleet. */
   shareFlowInitialCaps = $state<ShareCap[]>([]);
-  /** The folder the builder's Files toggle is about, once one is picked — the
-   *  minted id is what its grant pins to, so this is what turns "Files" from
-   *  "the whole disk" into "this folder". Null until picked, which is why the
-   *  toggle can't be completed without choosing one. */
-  shareFlowFolder = $state<{ id: string; label: string; path: string } | null>(null);
+  /** The durable, named folders/drives this share exposes. Each minted id is
+   *  opaque outside the source machine; paths are kept only for the local
+   *  builder display and never enter a grant. */
+  shareFlowFolders = $state<SharedFolderMount[]>([]);
   /** Set while the pick is being minted on the device that holds the folder,
    *  so the builder can say it's working rather than look stuck. */
   shareFlowFolderPending = $state(false);
@@ -2833,6 +2834,10 @@ class AppStore {
       this.shareFlowReceiver = this.canReceiveShare(receiver) ? receiver : null;
     }
     this.shareFlowInitialCaps = caps ?? [];
+    this.shareFlowFolders = this.existingShareFolders(
+      this.shareFlowSender,
+      this.shareFlowReceiver,
+    );
     this.shareFlowOpen = true;
   }
   closeShareFlow() {
@@ -2904,21 +2909,49 @@ class AppStore {
     // if it granted anything console-ish at all.
     if (grants.some((g) => forSender(g) && g.media === "display")) out.push("console");
     if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
-    // Re-opening a share whose folder grant is already in place shows the
-    // folder it names, so "Manage share" reads as what was actually shared
-    // rather than a bare toggle with no folder behind it.
-    const folderGrant = grants.find(
-      (g) => forSender(g) && g.media === "storage" && !!g.capability?.includes(":folder:"),
-    );
-    if (folderGrant?.capability) {
-      const id = folderGrant.capability.split(":folder:")[1] ?? "";
-      if (id && !id.includes(":")) {
-        this.shareFlowFolder = { id, label: folderGrant.label || "Shared folder", path: "" };
-      }
-    }
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
     if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
     return out;
+  }
+
+  /** Every standing folder mount granted from `sender` to the receiving
+   *  fleet. Grants carry only an opaque id and a display label; an existing
+   *  share therefore rehydrates without learning or displaying the source
+   *  path. */
+  existingShareFolders(
+    senderId: string | null,
+    receiverNodeId: string | null,
+  ): SharedFolderMount[] {
+    if (!senderId || !receiverNodeId) return [];
+    const recv = this.node(receiverNodeId);
+    if (!recv || recv.relationship.kind !== "shared") return [];
+    const personId = recv.relationship.person.id;
+    const sender = canonicalNodeId(senderId);
+    const mounts = new Map<string, SharedFolderMount>();
+    for (const node of this.catalog.nodes) {
+      if (
+        node.relationship.kind !== "shared" ||
+        node.relationship.person.id !== personId
+      ) continue;
+      for (const grant of node.relationship.grants) {
+        if (grant.media !== "storage" || !grant.capability) continue;
+        if (this.capNodeOf(grant.capability) !== sender) continue;
+        const marker = ":folder:";
+        const at = grant.capability.indexOf(marker);
+        if (at < 0) continue;
+        const id = grant.capability.slice(at + marker.length);
+        if (!id || id.includes(":")) continue;
+        mounts.set(id, { id, label: this.sharedFolderLabel(grant), path: "" });
+      }
+    }
+    return [...mounts.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }
+
+  private sharedFolderLabel(grant: Grant): string {
+    const label = grant.label?.trim() || "Shared folder";
+    const marker = " — share ";
+    const at = label.indexOf(marker);
+    return at >= 0 ? label.slice(at + marker.length) || "Shared folder" : label;
   }
 
   /** Whether the sender can actually offer a given capability — drives which
@@ -2991,7 +3024,11 @@ class AppStore {
         this.toast("warn", "That device couldn't share the folder");
         return false;
       }
-      this.shareFlowFolder = { id: minted.id, label: minted.label || label, path };
+      const folder = { id: minted.id, label: minted.label || label, path };
+      this.shareFlowFolders = [
+        ...this.shareFlowFolders.filter((existing) => existing.id !== folder.id),
+        folder,
+      ];
       return true;
     } catch (error) {
       this.toast("warn", `Couldn't share that folder: ${error}`);
@@ -3001,10 +3038,25 @@ class AppStore {
     }
   }
 
-  /** Forget the picked folder — the builder's Files toggle going off, or the
-   *  sender changing under it (a folder id belongs to one machine). */
-  clearShareFolder() {
-    this.shareFlowFolder = null;
+  /** Pick from this computer with the native OS dialog. Remote owned machines
+   *  still use the mesh folder browser because their filesystem is not local. */
+  async pickLocalShareFolder(): Promise<boolean> {
+    const path = await pickDriveFolder();
+    if (!path) return false;
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    const label = parts.at(-1)?.replace(/:$/, "") || "Shared drive";
+    return this.pickShareFolder(path, label);
+  }
+
+  removeShareFolder(id: string) {
+    this.shareFlowFolders = this.shareFlowFolders.filter((folder) => folder.id !== id);
+  }
+
+  /** Forget all picked folders when the source changes or folder sharing is
+   *  switched off. The durable registry may keep its opaque records, but with
+   *  no grants they authorize and expose nothing. */
+  clearShareFolders() {
+    this.shareFlowFolders = [];
   }
 
   /** The grants one chosen capability mints — a persistent permission for the
@@ -3070,12 +3122,13 @@ class AppStore {
         // is one folder, named by the id its own machine minted, and the
         // sharer's node resolves that id back to a path locally. No path is
         // in the grant, so a grant can't be read as "where their files are".
-        const folder = this.shareFlowFolder;
-        if (!folder) return [];
+        if (this.shareFlowFolders.length === 0) return [];
         // Files move from this source folder TO the receiving fleet. A
         // `provide` grant hosts that folder without implying the destination
         // shares any storage back.
-        return [mk("storage", "provide", `folder:${folder.id}`, `share ${folder.label}`)];
+        return this.shareFlowFolders.map((folder) =>
+          mk("storage", "provide", `folder:${folder.id}`, `share ${folder.label}`),
+        );
       }
       case "terminal":
         return [mk("generic", "provide", "terminal", "use its terminal")];
@@ -3152,8 +3205,8 @@ class AppStore {
     // `shareCapGrants` mints nothing for Files without a folder, which would
     // make the toggle look accepted and hand over precisely nothing. Say so
     // instead — a share nobody can open is worse than a refused one.
-    if (want.has("files") && !this.shareFlowFolder) {
-      this.toast("warn", "Pick the folder to share first");
+    if (want.has("files") && this.shareFlowFolders.length === 0) {
+      this.toast("warn", "Add at least one folder or drive to share first");
       return 0;
     }
     const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
@@ -4339,7 +4392,7 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.filesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet || this.hasShareGrant(node, "files");
+    return ownerIsMe || coFleet;
   }
 
   /** Open the file manager on a remote machine. On the desktop this opens
@@ -4385,7 +4438,11 @@ class AppStore {
    * therefore choose as the source of an inbound native mapping. */
   get driveSources(): MeshNode[] {
     return this.catalog.nodes.filter(
-      (node) => !this.isMe(node.id) && node.online && !this.isKvm(node) && this.filesAllowed(node),
+      (node) =>
+        !this.isMe(node.id) &&
+        node.online &&
+        !this.isKvm(node) &&
+        (this.filesAllowed(node) || this.sharedFoldersFrom(node).length > 0),
     );
   }
 
@@ -4626,6 +4683,42 @@ class AppStore {
     return this.shareGrantsFor(node).filter((grant) => !this.isShareOutGrant(grant));
   }
 
+  /** Named folder mounts this other fleet explicitly shared from `node`.
+   *  The source path is intentionally absent: the opaque folder id is the
+   *  only locator that crosses the fleet boundary. */
+  sharedFoldersFrom(nodeOrId: MeshNode | string | undefined): SharedFolderMount[] {
+    const node = typeof nodeOrId === "string" ? this.machineByAnyId(nodeOrId) : nodeOrId;
+    if (!node || node.relationship.kind !== "shared") return [];
+    const canon = canonicalNodeId(node.id);
+    const mounts = new Map<string, SharedFolderMount>();
+    for (const grant of this.shareInGrantsFor(node)) {
+      if (grant.media !== "storage" || !grant.capability) continue;
+      if (this.capNodeOf(grant.capability) !== canon) continue;
+      const marker = ":folder:";
+      const at = grant.capability.indexOf(marker);
+      if (at < 0) continue;
+      const id = grant.capability.slice(at + marker.length);
+      if (!id || id.includes(":")) continue;
+      mounts.set(id, { id, label: this.sharedFolderLabel(grant), path: "" });
+    }
+    return [...mounts.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }
+
+  async mountSharedFolderFrom(
+    source: string,
+    folder: SharedFolderMount,
+    mount = "",
+  ): Promise<boolean> {
+    try {
+      await openSharedFolder(source, folder.id, mount);
+      this.toast("ok", `${folder.label} is connecting to this computer`);
+      return true;
+    } catch (error) {
+      this.toast("warn", `Couldn't mount ${folder.label}: ${error}`);
+      return false;
+    }
+  }
+
   /** Whether a fleet that shared `node` with me granted me a given console on
    *  it. Direction matters: to *open* their console I need them to PROVIDE
    *  their screen/audio (and CONSUME my input for control) — the opposite of a
@@ -4749,7 +4842,11 @@ class AppStore {
         !self &&
         (!kvm || this.kvmHasNativeScreen(node)) &&
         (mineOrFleet || isCec || this.hasShareGrant(node, "remote")),
-      files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
+      // Whole-machine browsing stays owner/fleet-only. A scoped folder share
+      // appears under Drives as a named native mount instead; treating it as
+      // Files would open a root browser the grant does not (and must not)
+      // authorize.
+      files: this.filesSupported(node) && !self && mineOrFleet,
       terminal:
         this.terminalSupported(node) &&
         (self ? this.localTerminalAllowed : mineOrFleet || this.hasShareGrant(node, "terminal")),

@@ -466,9 +466,7 @@ struct DrivePullRequest {
     label: String,
     mount: String,
     /// Set when this pull asked for a **shared folder** rather than a path.
-    /// A folder pull carries no root — that is the point — so it also
-    /// registers no reconnect: a mapped drive reconnects by re-sending the
-    /// root it remembers, and a folder is re-opened by its id instead.
+    /// A folder pull carries no root — reconnect re-sends this opaque id.
     folder: Option<String>,
     made: Instant,
 }
@@ -479,6 +477,10 @@ struct DriveReconnect {
     root: String,
     label: String,
     mount: String,
+    /// Opaque shared-folder id. Older persisted mappings omit this and keep
+    /// reconnecting by their owner/fleet root path.
+    #[serde(default)]
+    folder: Option<String>,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -3258,12 +3260,16 @@ impl Mesh {
                         };
                         if authorized && is_mapped_drive_route(route) {
                             let reconnect = accepted_drive_pull
-                                .filter(|pull| pull.folder.is_none())
                                 .map(|pull| DriveReconnect {
                                     source: pull.source,
                                     root: pull.root,
-                                    label: pull.label,
+                                    label: if pull.label.is_empty() {
+                                        drive.as_ref().map(|offer| offer.label.clone()).unwrap_or_default()
+                                    } else {
+                                        pull.label
+                                    },
                                     mount: pull.mount,
+                                    folder: pull.folder,
                                 })
                                 .or_else(|| {
                                     let offer = drive.as_ref()?;
@@ -3272,6 +3278,7 @@ impl Mesh {
                                         root: offer.root.clone()?,
                                         label: offer.label.clone(),
                                         mount: offer.mount.clone(),
+                                        folder: None,
                                     })
                                 });
                             if let Some(reconnect) = reconnect {
@@ -5119,15 +5126,23 @@ impl Mesh {
                     if retry_delay != 0 {
                         tokio::time::sleep(Duration::from_millis(retry_delay)).await;
                     }
-                    match mesh
-                        .drive_map_from(
+                    let result = if let Some(folder) = intent.folder.clone() {
+                        mesh.folder_open(
+                            intent.source.clone(),
+                            folder,
+                            intent.mount.clone(),
+                        )
+                        .await
+                    } else {
+                        mesh.drive_map_from(
                             intent.source.clone(),
                             intent.root.clone(),
                             intent.label.clone(),
                             intent.mount.clone(),
                         )
                         .await
-                    {
+                    };
+                    match result {
                         Ok(()) => {
                             mesh.drive_reconnects.lock().remove(&old_route);
                             mesh.persist_drive_reconnects();
@@ -17411,6 +17426,7 @@ mod tests {
             root: "/Volumes/Install Media".into(),
             label: "Windows installer".into(),
             mount: "X:".into(),
+            folder: None,
         };
         let mappings = std::collections::HashMap::from([
             ("route:old".into(), intent.clone()),
@@ -17423,6 +17439,39 @@ mod tests {
         let loaded = super::load_drive_reconnects(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.values().next(), Some(&intent));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shared_folder_mapping_intents_keep_only_the_opaque_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "amst-folder-intents-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        let path = Some(dir.join("allmystuff-drives.json"));
+        let intent = super::DriveReconnect {
+            source: "source-key".into(),
+            root: String::new(),
+            label: "Family photos".into(),
+            mount: "Y:".into(),
+            folder: Some("opaque-folder-id".into()),
+        };
+        let mappings = std::collections::HashMap::from([("route:folder".into(), intent.clone())]);
+
+        assert!(super::persist_drive_reconnects(&path, &mappings));
+        let json = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
+        assert!(json.contains("opaque-folder-id"));
+        assert!(!json.contains("Family photos/"), "no source path is persisted");
+        let loaded = super::load_drive_reconnects(&path);
+        assert_eq!(loaded.values().next(), Some(&intent));
+
+        let legacy: super::DriveReconnect = serde_json::from_str(
+            r#"{"source":"old-source","root":"C:\\Work","label":"Work","mount":"W:"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.folder, None, "pre-folder reconnect records still load");
 
         let _ = std::fs::remove_dir_all(dir);
     }

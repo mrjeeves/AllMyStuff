@@ -19,6 +19,7 @@
   // popped tile holds a big "Return video here" in its middle so a
   // stream lost to another monitor is always one click from home.
   import { makeKeyForwarder } from "../input-keys";
+  import { makeRelativeMotionForwarder } from "../relative-motion";
   import { app } from "../store.svelte";
   import { clientLog, focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
@@ -66,6 +67,7 @@
   let pointerLockPending = false;
   function lockChanged() {
     pointerLocked = document.pointerLockElement === tileEl;
+    lockedMotion.reset();
     if (!pointerLocked) relativeMouse = false;
   }
   async function maybePointerLock(relativeIntent = relativeMouse) {
@@ -242,16 +244,20 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
-    if (pointerLocked) return;
+    if (pointerLocked) {
+      lockedMotion.forward(e, "pointer");
+      return;
+    }
     claimFocus();
     const p = norm(e);
     if (p) send({ kind: "mouse_move", x: p.x, y: p.y });
   }
+  const lockedMotion = makeRelativeMotionForwarder((dx, dy) => {
+    send({ kind: "mouse_move_rel", dx, dy });
+  });
   function onLockedMouseMove(e: MouseEvent) {
     if (!controlActive || !pointerLocked) return;
-    if (e.movementX !== 0 || e.movementY !== 0) {
-      send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
-    }
+    lockedMotion.forward(e, "mouse");
   }
   function onPointerDown(e: PointerEvent) {
     if (!controlActive) return;

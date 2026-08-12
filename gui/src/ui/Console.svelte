@@ -635,9 +635,21 @@
     const p0y = (cy - c.y - view.y) / view.scale;
     setView({ scale: sc, x: cx - c.x - p0x * sc, y: cy - c.y - p0y * sc });
   }
+  const ZOOM_STEP = 0.125;
   function zoomStep(dir: 1 | -1) {
     const c = stageCenter();
-    zoomAt(view.scale * (dir > 0 ? 1.5 : 1 / 1.5), c.x, c.y);
+    // Buttons land on a stable 12.5-point grid: 100, 112.5, 125… If a
+    // freeform pinch/trackpad gesture left the view between ticks, the next
+    // button press moves to the nearest tick in that direction.
+    const ticks = (view.scale - 1) / ZOOM_STEP;
+    const nextTick = dir > 0
+      ? Math.floor(ticks + 1e-6) + 1
+      : Math.ceil(ticks - 1e-6) - 1;
+    zoomAt(1 + nextTick * ZOOM_STEP, c.x, c.y);
+  }
+  function zoomPercent(scale: number): string {
+    const value = Math.round(scale * 1000) / 10;
+    return Number.isInteger(value) ? `${value}%` : `${value.toFixed(1)}%`;
   }
   function resetView() {
     view = { scale: 1, x: 0, y: 0 };
@@ -2149,7 +2161,7 @@
                   resetView();
                 }}
               >
-                {Math.round(view.scale * 100)}% ✕
+                {zoomPercent(view.scale)} ✕
               </button>
             {/if}
           {:else if selected}
@@ -2683,7 +2695,7 @@
               <div class="zoom-row" role="group" aria-label="Zoom">
                 <span class="zlabel">Zoom</span>
                 <button class="zbtn" aria-label="Zoom out" onclick={() => zoomStep(-1)}>−</button>
-                <span class="znow">{Math.round(view.scale * 100)}%</span>
+                <span class="znow">{zoomPercent(view.scale)}</span>
                 <button class="zbtn" aria-label="Zoom in" onclick={() => zoomStep(1)}>+</button>
                 {#if view.scale > 1.001}
                   <button class="zreset" onclick={resetView}>Reset</button>

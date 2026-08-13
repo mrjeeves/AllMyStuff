@@ -331,7 +331,7 @@
   }
   function onPointerUp(e: PointerEvent) {
     if (!controlActive) return;
-    if (pointerLocked) e.preventDefault();
+    if (pointerLocked || nativePointerLocked) e.preventDefault();
     send({ kind: "mouse_button", button: e.button, down: false });
   }
   function onWheel(e: WheelEvent) {

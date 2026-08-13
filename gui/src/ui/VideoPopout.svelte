@@ -590,7 +590,7 @@
     // forward even if the cursor was last over a hover-bar button.
     if (down) stageEl?.focus({ preventScroll: true });
     if (down) void maybePointerLock();
-    if (pointerLocked && !kvmSource) {
+    if ((pointerLocked || nativePointerLocked) && !kvmSource) {
       e.preventDefault();
       send({ kind: "mouse_button", button: e.button, down });
       return;

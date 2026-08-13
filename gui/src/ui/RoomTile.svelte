@@ -21,7 +21,7 @@
   import { makeKeyForwarder } from "../input-keys";
   import { makeRelativeMotionForwarder } from "../relative-motion";
   import { app } from "../store.svelte";
-  import { clientLog, focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
+  import { clientLog, focusThisWindow, isTauri, sendInput, setMacRelativePointerCapture, toggleWindowFullscreen, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
 
   let { route, member, windowed = false }: { route: Route; member: MeshNode; windowed?: boolean } =
@@ -63,12 +63,14 @@
   // console and its popout so shared gameplay is not forced through absolute
   // pointer coordinates.
   let pointerLocked = $state(false);
+  let nativePointerLocked = $state(false);
   let relativeMouse = $state(false);
   let pointerLockPending = false;
   function lockChanged() {
     pointerLocked = document.pointerLockElement === tileEl;
     lockedMotion.reset();
-    if (!pointerLocked) relativeMouse = false;
+    if (pointerLocked && nativePointerLocked) void releaseNativePointerLock(false);
+    if (!pointerLocked && !nativePointerLocked) relativeMouse = false;
   }
   async function maybePointerLock(relativeIntent = relativeMouse) {
     const target = tileEl;
@@ -76,6 +78,7 @@
       !relativeIntent ||
       !controlActive ||
       pointerLocked ||
+      nativePointerLocked ||
       pointerLockPending ||
       !target
     ) return;
@@ -85,18 +88,55 @@
       if (!document.hasFocus()) void focusThisWindow();
       if (target !== tileEl || !target.isConnected || !controlActive) return;
       await target.requestPointerLock();
+      setTimeout(() => {
+        if (relativeMouse && !pointerLocked && !nativePointerLocked) {
+          void activateNativePointerLock(target);
+        }
+      }, 150);
     } catch (error) {
       // Keep the mode armed. A native focus transition can reject the first
       // request; the next click on the shared screen retries it.
       console.warn("pointer lock request failed:", error);
+      await activateNativePointerLock(target);
     } finally {
       pointerLockPending = false;
     }
   }
+  let nativePointerLockPending = false;
+  async function activateNativePointerLock(target = tileEl) {
+    if (!target || pointerLocked || nativePointerLocked || nativePointerLockPending) return;
+    nativePointerLockPending = true;
+    try {
+      const rect = target.getBoundingClientRect();
+      const captured = await setMacRelativePointerCapture(true, {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+      });
+      if (!captured) return;
+      if (pointerLocked || !relativeMouse || !controlActive) {
+        await setMacRelativePointerCapture(false);
+        return;
+      }
+      nativePointerLocked = true;
+      lockedMotion.reset();
+      clientLog("[relative-mouse] macOS native pointer capture active in room share");
+    } finally {
+      nativePointerLockPending = false;
+    }
+  }
+  async function releaseNativePointerLock(disarm = true) {
+    if (disarm) relativeMouse = false;
+    if (!nativePointerLocked) return;
+    nativePointerLocked = false;
+    lockedMotion.reset();
+    await setMacRelativePointerCapture(false);
+  }
+  let nativeEscapeHeld = false;
   function toggleRelativeMouse() {
-    if (pointerLocked) {
+    if (pointerLocked || nativePointerLocked) {
       relativeMouse = false;
-      document.exitPointerLock();
+      if (pointerLocked) document.exitPointerLock();
+      if (nativePointerLocked) void releaseNativePointerLock();
       return;
     }
     relativeMouse = true;
@@ -104,10 +144,19 @@
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
-    return () => document.removeEventListener("pointerlockchange", lockChanged);
+    const lockFailed = () => void activateNativePointerLock();
+    document.addEventListener("pointerlockerror", lockFailed);
+    return () => {
+      document.removeEventListener("pointerlockchange", lockChanged);
+      document.removeEventListener("pointerlockerror", lockFailed);
+      if (nativePointerLocked) void setMacRelativePointerCapture(false);
+    };
   });
   $effect(() => {
-    if (pointerLocked && !controlActive) document.exitPointerLock();
+    if (!controlActive) {
+      if (pointerLocked) document.exitPointerLock();
+      if (nativePointerLocked) void releaseNativePointerLock();
+    }
   });
 
   async function flipTheater() {
@@ -122,6 +171,13 @@
   });
 
   function onWindowKey(e: KeyboardEvent) {
+    if (nativePointerLocked && e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      nativeEscapeHeld = true;
+      void releaseNativePointerLock();
+      return;
+    }
     // Esc leaves fullscreen — unless control is granted, where every key
     // belongs to the far machine (the hover ⛶ exits instead).
     if (theater && !controlActive && e.key === "Escape") {
@@ -244,7 +300,7 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
-    if (pointerLocked) {
+    if (pointerLocked || nativePointerLocked) {
       lockedMotion.forward(e, "pointer");
       return;
     }
@@ -256,14 +312,14 @@
     send({ kind: "mouse_move_rel", dx, dy });
   });
   function onLockedMouseMove(e: MouseEvent) {
-    if (!controlActive || !pointerLocked) return;
+    if (!controlActive || (!pointerLocked && !nativePointerLocked)) return;
     lockedMotion.forward(e, "mouse");
   }
   function onPointerDown(e: PointerEvent) {
     if (!controlActive) return;
     (e.currentTarget as HTMLElement).focus();
     if (relativeMouse) void maybePointerLock(true);
-    if (pointerLocked) {
+    if (pointerLocked || nativePointerLocked) {
       e.preventDefault();
       send({ kind: "mouse_button", button: e.button, down: true });
       return;
@@ -291,12 +347,27 @@
 
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!controlActive) return;
+    if (e.key === "Escape" && (nativePointerLocked || nativeEscapeHeld)) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (down) {
+        nativeEscapeHeld = true;
+        void releaseNativePointerLock();
+      } else {
+        nativeEscapeHeld = false;
+      }
+      return;
+    }
     e.preventDefault();
     keys.onKey(e, down);
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} />
+<svelte:window
+  onkeydown={onWindowKey}
+  onmousemove={onLockedMouseMove}
+  onblur={() => void releaseNativePointerLock()}
+/>
 
 <!-- role=application: like the console stage, a screen-share tile with
      control on is a remote-desktop surface — every pointer/key goes to
@@ -312,7 +383,6 @@
   role="application"
   aria-label="{who.who}'s {isCamera ? 'camera' : 'screen'}{who.machine ? ` (${who.machine})` : ''}"
   tabindex={controlActive ? 0 : -1}
-  onmousemove={onLockedMouseMove}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
@@ -350,14 +420,14 @@
       {#if controlActive}
         <button
           class="corner-btn"
-          class:on={relativeMouse || pointerLocked}
-          title={pointerLocked
+          class:on={pointerLocked || nativePointerLocked}
+          title={pointerLocked || nativePointerLocked
             ? "Release the mouse (Esc)"
             : relativeMouse
               ? "Relative mouse is armed — click the screen to capture"
               : "Capture the mouse — relative motion for a fullscreen app or game"}
           aria-label="Relative mouse"
-          aria-pressed={relativeMouse || pointerLocked}
+          aria-pressed={pointerLocked || nativePointerLocked}
           onpointerdown={(e) => e.stopPropagation()}
           onpointerup={(e) => e.stopPropagation()}
           onclick={(e) => {

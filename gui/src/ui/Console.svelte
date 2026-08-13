@@ -31,6 +31,7 @@
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
   import {
+    clientLog,
     closeThisWindow,
     focusThisWindow,
     isMobile,
@@ -38,6 +39,7 @@
     onNativeFileDrag,
     onThisWindowClose,
     refreshRoute,
+    setMacRelativePointerCapture,
     sendVideoFeedback,
     toggleWindowFullscreen,
     watchVideo,
@@ -1619,6 +1621,7 @@
   // "fullscreen game doesn't capture the cursor" field report. Esc (the
   // browser's own gesture) releases; leaving theater or control drops it.
   let pointerLocked = $state(false);
+  let nativePointerLocked = $state(false);
   // Relative mouse, asked for deliberately rather than inferred from theater.
   //
   // A remote fullscreen app or game captures the mouse on ITS machine: it
@@ -1637,7 +1640,8 @@
   function lockChanged() {
     pointerLocked = document.pointerLockElement === stageEl;
     lockedMotion.reset();
-    if (!pointerLocked) relativeMouse = false;
+    if (pointerLocked && nativePointerLocked) void releaseNativePointerLock(false);
+    if (!pointerLocked && !nativePointerLocked) relativeMouse = false;
   }
   /** Whether capture is wanted at all right now — theater as before, or an
    *  explicit relative-mouse session. Control over a real desktop either way;
@@ -1654,7 +1658,7 @@
       app.consoleControl &&
       selected?.media === "display" &&
       !kvmSource;
-    if (!captureWanted || pointerLocked || pointerLockPending || !target) return;
+    if (!captureWanted || pointerLocked || nativePointerLocked || pointerLockPending || !target) return;
 
     pointerLockPending = true;
     try {
@@ -1674,19 +1678,65 @@
         return;
       }
       await target.requestPointerLock();
+      // Older WKWebView builds return `void` before they report success or
+      // failure. If no pointerlock event follows, use the native macOS grab
+      // instead of leaving a permanently-lit but uncaptured switch.
+      setTimeout(() => {
+        if (relativeMouse && !pointerLocked && !nativePointerLocked) {
+          void activateNativePointerLock(target);
+        }
+      }, 150);
     } catch (error) {
       // A focus transition can still win the race on WebKit. Keep relative
       // mode armed so the next click retries, but never turn that expected
       // browser refusal into an unhandled-promise error screen.
       console.warn("pointer lock request failed:", error);
+      await activateNativePointerLock(target);
     } finally {
       pointerLockPending = false;
     }
   }
+  let nativePointerLockPending = false;
+  async function activateNativePointerLock(target = stageEl) {
+    if (!target || pointerLocked || nativePointerLocked || nativePointerLockPending) return;
+    nativePointerLockPending = true;
+    try {
+      const rect = target.getBoundingClientRect();
+      const captured = await setMacRelativePointerCapture(true, {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+      });
+      if (!captured) return;
+      if (
+        pointerLocked ||
+        !relativeMouse ||
+        !app.consoleControl ||
+        selected?.media !== "display" ||
+        kvmSource
+      ) {
+        await setMacRelativePointerCapture(false);
+        return;
+      }
+      nativePointerLocked = true;
+      lockedMotion.reset();
+      clientLog("[relative-mouse] macOS native pointer capture active");
+    } finally {
+      nativePointerLockPending = false;
+    }
+  }
+  async function releaseNativePointerLock(disarm = true) {
+    if (disarm) relativeMouse = false;
+    if (!nativePointerLocked) return;
+    nativePointerLocked = false;
+    lockedMotion.reset();
+    await setMacRelativePointerCapture(false);
+  }
+  let nativeEscapeHeld = false;
   function toggleRelativeMouse() {
-    if (pointerLocked) {
+    if (pointerLocked || nativePointerLocked) {
       relativeMouse = false;
-      document.exitPointerLock();
+      if (pointerLocked) document.exitPointerLock();
+      if (nativePointerLocked) void releaseNativePointerLock();
       return;
     }
     // A standing share can authorize control before its route is live. The
@@ -1701,13 +1751,20 @@
   }
   $effect(() => {
     document.addEventListener("pointerlockchange", lockChanged);
-    return () => document.removeEventListener("pointerlockchange", lockChanged);
+    const lockFailed = () => void activateNativePointerLock();
+    document.addEventListener("pointerlockerror", lockFailed);
+    return () => {
+      document.removeEventListener("pointerlockchange", lockChanged);
+      document.removeEventListener("pointerlockerror", lockFailed);
+      if (nativePointerLocked) void setMacRelativePointerCapture(false);
+    };
   });
   $effect(() => {
     // Losing control (or the desktop under it) releases the capture, and
     // leaving theater releases it only when relative mouse isn't holding it.
-    if (pointerLocked && !wantsCapture) {
-      document.exitPointerLock();
+    if (!wantsCapture) {
+      if (pointerLocked) document.exitPointerLock();
+      if (nativePointerLocked) void releaseNativePointerLock();
     }
   });
 
@@ -1721,7 +1778,7 @@
    *  usable locked stream can arrive as `pointermove`. Feed both through the
    *  compatibility-event de-duplicator. */
   function onLockedMouseMove(e: MouseEvent) {
-    if (!pointerLocked || !stagePointerActive || kvmSource) return;
+    if ((!pointerLocked && !nativePointerLocked) || !stagePointerActive || kvmSource) return;
     lockedMotion.forward(e, "mouse");
   }
   // Mouse-drag panning of a zoomed picture while control is off — the
@@ -1732,7 +1789,7 @@
       touchMouse.move(e);
       return;
     }
-    if (pointerLocked && stagePointerActive && !kvmSource) {
+    if ((pointerLocked || nativePointerLocked) && stagePointerActive && !kvmSource) {
       lockedMotion.forward(e, "pointer");
       return;
     }
@@ -1952,6 +2009,13 @@
   // fullscreen next, then (the popover habit) closes the session; in a
   // window it closes the window too.
   function onWindowKey(e: KeyboardEvent) {
+    if (nativePointerLocked && e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      nativeEscapeHeld = true;
+      void releaseNativePointerLock();
+      return;
+    }
     if (!node || app.consoleControl) return;
     if (e.key === "Escape") {
       if (openMenu) {
@@ -1969,6 +2033,17 @@
   // at the machine.
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node || !app.consoleControl) return;
+    if (e.key === "Escape" && (nativePointerLocked || nativeEscapeHeld)) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (down) {
+        nativeEscapeHeld = true;
+        void releaseNativePointerLock();
+      } else {
+        nativeEscapeHeld = false;
+      }
+      return;
+    }
     e.preventDefault();
     // Send-on-paste: with clipboard passthrough on, a paste pushes this
     // machine's clipboard to the remote first, then replays the paste
@@ -2040,7 +2115,13 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} onresize={clampBarPos} />
+<svelte:window
+  onkeydown={onWindowKey}
+  onmousemove={onLockedMouseMove}
+  onpointerdown={onWindowPointerDown}
+  onresize={clampBarPos}
+  onblur={() => void releaseNativePointerLock()}
+/>
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -2067,7 +2148,6 @@
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
         use:touchGuard
-        onmousemove={onLockedMouseMove}
         onpointermove={onPointerMove}
         onpointerdown={(e) => onPointerButton(e, true)}
         onpointerup={(e) => onPointerButton(e, false)}
@@ -2387,14 +2467,14 @@
                  deltas, not coordinates. Esc gives the pointer back. -->
             <button
               class="kbtn"
-              class:on={relativeMouse || pointerLocked}
-              title={pointerLocked
+              class:on={pointerLocked || nativePointerLocked}
+              title={pointerLocked || nativePointerLocked
                 ? "Release the mouse (Esc)"
                 : relativeMouse
                   ? "Relative mouse is armed — click the screen to capture"
                 : "Capture the mouse — relative motion for a fullscreen app or game"}
               aria-label="Relative mouse"
-              aria-pressed={relativeMouse || pointerLocked}
+              aria-pressed={pointerLocked || nativePointerLocked}
               onclick={toggleRelativeMouse}>🎯</button
             >
           {/if}

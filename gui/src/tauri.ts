@@ -1894,6 +1894,55 @@ export async function focusThisWindow(): Promise<void> {
   }
 }
 
+/** Native fallback for relative mouse capture in macOS WKWebView.
+ *
+ * WebKit's Pointer Lock request can be refused even when the DOM document is
+ * focused. Tauri's macOS window layer can still disassociate the physical
+ * mouse from the cursor, which keeps delivering NSEvent deltas without a
+ * desktop edge. Move the cursor onto the remote surface before grabbing so
+ * its buttons and wheel continue to target that surface. Other platforms keep
+ * using the browser Pointer Lock implementation and report `false` here. */
+export async function setMacRelativePointerCapture(
+  captured: boolean,
+  point?: { x: number; y: number },
+): Promise<boolean> {
+  if (
+    !isTauri() ||
+    typeof navigator === "undefined" ||
+    !/Macintosh|Mac OS X/.test(navigator.userAgent) ||
+    navigator.maxTouchPoints > 2
+  ) {
+    return false;
+  }
+
+  try {
+    const { getCurrentWindow, LogicalPosition } = await import("@tauri-apps/api/window");
+    const win = getCurrentWindow();
+    if (captured) {
+      await win.setFocus();
+      if (point) {
+        await win.setCursorPosition(new LogicalPosition(point.x, point.y));
+      }
+      await win.setCursorGrab(true);
+      try {
+        await win.setCursorVisible(false);
+      } catch (error) {
+        await win.setCursorGrab(false);
+        throw error;
+      }
+    } else {
+      // Reassociate first: a hidden but still-disassociated cursor is much
+      // worse than one briefly visible during release.
+      await win.setCursorGrab(false);
+      await win.setCursorVisible(true);
+    }
+    return true;
+  } catch (error) {
+    console.warn(`native macOS pointer ${captured ? "capture" : "release"} failed:`, error);
+    return false;
+  }
+}
+
 /** Flip this OS window in or out of fullscreen (a room window's
  *  fullscreen control). Resolves to the new state; web mode is a no-op
  *  (the browser owns fullscreen there). */

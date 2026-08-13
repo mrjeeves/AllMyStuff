@@ -1135,6 +1135,26 @@ impl Cec {
         }
     }
 
+    /// Move a session to `state` only while it is still in `expected`.
+    ///
+    /// Dial timeout/cancellation runs concurrently with inbound approval. A
+    /// plain read followed by [`Self::set_session`] could overwrite an approval
+    /// that landed between those operations, so keep the compare and write
+    /// under one lock.
+    pub fn transition_session(&self, session_id: &str, expected: &str, state: &str) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.sessions.get(session_id).map(String::as_str) != Some(expected) {
+            return false;
+        }
+        inner
+            .sessions
+            .insert(session_id.to_string(), state.to_string());
+        if matches!(state, "ended" | "denied") {
+            inner.session_tech.remove(session_id);
+        }
+        true
+    }
+
     /// Bind a session to the technician it authorises (customer side) — called
     /// when the customer approves or auto-approves, so the consent sweep can
     /// later end the right technician's sessions. The tech id is canonicalised,
@@ -1511,6 +1531,19 @@ mod tests {
     // ---- session ↔ technician binding (the consent sweep's teardown map) ----
 
     const TECH_B: &str = "techpubkeybase32cccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn terminal_dial_transition_cannot_overwrite_an_answer() {
+        let cec = Cec::new(None);
+        cec.set_session("waiting", "requested");
+        assert!(cec.transition_session("waiting", "requested", "ended"));
+        assert_eq!(cec.session_state("waiting").as_deref(), Some("ended"));
+
+        cec.set_session("answered", "requested");
+        cec.set_session("answered", "active");
+        assert!(!cec.transition_session("answered", "requested", "ended"));
+        assert_eq!(cec.session_state("answered").as_deref(), Some("active"));
+    }
 
     #[test]
     fn end_sessions_for_returns_only_that_techs_sessions_and_clears_them() {

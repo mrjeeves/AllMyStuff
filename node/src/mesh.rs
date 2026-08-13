@@ -1046,6 +1046,14 @@ const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3
 /// unreachable and the session honestly ends. (Delivery ≠ decision — the
 /// customer can take as long as they like to click once the prompt is up.)
 const CEC_CONNECT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+/// Bound each reliable connect-request attempt so cancellation and a rebuilt
+/// route are observed promptly; the complete dial still gets
+/// [`CEC_CONNECT_TTL`] to converge.
+const CEC_CONNECT_ATTEMPT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// A KVM re-sends its one-shot Approve for every duplicate Request. This beat
+/// closes the gap between daemon delivery acknowledgement and application
+/// acknowledgement without making the KVM persist handshake transport state.
+const CEC_CONNECT_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct State {
     session: Option<Session>,
@@ -6223,15 +6231,12 @@ impl Mesh {
         );
 
         // The connect handshake — the customer's node raises the 3-choice
-        // prompt from this. `connect_peer` above only *initiates* the WebRTC
-        // connection; the daemon's acknowledged-delivery contract does the
-        // rest: the Request is queued until the customer's link is up,
-        // retransmitted across session rebuilds, and the reply resolves only
-        // when the customer's node has actually taken the frame — the 2s
-        // retransmit loop this used to need is the daemon's job now. The
-        // send rides a spawned task so the dial returns immediately; a
-        // delivery failure (TTL, terminal drop) marks the session ended so
-        // the GUI's waiting badge tells the truth instead of hanging.
+        // prompt from this. Reliable delivery gets the Request through link
+        // bring-up and rebuilds, but its acknowledgement means only that the
+        // remote node consumed our Request; it does not acknowledge the remote
+        // application's Approve reply. Both KVM firmwares re-send that reply
+        // when a duplicate Request arrives, so the spawned task below keeps an
+        // application-level heartbeat until this session actually resolves.
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
         self.cec.set_session(&session_id, "requested");
@@ -6249,28 +6254,81 @@ impl Mesh {
             let sid = session_id.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                match mesh
-                    .cec_send_control_acked(&net, &peer, &request, CEC_CONNECT_TTL)
-                    .await
+                let deadline = std::time::Instant::now() + CEC_CONNECT_TTL;
+                let mut delivered = false;
+
+                // Reliable delivery acknowledges that the remote node consumed
+                // our Request, not that we received its application-level
+                // Approve. Bound each attempt so cancellation and rebuilt
+                // routes are observed promptly within the overall dial TTL.
+                while mesh.cec.session_state(&sid).as_deref() == Some("requested")
+                    && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline
                 {
-                    Ok(()) => {
-                        tracing::info!(
-                            "CEC Support: connect request delivered to {}",
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let attempt_ttl = remaining.min(CEC_CONNECT_ATTEMPT_TTL);
+                    match mesh
+                        .cec_send_control_acked(&net, &peer, &request, attempt_ttl)
+                        .await
+                    {
+                        Ok(()) => {
+                            delivered = true;
+                            tracing::info!(
+                                "CEC Support: connect request delivered to {}",
+                                short_id(&peer)
+                            );
+                            break;
+                        }
+                        Err(e) => tracing::warn!(
+                            "cec connect-request delivery attempt failed (will retry): {e}"
+                        ),
+                    }
+                    if !delivered && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(CEC_CONNECT_HEARTBEAT).await;
+                    }
+                }
+
+                // NanoKVM and NanoKVM Pro deliberately keep their approval
+                // reply stateless: each duplicate Request prompts a new
+                // Approve. Continue the idempotent beat until this side has
+                // actually observed Approve, Deny, or End.
+                while delivered
+                    && mesh.cec.session_state(&sid).as_deref() == Some("requested")
+                    && !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    tokio::time::sleep(CEC_CONNECT_HEARTBEAT).await;
+                    if mesh.cec.session_state(&sid).as_deref() != Some("requested")
+                        || cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    if let Err(e) = mesh.cec_send_control(&net, &peer, &request).await {
+                        tracing::warn!("cec connect-request heartbeat failed (will retry): {e}");
+                    }
+                }
+
+                if mesh.cec.session_state(&sid).as_deref() != Some("requested") {
+                    tracing::info!(
+                        "CEC Support: connect session with {} resolved",
+                        short_id(&peer)
+                    );
+                    return;
+                }
+
+                let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
+                if mesh.cec.transition_session(&sid, "requested", "ended") {
+                    if cancelled {
+                        tracing::info!("CEC Support: connect to {} cancelled", short_id(&peer));
+                    } else {
+                        tracing::warn!(
+                            "CEC Support: connect request to {} was never delivered",
                             short_id(&peer)
                         );
                     }
-                    Err(e) => {
-                        // "Stop trying" beat us here, or delivery genuinely
-                        // lapsed — either way the waiting badge clears.
-                        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                            tracing::warn!("cec connect request undelivered: {e}");
-                        }
-                        mesh.cec.set_session(&sid, "ended");
-                        mesh.sink.emit(
-                            "cec://session",
-                            json!({ "session_id": sid, "state": "ended" }),
-                        );
-                    }
+                    mesh.sink.emit(
+                        "cec://session",
+                        json!({ "session_id": sid, "state": "ended" }),
+                    );
                 }
             });
         }

@@ -13100,6 +13100,16 @@ impl Mesh {
             return;
         };
 
+        let (conn, kind) = match &frame.event {
+            SiteEvent::Open { conn, .. } => (*conn, 1),
+            SiteEvent::Data { conn, .. } => (*conn, 2),
+            SiteEvent::Close { conn } => (*conn, 3),
+            SiteEvent::Unknown => (0, 0),
+        };
+        if !self.sites.accept_frame(&frame.route, frame.seq, conn, kind) {
+            return;
+        }
+
         if hosts_here {
             // The proxy *into* this machine — as privileged as the terminal,
             // so the same owner/fleet gate, re-cleared per frame.

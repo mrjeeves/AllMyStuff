@@ -29,7 +29,7 @@
 //! protocol…) keeps flowing both ways for its whole life, exactly as it
 //! would direct. The proxy never interprets the stream; it just carries it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -95,7 +95,27 @@ pub struct SitesProxy {
     conns: Mutex<HashMap<(String, u64), ConnHandle>>,
     /// Client-side mappings, keyed by the site route id.
     mappings: Mutex<HashMap<String, ClientMapping>>,
+    /// Recently delivered site frames per route. The mesh daemon can briefly
+    /// retain overlapping event subscriptions across reconnects, so one wire
+    /// frame may be pushed more than once. Site transport is a byte stream:
+    /// duplicate Data corrupts it and duplicate Open replaces a live conn.
+    seen_frames: Mutex<HashMap<String, FrameWindow>>,
 }
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct FrameKey {
+    seq: u64,
+    conn: u64,
+    kind: u8,
+}
+
+#[derive(Default)]
+struct FrameWindow {
+    seen: HashSet<FrameKey>,
+    order: VecDeque<FrameKey>,
+}
+
+const FRAME_DEDUP_WINDOW: usize = 512;
 
 impl Default for SitesProxy {
     fn default() -> Self {
@@ -118,6 +138,7 @@ impl SitesProxy {
             path,
             conns: Mutex::new(HashMap::new()),
             mappings: Mutex::new(HashMap::new()),
+            seen_frames: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,6 +167,25 @@ impl SitesProxy {
     }
 
     // ---- connection table ---------------------------------------------
+
+    /// Admit this frame once. The bounded arrival-order window tolerates
+    /// interleaved connections without assuming sequence numbers are strictly
+    /// ordered, and route teardown removes the whole incarnation's history.
+    pub fn accept_frame(&self, route: &str, seq: u64, conn: u64, kind: u8) -> bool {
+        let mut routes = self.seen_frames.lock();
+        let window = routes.entry(route.to_string()).or_default();
+        let key = FrameKey { seq, conn, kind };
+        if !window.seen.insert(key) {
+            return false;
+        }
+        window.order.push_back(key);
+        if window.order.len() > FRAME_DEDUP_WINDOW {
+            if let Some(oldest) = window.order.pop_front() {
+                window.seen.remove(&oldest);
+            }
+        }
+        true
+    }
 
     /// Open a connection: if the route is under its [`MAX_CONNS_PER_ROUTE`]
     /// cap, register the inbound channel **now** and hand back its receiver
@@ -264,6 +304,7 @@ impl SitesProxy {
     /// close every connection it carried. Safe on either side, idempotent —
     /// called on unmap and on route teardown.
     pub fn stop_route(&self, route: &str) {
+        self.seen_frames.lock().remove(route);
         if let Some(m) = self.mappings.lock().remove(route) {
             m.accept_handle.abort();
         }
@@ -328,6 +369,7 @@ mod tests {
             path: None, // no disk in the test
             conns: Mutex::new(HashMap::new()),
             mappings: Mutex::new(HashMap::new()),
+            seen_frames: Mutex::new(HashMap::new()),
         };
         assert!(proxy.exposed_map().is_empty());
         assert!(!proxy.is_port_exposed(8080));
@@ -343,6 +385,24 @@ mod tests {
         assert!(!proxy.is_port_exposed(22), "never exposed → never proxied");
     }
 
+    #[test]
+    fn duplicate_frames_are_admitted_once_and_reset_with_route() {
+        let proxy = SitesProxy {
+            exposed: Mutex::new(BTreeMap::new()),
+            path: None,
+            conns: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(HashMap::new()),
+            seen_frames: Mutex::new(HashMap::new()),
+        };
+        let route = "route:site";
+        assert!(proxy.accept_frame(route, 7, 2, 1));
+        assert!(!proxy.accept_frame(route, 7, 2, 1));
+        // Same sequence on a different connection/event is not conflated.
+        assert!(proxy.accept_frame(route, 7, 3, 2));
+        proxy.stop_route(route);
+        assert!(proxy.accept_frame(route, 7, 2, 1));
+    }
+
     #[tokio::test]
     async fn mapping_task_marks_an_exited_accept_task_stale() {
         let proxy = SitesProxy {
@@ -350,6 +410,7 @@ mod tests {
             path: None,
             conns: Mutex::new(HashMap::new()),
             mappings: Mutex::new(HashMap::new()),
+            seen_frames: Mutex::new(HashMap::new()),
         };
         // Keep a finished handle in the mapping exactly like an offer that
         // expired before the host accepted it.

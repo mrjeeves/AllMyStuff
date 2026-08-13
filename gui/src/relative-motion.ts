@@ -48,12 +48,11 @@ export function makeRelativeMotionForwarder(
       }
 
       last = { source, timeStamp: event.timeStamp, dx, dy };
-      // Tauri's macOS cursor grab is expressed in logical window points, and
-      // WKWebView reports the resulting movement in that same coordinate
-      // space. The input wire carries device-pixel deltas, so native capture
-      // supplies the window's live backing scale here (2 on a typical Retina
-      // display). Browser Pointer Lock already owns its platform conversion
-      // and leaves this at the default 1.
+      // MouseEvent movement is expressed in the webview's logical/CSS pixel
+      // space. That is true both for browser Pointer Lock (WebView2 included)
+      // and Tauri's native macOS fallback. The input wire carries device-pixel
+      // deltas, so callers supply the window's live backing scale here (2 on
+      // a typical Retina display, and commonly 1.25/1.5 on Windows).
       const requestedScale = scale();
       const factor = Number.isFinite(requestedScale) && requestedScale > 0 ? requestedScale : 1;
       send(dx * factor, dy * factor);

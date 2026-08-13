@@ -14,7 +14,7 @@ test("forwards browser pointer-lock deltas unchanged by default", () => {
   assert.deepEqual(sent, [[7, -3]]);
 });
 
-test("converts native logical deltas with the live display scale", () => {
+test("converts captured logical deltas with the live display scale", () => {
   const sent = [];
   let displayScale = 2;
   const motion = makeRelativeMotionForwarder(

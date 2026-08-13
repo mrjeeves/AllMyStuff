@@ -312,7 +312,7 @@
     (dx, dy) => {
       send({ kind: "mouse_move_rel", dx, dy });
     },
-    () => (nativePointerLocked ? window.devicePixelRatio : 1),
+    () => window.devicePixelRatio,
   );
   function onLockedMouseMove(e: MouseEvent) {
     if (!controlActive || (!pointerLocked && !nativePointerLocked)) return;

@@ -1775,7 +1775,7 @@
     (dx, dy) => {
       app.sendConsoleInput({ kind: "mouse_move_rel", dx, dy });
     },
-    () => (nativePointerLocked ? window.devicePixelRatio : 1),
+    () => window.devicePixelRatio,
   );
   /** WebView2's unbounded edge stream arrives as `mousemove`; WKWebView's
    *  usable locked stream can arrive as `pointermove`. Feed both through the

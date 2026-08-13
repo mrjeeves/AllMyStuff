@@ -1887,7 +1887,7 @@
     // mouse; while captured, buttons forward raw (no position re-seat —
     // the relative stream owns the cursor).
     if (down) void maybePointerLock();
-    if (pointerLocked && !kvmSource) {
+    if ((pointerLocked || nativePointerLocked) && !kvmSource) {
       e.preventDefault();
       app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
       if (down) heldButtons.add(e.button);

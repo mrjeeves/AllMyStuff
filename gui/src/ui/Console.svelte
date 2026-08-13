@@ -1771,9 +1771,12 @@
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
-  const lockedMotion = makeRelativeMotionForwarder((dx, dy) => {
-    app.sendConsoleInput({ kind: "mouse_move_rel", dx, dy });
-  });
+  const lockedMotion = makeRelativeMotionForwarder(
+    (dx, dy) => {
+      app.sendConsoleInput({ kind: "mouse_move_rel", dx, dy });
+    },
+    () => window.devicePixelRatio,
+  );
   /** WebView2's unbounded edge stream arrives as `mousemove`; WKWebView's
    *  usable locked stream can arrive as `pointermove`. Feed both through the
    *  compatibility-event de-duplicator. */

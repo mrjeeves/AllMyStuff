@@ -173,16 +173,16 @@ node-check:
 node-check:
     @cd node; cargo fmt --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo clippy --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo test
 
-# Typecheck + build the Svelte front-end (no webview needed).
+# Test + typecheck + build the Svelte front-end (no webview needed).
 [unix]
-[doc("Typecheck + build the front-end.")]
+[doc("Test + typecheck + build the front-end.")]
 gui-check:
-    @cd gui && pnpm install --frozen-lockfile && pnpm check && pnpm build
+    @cd gui && pnpm install --frozen-lockfile && pnpm test && pnpm check && pnpm build
 
 [windows]
-[doc("Typecheck + build the front-end.")]
+[doc("Test + typecheck + build the front-end.")]
 gui-check:
-    @cd gui; pnpm install --frozen-lockfile; pnpm check; pnpm build
+    @cd gui; pnpm install --frozen-lockfile; pnpm test; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm build
 
 # Everything CI runs: Rust fmt + clippy + test (library workspace + the node
 # engine), then the GUI typecheck/build.

@@ -559,9 +559,12 @@
   });
 
   let lastMoveAt = 0;
-  const lockedMotion = makeRelativeMotionForwarder((dx, dy) => {
-    send({ kind: "mouse_move_rel", dx, dy });
-  });
+  const lockedMotion = makeRelativeMotionForwarder(
+    (dx, dy) => {
+      send({ kind: "mouse_move_rel", dx, dy });
+    },
+    () => (nativePointerLocked ? window.devicePixelRatio : 1),
+  );
   function onLockedMouseMove(e: MouseEvent) {
     if ((!pointerLocked && !nativePointerLocked) || !controlActive || kvmSource) return;
     lockedMotion.forward(e, "mouse");

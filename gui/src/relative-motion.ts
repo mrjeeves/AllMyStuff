@@ -19,6 +19,7 @@ export interface RelativeMotionForwarder {
 
 export function makeRelativeMotionForwarder(
   send: (dx: number, dy: number) => void,
+  scale: () => number = () => 1,
 ): RelativeMotionForwarder {
   let last:
     | { source: RelativeMotionSource; timeStamp: number; dx: number; dy: number }
@@ -47,7 +48,15 @@ export function makeRelativeMotionForwarder(
       }
 
       last = { source, timeStamp: event.timeStamp, dx, dy };
-      send(dx, dy);
+      // Tauri's macOS cursor grab is expressed in logical window points, and
+      // WKWebView reports the resulting movement in that same coordinate
+      // space. The input wire carries device-pixel deltas, so native capture
+      // supplies the window's live backing scale here (2 on a typical Retina
+      // display). Browser Pointer Lock already owns its platform conversion
+      // and leaves this at the default 1.
+      const requestedScale = scale();
+      const factor = Number.isFinite(requestedScale) && requestedScale > 0 ? requestedScale : 1;
+      send(dx * factor, dy * factor);
     },
     reset() {
       last = undefined;

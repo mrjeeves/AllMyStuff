@@ -308,9 +308,12 @@
     const p = norm(e);
     if (p) send({ kind: "mouse_move", x: p.x, y: p.y });
   }
-  const lockedMotion = makeRelativeMotionForwarder((dx, dy) => {
-    send({ kind: "mouse_move_rel", dx, dy });
-  });
+  const lockedMotion = makeRelativeMotionForwarder(
+    (dx, dy) => {
+      send({ kind: "mouse_move_rel", dx, dy });
+    },
+    () => (nativePointerLocked ? window.devicePixelRatio : 1),
+  );
   function onLockedMouseMove(e: MouseEvent) {
     if (!controlActive || (!pointerLocked && !nativePointerLocked)) return;
     lockedMotion.forward(e, "mouse");

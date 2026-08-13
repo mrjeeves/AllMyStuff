@@ -12,7 +12,7 @@
 
 [package]
 name = "allmystuff-node"
-version = "0.2.74"
+version = "0.2.75"
 description = "AllMyStuff headless mesh node — runs this machine on the mesh (presence + screen/camera/audio/input/terminal/files routes) with no GUI."
 authors = ["Chris Paul"]
 license = "MIT"

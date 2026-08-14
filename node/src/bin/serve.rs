@@ -99,7 +99,7 @@ fn reexec_self() -> ! {
                 // `execve`. Mark the child as our hand-off successor so it
                 // waits for this process to release the one-node control
                 // socket instead of stepping aside as an unrelated duplicate.
-                if let Err(e) = std::process::Command::new(&exe)
+                if let Err(e) = allmystuff_node::child_process::blocking_command(&exe)
                     .args(&args)
                     .env("ALLMYSTUFF_REEXEC_HANDOFF", "1")
                     .spawn()

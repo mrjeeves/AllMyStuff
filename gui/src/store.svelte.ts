@@ -348,6 +348,10 @@ interface KvmApiOutcome<T> {
   reason: string | null;
 }
 
+interface KvmPowerStatus {
+  pwr?: boolean;
+}
+
 function normalizeWifi(data: KvmWifiStatusRaw): KvmWifiStatus {
   const ssid = (data.ssid ?? data.wifi?.ssid ?? "").trim();
   return {
@@ -744,6 +748,13 @@ class AppStore {
   private wifiPort: number | null = null;
   private kvmTunnelRepairs = new Map<string, Promise<number | null>>();
   private kvmUpdating = $state<Record<string, boolean>>({});
+  /** Whether the computer behind each KVM is powered on, read from the KVM's
+   *  physical power-LED input (`GET /api/vm/gpio`). Missing/null means the
+   *  appliance could not be reached, never "off". The graph and every console
+   *  window read this one cache so their green power lamps cannot disagree. */
+  private kvmPower = $state<Record<string, boolean | null>>({});
+  private kvmPowerRefreshes = new Set<string>();
+  private kvmPowerWatchers = new Map<string, { nodeId: string; count: number; nextAt: number }>();
   /** The latched clock-skew warning: this machine's wall clock is well out
    *  of line with its peers' (estimated passively — no extra calls to any
    *  node). Null = in sync (or nothing measurable). Drives the topbar pill;
@@ -1853,6 +1864,12 @@ class AppStore {
     if (!isTauri() || this.meshPoll) return;
     this.meshPoll = setInterval(() => {
       void this.syncMeshGraph();
+      const now = Date.now();
+      for (const [key, watch] of this.kvmPowerWatchers) {
+        if (watch.nextAt > now || this.kvmPowerRefreshes.has(key)) continue;
+        watch.nextAt = now + 6_000;
+        void this.refreshKvmPower(watch.nodeId);
+      }
       // The dialed customers' `online` flags are reconciled by the node against
       // its live peer set on every fetch, but nothing re-fetches them off a
       // cec:// event — and a customer simply going offline fires none. Refresh
@@ -5191,7 +5208,7 @@ class AppStore {
    *  a local listener, then records the mapping. Re-mapping asks the backend
    *  to validate the listener before reusing it: the UI's mapping row is not
    *  proof that its localhost tunnel survived a rejected route or reconnect. */
-  async mapSite(nodeId: string, site: SiteAdvert) {
+  async mapSite(nodeId: string, site: SiteAdvert, quiet = false) {
     const node = this.node(nodeId);
     if (!node) return;
     // A KVM's own web UI rides this same proxy path — gated by its session
@@ -5200,7 +5217,15 @@ class AppStore {
     // and not the FEATURE_SITES tag. The door showing but this gate refusing
     // was the "Sites are owner/fleet only" a standing tech used to hit: the
     // KVM itself admits the session's tech, the GUI must not refuse first.
-    if (!this.siteAllowed(node, site) && !this.kvmDoors(node)) {
+    // The same applies when the live CEC standing belongs to the attached
+    // computer: that session's short appliance grant is the passthrough door
+    // used by its console Power and KVM-drives controls.
+    const attached =
+      this.isKvm(node) && node.kvm?.attachedTo
+        ? this.nodeByCanonical(node.kvm.attachedTo)
+        : undefined;
+    const kvmSessionDoor = this.kvmDoors(node) || this.kvmPassthroughDoors(node, attached);
+    if (!this.siteAllowed(node, site) && !kvmSessionDoor) {
       this.toast("warn", `${site.label} hasn't been shared with your fleet`);
       return;
     }
@@ -5218,7 +5243,7 @@ class AppStore {
     }
     const r = await siteMap(nodeId, site.port);
     if (!r) {
-      this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
+      if (!quiet) this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
       return;
     }
     const mapping: SiteMapping = {
@@ -5285,6 +5310,75 @@ class AppStore {
   // Power/Reset feature buttons drive the KVM's GPIO endpoint through the same
   // tunnel (auth is bypassed over the mesh, so no token); Attach/Detach curate
   // the binding via a gated control message the KVM confirms by re-advertising.
+
+  /** Last known physical power state of the computer behind `nodeId`'s KVM.
+   *  `null` is deliberately distinct from off: an unreachable KVM must never
+   *  paint a confident grey/off button. */
+  kvmPowerState(nodeId: string): boolean | null {
+    return this.kvmPower[canonicalNodeId(nodeId)] ?? null;
+  }
+
+  /** Keep one KVM's power-LED input fresh while a graph or console surface is
+   *  actually showing it. Refcounting matters because a console can render the
+   *  same KVM as the main graph; each window gets an immediate read, then the
+   *  existing lightweight mesh ticker drives one read every six seconds. */
+  watchKvmPower(nodeId: string): () => void {
+    const key = canonicalNodeId(nodeId);
+    const current = this.kvmPowerWatchers.get(key);
+    if (current) {
+      current.count += 1;
+    } else {
+      this.kvmPowerWatchers.set(key, { nodeId, count: 1, nextAt: Date.now() + 6_000 });
+      void this.refreshKvmPower(nodeId);
+    }
+    return () => {
+      const watch = this.kvmPowerWatchers.get(key);
+      if (!watch) return;
+      watch.count -= 1;
+      if (watch.count <= 0) this.kvmPowerWatchers.delete(key);
+    };
+  }
+
+  /** Read the KVM's power LED without surfacing tunnel-repair toasts. This is a
+   *  status lamp, not an action: a sleeping/offline appliance should simply
+   *  become unknown and recover on the next poll. */
+  private async refreshKvmPower(nodeId: string): Promise<void> {
+    const key = canonicalNodeId(nodeId);
+    if (this.kvmPowerRefreshes.has(key)) return;
+    if (!isTauri()) {
+      const demo = this.node(nodeId);
+      this.kvmPower = { ...this.kvmPower, [key]: demo?.online ?? null };
+      return;
+    }
+    if (!this.backendConnected) {
+      this.kvmPower = { ...this.kvmPower, [key]: null };
+      return;
+    }
+
+    this.kvmPowerRefreshes.add(key);
+    try {
+      const port = await this.kvmConsolePort(nodeId, true);
+      if (port === null) {
+        this.kvmPower = { ...this.kvmPower, [key]: null };
+        return;
+      }
+      const { rsp } = await this.kvmApi<KvmPowerStatus>(nodeId, port, "/api/vm/gpio", {
+        quiet: true,
+      });
+      const power = rsp?.code === 0 && typeof rsp.data?.pwr === "boolean" ? rsp.data.pwr : null;
+      this.kvmPower = { ...this.kvmPower, [key]: power };
+    } finally {
+      this.kvmPowerRefreshes.delete(key);
+    }
+  }
+
+  /** Re-read after an action at the moments a motherboard's power LED normally
+   *  changes. The ordinary six-second watcher remains the long-term fallback. */
+  private followKvmPowerChange(nodeId: string) {
+    void this.refreshKvmPower(nodeId);
+    setTimeout(() => void this.refreshKvmPower(nodeId), 1_500);
+    setTimeout(() => void this.refreshKvmPower(nodeId), 5_000);
+  }
 
   /** Whether `node` is a KVM appliance — it runs AllMyStuff and its presence
    *  advertises `FEATURE_KVM` (an older build never does). */
@@ -5395,11 +5489,11 @@ class AppStore {
   }
 
   /** Resolve and map a KVM's published web console to one local tunnel port. */
-  private async kvmConsolePort(nodeId: string): Promise<number | null> {
+  private async kvmConsolePort(nodeId: string, quiet = false): Promise<number | null> {
     const node = this.node(nodeId);
     const site = this.kvmWebSite(node);
     if (!node || !site) return null;
-    await this.mapSite(nodeId, site);
+    await this.mapSite(nodeId, site, quiet);
     return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
   }
 
@@ -5408,14 +5502,16 @@ class AppStore {
     nodeId: string,
     port: number,
     path: string,
-    init?: { method?: string; body?: unknown; timeoutMs?: number },
+    init?: { method?: string; body?: unknown; timeoutMs?: number; quiet?: boolean },
   ): Promise<KvmApiOutcome<T>> {
     const verb = (init?.method ?? "GET").toUpperCase();
     // Never discover a stale tunnel by sending a state-changing request. A
     // harmless version read first exercises (and, below, repairs) the whole
     // route; only then do we send power, Wi-Fi, update, or reboot commands.
     if (verb !== "GET") {
-      const probe = await this.kvmApi(nodeId, port, "/api/application/version");
+      const probe = await this.kvmApi(nodeId, port, "/api/application/version", {
+        quiet: init?.quiet,
+      });
       if (!probe.rsp) return { rsp: null, timedOut: probe.timedOut, reason: probe.reason };
       const node = this.node(nodeId);
       const site = this.kvmWebSite(node);
@@ -5433,7 +5529,7 @@ class AppStore {
     // Any transport failure on this safe GET therefore rebuilds the mapping
     // once. Mutating requests never enter this replay path.
     if (out.error && verb === "GET") {
-      const repairedPort = await this.repairKvmConsoleMapping(nodeId, port);
+      const repairedPort = await this.repairKvmConsoleMapping(nodeId, port, init?.quiet ?? false);
       if (repairedPort !== null) {
         try {
           out = await kvmApiCall(repairedPort, path, init);
@@ -5464,10 +5560,14 @@ class AppStore {
   }
 
   /** Drop one stale localhost tunnel and ask the mesh service to recreate it. */
-  private async repairKvmConsoleMapping(nodeId: string, failedPort: number): Promise<number | null> {
+  private async repairKvmConsoleMapping(
+    nodeId: string,
+    failedPort: number,
+    quiet = false,
+  ): Promise<number | null> {
     const inflight = this.kvmTunnelRepairs.get(nodeId);
     if (inflight) return inflight;
-    const repair = this.performKvmConsoleRepair(nodeId, failedPort);
+    const repair = this.performKvmConsoleRepair(nodeId, failedPort, quiet);
     this.kvmTunnelRepairs.set(nodeId, repair);
     try {
       return await repair;
@@ -5476,7 +5576,11 @@ class AppStore {
     }
   }
 
-  private async performKvmConsoleRepair(nodeId: string, failedPort: number): Promise<number | null> {
+  private async performKvmConsoleRepair(
+    nodeId: string,
+    failedPort: number,
+    quiet = false,
+  ): Promise<number | null> {
     const node = this.node(nodeId);
     const site = this.kvmWebSite(node);
     if (!node || !site || !this.backendConnected) return null;
@@ -5488,7 +5592,7 @@ class AppStore {
       (m) => !(sameMachine(m.node, nodeId) && m.site === site.id),
     );
     await siteUnmap(existing?.node ?? nodeId, existing?.port ?? site.port);
-    await this.mapSite(nodeId, site);
+    await this.mapSite(nodeId, site, quiet);
     const repairedPort = this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
     if (this.wifiFor && sameMachine(this.wifiFor, nodeId)) this.wifiPort = repairedPort;
     return repairedPort;
@@ -5566,6 +5670,7 @@ class AppStore {
         // time to land before tearing down a one-shot route so Shift can never
         // be left held on the attached machine.
         if (created) await new Promise<void>((resolve) => setTimeout(resolve, 200));
+        this.followKvmPowerChange(nodeId);
         this.toast("info", `Wake sent via ${node.label}`);
       } catch (error) {
         // If transport failed between key-down and key-up, make one last
@@ -5602,6 +5707,7 @@ class AppStore {
       this.toast("warn", `Couldn't send ${label.toLowerCase()} via ${node.label}: ${detail}`);
       return;
     }
+    this.followKvmPowerChange(nodeId);
     this.toast("info", `${label} sent via ${node.label}`);
   }
 

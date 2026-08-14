@@ -57,6 +57,7 @@ pub mod camera_capture;
 pub mod cec;
 #[cfg(feature = "host")]
 pub mod clipboard;
+pub mod child_process;
 #[cfg(not(feature = "host"))]
 #[path = "stubs/clipboard.rs"]
 pub mod clipboard;

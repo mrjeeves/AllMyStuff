@@ -177,7 +177,7 @@ async fn open_removable_disk(path: &Path, label: &str, _lazy: bool) -> Result<So
     let script = format!(
         "$p=Get-Partition -DriveLetter '{letter}' -ErrorAction Stop; $d=$p|Get-Disk; [pscustomobject]@{{Number=$d.Number;Size=[uint64]$d.Size;BusType=[string]$d.BusType}}|ConvertTo-Json -Compress"
     );
-    let output = tokio::process::Command::new("powershell.exe")
+    let output = crate::child_process::command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .await

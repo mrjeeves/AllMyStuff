@@ -88,6 +88,12 @@
       (kvmSource ? app.kvmDoors(consoleKvm) : app.kvmPassthroughDoors(consoleKvm, node)),
   );
   const kvmPowerAllowed = $derived(kvmMediaAllowed);
+  const kvmPowerState = $derived(consoleKvm ? app.kvmPowerState(consoleKvm.id) : null);
+  const kvmPowerOn = $derived(kvmPowerState === true);
+  $effect(() => {
+    if (!consoleKvm || !kvmPowerAllowed) return;
+    return app.watchKvmPower(consoleKvm.id);
+  });
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
   const selected = $derived<Capability | null>(
@@ -2448,7 +2454,10 @@
             <button
               class="kbtn slim"
               class:open={openMenu === "power"}
-              title="Power controls for the computer attached to this KVM"
+              class:on={kvmPowerOn}
+              title={kvmPowerOn
+                ? "Computer is on · power controls via KVM"
+                : "Power controls for the computer attached to this KVM"}
               aria-label="Power via KVM"
               aria-haspopup="menu"
               aria-expanded={openMenu === "power"}
@@ -2577,7 +2586,7 @@
                 </button>
               {/if}
               {#if kvmPowerAllowed}
-                <button class="mrow" onclick={() => toggleMenu("power")}>
+                <button class="mrow" class:power-on={kvmPowerOn} onclick={() => toggleMenu("power")}>
                   <span class="micon">⏻</span>Power
                 </button>
               {/if}
@@ -2594,7 +2603,14 @@
                 <span class="mavatar">⏻</span>
                 <div class="mid">
                   <div class="mname">Power via {consoleKvm ? displayName(consoleKvm) : "KVM"}</div>
-                  <div class="msub">Controls the computer attached to this KVM</div>
+                  <div class="msub">
+                    {kvmPowerState === true
+                      ? "Computer is on"
+                      : kvmPowerState === false
+                        ? "Computer is off"
+                        : "Power status unavailable"}
+                    · controls the computer attached to this KVM
+                  </div>
                 </div>
               </div>
               <div class="msep"></div>
@@ -3466,6 +3482,11 @@
   .mrow:hover {
     background: #241f38;
     color: #fff;
+  }
+  .mrow.power-on {
+    color: oklch(0.9 0.12 150);
+    background: oklch(0.72 0.16 150 / 0.14);
+    box-shadow: inset 0 0 0 1px oklch(0.72 0.16 150 / 0.28);
   }
   .mrow.sel {
     color: var(--accent-ink);

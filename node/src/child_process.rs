@@ -10,7 +10,9 @@ use std::ffi::OsStr;
 
 /// A Tokio child command that never creates a visible Windows console.
 pub fn command(program: impl AsRef<OsStr>) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(program);
+    let command = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
@@ -18,7 +20,9 @@ pub fn command(program: impl AsRef<OsStr>) -> tokio::process::Command {
 
 /// A blocking child command that never creates a visible Windows console.
 pub fn blocking_command(program: impl AsRef<OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(program);
+    let command = std::process::Command::new(program);
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

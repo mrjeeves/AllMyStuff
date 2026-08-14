@@ -55,9 +55,9 @@ pub mod byte_queues;
 #[cfg(feature = "host")]
 pub mod camera_capture;
 pub mod cec;
+pub mod child_process;
 #[cfg(feature = "host")]
 pub mod clipboard;
-pub mod child_process;
 #[cfg(not(feature = "host"))]
 #[path = "stubs/clipboard.rs"]
 pub mod clipboard;

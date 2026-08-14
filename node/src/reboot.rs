@@ -21,7 +21,10 @@
 pub fn restart_device() -> Result<(), String> {
     let mut refusals = Vec::new();
     for (bin, args) in attempts() {
-        match crate::child_process::blocking_command(bin).args(args).status() {
+        match crate::child_process::blocking_command(bin)
+            .args(args)
+            .status()
+        {
             Ok(status) if status.success() => {
                 tracing::info!("device reboot accepted by `{bin}`");
                 return Ok(());

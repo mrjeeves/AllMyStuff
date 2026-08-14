@@ -71,6 +71,28 @@
     ),
   );
 
+  // Power is the attached computer's physical LED input, not the KVM node's
+  // mesh-online state. Watch every usable KVM represented on the graph once;
+  // both its own card and its attached machine's card read the same store key.
+  $effect(() => {
+    const ids = [
+      ...new Set(
+        graphNodes
+          .filter(
+            (kvm) =>
+              app.isKvm(kvm) &&
+              (app.kvmDoors(kvm) ||
+                graphNodes.some(
+                  (target) => !app.isKvm(target) && app.kvmPassthroughDoors(kvm, target),
+                )),
+          )
+          .map((n) => n.id),
+      ),
+    ];
+    const unwatch = ids.map((id) => app.watchKvmPower(id));
+    return () => unwatch.forEach((stop) => stop());
+  });
+
   // ---- fleet grouping -------------------------------------------------
   //
   // Every node belongs to exactly one fleet: yours (this device, your
@@ -1195,7 +1217,8 @@
       1 +
       (normalMode && cons?.terminal ? 1 : 0) +
       (normalMode && cons?.files ? 1 : 0) +
-      (normalMode && mn && app.isKvm(mn) && cons?.sites ? 1 : 0) +
+      (mn && app.isKvm(mn) && cons?.sites ? 1 : 0) +
+      (normalMode && mn && app.isKvm(mn) && app.kvmAllowed(mn) ? 1 : 0) +
       (normalMode && mn && app.kvmAllowed(mn) ? 3 : 0) +
       (!app.isKvm(mn) && app.canRestartApp(mn) ? 1 : 0) +
       (!app.isKvm(mn) && app.canRestartDevice(mn) ? 1 : 0) +
@@ -1588,7 +1611,7 @@
         <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}<span class="action-label">Files</span></button>
       {/if}
-      {#if isAppNode(n) && driveAllowed}
+      {#if isAppNode(n) && driveAllowed && (!normalMode || !app.isKvm(n))}
         <button class="cbtn drive-trigger" data-tip={app.isKvm(n) ? "Install media via KVM" : "Mapped drives"} aria-label={app.isKvm(n) ? `Present install media to ${kvmDestination ? displayName(kvmDestination) : "the attached computer"} through ${displayName(n)}` : `Map drives with ${displayName(n)}`}
           aria-haspopup="menu" aria-expanded={driveMenu?.anchorId === n.id}
           onclick={(e) => openNodeDriveMenu(e, n)}>{@render cicon("drives")}<span class="action-label">Drives</span></button>
@@ -1597,9 +1620,20 @@
         <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}<span class="action-label">Terminal</span></button>
       {/if}
-      {#if cons.sites && (!normalMode || !app.isKvm(n))}
+      {#if cons.sites && !app.isKvm(n)}
         <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}<span class="action-label">Sites</span></button>
+      {/if}
+      {#if app.isKvm(n) && app.kvmDoors(n)}
+        <!-- Sites moved into this appliance's gear; the prime card position is
+             the attached computer's power menu, backed by the KVM power LED. -->
+        <button class="cbtn kvm-power-trigger"
+          class:power-on={app.kvmPowerState(n.id) === true}
+          data-tip="Power"
+          aria-label="Power menu through {displayName(n)}"
+          aria-haspopup="menu"
+          aria-expanded={kvmPowerMenu?.kvmId === n.id}
+          onclick={(e) => openKvmPowerMenu(e, n.id)}>{@render cicon("power")}<span class="action-label">Power</span></button>
       {/if}
       {#if app.canUpdateAllMyStuff(n)}
         <button class="cbtn update-action" data-tip="Update AllMyStuff" aria-label="Update AllMyStuff on {displayName(n)}"
@@ -1615,12 +1649,9 @@
           onclick={(e) => { e.stopPropagation(); app.openDirectRoom(n.id); }}>{@render cicon("room")}<span class="action-label">Room</span></button>
       {/if}
       {#if app.kvmAllowed(n)}
-        <!-- A KVM's extra controls, alongside the generic Remote Control +
-             Sites (globe) buttons every node gets now: update the KVM
-             itself, and the attach link, which drops the
-             target picker out under the card. Its web UI opens from the
-             Sites globe (which routes through openKVM), so there's no
-             separate "Open KVM" button. -->
+        <!-- Advanced-only appliance controls. Sites lives in the settings gear
+             in both modes; Normal also keeps these lower-frequency actions in
+             that menu. -->
         {#if !normalMode}
           <button class="cbtn" data-tip="Wi-Fi" aria-label="Configure Wi-Fi on {displayName(n)}"
             onclick={(e) => { e.stopPropagation(); void app.openKvmWifi(n.id); }}>{@render cicon("wifi")}<span class="action-label">Wi-Fi</span></button>
@@ -1641,11 +1672,13 @@
       {/if}
       {#if !app.isKvm(n)}
         {@const kvmHere = app.kvmAttachedTo(n.id)}
-        {#if kvmHere && app.kvmAllowed(kvmHere)}
+        {#if kvmHere && app.kvmPassthroughDoors(kvmHere, n)}
           <!-- This machine is wired into a KVM you control: its physical
                power and reset lines ride the KVM's GPIO, so they belong
                on THIS card — they act on this machine. -->
-          <button class="cbtn kvm-power-trigger" data-tip="Power (via KVM)"
+          <button class="cbtn kvm-power-trigger"
+            class:power-on={app.kvmPowerState(kvmHere.id) === true}
+            data-tip="Power (via KVM)"
             aria-label="Power menu for {displayName(n)} via KVM"
             aria-haspopup="menu"
             aria-expanded={kvmPowerMenu?.kvmId === kvmHere.id}
@@ -2248,7 +2281,23 @@
         </span>
       </button>
     {/if}
-    {#if normalMode && mn && app.isKvm(mn) && menuCons?.sites}
+    {#if normalMode && mn && app.isKvm(mn) && app.kvmAllowed(mn)}
+      <button
+        class="nm-item drive-trigger"
+        role="menuitem"
+        onclick={(e) => {
+          const id = menuId;
+          openDriveMenu(e, id, id);
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">{@render cicon("drives")}</span>
+        <span class="nm-text">
+          <span class="nm-label">Drives</span>
+          <span class="nm-sub">present install or recovery media</span>
+        </span>
+      </button>
+    {/if}
+    {#if mn && app.isKvm(mn) && menuCons?.sites}
       <button
         class="nm-item"
         role="menuitem"
@@ -3338,6 +3387,14 @@
     border-color: var(--accent);
     color: var(--accent-ink);
     background: var(--accent-soft);
+  }
+  /* Physical host-power status from the KVM's LED input. This is deliberately
+     green only for a positive `pwr: true`; unreachable/unknown stays neutral. */
+  .cbtn.power-on {
+    border-color: oklch(0.72 0.16 150 / 0.72);
+    color: oklch(0.9 0.12 150);
+    background: oklch(0.72 0.16 150 / 0.18);
+    box-shadow: inset 0 0 0 1px oklch(0.72 0.16 150 / 0.12), var(--shadow-sm);
   }
   .cbtn.update-action {
     border-color: var(--accent);

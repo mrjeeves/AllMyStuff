@@ -14,8 +14,6 @@
 //!
 //! [`AppControl::RestartDevice`]: allmystuff_protocol::AppControl::RestartDevice
 
-use std::process::Command;
-
 /// Ask the OS to reboot this machine. Returns once the reboot is *accepted*
 /// (the commands schedule it and exit); `Err` carries every attempt's
 /// refusal when none was. Blocking (waits on each command) — call it off
@@ -23,7 +21,10 @@ use std::process::Command;
 pub fn restart_device() -> Result<(), String> {
     let mut refusals = Vec::new();
     for (bin, args) in attempts() {
-        match Command::new(bin).args(args).status() {
+        match crate::child_process::blocking_command(bin)
+            .args(args)
+            .status()
+        {
             Ok(status) if status.success() => {
                 tracing::info!("device reboot accepted by `{bin}`");
                 return Ok(());

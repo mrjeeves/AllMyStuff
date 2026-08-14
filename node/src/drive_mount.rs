@@ -254,7 +254,7 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
     // attempt a reconnect before it answers. The listing includes connected,
     // disconnected, and reconnecting entries; drive-letter tokens themselves
     // are stable even when the surrounding output is localized.
-    let output = tokio::process::Command::new("net.exe")
+    let output = crate::child_process::command("net.exe")
         .arg("use")
         .output()
         .await
@@ -277,7 +277,7 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
 async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
     let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
-    let marker_query = tokio::process::Command::new("reg.exe")
+    let marker_query = crate::child_process::command("reg.exe")
         .args(["query", &marker])
         .output()
         .await
@@ -334,7 +334,7 @@ async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 async fn mount_native(mount: &str, url: &str) -> Result<(), String> {
-    let output = tokio::process::Command::new("net.exe")
+    let output = crate::child_process::command("net.exe")
         .args(["use", mount, url, "/persistent:no"])
         .output()
         .await
@@ -359,7 +359,7 @@ async fn mount_native(_mount: &str, _url: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 async fn unmount_native(mount: &str) -> Result<(), String> {
-    let output = tokio::process::Command::new("net.exe")
+    let output = crate::child_process::command("net.exe")
         .args(["use", mount, "/delete", "/y"])
         .output()
         .await
@@ -391,7 +391,7 @@ async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Resul
     let mount_point_key = format!(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
     );
-    let marked = tokio::process::Command::new("reg.exe")
+    let marked = crate::child_process::command("reg.exe")
         .args(["add", &marker, "/ve", "/t", "REG_SZ", "/d", route, "/f"])
         .output()
         .await
@@ -400,7 +400,7 @@ async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Resul
         return Err(String::from_utf8_lossy(&marked.stderr).trim().to_string());
     }
     let port_string = port.to_string();
-    let port_marked = tokio::process::Command::new("reg.exe")
+    let port_marked = crate::child_process::command("reg.exe")
         .args([
             "add",
             &marker,
@@ -420,7 +420,7 @@ async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Resul
             .trim()
             .to_string());
     }
-    let output = tokio::process::Command::new("reg.exe")
+    let output = crate::child_process::command("reg.exe")
         .args([
             "add",
             &drive_icon_key,
@@ -437,7 +437,7 @@ async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Resul
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let mount_label = tokio::process::Command::new("reg.exe")
+    let mount_label = crate::child_process::command("reg.exe")
         .args([
             "add",
             &mount_point_key,
@@ -477,12 +477,12 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
     // WebDAV redirector can still leave one behind. This function is called
     // only for a letter carrying our private lease marker.
     let network_key = format!(r"HKCU\Network\{letter}");
-    let _ = tokio::process::Command::new("reg.exe")
+    let _ = crate::child_process::command("reg.exe")
         .args(["delete", &network_key, "/f"])
         .output()
         .await;
     // A missing key is already the desired state, so deletion is best-effort.
-    let _ = tokio::process::Command::new("reg.exe")
+    let _ = crate::child_process::command("reg.exe")
         .args(["delete", &drive_icon_key, "/f"])
         .output()
         .await;
@@ -492,12 +492,12 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
         );
         // Leave Explorer's mount-history key intact; it owns that history.
         // Remove only the display value AllMyStuff authored.
-        let _ = tokio::process::Command::new("reg.exe")
+        let _ = crate::child_process::command("reg.exe")
             .args(["delete", &mount_point_key, "/v", "_LabelFromReg", "/f"])
             .output()
             .await;
     }
-    let _ = tokio::process::Command::new("reg.exe")
+    let _ = crate::child_process::command("reg.exe")
         .args(["delete", &marker, "/f"])
         .output()
         .await;
@@ -514,7 +514,7 @@ async fn clear_native_label(_mount: &str, _port: Option<u16>) -> Result<(), Stri
 async fn refresh_explorer_drive_labels() {
     // Ask Explorer to re-read DriveIcons now; otherwise an already-open This
     // PC window can retain the transport name until its next manual refresh.
-    let _ = tokio::process::Command::new("ie4uinit.exe")
+    let _ = crate::child_process::command("ie4uinit.exe")
         .arg("-show")
         .output()
         .await;
@@ -523,7 +523,7 @@ async fn refresh_explorer_drive_labels() {
 #[cfg(windows)]
 async fn cleanup_stale_native_mounts() {
     let base = r"HKCU\Software\AllMyStuff\MappedDrives";
-    let Ok(output) = tokio::process::Command::new("reg.exe")
+    let Ok(output) = crate::child_process::command("reg.exe")
         .args(["query", base])
         .output()
         .await
@@ -542,7 +542,7 @@ async fn cleanup_stale_native_mounts() {
     for letter in letters {
         let mount = format!("{letter}:");
         let marker = format!(r"{base}\{letter}");
-        let port = tokio::process::Command::new("reg.exe")
+        let port = crate::child_process::command("reg.exe")
             .args(["query", &marker, "/v", "Port"])
             .output()
             .await

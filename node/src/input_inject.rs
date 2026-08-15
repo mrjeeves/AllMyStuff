@@ -380,6 +380,7 @@ struct DesktopRect {
 
 impl DesktopRect {
     /// A physical desktop pixel → Win32 SendInput's 0..65535 absolute span.
+    #[cfg(any(windows, test))]
     fn normalize_absolute(&self, gx: i32, gy: i32) -> (i32, i32) {
         let w = i64::from(self.w).max(2);
         let h = i64::from(self.h).max(2);

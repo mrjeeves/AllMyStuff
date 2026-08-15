@@ -845,7 +845,11 @@ export async function openTerminalWindow(
   attach?: string,
 ): Promise<void> {
   if (!isTauri()) return;
-  await tryInvoke("open_terminal_window", { node, attach: attach ?? null });
+  // A terminal is an explicit user action. Do not use `tryInvoke` here: its
+  // null fallback is useful for optional web-preview data, but it used to turn
+  // a native window-creation failure into a button that simply did nothing.
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_terminal_window", { node, attach: attach ?? null });
 }
 
 /** Which machine this window is a terminal for, when the window was opened

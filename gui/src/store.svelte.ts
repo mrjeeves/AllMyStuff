@@ -4405,7 +4405,9 @@ class AppStore {
       }
     }
     if (isTauri() && !isMobile()) {
-      void openTerminalWindow(nodeId);
+      void openTerminalWindow(nodeId).catch((error) => {
+        this.toast("warn", `Couldn't open the terminal: ${String(error)}`);
+      });
       return;
     }
     this.terminalNodeId = nodeId;
@@ -4426,7 +4428,9 @@ class AppStore {
    *  popped-out window is an OS window, which the web preview can't open. */
   popOutTerminal(hostNodeId: string, session: string) {
     if (!isTauri() || isMobile()) return;
-    void openTerminalWindow(hostNodeId, session);
+    void openTerminalWindow(hostNodeId, session).catch((error) => {
+      this.toast("warn", `Couldn't open the terminal: ${String(error)}`);
+    });
   }
 
   /** Open one terminal *session* (a tab) to `hostNodeId`: a generic route

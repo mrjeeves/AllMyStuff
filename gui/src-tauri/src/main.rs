@@ -860,15 +860,54 @@ fn open_secondary_window(
     aumid: &'static str,
 ) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window(label) {
-        let _ = existing.set_focus();
-        return Ok(());
+        // A secondary window can outlive its native HWND in Tauri's window
+        // registry after a renderer or WebView failure. `set_focus()` on that
+        // orphan returns an error; ignoring it made every later click look
+        // successful while no window appeared. Probe the native window, make
+        // a healthy one visible again, and discard a stale entry so the build
+        // below can recreate it under the same stable label.
+        match (existing.is_visible(), existing.is_minimized()) {
+            (Ok(_), Ok(minimized)) => {
+                let shown = existing.show();
+                let restored = if minimized {
+                    existing.unminimize()
+                } else {
+                    Ok(())
+                };
+                if shown.is_ok() && restored.is_ok() {
+                    // Windows may refuse a foreground-stealing focus request;
+                    // the window is still visible, so that is not a launch
+                    // failure and must not make us destroy it.
+                    let _ = existing.set_focus();
+                    return Ok(());
+                }
+                tracing::warn!(
+                    window = label,
+                    show_error = ?shown.err(),
+                    restore_error = ?restored.err(),
+                    "secondary window could not be restored; recreating it"
+                );
+            }
+            (visible, minimized) => {
+                tracing::warn!(
+                    window = label,
+                    visible_error = ?visible.err(),
+                    minimized_error = ?minimized.err(),
+                    "secondary window registry entry is stale; recreating it"
+                );
+            }
+        }
+        let _ = existing.destroy();
     }
-    tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
+    let window = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
         .title(title)
         .inner_size(inner_size.0, inner_size.1)
         .min_inner_size(min_inner_size.0, min_inner_size.1)
+        .visible(true)
         .build()
         .map_err(|e| e.to_string())?;
+    window.show().map_err(|e| e.to_string())?;
+    let _ = window.set_focus();
     set_taskbar_identity(app, label, aumid);
     Ok(())
 }

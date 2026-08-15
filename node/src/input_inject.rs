@@ -201,8 +201,14 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
         let result = match action {
             InputAction::MouseMove { x, y, screen } => {
                 let rect = screens.resolve(screen);
+                // Keep both halves of the Windows absolute-coordinate
+                // conversion in the same (physical-pixel) coordinate space.
+                // xcap reports physical monitor rectangles; Win32's
+                // GetSystemMetrics is DPI-virtualized for an unaware process
+                // and made a 250%-scaled desktop look only 40% as large here.
+                let desktop = screens.virtual_bounds();
                 let (gx, gy) = rect.denorm(x, y);
-                move_mouse_global(&mut enigo, gx, gy)
+                move_mouse_global(&mut enigo, gx, gy, desktop)
             }
             // Pointer-lock deltas: native relative motion, straight through —
             // games read this as camera movement, so no screen resolve, no
@@ -283,7 +289,12 @@ fn injector_settings() -> Settings {
 
 /// Land the cursor on a global desktop coordinate (any monitor).
 #[cfg(not(windows))]
-fn move_mouse_global(enigo: &mut Enigo, gx: i32, gy: i32) -> Result<(), String> {
+fn move_mouse_global(
+    enigo: &mut Enigo,
+    gx: i32,
+    gy: i32,
+    _desktop: DesktopRect,
+) -> Result<(), String> {
     // CoreGraphics and X11 take global coordinates as-is.
     enigo
         .move_mouse(gx, gy, Coordinate::Abs)
@@ -295,34 +306,30 @@ fn move_mouse_global(enigo: &mut Enigo, gx: i32, gy: i32) -> Result<(), String> 
 /// Raised by hand because enigo's `Coordinate::Abs` normalizes against the
 /// primary monitor without `MOUSEEVENTF_VIRTUALDESK` — a point on a second
 /// screen is simply unreachable through it. With the flag, 0..65535 spans
-/// the whole virtual desktop.
+/// the whole virtual desktop. The bounds come from xcap's physical monitor
+/// rectangles rather than `GetSystemMetrics`, whose values Windows scales for
+/// DPI-unaware processes. Mixing those logical bounds with physical capture
+/// coordinates compressed the cursor into the upper-left portion of a scaled
+/// display.
 #[cfg(windows)]
-fn move_mouse_global(_enigo: &mut Enigo, gx: i32, gy: i32) -> Result<(), String> {
+fn move_mouse_global(
+    _enigo: &mut Enigo,
+    gx: i32,
+    gy: i32,
+    desktop: DesktopRect,
+) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
         MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
-    };
     unsafe {
-        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let vw = i64::from(GetSystemMetrics(SM_CXVIRTUALSCREEN)).max(2);
-        let vh = i64::from(GetSystemMetrics(SM_CYVIRTUALSCREEN)).max(2);
-        // Pixel → the API's 0..65535 span of the virtual desktop, rounding
-        // at the pixel center.
-        let nx =
-            ((i64::from(gx) - i64::from(vx)).clamp(0, vw - 1) * 65535 + (vw - 1) / 2) / (vw - 1);
-        let ny =
-            ((i64::from(gy) - i64::from(vy)).clamp(0, vh - 1) * 65535 + (vh - 1) / 2) / (vh - 1);
+        let (nx, ny) = desktop.normalize_absolute(gx, gy);
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
-                    dx: nx as i32,
-                    dy: ny as i32,
+                    dx: nx,
+                    dy: ny,
                     mouseData: 0,
                     dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
@@ -355,6 +362,34 @@ struct ScreenRect {
     w: u32,
     h: u32,
     primary: bool,
+}
+
+/// The physical-pixel bounding rectangle of the complete virtual desktop.
+///
+/// This is deliberately derived from the same xcap monitor rectangles used by
+/// [`ScreenRect::denorm`]. On Windows, using a second monitor API here can put
+/// one half of the conversion in DPI-logical pixels and the other in physical
+/// pixels when display scaling is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+impl DesktopRect {
+    /// A physical desktop pixel → Win32 SendInput's 0..65535 absolute span.
+    #[cfg(any(windows, test))]
+    fn normalize_absolute(&self, gx: i32, gy: i32) -> (i32, i32) {
+        let w = i64::from(self.w).max(2);
+        let h = i64::from(self.h).max(2);
+        let nx =
+            ((i64::from(gx) - i64::from(self.x)).clamp(0, w - 1) * 65535 + (w - 1) / 2) / (w - 1);
+        let ny =
+            ((i64::from(gy) - i64::from(self.y)).clamp(0, h - 1) * 65535 + (h - 1) / 2) / (h - 1);
+        (nx as i32, ny as i32)
+    }
 }
 
 impl ScreenRect {
@@ -428,6 +463,53 @@ impl ScreenMap {
                 h: 1080,
                 primary: true,
             })
+    }
+
+    /// Physical-pixel bounds of every attached monitor, including screens
+    /// placed above or to the left of the primary. This is the rectangle
+    /// `MOUSEEVENTF_VIRTUALDESK` expects the 0..65535 input span to cover.
+    fn virtual_bounds(&self) -> DesktopRect {
+        let fallback = self.primary();
+        if self.rects.is_empty() {
+            return DesktopRect {
+                x: fallback.x,
+                y: fallback.y,
+                w: fallback.w.max(1),
+                h: fallback.h.max(1),
+            };
+        }
+
+        let left = self
+            .rects
+            .iter()
+            .map(|r| i64::from(r.x))
+            .min()
+            .unwrap_or(i64::from(fallback.x));
+        let top = self
+            .rects
+            .iter()
+            .map(|r| i64::from(r.y))
+            .min()
+            .unwrap_or(i64::from(fallback.y));
+        let right = self
+            .rects
+            .iter()
+            .map(|r| i64::from(r.x) + i64::from(r.w.max(1)))
+            .max()
+            .unwrap_or(left + i64::from(fallback.w.max(1)));
+        let bottom = self
+            .rects
+            .iter()
+            .map(|r| i64::from(r.y) + i64::from(r.h.max(1)))
+            .max()
+            .unwrap_or(top + i64::from(fallback.h.max(1)));
+
+        DesktopRect {
+            x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            w: (right - left).clamp(1, i64::from(u32::MAX)) as u32,
+            h: (bottom - top).clamp(1, i64::from(u32::MAX)) as u32,
+        }
     }
 }
 
@@ -835,6 +917,60 @@ mod tests {
         };
         let fallback = map.resolve(Some(99));
         assert!(fallback.primary);
+    }
+
+    #[test]
+    fn virtual_bounds_use_the_capture_coordinate_space() {
+        // A 4K primary at 250% Windows scaling is still 3840x2160 in xcap's
+        // capture coordinate space. A second physical-pixel screen sits left
+        // of it. The SendInput span must cover those same physical rectangles,
+        // not GetSystemMetrics' DPI-virtualized 1536x864 primary.
+        let map = ScreenMap {
+            rects: vec![
+                ScreenRect {
+                    id: 1,
+                    x: 0,
+                    y: 0,
+                    w: 3840,
+                    h: 2160,
+                    primary: true,
+                },
+                ScreenRect {
+                    id: 2,
+                    x: -1920,
+                    y: 120,
+                    w: 1920,
+                    h: 1080,
+                    primary: false,
+                },
+            ],
+            refreshed: Instant::now(),
+        };
+        assert_eq!(
+            map.virtual_bounds(),
+            DesktopRect {
+                x: -1920,
+                y: 0,
+                w: 5760,
+                h: 2160,
+            }
+        );
+    }
+
+    #[test]
+    fn absolute_coordinates_span_a_scaled_physical_desktop() {
+        let desktop = DesktopRect {
+            x: 0,
+            y: 0,
+            w: 3840,
+            h: 2160,
+        };
+        assert_eq!(desktop.normalize_absolute(0, 0), (0, 0));
+        assert_eq!(desktop.normalize_absolute(3839, 2159), (65535, 65535));
+
+        let (x, y) = desktop.normalize_absolute(1920, 1080);
+        assert!((32760..=32780).contains(&x));
+        assert!((32760..=32790).contains(&y));
     }
 
     #[test]

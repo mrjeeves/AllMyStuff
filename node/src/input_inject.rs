@@ -383,12 +383,10 @@ impl DesktopRect {
     fn normalize_absolute(&self, gx: i32, gy: i32) -> (i32, i32) {
         let w = i64::from(self.w).max(2);
         let h = i64::from(self.h).max(2);
-        let nx = ((i64::from(gx) - i64::from(self.x)).clamp(0, w - 1) * 65535
-            + (w - 1) / 2)
-            / (w - 1);
-        let ny = ((i64::from(gy) - i64::from(self.y)).clamp(0, h - 1) * 65535
-            + (h - 1) / 2)
-            / (h - 1);
+        let nx =
+            ((i64::from(gx) - i64::from(self.x)).clamp(0, w - 1) * 65535 + (w - 1) / 2) / (w - 1);
+        let ny =
+            ((i64::from(gy) - i64::from(self.y)).clamp(0, h - 1) * 65535 + (h - 1) / 2) / (h - 1);
         (nx as i32, ny as i32)
     }
 }

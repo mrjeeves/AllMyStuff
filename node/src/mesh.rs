@@ -1979,6 +1979,30 @@ impl Mesh {
                 seed_peer_networks(&mut st.peer_networks, peers, &network);
                 seed_peer_links(&mut st.peer_links, peers)
             };
+            // The LAN claim rendezvous is an application directory, but its
+            // claimable presence still rides the normal app channel. A newly
+            // discovered peer can remain only `sighted` (no WebRTC session),
+            // which deadlocks discovery: the claimer cannot see the profile
+            // that would tell it to claim, and therefore has no UI action that
+            // would dial the peer. While *this* device is offering itself,
+            // explicitly open an unpinned link to every sighted LAN peer. The
+            // normal connection event sends our freshly-restamped profile as
+            // soon as the link opens. Re-running this during peer refresh also
+            // covers a potential claimer that joins the LAN after claim mode
+            // was enabled.
+            if network == LOCAL_CLAIM_NETWORK_ID && self.ownership.claimable() {
+                for peer in local_claim_link_candidates(peers) {
+                    let _ = self
+                        .client
+                        .request(&Request::NetworkConnectPeer {
+                            network: network.clone(),
+                            peer,
+                            pin: false,
+                            wait_ms: 0,
+                        })
+                        .await;
+                }
+            }
             // A peer's link class landing (or flipping — an ICE-restart
             // handoff can move a link LAN→STUN mid-life) re-gates its live
             // streams' automatic dials. retune_link is a no-op unless the
@@ -9204,7 +9228,13 @@ impl Mesh {
         // network only exists while claimable with public claims on).
         self.ensure_claim_networks().await;
         self.refresh_profile_ownership().await;
-        Ok(self.ownership.claimable())
+        let claimable = self.ownership.claimable();
+        if claimable {
+            // Do not wait for the next background peer sweep: a peer already
+            // sighted on the LAN should receive the claimable profile now.
+            self.refresh_peer_networks().await;
+        }
+        Ok(claimable)
     }
 
     /// Front-end command: flip **this device's** public-claims setting —
@@ -16138,6 +16168,20 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
     }
 }
 
+/// Peers that the LAN claim rendezvous has discovered but has not opened a
+/// session to yet. Claimable presence is an AllMyStuff app frame, so `sighted`
+/// alone is not enough to make a device appear in another machine's Claim UI.
+/// Canonicalize here because the daemon's peer id may carry a device suffix
+/// while `network_connect_peer` addresses the identity pubkey.
+fn local_claim_link_candidates(peers: &[Value]) -> Vec<String> {
+    peers
+        .iter()
+        .filter(|peer| peer.get("status").and_then(Value::as_str) == Some("sighted"))
+        .filter_map(|peer| peer.get("device_id").and_then(Value::as_str))
+        .map(|peer| pubkey_part(peer).to_string())
+        .collect()
+}
+
 /// Fold one network-scoped presence advert into the peer's machine-wide
 /// claimability. A sender deliberately advertises `claimable: true` only on a
 /// claim rendezvous (or an ordinary mesh when legacy public claiming is
@@ -17342,6 +17386,28 @@ mod tests {
         // …and an unreachable peer claims no slot.
         assert_eq!(map.get("dave"), None);
         assert_eq!(map.get("erin"), None);
+    }
+
+    #[test]
+    fn local_claim_links_dial_only_sighted_peers() {
+        use serde_json::json;
+        let peers = vec![
+            // The observed field case: mDNS knows the machine, but there is no
+            // app session yet. Strip the daemon's display suffix before dial.
+            json!({ "device_id": "claimable-peer-BD91C", "status": "sighted" }),
+            // Existing or in-flight links do not need another explicit dial.
+            json!({ "device_id": "active-peer", "status": "active" }),
+            json!({ "device_id": "connecting-peer", "status": "handshaking" }),
+            json!({ "device_id": "offline-peer", "status": "offline" }),
+            // Malformed diagnostic rows are ignored rather than becoming an
+            // empty connect request.
+            json!({ "status": "sighted" }),
+        ];
+
+        assert_eq!(
+            local_claim_link_candidates(&peers),
+            vec!["claimable-peer".to_string()]
+        );
     }
 
     #[test]

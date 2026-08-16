@@ -744,7 +744,7 @@ async fn list_sessions(client: &Arc<NodeClient>, host: &Machine) -> Result<(), S
 
 /// The `state` string of `route_id` in a snapshot (`active` / `offered` /
 /// `rejected` / `torn_down` / …), if the route is present.
-fn route_state(snap: &Value, route_id: &str) -> Option<String> {
+pub(crate) fn route_state(snap: &Value, route_id: &str) -> Option<String> {
     find_route(snap, route_id)?
         .get("state")?
         .get("state")?

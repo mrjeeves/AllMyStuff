@@ -37,6 +37,8 @@
 
 use std::future::Future;
 use std::io::IsTerminal;
+#[cfg(windows)]
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -293,6 +295,82 @@ fn service_environment_paths(
         profile_home.join(".allmystuff"),
         profile_home.to_path_buf(),
     )
+}
+
+/// Keep the Windows Firewall application rule aligned with the protected
+/// MyOwnMesh binary the service actually launches. Older AllMyStuff / CEC
+/// Support installs left rules tied to per-user AppData copies; after the
+/// privileged host moved to ProgramData, mDNS could still sight peers but the
+/// random-port signaling / WebRTC connection could not reach the live daemon.
+///
+/// The SCM process is LocalSystem, so repairing this exact, app-owned rule at
+/// every service start is both idempotent and sufficient for existing installs:
+/// a normal update restarts the service and heals the stale path without UAC.
+#[cfg(windows)]
+fn repair_service_mesh_firewall(mesh_bin: &Path) -> std::io::Result<()> {
+    const RULE_NAME: &str = "AllMyStuff MyOwnMesh Service";
+    let name = format!("name={RULE_NAME}");
+    let program = format!("program={}", mesh_bin.display());
+    let settings = [
+        "dir=in".to_owned(),
+        "action=allow".to_owned(),
+        program,
+        "enable=yes".to_owned(),
+        "profile=any".to_owned(),
+        "protocol=any".to_owned(),
+    ];
+
+    // Update our exact rule in place first. Unlike delete-then-add, a
+    // transient firewall-service failure cannot erase a previously working
+    // rule. If this is an older install with no owned rule yet, `set` fails
+    // harmlessly and `add` creates it. Never touch legacy or user-managed
+    // rules merely because they mention myownmesh.exe.
+    let mut set_args = vec![
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "set".to_owned(),
+        "rule".to_owned(),
+        name.clone(),
+        "new".to_owned(),
+    ];
+    set_args.extend(settings.iter().cloned());
+    let set = allmystuff_node::child_process::blocking_command("netsh.exe")
+        .args(&set_args)
+        .output()?;
+    let output = if set.status.success() {
+        set
+    } else {
+        let mut add_args = vec![
+            "advfirewall".to_owned(),
+            "firewall".to_owned(),
+            "add".to_owned(),
+            "rule".to_owned(),
+            name,
+        ];
+        add_args.extend(settings);
+        allmystuff_node::child_process::blocking_command("netsh.exe")
+            .args(&add_args)
+            .output()?
+    };
+    if output.status.success() {
+        tracing::info!(
+            daemon = %mesh_bin.display(),
+            rule = RULE_NAME,
+            "reconciled the Windows Firewall rule for the service mesh daemon"
+        );
+        Ok(())
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = format!("{} {}", stdout.trim(), stderr.trim())
+            .trim()
+            .to_owned();
+        Err(std::io::Error::other(if detail.is_empty() {
+            format!("netsh exited with {}", output.status)
+        } else {
+            format!("netsh exited with {}: {detail}", output.status)
+        }))
+    }
 }
 
 /// Build the async runtime and run the node to completion, stopping when
@@ -906,6 +984,22 @@ mod winsvc {
             wait_hint: Duration::default(),
             process_id: None,
         })?;
+
+        // The daemon moved from per-user AppData into this protected shared
+        // payload. Reconcile its application rule before launching the agent;
+        // otherwise peers stop at mDNS `sighted` with no usable host candidate.
+        if let Some(mesh_bin) = std::env::var_os("MYOWNMESH_BIN").map(PathBuf::from) {
+            if let Err(e) = super::repair_service_mesh_firewall(&mesh_bin) {
+                tracing::warn!(
+                    daemon = %mesh_bin.display(),
+                    "couldn't reconcile the Windows Firewall rule for the service mesh daemon: {e}"
+                );
+            }
+        } else {
+            tracing::warn!(
+                "service has no --mesh-bin argument; couldn't reconcile its Windows Firewall rule"
+            );
+        }
 
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,

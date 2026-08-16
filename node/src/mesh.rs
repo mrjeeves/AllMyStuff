@@ -1925,13 +1925,6 @@ impl Mesh {
         // engine's life — it survives daemon-link drops untouched.
         self.spawn_inventory_watch();
 
-        // Presence changes are still pushed immediately, but the claim
-        // rendezvous can finish connecting after that one push. Keep the same
-        // slow recovery heartbeat as the KVM bridge so a peer that missed the
-        // claimable advert (or our boot advert) catches up without either app
-        // having to restart. This is app presence only — not governance.
-        self.spawn_presence_heartbeat();
-
         // Offers need a deadline: a route offered to a machine whose
         // AllMyStuff app died (daemon still up, so it looks present) used to
         // sit "awaiting accept" forever — a black console with no error.
@@ -2432,26 +2425,6 @@ impl Mesh {
         });
     }
 
-    /// Re-assert the current app profile on the same slow cadence as the KVM
-    /// bridge. State changes still broadcast immediately; this only closes the
-    /// race where the LAN claim network has been joined but its peers become
-    /// active after that one-shot send. A weak reference makes the task end
-    /// with the engine, and `sleep` (rather than a catch-up interval) prevents
-    /// a suspended machine from bursting stale ticks when it wakes.
-    fn spawn_presence_heartbeat(self: &Arc<Self>) {
-        const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-        let mesh = Arc::downgrade(self);
-        crate::spawn(async move {
-            loop {
-                tokio::time::sleep(PRESENCE_INTERVAL).await;
-                let Some(mesh) = mesh.upgrade() else {
-                    return;
-                };
-                mesh.broadcast_presence().await;
-            }
-        });
-    }
-
     async fn fetch_identity(&self) -> Option<String> {
         let resp = self.client.request(&Request::IdentityShow).await.ok()?;
         resp.data?
@@ -2739,24 +2712,14 @@ impl Mesh {
             let Ok(payload) = serde_json::to_value(&scoped) else {
                 continue;
             };
-            match self
+            let _ = self
                 .client
                 .request(&Request::ChannelSendAll {
-                    network: network.clone(),
+                    network,
                     channel: CHANNEL_PRESENCE.to_string(),
                     payload,
                 })
-                .await
-            {
-                Ok(response) if response.ok => {}
-                Ok(response) => tracing::warn!(
-                    "mesh: presence broadcast on {network} refused: {}",
-                    response.error.unwrap_or_else(|| "unknown error".into())
-                ),
-                Err(error) => {
-                    tracing::warn!("mesh: presence broadcast on {network} failed: {error}")
-                }
-            }
+                .await;
         }
     }
 

@@ -161,6 +161,18 @@ pub struct Mesh {
     /// so a peer draining a full pipe onto a route we no longer hold gets one
     /// Reject, not one per frame.
     site_nack_at: Mutex<HashMap<String, std::time::Instant>>,
+    /// Client mappings whose host refused every heal attempt (keyed
+    /// `<pubkey>:<host_port>`), holding off the next auto-re-map on a
+    /// widening backoff so a route the host won't accept stops being
+    /// re-offered flat out. Cleared by a successful heal, or by a deliberate
+    /// [`Self::site_map`] — the user asking again is the signal that access
+    /// may have changed.
+    site_remap_refused: Mutex<HashMap<String, RefusedMapping>>,
+    /// Graduating rate limit for the inbound route-reject log, keyed
+    /// `(peer, reason)` — see [`ROUTE_REJECT_LOG_BACKOFF`]. A peer that
+    /// refuses every re-offer would otherwise write one INFO per rejection
+    /// for as long as it keeps refusing.
+    route_reject_log: Mutex<HashMap<(String, String), RejectLogState>>,
     /// Viewer-side download sinks: a `(route, req)` whose `Chunk`s should
     /// stream straight to a local file (the Downloads folder) instead of
     /// the window's queue — registered by `file_download` *before* the
@@ -1040,6 +1052,113 @@ const SITE_REMAP_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// pipe onto a route we no longer hold gets one Reject, not one per frame.
 const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Graduating cooldown for the inbound route-reject log line. A peer that
+/// refuses a route generally refuses every re-offer of it — an unclaimed KVM
+/// answering each attempt with "not this KVM's owner — claim it first" is the
+/// case in the field — and the re-offer path mints a *fresh* route id per
+/// attempt, so unbounded this writes one INFO per rejection, a couple of times
+/// a second, for as long as the app runs. The first rejection still logs
+/// immediately: that line is the diagnosis. Repeats walk this schedule and
+/// then hold at the last step, so a standing refusal costs one line every
+/// three minutes, each carrying the count it stands for.
+const ROUTE_REJECT_LOG_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(180),
+];
+
+/// A gap this long ends an episode: the next rejection logs immediately and
+/// restarts the schedule, so a refusal that returns an hour later reads as
+/// news instead of inheriting a stale three-minute cooldown. Longer than the
+/// last backoff step, so a refusal that is still going never retires itself.
+const ROUTE_REJECT_LOG_RESET: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// After a heal run whose every attempt was refused, how long to leave that
+/// mapping alone before trying again. Each fully-refused run advances a step
+/// and then holds at the last, so a host that isn't coming back — an unclaimed
+/// KVM — settles at one short run per half hour: quiet enough to ignore, live
+/// enough that claiming the KVM heals the tunnel on its own instead of needing
+/// a manual re-map.
+const SITE_REMAP_REFUSED_BACKOFF: &[Duration] = &[
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+    Duration::from_secs(1800),
+];
+
+/// Per-mapping cooldown after a fully-refused heal run — see
+/// [`SITE_REMAP_REFUSED_BACKOFF`].
+#[derive(Debug)]
+struct RefusedMapping {
+    /// Earliest instant a fresh heal run may start.
+    retry_at: Instant,
+    /// Index into [`SITE_REMAP_REFUSED_BACKOFF`]; saturates at the last step.
+    step: usize,
+}
+
+impl RefusedMapping {
+    /// First fully-refused run — hold off for the opening step.
+    fn new(now: Instant) -> Self {
+        Self {
+            retry_at: now + SITE_REMAP_REFUSED_BACKOFF[0],
+            step: 0,
+        }
+    }
+
+    /// Another fully-refused run: widen the wait, holding at the last step.
+    fn refused_again(&mut self, now: Instant) {
+        self.step = (self.step + 1).min(SITE_REMAP_REFUSED_BACKOFF.len() - 1);
+        self.retry_at = now + SITE_REMAP_REFUSED_BACKOFF[self.step];
+    }
+
+    /// How long until a fresh heal run may start; zero once it's due.
+    fn wait(&self, now: Instant) -> Duration {
+        self.retry_at.saturating_duration_since(now)
+    }
+}
+
+/// Per-`(peer, reason)` bookkeeping behind [`ROUTE_REJECT_LOG_BACKOFF`].
+#[derive(Debug)]
+struct RejectLogState {
+    /// When a line was last actually written for this key.
+    last_logged: std::time::Instant,
+    /// Rejections swallowed since that line — reported by the next one.
+    suppressed: u64,
+    /// Index into [`ROUTE_REJECT_LOG_BACKOFF`]; saturates at the last step.
+    step: usize,
+}
+
+impl RejectLogState {
+    /// Record a key whose first rejection is being logged *now* — so the
+    /// opening line is free and the schedule starts from the one after it.
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            last_logged: now,
+            suppressed: 0,
+            step: 0,
+        }
+    }
+
+    /// True once this key has been quiet long enough that its next rejection
+    /// is a fresh episode rather than a continuation of this one.
+    fn stale(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.last_logged) >= ROUTE_REJECT_LOG_RESET
+    }
+
+    /// Admit or swallow one rejection. `Some(n)` means log it, standing for
+    /// the `n` swallowed since the previous line; `None` means stay quiet.
+    fn admit(&mut self, now: std::time::Instant) -> Option<u64> {
+        let wait = ROUTE_REJECT_LOG_BACKOFF[self.step.min(ROUTE_REJECT_LOG_BACKOFF.len() - 1)];
+        if now.duration_since(self.last_logged) < wait {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last_logged = now;
+        self.step = (self.step + 1).min(ROUTE_REJECT_LOG_BACKOFF.len() - 1);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 /// How long a CEC connect-request may wait for acknowledged delivery to
 /// the customer's node. Covers the WebRTC bring-up plus a mid-dial
 /// network wobble with room to spare; past it, the customer is genuinely
@@ -1219,6 +1338,8 @@ impl Mesh {
             site_seq: AtomicU64::new(0),
             site_remap_inflight: Mutex::new(std::collections::HashSet::new()),
             site_nack_at: Mutex::new(HashMap::new()),
+            site_remap_refused: Mutex::new(HashMap::new()),
+            route_reject_log: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             shared: Mutex::new(HashMap::new()),
             room_scopes: Mutex::new(HashMap::new()),
@@ -3552,10 +3673,20 @@ impl Mesh {
                     } else if let ControlMessage::Route(RouteControl::Reject { route_id, reason }) =
                         &msg
                     {
-                        tracing::info!(
-                            "inbound route reject for {route_id} from {}: {reason}",
-                            short_id(&from)
-                        );
+                        // Rate-limited: a host that refuses one offer refuses
+                        // the re-offers too, and each carries a fresh route
+                        // id, so left alone this line floods.
+                        if let Some(suppressed) = self.should_log_route_reject(&from, reason) {
+                            let repeats = if suppressed > 0 {
+                                format!(" ({suppressed} more since the last line)")
+                            } else {
+                                String::new()
+                            };
+                            tracing::info!(
+                                "inbound route reject for {route_id} from {}: {reason}{repeats}",
+                                short_id(&from)
+                            );
+                        }
                     }
                     // Site management (list a co-owned machine's sites,
                     // re-expose them) and the terminal-sessions picker plane
@@ -12651,6 +12782,12 @@ impl Mesh {
         if pubkey_part(&node) == pubkey_part(&me) {
             return Err("that's this device".into());
         }
+        // Asking again clears a previous refusal: the user is the one who
+        // knows access may have changed (they just claimed the KVM), and this
+        // is a deliberate act, not the auto-heal loop retrying itself.
+        self.site_remap_refused
+            .lock()
+            .remove(&format!("{}:{}", pubkey_part(&node), port));
         // Already mapped? Hand back the existing local port only while its
         // accept task is alive. A route offer that expires/rejects causes that
         // task to exit and drop the listener; retaining its mapping produced a
@@ -12750,15 +12887,45 @@ impl Mesh {
     /// retries with a growing backoff: enough to ride out a reconnect, few
     /// enough to give up (rather than loop) if we've genuinely lost access and
     /// the host keeps refusing.
+    ///
+    /// That give-up has to outlive the run, which is what `site_remap_refused`
+    /// is for. Each re-offer draws its own reject, and every inbound reject
+    /// lands back here — so bounding a single run only bounds one lap: the run
+    /// ends, the inflight key clears, the next reject starts five more, and the
+    /// pair trade offers and rejects for as long as the app is up. A run whose
+    /// every attempt was refused therefore parks the mapping on the widening
+    /// [`SITE_REMAP_REFUSED_BACKOFF`] instead of leaving the door open. The
+    /// cooldown is a delay, not a verdict: a host that starts accepting (the
+    /// KVM finally gets claimed) is picked up by the next run on its own.
     async fn remap_site_route(self: &Arc<Self>, node: String, host_port: u16, local_port: u16) {
         let key = format!("{}:{}", pubkey_part(&node), host_port);
+        let started = Instant::now();
+        if let Some(wait) = self
+            .site_remap_refused
+            .lock()
+            .get(&key)
+            .map(|r| r.wait(started))
+            .filter(|w| !w.is_zero())
+        {
+            // Cooling off after a refused run — say so at DEBUG only, since
+            // this is the branch that fires on every reject in the flood.
+            tracing::debug!(
+                "site {}:{} re-map still cooling off ({}s to go)",
+                short_id(&node),
+                host_port,
+                wait.as_secs()
+            );
+            return;
+        }
         if !self.site_remap_inflight.lock().insert(key.clone()) {
             return; // already healing this mapping
         }
+        let mut healed = false;
         for attempt in 0..SITE_REMAP_ATTEMPTS {
             tokio::time::sleep(SITE_REMAP_BACKOFF.saturating_mul(attempt + 1)).await;
             // A manual remap (or a prior attempt) already restored it.
             if self.sites.route_for(&node, host_port).is_some() {
+                healed = true;
                 break;
             }
             let listener = match self.bind_exact_local_port(local_port).await {
@@ -12780,6 +12947,7 @@ impl Mesh {
                             host_port,
                             local_port
                         );
+                        healed = true;
                         break;
                     }
                     // Host didn't accept in time — clear this attempt fully so
@@ -12792,6 +12960,37 @@ impl Mesh {
                 }
                 Err(e) => tracing::debug!("site re-map offer failed: {e}"),
             }
+        }
+        // Park or clear the cooldown *before* releasing the inflight key: an
+        // inbound reject racing these lines must see the new state, not a run
+        // that has ended with the door still open.
+        let now = Instant::now();
+        if healed {
+            self.site_remap_refused.lock().remove(&key);
+        } else {
+            let mut refused = self.site_remap_refused.lock();
+            // Bound the map: a mapping that is gone stops being re-run, so its
+            // entry falls ever further past due — that's what marks it dead.
+            if refused.len() > 64 {
+                let cap = *SITE_REMAP_REFUSED_BACKOFF
+                    .last()
+                    .unwrap_or(&Duration::from_secs(1800));
+                refused.retain(|_, r| now.saturating_duration_since(r.retry_at) < cap * 2);
+            }
+            let wait = refused
+                .entry(key.clone())
+                .and_modify(|r| r.refused_again(now))
+                .or_insert_with(|| RefusedMapping::new(now))
+                .wait(now);
+            drop(refused);
+            tracing::warn!(
+                "site {}:{} refused all {SITE_REMAP_ATTEMPTS} re-map attempts — \
+                 backing off {}s before trying again (an unclaimed KVM needs \
+                 claiming first; re-mapping it by hand retries immediately)",
+                short_id(&node),
+                host_port,
+                wait.as_secs()
+            );
         }
         self.site_remap_inflight.lock().remove(&key);
     }
@@ -12849,6 +13048,32 @@ impl Mesh {
                 )
                 .await;
         });
+    }
+
+    /// Rate-limit the inbound route-reject log line: `Some(n)` means log this
+    /// rejection, standing for the `n` swallowed since the last line; `None`
+    /// means stay quiet. See [`ROUTE_REJECT_LOG_BACKOFF`] for the schedule.
+    ///
+    /// Keyed by `(peer, reason)` and deliberately *not* by route id: the
+    /// re-offer path mints a fresh id — a new `site_seq` — for every attempt,
+    /// so a per-route key would never match twice and the limit would be no
+    /// limit at all.
+    fn should_log_route_reject(&self, from: &str, reason: &str) -> Option<u64> {
+        let now = std::time::Instant::now();
+        let key = (from.to_string(), reason.to_string());
+        let mut states = self.route_reject_log.lock();
+        // Bound the map across many peers and reasons, dropping entries whose
+        // episode has already ended.
+        if states.len() > 128 {
+            states.retain(|_, s| !s.stale(now));
+        }
+        // Never seen, or quiet long enough to count as new: log it now and
+        // start the schedule from the line after this one.
+        if states.get(&key).is_none_or(|s| s.stale(now)) {
+            states.insert(key, RejectLogState::new(now));
+            return Some(0);
+        }
+        states.get_mut(&key)?.admit(now)
     }
 
     /// Unmap a site: tear the route down (closing the listener + every
@@ -17705,5 +17930,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- refused-mapping re-map cooldown -----------------------------------
+
+    #[test]
+    fn refused_mapping_widens_its_cooldown_then_holds() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedMapping::new(t0);
+        assert_eq!(refused.wait(t0), SITE_REMAP_REFUSED_BACKOFF[0]);
+
+        // Each further fully-refused run steps the schedule out...
+        let mut at = t0;
+        for step in &SITE_REMAP_REFUSED_BACKOFF[1..] {
+            at += refused.wait(at);
+            refused.refused_again(at);
+            assert_eq!(refused.wait(at), *step);
+        }
+
+        // ...and then holds at the last one instead of growing forever.
+        let cap = *SITE_REMAP_REFUSED_BACKOFF.last().unwrap();
+        at += refused.wait(at);
+        refused.refused_again(at);
+        assert_eq!(refused.wait(at), cap, "the half-hour cap is the ceiling");
+    }
+
+    #[test]
+    fn refused_mapping_comes_due_so_a_claimed_host_heals_itself() {
+        let t0 = std::time::Instant::now();
+        let refused = RefusedMapping::new(t0);
+        let opening = SITE_REMAP_REFUSED_BACKOFF[0];
+
+        // A cooldown is a delay, not a verdict: it expires on its own, so the
+        // next reject starts a real run and a newly-claimed host reconnects
+        // with no manual re-map.
+        assert!(!refused
+            .wait(t0 + opening - Duration::from_secs(1))
+            .is_zero());
+        assert!(refused.wait(t0 + opening).is_zero());
+    }
+
+    // ---- inbound route-reject log rate limit -------------------------------
+    //
+    // The flood these bound is real: one 80-minute session logged 19,800
+    // rejects from a single unclaimed KVM, 99.7% of the whole log.
+
+    #[test]
+    fn route_reject_log_counts_repeats_instead_of_writing_them() {
+        let t0 = std::time::Instant::now();
+        // `new` stands for "the opening line just went out".
+        let mut state = RejectLogState::new(t0);
+
+        // Everything inside the first step is counted, not logged.
+        assert_eq!(state.admit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(state.admit(t0 + Duration::from_secs(2)), None);
+        // Past it, one line stands for both of them...
+        assert_eq!(state.admit(t0 + ROUTE_REJECT_LOG_BACKOFF[0]), Some(2));
+        // ...and the count starts over rather than accumulating forever.
+        assert_eq!(state.admit(t0 + ROUTE_REJECT_LOG_BACKOFF[0]), None);
+    }
+
+    #[test]
+    fn route_reject_log_graduates_then_holds_at_three_minutes() {
+        let t0 = std::time::Instant::now();
+        let mut state = RejectLogState::new(t0);
+
+        // Each admitted line widens the next window by one schedule step.
+        let mut at = t0;
+        for step in ROUTE_REJECT_LOG_BACKOFF {
+            at += *step;
+            assert_eq!(state.admit(at), Some(0), "step {step:?} should admit");
+        }
+
+        // Schedule exhausted: the last step becomes the standing cap rather
+        // than growing without bound — just under it stays quiet, on it logs.
+        let cap = *ROUTE_REJECT_LOG_BACKOFF.last().unwrap();
+        assert_eq!(
+            cap,
+            Duration::from_secs(180),
+            "the cap is the 3 min ceiling"
+        );
+        assert_eq!(state.admit(at + cap - Duration::from_secs(1)), None);
+        assert_eq!(state.admit(at + cap), Some(1));
+    }
+
+    #[test]
+    fn route_reject_log_retires_a_key_that_has_gone_quiet() {
+        let t0 = std::time::Instant::now();
+        let state = RejectLogState::new(t0);
+
+        assert!(!state.stale(t0 + ROUTE_REJECT_LOG_RESET - Duration::from_secs(1)));
+        assert!(
+            state.stale(t0 + ROUTE_REJECT_LOG_RESET),
+            "a refusal that returns much later is news, not a continuation"
+        );
+        // The reset must outlast the widest step, or an ongoing refusal would
+        // retire itself between lines and log at full rate forever.
+        assert!(ROUTE_REJECT_LOG_RESET > *ROUTE_REJECT_LOG_BACKOFF.last().unwrap());
     }
 }

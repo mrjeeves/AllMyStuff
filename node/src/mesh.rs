@@ -58,6 +58,13 @@ use std::time::{Duration, Instant};
 type ClipboardReceiptWaiters =
     Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>;
 
+/// A claimable profile carried over an already-active ordinary mesh when the
+/// LAN claim rendezvous has independently sighted the same peer but its own
+/// WebRTC session cannot come up. The receiver never trusts this channel by
+/// itself: [`Mesh::handle_channel`] accepts it only while the authenticated
+/// sender is present in the daemon's local-claim peer list.
+const CHANNEL_LOCAL_CLAIM_PRESENCE: &str = "allmystuff/local-claim-presence/v1";
+
 pub struct Mesh {
     client: Arc<ControlClient>,
     /// The media plane's dedicated daemon connection: frame chunks ride it
@@ -1194,6 +1201,10 @@ struct State {
     /// into one last-writer-wins profile made the ordinary false erase the
     /// authoritative claim advert on every multi-homed desktop.
     peer_claimable_networks: HashMap<String, HashSet<String>>,
+    /// Peers the daemon currently sees on the LAN-only mDNS claim
+    /// rendezvous. This is the independent locality proof that permits a
+    /// claimable profile or Claim control to ride some other active mesh.
+    local_claim_sighted: HashSet<String>,
     /// App features each peer last advertised (canonical pubkey → feature
     /// list from its presence profile). Read to decide whether a peer can
     /// ride the media-lane pool — `FEATURE_MEDIA_LANES` present means both
@@ -1356,6 +1367,7 @@ impl Mesh {
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
                 peer_claimable_networks: HashMap::new(),
+                local_claim_sighted: HashSet::new(),
                 peer_features: HashMap::new(),
                 peer_links: HashMap::new(),
                 peer_boots: HashMap::new(),
@@ -1956,6 +1968,7 @@ impl Mesh {
     /// [`Mesh::prune_unjoined_peers`] reconciles against.
     async fn refresh_peer_networks(self: &Arc<Self>) {
         let networks = { self.state.lock().networks.clone() };
+        let mut local_claim_peers = None;
         for network in networks {
             let Ok(resp) = self
                 .client
@@ -1990,17 +2003,22 @@ impl Mesh {
             // soon as the link opens. Re-running this during peer refresh also
             // covers a potential claimer that joins the LAN after claim mode
             // was enabled.
-            if network == LOCAL_CLAIM_NETWORK_ID && self.ownership.claimable() {
-                for peer in local_claim_link_candidates(peers) {
-                    let _ = self
-                        .client
-                        .request(&Request::NetworkConnectPeer {
-                            network: network.clone(),
-                            peer,
-                            pin: false,
-                            wait_ms: 0,
-                        })
-                        .await;
+            if network == LOCAL_CLAIM_NETWORK_ID {
+                let sighted = local_claim_sighted_peers(peers);
+                self.state.lock().local_claim_sighted = sighted.clone();
+                local_claim_peers = Some(sighted.clone());
+                if self.ownership.claimable() {
+                    for peer in local_claim_link_candidates(peers) {
+                        let _ = self
+                            .client
+                            .request(&Request::NetworkConnectPeer {
+                                network: network.clone(),
+                                peer,
+                                pin: false,
+                                wait_ms: 0,
+                            })
+                            .await;
+                    }
                 }
             }
             // A peer's link class landing (or flipping — an ICE-restart
@@ -2022,6 +2040,51 @@ impl Mesh {
                     }
                 }
             }
+        }
+        // A local DNS-SD sighting proves proximity even when the local-claim
+        // network's separate WebRTC session is the thing that failed. Carry a
+        // deliberately scoped copy of our claim state over an already-active
+        // ordinary mesh with the same peer. The receiver independently checks
+        // its own local sighting before accepting it, so this does not turn an
+        // ordinary/public mesh into a remote-claim path.
+        if let Some(peers) = local_claim_peers {
+            self.send_local_claim_presence_fallbacks(&peers).await;
+        }
+    }
+
+    async fn send_local_claim_presence_fallbacks(&self, peers: &HashSet<String>) {
+        let (mut profile, targets) = {
+            let st = self.state.lock();
+            let Some(profile) = st.profile.clone() else {
+                return;
+            };
+            let targets = peers
+                .iter()
+                .filter_map(|peer| {
+                    let network = st.peer_networks.get(peer)?;
+                    (network != LOCAL_CLAIM_NETWORK_ID
+                        && !crate::cec::is_cec_network(network)
+                        && st.networks.contains(network))
+                    .then(|| (peer.clone(), network.clone()))
+                })
+                .collect::<Vec<_>>();
+            (profile, targets)
+        };
+        profile.sent_at = unix_now_ms();
+        profile.claimable = self.ownership.claimable();
+        let Ok(payload) = serde_json::to_value(profile) else {
+            return;
+        };
+        for (peer, network) in targets {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_LOCAL_CLAIM_PRESENCE.to_string(),
+                    peer,
+                    payload: payload.clone(),
+                })
+                .await;
         }
     }
 
@@ -3075,6 +3138,21 @@ impl Mesh {
         network: String,
         payload: Value,
     ) {
+        let local_claim_fallback = channel == CHANNEL_LOCAL_CLAIM_PRESENCE;
+        if local_claim_fallback {
+            let allowed = local_claim_fallback_authorized(
+                &network,
+                &from,
+                &self.state.lock().local_claim_sighted,
+            );
+            if !allowed {
+                tracing::warn!(
+                    "ignoring local-claim fallback presence from {} on {network:?}: no independent LAN sighting",
+                    short_id(&from)
+                );
+                return;
+            }
+        }
         // Reject CEC strangers before recording *any* app-layer state about
         // them. The standing support room is world-joinable; during migration
         // an old Open roster can briefly establish a data channel before the
@@ -3125,7 +3203,7 @@ impl Mesh {
                 .insert(pubkey_part(&from).to_string(), network.clone());
         }
         match channel {
-            CHANNEL_PRESENCE => {
+            CHANNEL_PRESENCE | CHANNEL_LOCAL_CLAIM_PRESENCE => {
                 // On the CEC rooms, a profile advert is accepted only from a
                 // peer this node has a deliberate CEC relationship with (a
                 // customer this technician dialed; a technician this customer
@@ -3149,6 +3227,13 @@ impl Mesh {
                     tracing::warn!("dropping presence advert from {}: {e}", short_id(&from));
                 }
                 if let Ok(mut profile) = parsed {
+                    if local_claim_fallback && !same_node(profile.node.as_str(), &from) {
+                        tracing::warn!(
+                            "ignoring local-claim fallback presence from {}: profile names a different node",
+                            short_id(&from)
+                        );
+                        return;
+                    }
                     // We answer a peer's presence with our own (+ roster) when
                     // either it's the first we've heard of them this session or
                     // their app just (re)started — so the bootstrap is mutual
@@ -3159,12 +3244,17 @@ impl Mesh {
                     // neither condition fires again. `boot == 0` is an older
                     // heartbeating peer. Our own echo never replies to itself.
                     let canon = pubkey_part(profile.node.as_str()).to_string();
+                    let claim_scope = if local_claim_fallback {
+                        LOCAL_CLAIM_NETWORK_ID
+                    } else {
+                        network.as_str()
+                    };
                     {
                         let mut st = self.state.lock();
                         profile.claimable = fold_scoped_claimable(
                             &mut st.peer_claimable_networks,
                             &canon,
-                            &network,
+                            claim_scope,
                             profile.claimable,
                         );
                         st.peer_features
@@ -3356,7 +3446,7 @@ impl Mesh {
                     // are deliberately enabled on this device. The decline
                     // names the fix so the claimer's toast is actionable.
                     if let ControlMessage::Ownership(OwnershipControl::Claim { .. }) = &msg {
-                        if !self.claim_network_allowed(&network) {
+                        if !self.claim_arrival_allowed(&network, &from) {
                             tracing::warn!(
                                 "claim from {} over {network:?} refused — claims over the \
                                  public mesh are disabled on this device",
@@ -8786,7 +8876,17 @@ impl Mesh {
             .insert(pubkey_part(&node).to_string());
         tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
-        self.send_control_on_network(&node, &claim_network, &msg)
+        // When the exact LAN rendezvous is stuck at `sighted`, its proven
+        // claimable profile arrived over an already-active ordinary mesh.
+        // Send the Claim back over that same transport; the target accepts it
+        // only while it independently mDNS-sights us on the LAN network.
+        let delivery_network = if claim_network == LOCAL_CLAIM_NETWORK_ID {
+            self.local_claim_fallback_network(&node)
+                .unwrap_or(claim_network)
+        } else {
+            claim_network
+        };
+        self.send_control_on_network(&node, &delivery_network, &msg)
             .await
     }
 
@@ -9248,11 +9348,11 @@ impl Mesh {
         self.ensure_claim_networks().await;
         self.refresh_profile_ownership().await;
         let claimable = self.ownership.claimable();
-        if claimable {
-            // Do not wait for the next background peer sweep: a peer already
-            // sighted on the LAN should receive the claimable profile now.
-            self.refresh_peer_networks().await;
-        }
+        // Do not wait for the next background peer sweep: a peer already
+        // sighted on the LAN should receive both edges immediately. The false
+        // edge matters for removing a fallback claim advert after claim mode
+        // is cancelled.
+        self.refresh_peer_networks().await;
         Ok(claimable)
     }
 
@@ -9440,6 +9540,26 @@ impl Mesh {
     /// device**.
     fn claim_network_allowed(&self, network: &str) -> bool {
         network == LOCAL_CLAIM_NETWORK_ID || self.ownership.public_claims_allowed()
+    }
+
+    /// An ordinary transport may carry a LAN Claim only while the daemon's
+    /// separate mDNS rendezvous independently sights the authenticated sender.
+    /// CEC support rooms are deliberately excluded even with that proof.
+    fn claim_arrival_allowed(&self, network: &str, peer: &str) -> bool {
+        self.claim_network_allowed(network)
+            || local_claim_fallback_authorized(
+                network,
+                peer,
+                &self.state.lock().local_claim_sighted,
+            )
+    }
+
+    /// The already-active non-CEC mesh that delivered a peer's fallback
+    /// profile. No primary-network guess: this must be a route learned from a
+    /// real inbound frame or a daemon-reachable peer row.
+    fn local_claim_fallback_network(&self, peer: &str) -> Option<String> {
+        let st = self.state.lock();
+        local_claim_fallback_route(&st.peer_networks, &st.local_claim_sighted, peer)
     }
 
     /// Make sure the fleet's closed network exists, is genuinely closed, and
@@ -10579,6 +10699,9 @@ impl Mesh {
             let mut st = self.state.lock();
             st.networks = networks.clone();
             st.network = primary.clone();
+            if !networks.iter().any(|n| n == LOCAL_CLAIM_NETWORK_ID) {
+                st.local_claim_sighted.clear();
+            }
         }
         // A network reset (one disabled, removed, or left — its config_id is
         // gone from the joined set) leaves behind ghosts: peers and the
@@ -10688,6 +10811,7 @@ impl Mesh {
     async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
         let channels = [
             CHANNEL_PRESENCE,
+            CHANNEL_LOCAL_CLAIM_PRESENCE,
             CHANNEL_CONTROL,
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
@@ -16231,6 +16355,55 @@ fn local_claim_link_candidates(peers: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// The authenticated identities the LAN-only daemon currently knows through
+/// mDNS. A peer need not have reached `active` on the claim rendezvous—that
+/// failure is precisely what the fallback repairs—but an explicitly offline
+/// or errored cache row is not current locality proof.
+fn local_claim_sighted_peers(peers: &[Value]) -> HashSet<String> {
+    peers
+        .iter()
+        .filter(|peer| {
+            matches!(
+                peer.get("status").and_then(Value::as_str),
+                Some("sighted")
+                    | Some("handshaking")
+                    | Some("pending_approval")
+                    | Some("active")
+                    | Some("shelved")
+                    | Some("reconnecting")
+            )
+        })
+        .filter_map(|peer| peer.get("device_id").and_then(Value::as_str))
+        .map(|peer| pubkey_part(peer).to_string())
+        .collect()
+}
+
+fn local_claim_fallback_authorized(
+    network: &str,
+    peer: &str,
+    locally_sighted: &HashSet<String>,
+) -> bool {
+    network != LOCAL_CLAIM_NETWORK_ID
+        && !crate::cec::is_cec_network(network)
+        && locally_sighted.contains(pubkey_part(peer))
+}
+
+fn local_claim_fallback_route(
+    peer_networks: &HashMap<String, String>,
+    locally_sighted: &HashSet<String>,
+    peer: &str,
+) -> Option<String> {
+    if !locally_sighted.contains(pubkey_part(peer)) {
+        return None;
+    }
+    peer_networks
+        .get(pubkey_part(peer))
+        .filter(|network| {
+            network.as_str() != LOCAL_CLAIM_NETWORK_ID && !crate::cec::is_cec_network(network)
+        })
+        .cloned()
+}
+
 /// Fold one network-scoped presence advert into the peer's machine-wide
 /// claimability. A sender deliberately advertises `claimable: true` only on a
 /// claim rendezvous (or an ordinary mesh when legacy public claiming is
@@ -17502,6 +17675,74 @@ mod tests {
         assert_eq!(
             local_claim_link_candidates(&peers),
             vec!["claimable-peer".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_claim_sighting_is_independent_of_session_success() {
+        use serde_json::json;
+        let peers = vec![
+            json!({ "device_id": "sighted-peer-SUFFX", "status": "sighted" }),
+            json!({ "device_id": "handshaking-peer", "status": "handshaking" }),
+            json!({ "device_id": "active-peer", "status": "active" }),
+            json!({ "device_id": "offline-peer", "status": "offline" }),
+            json!({ "device_id": "errored-peer", "status": "error" }),
+            json!({ "status": "sighted" }),
+        ];
+        let sighted = local_claim_sighted_peers(&peers);
+        assert!(sighted.contains("sighted-peer"));
+        assert!(sighted.contains("handshaking-peer"));
+        assert!(sighted.contains("active-peer"));
+        assert!(!sighted.contains("offline-peer"));
+        assert!(!sighted.contains("errored-peer"));
+    }
+
+    #[test]
+    fn local_claim_fallback_requires_independent_lan_proof() {
+        let sighted = HashSet::from(["local-peer".to_string()]);
+        assert!(local_claim_fallback_authorized(
+            "ordinary-mesh",
+            "local-peer-SUFFX",
+            &sighted
+        ));
+        assert!(!local_claim_fallback_authorized(
+            "ordinary-mesh",
+            "remote-peer",
+            &sighted
+        ));
+        assert!(!local_claim_fallback_authorized(
+            LOCAL_CLAIM_NETWORK_ID,
+            "local-peer",
+            &sighted
+        ));
+        assert!(!local_claim_fallback_authorized(
+            allmystuff_cec_protocol::HELP_NETWORK_ID,
+            "local-peer",
+            &sighted
+        ));
+    }
+
+    #[test]
+    fn local_claim_fallback_uses_only_a_proven_ordinary_route() {
+        let sighted = HashSet::from(["local-peer".to_string()]);
+        let mut routes = HashMap::from([("local-peer".to_string(), "tracymesh".to_string())]);
+        assert_eq!(
+            local_claim_fallback_route(&routes, &sighted, "local-peer-SUFFX").as_deref(),
+            Some("tracymesh")
+        );
+        assert_eq!(
+            local_claim_fallback_route(&routes, &HashSet::new(), "local-peer"),
+            None,
+            "an ordinary route alone is not locality proof"
+        );
+        routes.insert(
+            "local-peer".to_string(),
+            allmystuff_cec_protocol::HELP_NETWORK_ID.to_string(),
+        );
+        assert_eq!(
+            local_claim_fallback_route(&routes, &sighted, "local-peer"),
+            None,
+            "support rooms never carry claims"
         );
     }
 

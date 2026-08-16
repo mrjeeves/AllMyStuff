@@ -511,7 +511,9 @@
     closing = true;
     // A normal Files window owns its temporary route. A mapped drive does not:
     // closing the browser leaves the mapping alive until the user taps Unmap.
-    const teardown = routeId && !mappedRoute ? app.filesDisconnect(routeId) : Promise.resolve();
+    const ownedRoute = routeId && !mappedRoute ? routeId : null;
+    if (ownedRoute) routeId = null;
+    const teardown = ownedRoute ? app.filesDisconnect(ownedRoute) : Promise.resolve();
     if (windowed) {
       await Promise.race([teardown, new Promise((r) => setTimeout(r, 600))]);
       void closeThisWindow();
@@ -564,6 +566,10 @@
       unlistenProgress?.();
       unlistenClose?.();
       if (preview?.url) URL.revokeObjectURL(preview.url);
+      // Window-close calls endAll first. A direct component remount does not,
+      // so always retire this window's temporary browsing route on unmount.
+      // Persistent mapped-drive routes remain owned by the mapping itself.
+      if (routeId && !mappedRoute) void app.filesDisconnect(routeId);
     };
   });
 
@@ -737,7 +743,6 @@
               <p>Connecting to <b>{displayName(node)}</b>…</p>
               <p class="diag">
                 route {app.routeStates[routeId ?? ""]?.state ?? "not negotiated yet"}
-                · {Object.keys(app.routeStates).length} known
               </p>
             {:else if status === "rejected"}
               <p>Refused: {note}</p>

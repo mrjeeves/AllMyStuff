@@ -5837,12 +5837,21 @@ impl Mesh {
     }
 
     pub fn snapshot(&self) -> Value {
-        let st = self.state.lock();
-        let Some(session) = st.session.as_ref() else {
+        const COMPLETED_ROUTE_HISTORY: usize = 256;
+        let mut st = self.state.lock();
+        let network = st.network.clone();
+        let Some(session) = st.session.as_mut() else {
             return json!({ "ready": false });
         };
+        let pruned = session.prune_completed_routes(COMPLETED_ROUTE_HISTORY);
+        if pruned > 0 {
+            tracing::info!(
+                pruned,
+                retained = COMPLETED_ROUTE_HISTORY,
+                "pruned completed route history"
+            );
+        }
         let me = session.me().to_string();
-        let network = st.network.clone();
         // A CEC customer a technician dialed is an ordinary mesh peer here, with
         // no special grouping: the CEC area is Silent (no roster), so there is no
         // "fleet" to seat it under. Strangers merely co-resident on the CEC

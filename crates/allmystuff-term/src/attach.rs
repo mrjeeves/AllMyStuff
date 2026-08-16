@@ -18,6 +18,13 @@ use crate::client::{NodeClient, NodeEvent};
 /// How often we drain output as a safety net even if a `term-ready` poke was
 /// lost — the same 50 ms the GUI's watcher uses.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// A terminal's final media `Exit` and route-control `Teardown` travel on
+/// separate lanes. Either one can win the race (or the best-effort media
+/// frame can be lost), so the CLI also watches the node's authoritative route
+/// state. Without this fallback an already-ended `amst --run` stayed alive
+/// forever and looked like a connected terminal in the device drawer even
+/// though the host had no attachable PTY left.
+const ROUTE_STATE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Restores the terminal out of raw mode on the way out — on a clean return or
 /// an early `?`. (Release builds abort on panic, so there are no unwinds to
@@ -74,6 +81,8 @@ pub async fn run(
     send_resize(&client, &route_id, last_size).await;
 
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    let mut route_ticker = tokio::time::interval(ROUTE_STATE_INTERVAL);
+    route_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stdout = std::io::stdout();
     let mut stdin_open = true;
     let mut exit_code = 0i32;
@@ -129,6 +138,19 @@ pub async fn run(
                     send_resize(&client, &route_id, size).await;
                 }
             }
+
+            // `term-exit` is the rich path (it carries the process status),
+            // but teardown is independently authoritative. A host may end the
+            // PTY and tear down the route before its final media frame reaches
+            // this viewer; observe that state so the local `amst` process and
+            // its route cannot become a phantom terminal forever.
+            _ = route_ticker.tick() => {
+                if let Ok(snap) = client.request("session_snapshot", Value::Null).await {
+                    if !route_still_live(&snap, &route_id) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -145,6 +167,16 @@ pub async fn run(
         .request("disconnect_route", json!({ "route_id": route_id }))
         .await;
     Ok(exit_code)
+}
+
+/// After [`crate::wait_active`] returns, a route is expected to stay active.
+/// Negotiating states are accepted defensively across a node snapshot rebuild;
+/// a terminal state or a pruned/absent route means this viewer is finished.
+fn route_still_live(snapshot: &Value, route_id: &str) -> bool {
+    matches!(
+        crate::route_state(snapshot, route_id).as_deref(),
+        Some("active" | "offered" | "incoming")
+    )
 }
 
 /// Handle one node event for our route. Returns `Some(code)` when the far shell
@@ -273,7 +305,8 @@ fn spawn_stdin_reader(tx: mpsc::Sender<Vec<u8>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_batch;
+    use super::{route_still_live, split_batch};
+    use serde_json::json;
 
     /// `[u32 le len][bytes]` per chunk — the exact framing `ByteQueues::poll`
     /// emits and the GUI's watcher decodes.
@@ -288,5 +321,23 @@ mod tests {
         // dropped, keeping the whole first chunk.
         let batch = [1, 0, 0, 0, b'x', 4, 0, 0, 0, b'y'];
         assert_eq!(split_batch(&batch), vec![&b"x"[..]]);
+    }
+
+    #[test]
+    fn route_state_fallback_ends_a_terminal_after_teardown_or_prune() {
+        let route = |state: &str| {
+            json!({
+                "routes": [{
+                    "route": { "id": "terminal-route" },
+                    "state": { "state": state }
+                }]
+            })
+        };
+        assert!(route_still_live(&route("active"), "terminal-route"));
+        assert!(!route_still_live(&route("torn_down"), "terminal-route"));
+        assert!(!route_still_live(
+            &json!({ "routes": [] }),
+            "terminal-route"
+        ));
     }
 }

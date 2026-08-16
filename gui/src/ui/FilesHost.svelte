@@ -27,6 +27,15 @@
     return "ready" as const;
   });
 
+  // Once this window has been admitted, keep its route-owning child mounted.
+  // Presence and fleet facts converge independently and a node can be re-keyed
+  // between bare/display ids; treating those transient forms as a new child
+  // leaked one unique Files route per remount.
+  let admitted = $state(false);
+  $effect(() => {
+    if (stage === "ready") admitted = true;
+  });
+
   onMount(() => {
     void app.init();
   });
@@ -38,10 +47,8 @@
 </script>
 
 <div class="host">
-  {#if stage === "ready" && node}
-    {#key node.id}
-      <Files host={node.id} windowed={true} />
-    {/key}
+  {#if admitted}
+    <Files host={target} windowed={true} />
   {:else if stage === "unsupported"}
     <div class="notice">
       <div class="glyph">🗂</div>

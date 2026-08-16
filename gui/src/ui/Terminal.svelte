@@ -678,6 +678,13 @@
       unlistenSessions?.();
       unlistenResize?.();
       if (bellTimer) clearTimeout(bellTimer);
+      // The native window-close path normally clears `tabs` through endAll.
+      // A parent remount/navigation is different: Svelte destroys us directly.
+      // Retire those routes too so a UI lifecycle blip cannot leave thousands
+      // of offered/active terminal sessions in the backend.
+      for (const t of tabs) {
+        if (t.routeId) void app.terminalDisconnect(t.routeId);
+      }
     };
   });
 </script>
@@ -821,12 +828,10 @@
                 <p>Connecting to <b>{displayName(node)}</b>…</p>
                 <!-- The raw negotiation state, so a stall names its stage:
                      "offered" = the far side never answered; "not
-                     negotiated yet" with other routes known = this route
-                     id is missing from the snapshot (a key bug); with 0
-                     known = snapshots aren't reaching this window. -->
+                     negotiated yet" = this route is missing from the
+                     snapshot. Global route history is unrelated noise here. -->
                 <p class="diag">
                   route {app.routeStates[t.routeId ?? ""]?.state ?? "not negotiated yet"}
-                  · {Object.keys(app.routeStates).length} known
                 </p>
               </div>
             {:else if t.status === "offline"}

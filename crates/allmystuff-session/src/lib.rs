@@ -22,7 +22,7 @@
 mod audio;
 mod media;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use allmystuff_graph::{NodeId, Route};
 use allmystuff_protocol::{
@@ -181,6 +181,10 @@ pub struct Session {
     me: NodeId,
     peers: HashMap<NodeId, NodeProfile>,
     routes: HashMap<String, LiveRoute>,
+    /// Route insertion order, used to bound completed negotiation history.
+    /// Active/pending routes are never reaped; rejected/torn-down records only
+    /// exist long enough for a UI snapshot to explain how a route ended.
+    route_order: VecDeque<String>,
     /// Auto-accept inbound offers from known peers (the offerer already
     /// authorized them against their catalog). The backend can turn this
     /// off to prompt the user per offer.
@@ -193,6 +197,7 @@ impl Session {
             me: me.into(),
             peers: HashMap::new(),
             routes: HashMap::new(),
+            route_order: VecDeque::new(),
             auto_accept: true,
         }
     }
@@ -260,6 +265,14 @@ impl Session {
     }
 
     // ---- routes ------------------------------------------------------
+
+    fn insert_route(&mut self, live: LiveRoute) {
+        let id = live.route.id.clone();
+        if !self.routes.contains_key(&id) {
+            self.route_order.push_back(id.clone());
+        }
+        self.routes.insert(id, live);
+    }
 
     /// Offer a route to the peer that owns its other endpoint. Records it
     /// as `Outbound`/`Offered` and returns the message to send. `video`
@@ -352,20 +365,17 @@ impl Session {
             room,
         } = context;
         let peer = peer.into();
-        self.routes.insert(
-            route.id.clone(),
-            LiveRoute {
-                route: route.clone(),
-                peer,
-                origin: Origin::Outbound,
-                state: RouteState::Offered,
-                video: video.clone(),
-                audio: audio.clone(),
-                term_session: session.clone(),
-                drive: drive.clone(),
-                room: room.clone(),
-            },
-        );
+        self.insert_route(LiveRoute {
+            route: route.clone(),
+            peer,
+            origin: Origin::Outbound,
+            state: RouteState::Offered,
+            video: video.clone(),
+            audio: audio.clone(),
+            term_session: session.clone(),
+            drive: drive.clone(),
+            room: room.clone(),
+        });
         ControlMessage::Route(RouteControl::Offer {
             route,
             video,
@@ -422,6 +432,40 @@ impl Session {
 
     pub fn routes(&self) -> impl Iterator<Item = &LiveRoute> {
         self.routes.values()
+    }
+
+    /// Keep at most `max` completed route records, oldest first. A route's
+    /// terminal state is useful briefly (the UI can say rejected/torn down),
+    /// but retaining every unique Terminal/Files attempt for the lifetime of
+    /// the service turns a transient reconnect loop into an unbounded map.
+    /// Negotiating and active routes are never removed.
+    pub fn prune_completed_routes(&mut self, max: usize) -> usize {
+        let completed =
+            |r: &LiveRoute| matches!(r.state, RouteState::Rejected { .. } | RouteState::TornDown);
+        let mut remove = self
+            .routes
+            .values()
+            .filter(|r| completed(r))
+            .count()
+            .saturating_sub(max);
+        if remove == 0 {
+            return 0;
+        }
+        let mut kept = VecDeque::with_capacity(self.route_order.len());
+        let mut removed = 0;
+        while let Some(id) = self.route_order.pop_front() {
+            match self.routes.get(&id) {
+                None => {}
+                Some(r) if remove > 0 && completed(r) => {
+                    self.routes.remove(&id);
+                    remove -= 1;
+                    removed += 1;
+                }
+                Some(_) => kept.push_back(id),
+            }
+        }
+        self.route_order = kept;
+        removed
     }
 
     pub fn route(&self, id: &str) -> Option<&LiveRoute> {
@@ -500,24 +544,21 @@ impl Session {
                 } else {
                     RouteState::Incoming
                 };
-                self.routes.insert(
-                    route.id.clone(),
-                    LiveRoute {
-                        route: route.clone(),
-                        peer: from.clone(),
-                        origin: Origin::Inbound,
-                        state,
-                        video,
-                        audio,
-                        // The session the viewer asked to attach to (a
-                        // terminal route); the backend resolves it to the
-                        // real id once it opens the shell, via
-                        // [`set_term_session`](Self::set_term_session).
-                        term_session: session,
-                        drive,
-                        room,
-                    },
-                );
+                self.insert_route(LiveRoute {
+                    route: route.clone(),
+                    peer: from.clone(),
+                    origin: Origin::Inbound,
+                    state,
+                    video,
+                    audio,
+                    // The session the viewer asked to attach to (a
+                    // terminal route); the backend resolves it to the
+                    // real id once it opens the shell, via
+                    // [`set_term_session`](Self::set_term_session).
+                    term_session: session,
+                    drive,
+                    room,
+                });
                 if accept {
                     // The resolved terminal session id isn't known until the
                     // backend has actually opened the PTY (it happens while
@@ -1205,6 +1246,38 @@ mod tests {
         );
         assert!(!s.expire_offer("r2", "too late"));
         assert!(s.route("r2").unwrap().is_active());
+    }
+
+    #[test]
+    fn completed_route_history_is_bounded_without_touching_live_routes() {
+        let mut s = Session::new("desk");
+        for n in 0..5 {
+            let id = format!("done-{n}");
+            let _ = s.offer(route(&id), "peer", Vec::new(), Vec::new());
+            assert!(s.expire_offer(&id, "no answer"));
+        }
+        let _ = s.offer(route("live"), "peer", Vec::new(), Vec::new());
+        let _ = s.handle(
+            "peer".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "live".into(),
+                session: None,
+            }),
+        );
+
+        assert_eq!(s.prune_completed_routes(2), 3);
+        assert!(s.route("done-0").is_none());
+        assert!(s.route("done-1").is_none());
+        assert!(s.route("done-2").is_none());
+        assert!(matches!(
+            s.route("done-3").unwrap().state,
+            RouteState::Rejected { .. }
+        ));
+        assert!(matches!(
+            s.route("done-4").unwrap().state,
+            RouteState::Rejected { .. }
+        ));
+        assert!(s.route("live").unwrap().is_active());
     }
 
     #[test]

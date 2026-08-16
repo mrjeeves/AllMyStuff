@@ -36,6 +36,17 @@
     return "ready" as const;
   });
 
+  // Admission is a one-way gate for this window. The graph can briefly
+  // re-key a peer between its bare pubkey and display id, and fleet/presence
+  // facts can arrive on different polls. Re-mounting the terminal through
+  // those harmless convergence blips mints a fresh unique terminal route on
+  // every pass. Keep the already-authorized surface alive; the backend still
+  // enforces every route and reports a real disconnect/rejection itself.
+  let admitted = $state(false);
+  $effect(() => {
+    if (stage === "ready") admitted = true;
+  });
+
   onMount(() => {
     void app.init();
   });
@@ -47,10 +58,10 @@
 </script>
 
 <div class="host">
-  {#if stage === "ready" && node}
-    {#key node.id}
-      <Terminal host={node.id} windowed={true} {initialAttach} />
-    {/key}
+  {#if admitted}
+    <!-- `target` is fixed in this window's URL. Unlike `node.id`, it cannot
+         oscillate while mesh identity forms converge and remount the shell. -->
+    <Terminal host={target} windowed={true} {initialAttach} />
   {:else if stage === "unsupported"}
     <div class="notice">
       <div class="glyph">📟</div>

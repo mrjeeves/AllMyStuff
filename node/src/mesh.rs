@@ -8751,22 +8751,31 @@ impl Mesh {
     /// "asking…" hanging forever.
     pub async fn claim(self: &Arc<Self>, node: String) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
-        // Claimer-side mirror of the claimee's arrival-network gate: with
-        // public claims off (the default), a claim only goes out over the
-        // LAN claim rendezvous. The error names the fix — either walk the
-        // two machines onto one local network, or deliberately enable the
-        // public-mesh path on this device.
-        if !self.ownership.public_claims_allowed() {
-            let route = self.network_for_peer(&node);
-            if route.as_deref() != Some(LOCAL_CLAIM_NETWORK_ID) {
-                return Err(
-                    "this device was discovered over a public mesh — put both machines on \
-                     the same local network, or enable \"Allow claiming over the public \
-                     mesh\" in Fleet settings on this machine"
-                        .into(),
-                );
-            }
-        }
+        // Address the claim on the network where the peer actually advertised
+        // `claimable: true`, preferring the LAN rendezvous. A multi-homed peer
+        // also sends ordinary `claimable: false` presence on its other meshes;
+        // whichever frame arrived last used to overwrite `peer_networks`, so
+        // the Claim button sent on that unrelated mesh and the target correctly
+        // refused it as a non-LAN claim. `peer_claimable_networks` is already
+        // the authoritative per-network union used to render the button — use
+        // that same fact for delivery.
+        let public_allowed = self.ownership.public_claims_allowed();
+        let claim_network = {
+            let st = self.state.lock();
+            claim_network_for_peer(
+                &st.peer_claimable_networks,
+                pubkey_part(&node),
+                public_allowed,
+            )
+        };
+        let Some(claim_network) = claim_network else {
+            return Err(
+                "this device was not discovered as claimable on the local network — put both \
+                 machines on the same LAN, or enable \"Allow claiming over the public mesh\" \
+                 in Fleet settings on this machine"
+                    .into(),
+            );
+        };
         // Record that we're now awaiting this device's `Claimed` confirmation,
         // so the inbound handler honours only a confirmation we actually
         // solicited (see `pending_claims` / the `Claimed` arm). Recorded before
@@ -8777,7 +8786,8 @@ impl Mesh {
             .insert(pubkey_part(&node).to_string());
         tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
-        self.send_control(&node, &msg).await
+        self.send_control_on_network(&node, &claim_network, &msg)
+            .await
     }
 
     /// Front-end command: claim a **remote** device by the claim code its
@@ -15435,6 +15445,36 @@ impl Mesh {
         Err(last_err)
     }
 
+    /// Send control on one deliberately selected network. Claiming uses this
+    /// instead of the ordinary multi-network try-order because the network is
+    /// part of the authorization decision: a LAN claim delivered over some
+    /// other shared mesh must be refused by the target.
+    async fn send_control_on_network(
+        &self,
+        peer: &str,
+        network: &str,
+        message: &ControlMessage,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let response = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.to_string(),
+                channel: CHANNEL_CONTROL.to_string(),
+                peer: pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "channel send failed".into()));
+        }
+        self.note_peer_network(peer, network);
+        Ok(())
+    }
+
     /// The acknowledged-delivery twin of [`Self::send_control`]: the daemon
     /// queues the frame until the peer's link is up, retransmits it across
     /// session rebuilds, and resolves only once the peer's node has actually
@@ -16228,6 +16268,27 @@ fn fold_scoped_claimable(
     claimable
 }
 
+/// Pick the exact network that authorized the Claim button. LAN always wins;
+/// a public claim-advertising network is eligible only when this device opted
+/// into public claiming. Sorting keeps the choice deterministic if a peer is
+/// simultaneously present on more than one permitted rendezvous.
+fn claim_network_for_peer(
+    claims: &HashMap<String, HashSet<String>>,
+    peer: &str,
+    public_allowed: bool,
+) -> Option<String> {
+    let networks = claims.get(pubkey_part(peer))?;
+    if networks.contains(LOCAL_CLAIM_NETWORK_ID) {
+        return Some(LOCAL_CLAIM_NETWORK_ID.to_string());
+    }
+    if !public_allowed {
+        return None;
+    }
+    let mut networks = networks.iter().cloned().collect::<Vec<_>>();
+    networks.sort();
+    networks.into_iter().next()
+}
+
 /// The try-order for sending to one peer: its slot (last proven network)
 /// first, then the primary, then every other joined network, deduped in that
 /// priority. Pure, so the order — the part that decides whether a
@@ -16605,6 +16666,31 @@ mod tests {
             false,
         ));
         assert!(!claims.contains_key(peer));
+    }
+
+    #[test]
+    fn claim_delivery_uses_the_network_that_advertised_claimability() {
+        let peer = "desktop";
+        let mut claims = HashMap::new();
+        claims.insert(
+            peer.to_string(),
+            HashSet::from([
+                "ordinary-share".to_string(),
+                LOCAL_CLAIM_NETWORK_ID.to_string(),
+            ]),
+        );
+
+        assert_eq!(
+            claim_network_for_peer(&claims, peer, false).as_deref(),
+            Some(LOCAL_CLAIM_NETWORK_ID),
+            "an unrelated last-seen mesh must not steal a LAN claim",
+        );
+        claims.get_mut(peer).unwrap().remove(LOCAL_CLAIM_NETWORK_ID);
+        assert_eq!(claim_network_for_peer(&claims, peer, false), None);
+        assert_eq!(
+            claim_network_for_peer(&claims, peer, true).as_deref(),
+            Some("ordinary-share"),
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! Everything the front-end sees comes through `allmystuff://session`
 //! snapshots emitted after each change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1187,6 +1187,13 @@ struct State {
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
     peer_networks: HashMap<String, String>,
+    /// Networks on which each peer most recently advertised itself as
+    /// claimable (canonical pubkey → network ids). Presence is intentionally
+    /// network-scoped: a claimable machine says `true` on the LAN/claim-code
+    /// rendezvous and `false` on ordinary meshes. Collapsing those adverts
+    /// into one last-writer-wins profile made the ordinary false erase the
+    /// authoritative claim advert on every multi-homed desktop.
+    peer_claimable_networks: HashMap<String, HashSet<String>>,
     /// App features each peer last advertised (canonical pubkey → feature
     /// list from its presence profile). Read to decide whether a peer can
     /// ride the media-lane pool — `FEATURE_MEDIA_LANES` present means both
@@ -1348,6 +1355,7 @@ impl Mesh {
                 network: None,
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
+                peer_claimable_networks: HashMap::new(),
                 peer_features: HashMap::new(),
                 peer_links: HashMap::new(),
                 peer_boots: HashMap::new(),
@@ -3116,7 +3124,7 @@ impl Mesh {
                 if let Err(e) = &parsed {
                     tracing::warn!("dropping presence advert from {}: {e}", short_id(&from));
                 }
-                if let Ok(profile) = parsed {
+                if let Ok(mut profile) = parsed {
                     // We answer a peer's presence with our own (+ roster) when
                     // either it's the first we've heard of them this session or
                     // their app just (re)started — so the bootstrap is mutual
@@ -3127,10 +3135,17 @@ impl Mesh {
                     // neither condition fires again. `boot == 0` is an older
                     // heartbeating peer. Our own echo never replies to itself.
                     let canon = pubkey_part(profile.node.as_str()).to_string();
-                    self.state
-                        .lock()
-                        .peer_features
-                        .insert(canon.clone(), profile.features.clone());
+                    {
+                        let mut st = self.state.lock();
+                        profile.claimable = fold_scoped_claimable(
+                            &mut st.peer_claimable_networks,
+                            &canon,
+                            &network,
+                            profile.claimable,
+                        );
+                        st.peer_features
+                            .insert(canon.clone(), profile.features.clone());
+                    }
                     let is_self = self
                         .local_node_id()
                         .is_some_and(|me| pubkey_part(&me) == canon);
@@ -4733,6 +4748,7 @@ impl Mesh {
         let (effects, dropped) = {
             let mut st = self.state.lock();
             st.peer_networks.remove(kvm);
+            st.peer_claimable_networks.remove(kvm);
             st.peer_features.remove(kvm);
             st.peer_links.remove(kvm);
             st.peer_boots.remove(kvm);
@@ -10572,6 +10588,7 @@ impl Mesh {
             }
             for peer in &stale {
                 st.peer_networks.remove(peer);
+                st.peer_claimable_networks.remove(peer);
                 st.peer_features.remove(peer);
                 st.peer_boots.remove(peer);
             }
@@ -16121,6 +16138,43 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
     }
 }
 
+/// Fold one network-scoped presence advert into the peer's machine-wide
+/// claimability. A sender deliberately advertises `claimable: true` only on a
+/// claim rendezvous (or an ordinary mesh when legacy public claiming is
+/// explicitly enabled), while every other shared network carries a scoped
+/// `false`. The receiver therefore has to union the true networks instead of
+/// letting whichever advert arrived last overwrite the whole device profile.
+///
+/// A false advert removes only the network it arrived on. This preserves a
+/// simultaneous true from the LAN claim network, while still making a toggle
+/// off authoritative: that same LAN network sends false and is removed.
+fn fold_scoped_claimable(
+    claims: &mut HashMap<String, HashSet<String>>,
+    peer: &str,
+    network: &str,
+    advertised: bool,
+) -> bool {
+    if network.is_empty() {
+        return advertised;
+    }
+    if advertised {
+        claims
+            .entry(peer.to_string())
+            .or_default()
+            .insert(network.to_string());
+        return true;
+    }
+    let Some(networks) = claims.get_mut(peer) else {
+        return false;
+    };
+    networks.remove(network);
+    let claimable = !networks.is_empty();
+    if !claimable {
+        claims.remove(peer);
+    }
+    claimable
+}
+
 /// The try-order for sending to one peer: its slot (last proven network)
 /// first, then the primary, then every other joined network, deduped in that
 /// priority. Pure, so the order — the part that decides whether a
@@ -16466,6 +16520,70 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn claimability_is_the_union_of_network_scoped_presence() {
+        let mut claims = HashMap::new();
+        let peer = "desktop";
+
+        assert!(fold_scoped_claimable(
+            &mut claims,
+            peer,
+            LOCAL_CLAIM_NETWORK_ID,
+            true,
+        ));
+        assert!(fold_scoped_claimable(
+            &mut claims,
+            peer,
+            "ordinary-share",
+            false,
+        ));
+        assert!(
+            claims
+                .get(peer)
+                .is_some_and(|networks| networks.contains(LOCAL_CLAIM_NETWORK_ID)),
+            "an ordinary mesh's scoped false must not erase the LAN claim advert",
+        );
+
+        assert!(!fold_scoped_claimable(
+            &mut claims,
+            peer,
+            LOCAL_CLAIM_NETWORK_ID,
+            false,
+        ));
+        assert!(!claims.contains_key(peer));
+    }
+
+    #[test]
+    fn each_network_can_withdraw_only_its_own_claim_advert() {
+        let mut claims = HashMap::new();
+        let peer = "desktop";
+
+        assert!(fold_scoped_claimable(
+            &mut claims,
+            peer,
+            LOCAL_CLAIM_NETWORK_ID,
+            true,
+        ));
+        assert!(fold_scoped_claimable(
+            &mut claims,
+            peer,
+            "public-mesh",
+            true,
+        ));
+        assert!(fold_scoped_claimable(
+            &mut claims,
+            peer,
+            "public-mesh",
+            false,
+        ));
+        assert!(!fold_scoped_claimable(
+            &mut claims,
+            peer,
+            LOCAL_CLAIM_NETWORK_ID,
+            false,
+        ));
+    }
 
     #[test]
     fn volume_inventory_is_a_viewer_file_request() {

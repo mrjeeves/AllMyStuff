@@ -148,6 +148,13 @@ impl DriveMounts {
             let _ = clear_native_label(&mount, Some(port)).await;
             return Err(error);
         }
+        // Explorer can create or refresh its MountPoints2 entry while
+        // `net use` publishes the mapping. Re-apply the friendly label after
+        // that race as well as before it so new mappings and reconnects both
+        // retain the name selected in AllMyStuff.
+        if let Err(error) = label_native(&mount, &label, &route, port).await {
+            tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
+        }
         let info = NativeDriveInfo {
             route: route.clone(),
             label,
@@ -276,7 +283,10 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
 #[cfg(windows)]
 async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
-    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
+    let marker = format!(
+        r"{}\Software\AllMyStuff\MappedDrives\{letter}",
+        drive_registry_root()?
+    );
     let marker_query = crate::child_process::command("reg.exe")
         .args(["query", &marker])
         .output()
@@ -379,9 +389,10 @@ async fn unmount_native(_mount: &str) -> Result<(), String> {
 #[cfg(windows)]
 async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
-    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
+    let root = drive_registry_root()?;
+    let marker = format!(r"{root}\Software\AllMyStuff\MappedDrives\{letter}");
     let drive_icon_key = format!(
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
     // Explorer does not use DriveIcons for a WebDAV network drive. It keys
     // that mount by its UNC transport path and reads `_LabelFromReg` from
@@ -389,7 +400,7 @@ async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Resul
     // the value that changes "DavWWWRoot (\\localhost@12345)" into the name
     // the user chose in AllMyStuff.
     let mount_point_key = format!(
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
     );
     let marked = crate::child_process::command("reg.exe")
         .args(["add", &marker, "/ve", "/t", "REG_SZ", "/d", route, "/f"])
@@ -469,14 +480,15 @@ async fn label_native(_mount: &str, _label: &str, _route: &str, _port: u16) -> R
 #[cfg(windows)]
 async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
-    let marker = format!(r"HKCU\Software\AllMyStuff\MappedDrives\{letter}");
+    let root = drive_registry_root()?;
+    let marker = format!(r"{root}\Software\AllMyStuff\MappedDrives\{letter}");
     let drive_icon_key = format!(
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
     );
     // `/persistent:no` should avoid this key, but a failed or interrupted
     // WebDAV redirector can still leave one behind. This function is called
     // only for a letter carrying our private lease marker.
-    let network_key = format!(r"HKCU\Network\{letter}");
+    let network_key = format!(r"{root}\Network\{letter}");
     let _ = crate::child_process::command("reg.exe")
         .args(["delete", &network_key, "/f"])
         .output()
@@ -488,7 +500,7 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
         .await;
     if let Some(port) = port {
         let mount_point_key = format!(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+            r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
         );
         // Leave Explorer's mount-history key intact; it owns that history.
         // Remove only the display value AllMyStuff authored.
@@ -522,9 +534,13 @@ async fn refresh_explorer_drive_labels() {
 
 #[cfg(windows)]
 async fn cleanup_stale_native_mounts() {
-    let base = r"HKCU\Software\AllMyStuff\MappedDrives";
+    let Ok(root) = drive_registry_root() else {
+        tracing::warn!("couldn't select the signed-in user's drive registry hive");
+        return;
+    };
+    let base = format!(r"{root}\Software\AllMyStuff\MappedDrives");
     let Ok(output) = crate::child_process::command("reg.exe")
-        .args(["query", base])
+        .args(["query", &base])
         .output()
         .await
     else {
@@ -561,6 +577,33 @@ fn parse_registry_dword(bytes: &[u8]) -> Option<u32> {
         .split_whitespace()
         .find_map(|part| part.strip_prefix("0x"))
         .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+}
+
+/// Registry root for per-user drive state. The Windows service launches the
+/// node in the interactive session but retains its LocalSystem token, so HKCU
+/// is the service account rather than the Explorer user's hive. The service
+/// already supplies that user's SID for IPC ACLs; use the same SID explicitly
+/// for drive leases and Explorer labels.
+#[cfg(any(windows, test))]
+fn registry_root_for_client(client_sid: Option<&str>) -> Result<String, String> {
+    let Some(sid) = client_sid else {
+        return Ok("HKCU".into());
+    };
+    let valid = sid.starts_with("S-1-")
+        && sid
+            .split('-')
+            .skip(2)
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if !valid {
+        return Err("refusing invalid ALLMYSTUFF_CLIENT_SID value".into());
+    }
+    Ok(format!(r"HKU\{sid}"))
+}
+
+#[cfg(windows)]
+fn drive_registry_root() -> Result<String, String> {
+    let sid = std::env::var("ALLMYSTUFF_CLIENT_SID").ok();
+    registry_root_for_client(sid.as_deref())
 }
 
 #[cfg(not(windows))]
@@ -868,6 +911,26 @@ fn map_remote_error(reason: &str) -> FsError {
         FsError::Forbidden
     } else {
         FsError::GeneralFailure
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::registry_root_for_client;
+
+    #[test]
+    fn service_drive_state_targets_the_interactive_user_hive() {
+        assert_eq!(
+            registry_root_for_client(Some("S-1-5-21-1000-2000-3000-1001")).unwrap(),
+            r"HKU\S-1-5-21-1000-2000-3000-1001"
+        );
+        assert_eq!(registry_root_for_client(None).unwrap(), "HKCU");
+    }
+
+    #[test]
+    fn service_client_sid_cannot_inject_a_registry_path() {
+        assert!(registry_root_for_client(Some(r"S-1-5-21\Software")).is_err());
+        assert!(registry_root_for_client(Some("not-a-sid")).is_err());
     }
 }
 

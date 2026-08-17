@@ -1247,7 +1247,12 @@ pub async fn dispatch(
         "site_map" => {
             let node: String = try_arg!(arg(a, "node"));
             let port: u16 = try_arg!(arg(a, "port"));
-            match mesh.site_map(node, port).await {
+            // Absent means a person asked (the historical meaning of this
+            // command, and what a CLI caller means); only a background caller
+            // that knows it isn't one says so, and forgoes clearing the
+            // auto-heal refusal backoff.
+            let user_initiated: bool = try_arg!(opt(a, "userInitiated")).unwrap_or(true);
+            match mesh.site_map(node, port, user_initiated).await {
                 Ok(local_port) => DispatchOut::Json(json!({ "localPort": local_port })),
                 Err(e) => DispatchOut::Err(e),
             }

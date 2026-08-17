@@ -180,6 +180,10 @@ pub struct Mesh {
     /// refuses every re-offer would otherwise write one INFO per rejection
     /// for as long as it keeps refusing.
     route_reject_log: Mutex<HashMap<(String, String), RejectLogState>>,
+    /// Rate limit for the completed-route prune line — see
+    /// [`PRUNE_LOG_INTERVAL`]. The prune sits in the snapshot path, so route
+    /// churn would otherwise write one INFO per snapshot.
+    prune_log: Mutex<PruneLogState>,
     /// Viewer-side download sinks: a `(route, req)` whose `Chunk`s should
     /// stream straight to a local file (the Downloads folder) instead of
     /// the window's queue — registered by `file_download` *before* the
@@ -1080,6 +1084,15 @@ const ROUTE_REJECT_LOG_BACKOFF: &[std::time::Duration] = &[
 /// last backoff step, so a refusal that is still going never retires itself.
 const ROUTE_REJECT_LOG_RESET: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Rate limit for the completed-route prune line. The prune runs inside
+/// [`Mesh::snapshot`], which is emitted on every route event — so anything
+/// that churns routes prunes one record per snapshot, tens of times a second,
+/// and unbounded this line buries the very messages that explain the churn.
+/// The first prune after a quiet spell still writes immediately (that history
+/// is filling at all is the diagnosis) and each line carries every prune it
+/// stands for, so the rate reads off the numbers instead of the line count.
+const PRUNE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// After a heal run whose every attempt was refused, how long to leave that
 /// mapping alone before trying again. Each fully-refused run advances a step
 /// and then holds at the last, so a host that isn't coming back — an unclaimed
@@ -1163,6 +1176,33 @@ impl RejectLogState {
         self.last_logged = now;
         self.step = (self.step + 1).min(ROUTE_REJECT_LOG_BACKOFF.len() - 1);
         Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Bookkeeping behind [`PRUNE_LOG_INTERVAL`]: when the completed-route prune
+/// last wrote a line, and how many records it has dropped since.
+#[derive(Debug, Default)]
+struct PruneLogState {
+    /// When a line was last written; `None` until the first one.
+    last_logged: Option<Instant>,
+    /// Records pruned since that line — reported by the next one.
+    pending: u64,
+}
+
+impl PruneLogState {
+    /// Fold `pruned` into the episode. `Some(n)` means write a line now
+    /// standing for `n` records (this prune included); `None` means stay
+    /// quiet and let a later line carry them.
+    fn admit(&mut self, pruned: u64, now: Instant) -> Option<u64> {
+        self.pending += pruned;
+        if self
+            .last_logged
+            .is_some_and(|last| now.saturating_duration_since(last) < PRUNE_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.pending))
     }
 }
 
@@ -1358,6 +1398,7 @@ impl Mesh {
             site_nack_at: Mutex::new(HashMap::new()),
             site_remap_refused: Mutex::new(HashMap::new()),
             route_reject_log: Mutex::new(HashMap::new()),
+            prune_log: Mutex::new(PruneLogState::default()),
             downloads: Mutex::new(HashMap::new()),
             shared: Mutex::new(HashMap::new()),
             room_scopes: Mutex::new(HashMap::new()),
@@ -4913,7 +4954,7 @@ impl Mesh {
                     .into(),
             );
         }
-        let port = self.site_map(kvm.clone(), 80).await?;
+        let port = self.site_map(kvm.clone(), 80, true).await?;
         crate::kvm_media::stage(port, &me, &path, &label).await?;
         // Mount metadata is now part of KVM presence. Ask for a fresh advert
         // so every graph learns the source→KVM relationship immediately.
@@ -4995,7 +5036,7 @@ impl Mesh {
         if kvm.is_empty() {
             return Err("choose a KVM".into());
         }
-        let port = self.site_map(kvm.clone(), 80).await?;
+        let port = self.site_map(kvm.clone(), 80, true).await?;
         crate::kvm_media::unmount(port).await?;
         let _ = self
             .send_control(&kvm, &ControlMessage::ProfileRequest)
@@ -5935,11 +5976,13 @@ impl Mesh {
         };
         let pruned = session.prune_completed_routes(COMPLETED_ROUTE_HISTORY);
         if pruned > 0 {
-            tracing::info!(
-                pruned,
-                retained = COMPLETED_ROUTE_HISTORY,
-                "pruned completed route history"
-            );
+            if let Some(total) = self.prune_log.lock().admit(pruned as u64, Instant::now()) {
+                tracing::info!(
+                    pruned = total,
+                    retained = COMPLETED_ROUTE_HISTORY,
+                    "pruned completed route history"
+                );
+            }
         }
         let me = session.me().to_string();
         // A CEC customer a technician dialed is an ordinary mesh peer here, with
@@ -12967,17 +13010,30 @@ impl Mesh {
     /// the accept loop. Returns the bound local port. The far side gates the
     /// offer owner/fleet and re-checks every connection's port against its
     /// own exposed allow-list.
-    pub async fn site_map(self: &Arc<Self>, node: String, port: u16) -> Result<u16, String> {
+    pub async fn site_map(
+        self: &Arc<Self>,
+        node: String,
+        port: u16,
+        user_initiated: bool,
+    ) -> Result<u16, String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         if pubkey_part(&node) == pubkey_part(&me) {
             return Err("that's this device".into());
         }
-        // Asking again clears a previous refusal: the user is the one who
-        // knows access may have changed (they just claimed the KVM), and this
-        // is a deliberate act, not the auto-heal loop retrying itself.
-        self.site_remap_refused
-            .lock()
-            .remove(&format!("{}:{}", pubkey_part(&node), port));
+        // A *person* asking again clears a previous refusal: they're the one
+        // who knows access may have changed (they just claimed the KVM), and
+        // that's a deliberate act, not the auto-heal loop retrying itself.
+        //
+        // Automatic callers must never take this branch, or the refusal
+        // backoff is no backoff at all — a background poll on this same entry
+        // point (the KVM power lamp did exactly this) resets the cooldown
+        // faster than it can ever elapse, and a host that refuses every offer
+        // is re-offered forever instead of settling.
+        if user_initiated {
+            self.site_remap_refused
+                .lock()
+                .remove(&format!("{}:{}", pubkey_part(&node), port));
+        }
         // Already mapped? Hand back the existing local port only while its
         // accept task is alive. A route offer that expires/rejects causes that
         // task to exit and drop the listener; retaining its mapping produced a
@@ -18547,5 +18603,39 @@ mod tests {
         // The reset must outlast the widest step, or an ongoing refusal would
         // retire itself between lines and log at full rate forever.
         assert!(ROUTE_REJECT_LOG_RESET > *ROUTE_REJECT_LOG_BACKOFF.last().unwrap());
+    }
+
+    // ---- completed-route prune log rate limit ------------------------------
+    //
+    // Also a real flood: route churn between the GUI and a KVM console pruned
+    // one record per snapshot, writing 26,767 of one 13-minute log's 26,832
+    // lines and hiding the churn that caused it.
+
+    #[test]
+    fn prune_log_writes_the_first_line_then_carries_the_count() {
+        let t0 = std::time::Instant::now();
+        let mut state = PruneLogState::default();
+
+        // Nothing has been written yet, so the opening prune is the diagnosis
+        // and goes out immediately.
+        assert_eq!(state.admit(1, t0), Some(1));
+        // Everything inside the window is counted, not written...
+        assert_eq!(state.admit(1, t0 + Duration::from_secs(1)), None);
+        assert_eq!(state.admit(3, t0 + Duration::from_secs(2)), None);
+        // ...and the next line stands for all of it.
+        assert_eq!(state.admit(1, t0 + PRUNE_LOG_INTERVAL), Some(5));
+        // The count starts over rather than accumulating forever.
+        assert_eq!(state.admit(2, t0 + PRUNE_LOG_INTERVAL * 2), Some(2));
+    }
+
+    #[test]
+    fn prune_log_reopens_after_a_quiet_spell() {
+        let t0 = std::time::Instant::now();
+        let mut state = PruneLogState::default();
+
+        assert_eq!(state.admit(1, t0), Some(1));
+        // History that starts filling again long afterwards is news: it opens
+        // with a line of its own instead of waiting out a stale window.
+        assert_eq!(state.admit(1, t0 + Duration::from_secs(3600)), Some(1));
     }
 }

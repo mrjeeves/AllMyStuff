@@ -755,6 +755,14 @@ class AppStore {
   private kvmPower = $state<Record<string, boolean | null>>({});
   private kvmPowerRefreshes = new Set<string>();
   private kvmPowerWatchers = new Map<string, { nodeId: string; count: number; nextAt: number }>();
+  /** When each KVM's power lamp is next due a read, kept *outside* the
+   *  watcher map so the cadence survives a watcher being dropped and
+   *  rebuilt — which the graph's effect does on every session snapshot. */
+  private kvmPowerDueAt = new Map<string, number>();
+  /** KVMs whose console this device has already mapped for the power lamp,
+   *  so a status poll maps once and then rides the standing tunnel. Cleared
+   *  when the appliance goes offline, so it re-maps once on its return. */
+  private kvmConsoleMapped = new Set<string>();
   /** The latched clock-skew warning: this machine's wall clock is well out
    *  of line with its peers' (estimated passively — no extra calls to any
    *  node). Null = in sync (or nothing measurable). Drives the topbar pill;
@@ -1868,6 +1876,9 @@ class AppStore {
       for (const [key, watch] of this.kvmPowerWatchers) {
         if (watch.nextAt > now || this.kvmPowerRefreshes.has(key)) continue;
         watch.nextAt = now + 6_000;
+        // Mirrored onto the durable due-map so a watcher rebuilt between
+        // ticks resumes this cadence instead of reading immediately.
+        this.kvmPowerDueAt.set(key, watch.nextAt);
         void this.refreshKvmPower(watch.nodeId);
       }
       // The dialed customers' `online` flags are reconciled by the node against
@@ -5211,8 +5222,12 @@ class AppStore {
   /** Map a peer's site to a local port — sets up the reverse-proxy and binds
    *  a local listener, then records the mapping. Re-mapping asks the backend
    *  to validate the listener before reusing it: the UI's mapping row is not
-   *  proof that its localhost tunnel survived a rejected route or reconnect. */
-  async mapSite(nodeId: string, site: SiteAdvert, quiet = false) {
+   *  proof that its localhost tunnel survived a rejected route or reconnect.
+   *
+   *  `userInitiated` false marks a background map (the power lamp's one-time
+   *  console map): the node keeps its auto-heal refusal backoff instead of
+   *  treating the call as a person insisting that access has changed. */
+  async mapSite(nodeId: string, site: SiteAdvert, quiet = false, userInitiated = true) {
     const node = this.node(nodeId);
     if (!node) return;
     // A KVM's own web UI rides this same proxy path — gated by its session
@@ -5245,7 +5260,7 @@ class AppStore {
       // No toast — the row now shows its localhost:<port> address inline.
       return;
     }
-    const r = await siteMap(nodeId, site.port);
+    const r = await siteMap(nodeId, site.port, userInitiated);
     if (!r) {
       if (!quiet) this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
       return;
@@ -5332,8 +5347,23 @@ class AppStore {
     if (current) {
       current.count += 1;
     } else {
-      this.kvmPowerWatchers.set(key, { nodeId, count: 1, nextAt: Date.now() + 6_000 });
-      void this.refreshKvmPower(nodeId);
+      // The due time outlives the watcher deliberately. Callers register from
+      // an effect whose dependencies (the graph) change on every session
+      // snapshot, so the watcher is dropped and rebuilt constantly — and
+      // treating each rebuild as a first watch fired the "immediate" read on
+      // every snapshot instead of once. Since that read maps the KVM's
+      // console, and mapping emits a snapshot, the reads drove the very
+      // change that re-armed them: one map/teardown per IPC round trip, for
+      // as long as a KVM was on screen. Honour the six-second cadence across
+      // rebuilds; only a genuinely new key reads immediately.
+      const due = this.kvmPowerDueAt.get(key);
+      const now = Date.now();
+      const fresh = due !== undefined && due > now;
+      this.kvmPowerWatchers.set(key, { nodeId, count: 1, nextAt: fresh ? due : now + 6_000 });
+      if (!fresh) {
+        this.kvmPowerDueAt.set(key, now + 6_000);
+        void this.refreshKvmPower(nodeId);
+      }
     }
     return () => {
       const watch = this.kvmPowerWatchers.get(key);
@@ -5361,13 +5391,14 @@ class AppStore {
 
     this.kvmPowerRefreshes.add(key);
     try {
-      const port = await this.kvmConsolePort(nodeId, true);
+      const port = await this.kvmConsolePort(nodeId, true, true);
       if (port === null) {
         this.kvmPower = { ...this.kvmPower, [key]: null };
         return;
       }
       const { rsp } = await this.kvmApi<KvmPowerStatus>(nodeId, port, "/api/vm/gpio", {
         quiet: true,
+        background: true,
       });
       const power = rsp?.code === 0 && typeof rsp.data?.pwr === "boolean" ? rsp.data.pwr : null;
       this.kvmPower = { ...this.kvmPower, [key]: power };
@@ -5492,21 +5523,62 @@ class AppStore {
     this.openSite(m);
   }
 
-  /** Resolve and map a KVM's published web console to one local tunnel port. */
-  private async kvmConsolePort(nodeId: string, quiet = false): Promise<number | null> {
+  /** Resolve and map a KVM's published web console to one local tunnel port.
+   *
+   *  `background` marks a caller that is only reading state (the power lamp).
+   *  Such a caller maps **once** per appliance and then rides the standing
+   *  tunnel: an existing mapping is reused without touching the backend at
+   *  all, and a mapping that has since gone leaves the lamp unknown rather
+   *  than re-mapping. Re-mapping on every poll is what turned a status read
+   *  into a route-churn loop — each map emits a session snapshot, which
+   *  re-ran the graph effect that scheduled the next read. A person opening
+   *  the KVM (or driving power, Wi-Fi, virtual media) always maps. */
+  private async kvmConsolePort(
+    nodeId: string,
+    quiet = false,
+    background = false,
+  ): Promise<number | null> {
     const node = this.node(nodeId);
     const site = this.kvmWebSite(node);
     if (!node || !site) return null;
-    await this.mapSite(nodeId, site, quiet);
+    const key = canonicalNodeId(nodeId);
+    const existing = this.siteMappingFor(nodeId, site.id);
+    if (background) {
+      // An appliance that dropped off re-earns its one map when it returns.
+      if (!node.online) {
+        this.kvmConsoleMapped.delete(key);
+        return null;
+      }
+      if (existing) {
+        this.kvmConsoleMapped.add(key);
+        return existing.localPort;
+      }
+      if (this.kvmConsoleMapped.has(key)) return null;
+    }
+    this.kvmConsoleMapped.add(key);
+    await this.mapSite(nodeId, site, quiet, !background);
     return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
   }
 
-  /** Call one KVM JSON endpoint outside the webview's CORS boundary. */
+  /** Call one KVM JSON endpoint outside the webview's CORS boundary.
+   *
+   *  `background` marks a status read (the power lamp) rather than something
+   *  a person asked for: it never rebuilds the tunnel on failure. Repair
+   *  unmaps and re-maps, each step emitting a session snapshot that re-runs
+   *  the graph effect scheduling the next read — so a poll that repairs is a
+   *  poll that feeds itself. An unreachable appliance simply reads unknown
+   *  and recovers when a person opens it (or when the tunnel heals itself). */
   private async kvmApi<T>(
     nodeId: string,
     port: number,
     path: string,
-    init?: { method?: string; body?: unknown; timeoutMs?: number; quiet?: boolean },
+    init?: {
+      method?: string;
+      body?: unknown;
+      timeoutMs?: number;
+      quiet?: boolean;
+      background?: boolean;
+    },
   ): Promise<KvmApiOutcome<T>> {
     const verb = (init?.method ?? "GET").toUpperCase();
     // Never discover a stale tunnel by sending a state-changing request. A
@@ -5515,6 +5587,7 @@ class AppStore {
     if (verb !== "GET") {
       const probe = await this.kvmApi(nodeId, port, "/api/application/version", {
         quiet: init?.quiet,
+        background: init?.background,
       });
       if (!probe.rsp) return { rsp: null, timedOut: probe.timedOut, reason: probe.reason };
       const node = this.node(nodeId);
@@ -5531,8 +5604,9 @@ class AppStore {
     // A stale route can leave localhost listening while every accepted socket
     // immediately closes, which reqwest reports as `other`, not `connect`.
     // Any transport failure on this safe GET therefore rebuilds the mapping
-    // once. Mutating requests never enter this replay path.
-    if (out.error && verb === "GET") {
+    // once. Mutating requests never enter this replay path, and neither do
+    // background status reads (see the doc comment).
+    if (out.error && verb === "GET" && !init?.background) {
       const repairedPort = await this.repairKvmConsoleMapping(nodeId, port, init?.quiet ?? false);
       if (repairedPort !== null) {
         try {

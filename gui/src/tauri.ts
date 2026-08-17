@@ -2108,12 +2108,17 @@ export interface SiteMappingInfo {
 
 /** Map a peer's site to a local port — sets up the reverse-proxy route and
  *  binds a local listener. Returns the bound local port (the same number
- *  when free, else a remapped one), or null in web mode. */
+ *  when free, else a remapped one), or null in web mode.
+ *
+ *  `userInitiated` false marks a background map (a status poll, a repair):
+ *  the node then leaves its auto-heal refusal backoff alone, so a host that
+ *  refuses every offer settles instead of being re-offered forever. */
 export function siteMap(
   node: string,
   port: number,
+  userInitiated = true,
 ): Promise<{ localPort: number } | null> {
-  return tryInvoke<{ localPort: number }>("site_map", { node, port });
+  return tryInvoke<{ localPort: number }>("site_map", { node, port, userInitiated });
 }
 
 /** Tear a site mapping down (unbinds the local listener, drops the route). */

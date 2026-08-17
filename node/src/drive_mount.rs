@@ -584,6 +584,7 @@ fn parse_registry_dword(bytes: &[u8]) -> Option<u32> {
 /// is the service account rather than the Explorer user's hive. The service
 /// already supplies that user's SID for IPC ACLs; use the same SID explicitly
 /// for drive leases and Explorer labels.
+#[cfg(any(windows, test))]
 fn registry_root_for_client(client_sid: Option<&str>) -> Result<String, String> {
     let Some(sid) = client_sid else {
         return Ok("HKCU".into());

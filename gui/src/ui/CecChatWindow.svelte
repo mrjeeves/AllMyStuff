@@ -66,7 +66,7 @@
   // Stamp / refresh the OS window title as the customer name resolves, and
   // stick to the newest line as the thread grows.
   $effect(() => {
-    void setWindowTitle(`Chat — ${title}`);
+    void setWindowTitle(`Chat: ${title}`);
   });
   $effect(() => {
     // Re-run whenever a line lands, then pin to the bottom.
@@ -168,7 +168,7 @@
           onclick={answer}
           title={pending
             ? "Answer this customer's raised hand"
-            : "Reconnect — dial the customer; their screen opens on approval"}
+            : "Reconnect: dial the customer; their screen opens on approval"}
         >
           {app.cecDialing ? "Dialing…" : pending ? "Answer" : "Connect"}
         </button>
@@ -194,7 +194,7 @@
       <div class="empty">
         <p>No messages yet.</p>
         <p class="hint">
-          Send the customer a note — “close the browser and reopen it”, a code
+          Send the customer a note: “close the browser and reopen it”, a code
           to read back, or just let them know what you’re doing.
         </p>
       </div>

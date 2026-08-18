@@ -27,9 +27,6 @@
 
 <div class="section">
   <h3>Danger Zone</h3>
-  <p class="lead">
-    Destructive identity and networking resets live here, away from routine update and repair controls.
-  </p>
 
   <section class="danger">
     <div class="danger-row">
@@ -38,7 +35,7 @@
         <div class="danger-desc">Drop ownership, the fleet key, and signed roster. Keep other meshes and settings.</div>
       </div>
       <button class:armed={armed === "leave"} disabled={resetting !== null} onclick={() => runReset("leave")}>
-        {resetting === "leave" ? "Restarting…" : armed === "leave" ? "Confirm — reboots" : "Leave fleet"}
+        {resetting === "leave" ? "Restarting…" : armed === "leave" ? "Confirm and restart" : "Leave fleet"}
       </button>
     </div>
 
@@ -48,7 +45,7 @@
         <div class="danger-desc">Leave the fleet and forget every mesh while keeping this device's identity.</div>
       </div>
       <button class:armed={armed === "network"} disabled={resetting !== null} onclick={() => runReset("network")}>
-        {resetting === "network" ? "Restarting…" : armed === "network" ? "Confirm — reboots" : "Reset networking"}
+        {resetting === "network" ? "Restarting…" : armed === "network" ? "Confirm and restart" : "Reset networking"}
       </button>
     </div>
 
@@ -58,7 +55,7 @@
         <div class="danger-desc">Erase identity, config, meshes, and fleet ownership. This cannot be undone.</div>
       </div>
       <button class="nuke" class:armed={armed === "factory"} disabled={resetting !== null} onclick={() => runReset("factory")}>
-        {resetting === "factory" ? "Resetting…" : armed === "factory" ? "Confirm wipe — reboots" : "Factory reset"}
+        {resetting === "factory" ? "Resetting…" : armed === "factory" ? "Confirm wipe and restart" : "Factory reset"}
       </button>
     </div>
 
@@ -69,7 +66,6 @@
 
 <style>
   h3 { margin: 0 0 0.35rem; font-size: 1.2rem; color: var(--danger); }
-  .lead { margin: 0 0 1rem; color: var(--ink-soft); font-size: 0.82rem; line-height: 1.45; }
   .danger { padding: 0.9rem; border: 1px solid var(--danger); border-radius: var(--r-sm); background: var(--danger-soft); display: flex; flex-direction: column; gap: 0.7rem; }
   .danger-row { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding-top: 0.7rem; border-top: 1px solid var(--line); }
   .danger-row:first-child { padding-top: 0; border-top: 0; }

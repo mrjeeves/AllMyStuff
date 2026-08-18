@@ -1422,6 +1422,40 @@ pub async fn dispatch(
         }
         "mesh_network_remove" => {
             let network: String = try_arg!(arg(a, "network"));
+            // A disabled network is no longer present in the daemon: its full
+            // config is parked in `DisabledNetworks`. Leaving one therefore
+            // means deleting that parked config, not asking the daemon to
+            // remove a network it cannot see. Keep Local protected even when
+            // the caller used its config id instead of its wire id.
+            if disabled.contains(&network) {
+                let parked = disabled.list().into_iter().find(|config| {
+                    config.get("id").and_then(Value::as_str) == Some(network.as_str())
+                        || config.get("network_id").and_then(Value::as_str)
+                            == Some(network.as_str())
+                });
+                if parked
+                    .as_ref()
+                    .and_then(|config| config.get("network_id").and_then(Value::as_str))
+                    == Some(LOCAL_CLAIM_NETWORK_ID)
+                {
+                    return DispatchOut::Err(
+                        "the Local network can't be left — switch it off instead".into(),
+                    );
+                }
+                let Some(config) = disabled.take(&network) else {
+                    return DispatchOut::Err(format!(
+                        "couldn't remove disabled network '{network}'"
+                    ));
+                };
+                tracing::info!(
+                    network_id = config
+                        .get("network_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    "forgot disabled network"
+                );
+                return DispatchOut::Json(Value::Null);
+            }
             // The local claim network can't be left, only switched on and
             // off (`network_set_enabled`) — a remove would be undone by the
             // next ownership check anyway, since the node re-joins it

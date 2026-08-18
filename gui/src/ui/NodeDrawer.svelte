@@ -481,7 +481,7 @@
       <button
         class="btn primary console-open"
         disabled={app.cecDialing}
-        title="Connect and open their screen — they approve unless a standing grant still covers you"
+        title="Connect and open their screen: they approve unless a standing grant still covers you"
         onclick={() => {
           if (cecPeer) void app.reconnectCec(cecPeer.node);
         }}
@@ -587,7 +587,7 @@
         {:else if fleetKvm && canEvictHere}
           <p class="hint">KVMs are fixed-role fleet appliances. They can be evicted, but never promoted or demoted.</p>
           <div class="fleet-actions">
-            <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so this KVM loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
+            <button class="btn small danger" title="Evict: a signed removal that propagates to every member, so this KVM loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
           </div>
         {:else if canActHere}
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
@@ -597,16 +597,16 @@
                  evicting an owner needs every owner's consent, so step them down
                  to manager first rather than evicting outright. -->
             {#if st.role === "owner"}
-              <button class="btn small" title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent.)" onclick={() => app.grantFleetRole(node.id, "manager")}>⤓ Make manager</button>
+              <button class="btn small" title="Step this co-owner back down to manager: they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent.)" onclick={() => app.grantFleetRole(node.id, "manager")}>⤓ Make manager</button>
             {:else if st.role === "manager"}
-              <button class="btn small" title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner." onclick={() => app.grantFleetRole(node.id, "owner")}>★ Make owner</button>
+              <button class="btn small" title="Promote this manager to a co-owner: full fleet authority alongside you. Only an owner can make an owner." onclick={() => app.grantFleetRole(node.id, "owner")}>★ Make owner</button>
               <button class="btn small" title="Withdraw this manager back to a plain member" onclick={() => app.withdrawFleetRole(node.id)}>⤓ Make member</button>
-              <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
+              <button class="btn small danger" title="Evict: a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
             {:else}
               {#if iOwn}
-                <button class="btn small" title="Promote this member to a manager — they can admit members. Promote again to make them a co-owner. (Only an owner can promote.)" onclick={() => app.grantFleetRole(node.id, "manager")}>★ Make manager</button>
+                <button class="btn small" title="Promote this member to a manager: they can admit members. Promote again to make them a co-owner. (Only an owner can promote.)" onclick={() => app.grantFleetRole(node.id, "manager")}>★ Make manager</button>
               {/if}
-              <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
+              <button class="btn small danger" title="Evict: a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
             {/if}
           </div>
           <p class="hint tiny">
@@ -643,7 +643,7 @@
     <section class="block">
       {#if !st || !st.app}
         <p class="muted">
-          This device is on your mesh, but it isn't running AllMyStuff — so it
+          This device is on your mesh, but it isn't running AllMyStuff: so it
           has no screens, mics or other things to wire up, and it can't be a
           connection target. Install AllMyStuff on it and it'll fill in here.
         </p>
@@ -656,10 +656,10 @@
           {/if}
         </div>
         {#if outGrants.length === 0}
-          <p class="muted">Nothing yet — use <b>Manage share</b> to let {st.shared.name} open one of your device's consoles.</p>
+          <p class="muted">Nothing yet: use <b>Manage share</b> to let {st.shared.name} open one of your device's consoles.</p>
         {:else if (partner?.nodes.length ?? 0) > 1}
           <p class="muted">
-            You're sharing with {st.shared.name}, not one machine — these work to
+            You're sharing with {st.shared.name}, not one machine: these work to
             any of their {partner?.nodes.length} devices.
           </p>
         {/if}
@@ -685,7 +685,7 @@
             <span class="claim-glyph" aria-hidden="true">＋</span>
             <div>
               <div class="claim-card-title">Make {displayName(node)} yours</div>
-              <div class="claim-card-sub">It's in claim mode — offering itself for adoption.</div>
+              <div class="claim-card-sub">It's in claim mode: offering itself for adoption.</div>
             </div>
           </div>
           <p class="claim-card-what">
@@ -709,7 +709,7 @@
       {:else if st.kind === "free"}
         <p class="muted">
           This device hasn't been put up for adoption. You can't just take
-          ownership — start AllMyStuff on it in claim mode (or toggle
+          ownership: start AllMyStuff on it in claim mode (or toggle
           “allow adoption” there), then claim it from here.
         </p>
         {#if !app.isKvm(node)}
@@ -717,7 +717,7 @@
         {/if}
       {:else}
         <p class="muted own-note">
-          {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
+          {st.self ? "This is you." : "Yours: it connects freely with everything else you own."}
         </p>
         {#if !st.self && !app.isKvm(node)}
           <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
@@ -828,7 +828,7 @@
           <p class="sites-empty">
             {app.isMe(node.id)
               ? "No listening services found."
-              : "No services reported — it may be offline or older."}
+              : "No services reported: it may be offline or older."}
           </p>
         {:else}
           <ul class="dsites">
@@ -877,7 +877,7 @@
       <section class="block kvm-controlled">
         <h4>Out-of-band</h4>
         <p class="kvm-note">
-          Controlled by KVM <b>{displayName(controllingKvm)}</b> — its screen and
+          Controlled by KVM <b>{displayName(controllingKvm)}</b>: its screen and
           keyboard reach this machine even when it's off or stuck.
         </p>
         <button class="btn small primary" onclick={() => controllingKvm && app.openKVM(controllingKvm.id)}>
@@ -952,7 +952,7 @@
                   <li class="kvm-mesh-row">
                     <code class="kvm-mesh-id">{m}</code>
                     {#if app.kvmMeshIsFleet(m)}
-                      <span class="kvm-mesh-tag fleet" title="The fleet's own mesh — leave it by unclaiming the device">fleet</span>
+                      <span class="kvm-mesh-tag fleet" title="The fleet's own mesh: leave it by unclaiming the device">fleet</span>
                     {:else}
                       {#if m === node.kvm?.joiningMesh}
                         <span class="kvm-mesh-tag" title="The device's own joining mesh">joining</span>
@@ -968,7 +968,7 @@
                 {/each}
               </ul>
             {:else}
-              <p class="kvm-note">No meshes reported yet — the device advertises its list.</p>
+              <p class="kvm-note">No meshes reported yet: the device advertises its list.</p>
             {/if}
             <div class="kvm-attach-row">
               <input
@@ -1028,7 +1028,7 @@
         </header>
         <p class="kvm-modal-lead">
           Detaching removes this machine's out-of-band screen &amp; keyboard. You
-          won't be able to reach it through the KVM until you attach it again —
+          won't be able to reach it through the KVM until you attach it again :
           including when its own agent is down (a crashed OS, a BIOS screen, a
           headless box). This is exactly the case the KVM is there for.
         </p>
@@ -1054,7 +1054,7 @@
         <p class="kvm-modal-lead">
           It leaves your fleet and every mesh, forgets its owner and attachment,
           and goes back into claim mode on its own joining mesh{node.kvm?.joiningMesh
-            ? ` (${node.kvm.joiningMesh} — also shown on the device's screen)`
+            ? ` (${node.kvm.joiningMesh}: also shown on the device's screen)`
             : ""}. To use it again, join that mesh and claim it like a new
           device.
         </p>

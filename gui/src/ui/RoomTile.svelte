@@ -413,7 +413,7 @@
     {:else}
       <div class="badge">
         {isCamera ? "📷" : "🖥"} <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
-        {#if controlActive}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
+        {#if controlActive}<span class="ctl" title="They turned control sharing on: click and type here to drive their machine">🕹 you can drive</span>{/if}
       </div>
     {/if}
     <!-- The video player's corner: fullscreen where everyone looks for
@@ -427,8 +427,8 @@
           title={pointerLocked || nativePointerLocked
             ? "Release the mouse (Esc)"
             : relativeMouse
-              ? "Relative mouse is armed — click the screen to capture"
-              : "Capture the mouse — relative motion for a fullscreen app or game"}
+              ? "Relative mouse is armed: click the screen to capture"
+              : "Capture the mouse: relative motion for a fullscreen app or game"}
           aria-label="Relative mouse"
           aria-pressed={pointerLocked || nativePointerLocked}
           onpointerdown={(e) => e.stopPropagation()}

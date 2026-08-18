@@ -1,9 +1,9 @@
 <script lang="ts">
-  // Devices — the all-machines roster: every machine you've seen, know, or
+  // Devices: the all-machines roster: every machine you've seen, know, or
   // remember across all your meshes, and which network(s) each one rides. Its
   // own top-level settings tab now (it used to be a hidden sub-tab under
   // Meshes). The point: you're joined to however many networks, and a device
-  // may be on only some of them — so this makes the overlap explicit rather
+  // may be on only some of them: so this makes the overlap explicit rather
   // than pretending it's one flat mesh.
   import { app } from "../../store.svelte";
   import { displayName, isAppNode } from "../../types";
@@ -16,9 +16,11 @@
       return rank(a) - rank(b) || a.label.localeCompare(b.label);
     }),
   );
+  const knownDevices = $derived(devices.filter((node) => app.isKnownDevice(node)));
+  const discoveredSignals = $derived(devices.filter((node) => !app.isKnownDevice(node)));
 
   // The device's mesh id (pubkey), trimmed to a glanceable hash with the full
-  // value on hover — shown grey under the display name.
+  // value on hover: shown grey under the display name.
   const shortHash = (id: string) => (id.length > 20 ? `${id.slice(0, 10)}…${id.slice(-6)}` : id);
 
   function relLabel(n: MeshNode): { text: string; cls: string } {
@@ -31,6 +33,7 @@
   // Two-step arm for Forget (the graph gear's pattern): first click arms the
   // one row, the second acts; any other row's click or a 3.5s lapse disarms.
   let forgetArmed = $state<string | null>(null);
+  let flushArmed = $state(false);
   function forgetRow(id: string) {
     if (forgetArmed === id) {
       forgetArmed = null;
@@ -42,54 +45,83 @@
       }, 3500);
     }
   }
+
+  function flushSignals() {
+    if (!flushArmed) {
+      flushArmed = true;
+      setTimeout(() => (flushArmed = false), 4000);
+      return;
+    }
+    flushArmed = false;
+    void app.forgetDiscoveredDevices();
+  }
 </script>
+
+{#snippet deviceRow(n: MeshNode, signal: boolean)}
+  {@const rel = relLabel(n)}
+  <li>
+    <span class="avatar">{n.kind === "this" ? "💻" : isAppNode(n) ? "🖥" : "📡"}</span>
+    <div class="id">
+      <div class="name">{displayName(n)}</div>
+      <div class="devid" title={n.id}>{shortHash(n.id)}</div>
+      <div class="meta">
+        <span class="pill {rel.cls}">{rel.text}</span>
+        <span class="state" class:on={n.online}>{n.online ? "online" : "offline"}</span>
+        {#if app.isFleetMember(n.id)}<span class="pill fleet">🔗 fleet</span>{/if}
+      </div>
+    </div>
+    <div class="nets">
+      {#if n.networks && n.networks.length}
+        {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
+      {:else}
+        <span class="net-chip none">None</span>
+      {/if}
+    </div>
+    {#if signal}
+      <button class="btn-keep" title="Keep this device out of batch signal cleanup" onclick={() => app.rememberDevice(n.id)}>Keep</button>
+    {/if}
+    {#if n.kind !== "this" && !app.isMe(n.id)}
+      <button
+        class="btn-forget"
+        class:armed={forgetArmed === n.id}
+        title="Remove this node from the graph and end its session"
+        onclick={() => forgetRow(n.id)}
+      >
+        {forgetArmed === n.id ? "Sure?" : "Forget"}
+      </button>
+    {/if}
+  </li>
+{/snippet}
 
 <div class="devices">
   <h3>Devices</h3>
   <p class="lead">
-    Every machine you've seen, know, or remember — across all your meshes. A
-    device is only reachable on a network you both share, so the chips show
-    where each one lives.
+    Known devices are kept during signal cleanup. Unrecognized sightings appear
+    under <b>Discovered signals</b>.
   </p>
 
+  <div class="list-head">
+    <h4>Known devices · {knownDevices.length}</h4>
+  </div>
   <ul class="list">
-    {#each devices as n (n.id)}
-      {@const rel = relLabel(n)}
-      <li>
-        <span class="avatar">{n.kind === "this" ? "💻" : isAppNode(n) ? "🖥" : "📡"}</span>
-        <div class="id">
-          <div class="name">{displayName(n)}</div>
-          <div class="devid" title={n.id}>{shortHash(n.id)}</div>
-          <div class="meta">
-            <span class="pill {rel.cls}">{rel.text}</span>
-            <span class="state" class:on={n.online}>{n.online ? "online" : "offline"}</span>
-            {#if app.isFleetMember(n.id)}<span class="pill fleet">🔗 fleet</span>{/if}
-          </div>
-        </div>
-        <div class="nets">
-          {#if n.networks && n.networks.length}
-            {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
-          {:else}
-            <span class="net-chip none">—</span>
-          {/if}
-        </div>
-        {#if n.kind !== "this" && !app.isMe(n.id)}
-          <!-- Forget this node — the same action the graph's gear offers,
-               reachable from the roster too. Never on this device. -->
-          <button
-            class="btn-forget"
-            class:armed={forgetArmed === n.id}
-            title="Remove this node from the graph and end its session"
-            onclick={() => forgetRow(n.id)}
-          >
-            {forgetArmed === n.id ? "Sure?" : "Forget"}
-          </button>
-        {/if}
-      </li>
-    {/each}
-    {#if devices.length === 0}
-      <li class="empty">No devices yet.</li>
+    {#each knownDevices as n (n.id)}{@render deviceRow(n, false)}{/each}
+    {#if knownDevices.length === 0}<li class="empty">No known devices yet.</li>{/if}
+  </ul>
+
+  <div class="list-head signals-head">
+    <div>
+      <h4>Discovered signals · {discoveredSignals.length}</h4>
+      <p>Unclassified devices heard on your meshes. Keep anything recognizable before clearing the rest.</p>
+    </div>
+    {#if discoveredSignals.length > 0}
+      <button class="flush" class:armed={flushArmed} onclick={flushSignals}>
+        {flushArmed ? `Confirm forgetting ${discoveredSignals.length}` : `Forget all ${discoveredSignals.length}`}
+      </button>
     {/if}
+  </div>
+  <ul class="list signals">
+    {#each discoveredSignals as n (n.id)}{@render deviceRow(n, true)}{/each}
+    {#if discoveredSignals.length === 0}<li class="empty">No stray signals.</li>{/if}
   </ul>
 </div>
 
@@ -106,6 +138,29 @@
     color: var(--ink-soft);
     line-height: 1.45;
     margin: 0 0 0.7rem;
+  }
+  .list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin: 1rem 0 0.45rem;
+  }
+  .list-head h4 {
+    margin: 0;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-soft);
+  }
+  .list-head p {
+    margin: 0.2rem 0 0;
+    color: var(--ink-faint);
+    font-size: 0.72rem;
+  }
+  .signals-head {
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--line);
   }
   .list {
     list-style: none;
@@ -218,6 +273,29 @@
     font-weight: 700;
     cursor: pointer;
     white-space: nowrap;
+  }
+  .btn-keep,
+  .flush {
+    flex-shrink: 0;
+    border: 1px solid var(--ok);
+    background: var(--ok-soft);
+    color: var(--ok);
+    border-radius: var(--r-sm);
+    padding: 0.3rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .flush {
+    border-color: var(--danger);
+    background: transparent;
+    color: var(--danger);
+  }
+  .flush:hover,
+  .flush.armed {
+    color: #fff;
+    background: var(--danger);
   }
   .btn-forget:hover,
   .btn-forget.armed {

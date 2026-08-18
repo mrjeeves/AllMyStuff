@@ -44,14 +44,14 @@
         <div class="title">
           {claimables.length === 1 ? "A device is ready to claim" : `${claimables.length} devices ready to claim`}
         </div>
-        <div class="sub">Claiming makes a device yours — it joins your fleet.</div>
+        <div class="sub">Claiming makes a device yours: it joins your fleet.</div>
       </div>
       <button class="x" onclick={close} aria-label="Close">✕</button>
     </header>
 
     <p class="lead">
       Your devices recognise each other once they share a fleet. Claim one and
-      it's linked to everything else you own under a shared key — your machines
+      it's linked to everything else you own under a shared key: your machines
       trust each other for screen, files and control. It's the same kind of
       “yes, I allow this” you'll use to share with people.
     </p>
@@ -84,7 +84,7 @@
     <footer class="foot">
       A device only shows up here when it's started in claim mode (or you toggle
       “offer for adoption” on it). Sharing a machine with someone else works the
-      same way — from the device on the graph.
+      same way: from the device on the graph.
     </footer>
   </div>
 </div>

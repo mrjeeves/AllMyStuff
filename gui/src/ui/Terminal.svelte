@@ -251,7 +251,7 @@
     const id = nextTabId++;
     const routeId = app.terminalConnect(host, session);
     console.debug(
-      `[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}` +
+      `[terminal] tab ${id} opened: route ${routeId ?? "(none: web mode)"}` +
         (session ? ` attaching to ${session}` : ""),
     );
     tabs.push({
@@ -427,7 +427,7 @@
     rt.cleanup.push(() => ro.disconnect());
 
     if (meta.status === "offline") {
-      term.write("\x1b[2m[demo mode — live terminals need the desktop app]\x1b[0m\r\n");
+      term.write("\x1b[2m[demo mode: live terminals need the desktop app]\x1b[0m\r\n");
     }
 
     return {
@@ -564,7 +564,7 @@
     if (!t || !t.routeId) return;
     const session = app.routeSessions[t.routeId];
     if (!session) {
-      app.toast("warn", "This shell isn't ready to pop out yet — give it a moment.");
+      app.toast("warn", "This shell isn't ready to pop out yet: give it a moment.");
       return;
     }
     app.popOutTerminal(host, session);
@@ -726,7 +726,7 @@
                 <span class="tab-state {t.status}"></span>
                 <span class="tab-label">{t.title}</span>
                 {#if shared > 1}
-                  <span class="tab-shared" title="Shared session — {shared} viewers attached"
+                  <span class="tab-shared" title="Shared session: {shared} viewers attached"
                     >👥{shared}</span
                   >
                 {/if}
@@ -778,14 +778,14 @@
                 {:else if otherSessions.length === 0}
                   <div class="picker-empty">
                     {#if hostSessions.length > 0}
-                      Every shell open here is already a tab in this window. Open another window — or
-                      have a fleet member open one — and it'll show up here to join.
+                      Every shell open here is already a tab in this window. Open another window: or
+                      have a fleet member open one: and it'll show up here to join.
                     {:else if app.isMe(host)}
                       No other shells open on this machine yet. Open one from another terminal window
-                      (here or from a fleet member) and it'll appear here — joining shares the shell,
+                      (here or from a fleet member) and it'll appear here: joining shares the shell,
                       its scrollback and its keyboard.
                     {:else}
-                      No other shells open on {displayName(node)} yet — or it's running an older
+                      No other shells open on {displayName(node)} yet: or it's running an older
                       AllMyStuff that can't share them. Shells started there (by its owner or a fleet
                       member) show up here to join.
                     {/if}

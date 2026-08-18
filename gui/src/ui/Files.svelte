@@ -237,7 +237,7 @@
         if (p.bytes > PREVIEW_MAX) {
           previews.delete(ev.req);
           if (preview?.loading) preview = { ...preview, kind: "none", loading: false };
-          app.toast("info", "Too big to preview — download it instead");
+          app.toast("info", "Too big to preview: download it instead");
           return;
         }
         if (ev.eof) {
@@ -690,7 +690,7 @@
                     {e.name}{#if e.symlink}<span class="link-mark" title="symlink"> ⤳</span>{/if}
                   </span>
                 {/if}
-                <span class="c-size">{e.dir ? "—" : humanBytes(e.size)}</span>
+                <span class="c-size">{e.dir ? "Folder" : humanBytes(e.size)}</span>
                 <span class="c-when">{whenLabel(e.modified)}</span>
                 <span class="c-acts">
                   {#if !e.dir}
@@ -732,7 +732,7 @@
                 </div>
               {:else}
                 <div class="p-body p-center muted">
-                  No preview for this file — use ⬇ to save it to Downloads.
+                  No preview for this file: use ⬇ to save it to Downloads.
                 </div>
               {/if}
             </div>
@@ -766,7 +766,7 @@
                 <span class="t-note ok" title={t.note}>{t.kind === "down" ? "saved to Downloads" : "uploaded"} ✓</span>
                 <button class="act" title="Dismiss" onclick={() => dismissTransfer(t.req)}>✕</button>
               {:else}
-                <span class="t-note bad" title={t.note}>failed — {t.note}</span>
+                <span class="t-note bad" title={t.note}>failed: {t.note}</span>
                 <button class="act" title="Dismiss" onclick={() => dismissTransfer(t.req)}>✕</button>
               {/if}
             </div>

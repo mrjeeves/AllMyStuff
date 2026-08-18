@@ -1138,7 +1138,7 @@
         return;
       }
       if (n.relationship.kind === "unclaimed") {
-        app.toast("warn", `Claim ${n.label} first — open it to adopt it`);
+        app.toast("warn", `Claim ${n.label} first: open it to adopt it`);
         return;
       }
       app.dropConnectOnNode(n.id);
@@ -1570,7 +1570,7 @@
                is just… quiet, and nobody guesses "add a TURN server". -->
           <span
             class="tag blocked"
-            title="Direct connection keeps failing and no relay is configured — add a TURN server to this mesh's venue (mesh settings → Servers)"
+            title="Direct connection keeps failing and no relay is configured: add a TURN server to this mesh's venue (mesh settings → Servers)"
             >⛔ needs relay</span
           >
         {/if}
@@ -2016,7 +2016,7 @@
 
   {#if armed}
     <div class="arm-banner">
-      Tap a device to connect — or tap empty space to cancel
+      Tap a device to connect: or tap empty space to cancel
       <button class="btn small" onclick={() => app.cancelConnect()}>Cancel</button>
     </div>
   {/if}
@@ -2030,7 +2030,7 @@
         <button
           class="zbtn"
           class:active={view === "radial"}
-          title="Radial view — this device in the centre"
+          title="Radial view: this device in the centre"
           aria-label="Radial view"
           onclick={() => setView("radial")}>◎</button
         >
@@ -2038,14 +2038,14 @@
       <button
         class="zbtn"
         class:active={view === "grid"}
-        title="Grid view — grouped by fleet"
+        title="Grid view: grouped by fleet"
         aria-label="Grid view, grouped by fleet"
         onclick={() => setView("grid")}>⊞</button
       >
       <button
         class="zbtn"
         class:active={view === "list"}
-        title="List view — a searchable, fleet-grouped roster"
+        title="List view: a searchable, fleet-grouped roster"
         aria-label="List view, grouped by fleet"
         onclick={() => setView("list")}>☰</button
       >

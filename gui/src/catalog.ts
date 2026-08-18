@@ -221,13 +221,13 @@ function validateRoute(cat: Catalog, from: string, to: string): ConnectResult {
   const srcNode = cat.nodes.find((n) => n.id === src.node);
   const dstNode = cat.nodes.find((n) => n.id === dst.node);
   if (srcNode?.relationship.kind === "unclaimed")
-    return { ok: false, reason: `${srcNode.label} isn't yours yet — claim it first.` };
+    return { ok: false, reason: `${srcNode.label} isn't yours yet: claim it first.` };
   if (dstNode?.relationship.kind === "unclaimed")
-    return { ok: false, reason: `${dstNode.label} isn't yours yet — claim it first.` };
+    return { ok: false, reason: `${dstNode.label} isn't yours yet: claim it first.` };
   if (!canSource(src.flow))
-    return { ok: false, reason: `${src.label} can't send — it only receives.` };
+    return { ok: false, reason: `${src.label} can't send: it only receives.` };
   if (!canSink(dst.flow))
-    return { ok: false, reason: `${dst.label} can't receive — it only sends.` };
+    return { ok: false, reason: `${dst.label} can't receive: it only sends.` };
   if (!mediaCompatible(src.media, dst.media))
     return {
       ok: false,

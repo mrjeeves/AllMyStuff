@@ -36,7 +36,7 @@
       </ul>
 
       <p class="fine">
-        Only this is shared — nothing else of yours becomes reachable, and you can take
+        Only this is shared: nothing else of yours becomes reachable, and you can take
         it back any time.
       </p>
 

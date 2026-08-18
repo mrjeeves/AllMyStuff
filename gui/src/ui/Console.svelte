@@ -330,10 +330,10 @@
   // software H.264 decode for webviews that can't, and the MJPEG
   // compatibility fallback.
   const CODEC_CHOICES: Array<{ label: string; value: CodecChoice; hint: string }> = [
-    { label: "Auto", value: "auto", hint: "Best available — H.264, hardware decode where the viewer supports it" },
+    { label: "Auto", value: "auto", hint: "Best available: H.264, hardware decode where the viewer supports it" },
     { label: "H.264 · hardware decode", value: "h264", hint: "GPU-accelerated decode in the viewer (lowest CPU)" },
-    { label: "H.264 · software decode", value: "native", hint: "Decoded on the CPU — for viewers without hardware H.264" },
-    { label: "MJPEG · compatibility", value: "mjpeg", hint: "Per-frame JPEG — the universal fallback, higher bandwidth" },
+    { label: "H.264 · software decode", value: "native", hint: "Decoded on the CPU: for viewers without hardware H.264" },
+    { label: "MJPEG · compatibility", value: "mjpeg", hint: "Per-frame JPEG: the universal fallback, higher bandwidth" },
   ];
 
   // ---- source aspect (mouse letterbox correction) --------------------
@@ -919,7 +919,7 @@
         // Software decode stalled too — hand the stream to the backend's
         // openh264 decoder. Setting the flag re-runs this effect, which
         // re-watches the route in native mode (and tears this rung down).
-        console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
+        console.warn(`video decoder (${codecString}) stalled twice: switching to native decode`);
         nativeDecoderPreference = "software";
         nativeDecode = true;
         decodePath = "native (sw)";
@@ -927,7 +927,7 @@
         return;
       }
       console.warn(
-        `video decoder (${codecString}) stalled — rebuilding with ${decodeMode}`,
+        `video decoder (${codecString}) stalled: rebuilding with ${decodeMode}`,
       );
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
@@ -1182,15 +1182,15 @@
       case "waiting_consent":
         return "Waiting for someone at the remote machine to approve screen sharing (a one-time consent dialog is open there).";
       case "display_asleep":
-        return "The remote display is asleep or blank — forcing it awake (clicking here helps too)…";
+        return "The remote display is asleep or blank: forcing it awake (clicking here helps too)…";
       case "no_monitor":
-        return "No monitor to capture on the remote machine — its displays are detached or in deep sleep.";
+        return "No monitor to capture on the remote machine: its displays are detached or in deep sleep.";
       case "grab_failed":
         return `Screen capture is failing on the remote machine${s.detail ? `: ${s.detail}` : "."}`;
       case "no_camera":
-        return "No camera to capture on the remote machine — it may have been unplugged since the scan.";
+        return "No camera to capture on the remote machine: it may have been unplugged since the scan.";
       case "camera_failed":
-        return `The remote camera won't stream — another app may be holding it, or its camera permission is off${s.detail ? ` (${s.detail})` : ""}.`;
+        return `The remote camera won't stream: another app may be holding it, or its camera permission is off${s.detail ? ` (${s.detail})` : ""}.`;
       default:
         return "";
     }
@@ -2154,7 +2154,7 @@
         class="stage"
         class:grabbing={stagePointerActive}
         role="application"
-        aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
+        aria-label="Remote screen: input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
         use:touchGuard
         onpointermove={onPointerMove}
@@ -2270,7 +2270,7 @@
                 </div>
               {:else}
                 <div class="screen-note">
-                  This machine runs an older AllMyStuff — update it there and its cameras will
+                  This machine runs an older AllMyStuff: update it there and its cameras will
                   stream here.
                 </div>
               {/if}
@@ -2321,7 +2321,7 @@
           <button
             class="kbtn"
             class:open={openMenu === "session"}
-            title="{displayName(node)} — session"
+            title="{displayName(node)}: session"
             aria-label="Session menu"
             onclick={() => toggleMenu("session")}
           >
@@ -2332,7 +2332,7 @@
             <button
               class="kbtn"
               class:open={openMenu === "screens"}
-              title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
+              title="Screens & cameras{selected ? `: ${selected.label}` : ''}"
               aria-label="Screens and cameras menu"
               onclick={() => toggleMenu("screens")}
             >
@@ -2353,7 +2353,7 @@
                 class="kbtn input"
                 class:active={inp.id === selectedId && !inpPopped}
                 class:hollow={inpPopped}
-                title={inpPopped ? `${inp.label} — in its own window` : inp.label}
+                title={inpPopped ? `${inp.label}: in its own window` : inp.label}
                 aria-label={inp.label}
                 onclick={() => app.setConsoleInput(inp.id)}
               >
@@ -2397,7 +2397,7 @@
             <button
               class="kbtn slim"
               class:on={app.consoleAudio}
-              title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
+              title="Play that machine's audio on this machine (listen-only: nothing is sent back)"
               aria-label="Audio"
               aria-pressed={app.consoleAudio}
               onclick={() => app.toggleConsoleAudio()}>🔊</button
@@ -2407,7 +2407,7 @@
             <button
               class="kbtn slim"
               class:on={app.consoleClipboard}
-              title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote"
+              title="Share clipboard on paste: pasting here sends this machine's clipboard so it lands on the remote"
               aria-label="Clipboard passthrough"
               aria-pressed={app.consoleClipboard}
               onclick={() => app.toggleConsoleClipboard()}>📋</button
@@ -2483,8 +2483,8 @@
               title={pointerLocked || nativePointerLocked
                 ? "Release the mouse (Esc)"
                 : relativeMouse
-                  ? "Relative mouse is armed — click the screen to capture"
-                : "Capture the mouse — relative motion for a fullscreen app or game"}
+                  ? "Relative mouse is armed: click the screen to capture"
+                : "Capture the mouse: relative motion for a fullscreen app or game"}
               aria-label="Relative mouse"
               aria-pressed={pointerLocked || nativePointerLocked}
               onclick={toggleRelativeMouse}>🎯</button
@@ -2532,7 +2532,7 @@
               {#if hasFrame || app.consoleSessionRoutes.length > 0}
                 <div class="mchips">
                   {#if hasFrame}
-                    <span class="chip stream" title="Live stream — frame size · rate">
+                    <span class="chip stream" title="Live stream: frame size · rate">
                       <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}
                     </span>
                   {/if}
@@ -2640,7 +2640,7 @@
                   <button
                     class="mrow"
                     class:sel={inp.id === selectedId}
-                    title={inpPopped ? `${inp.label} — in its own window` : inp.label}
+                    title={inpPopped ? `${inp.label}: in its own window` : inp.label}
                     onclick={() => {
                       app.setConsoleInput(inp.id);
                       openMenu = null;
@@ -2770,7 +2770,7 @@
                     <button
                       class="vrow"
                       class:tuned={aspectChoice !== "auto"}
-                      title="Source aspect — corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      title="Source aspect: corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
                       onclick={() => (openSub = openSub === "aspect" ? null : "aspect")}
                     >
                       <span>Aspect</span>

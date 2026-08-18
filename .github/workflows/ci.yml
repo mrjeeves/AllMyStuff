@@ -21,6 +21,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # `just release` runs this with the OS-provided shell. macOS still ships
+      # Bash 3.2, so execute the real pin/lock guard there in CI rather than
+      # discovering Bash-4-only builtins while cutting a release.
+      - name: release pin-lock guard (system Bash)
+        if: matrix.os == 'macos-latest'
+        run: bash scripts/sync-pinned-locks.sh --check
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

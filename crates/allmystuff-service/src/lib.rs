@@ -530,7 +530,15 @@ impl Manager {
                 systemctl(scope, &["daemon-reload"]),
                 systemctl(scope, &["enable", "--now", SYSTEMD_UNIT]),
             ],
-            Manager::Launchd => vec![launchctl(&["load", "-w", &path_arg(unit_path)])],
+            // `install` also repairs an existing registration after the plist
+            // changes (for example, when a release adds a supervised argument).
+            // The legacy unload command is deliberately used here because it
+            // returns success for a job that was not loaded, keeping first
+            // install and reinstall on one idempotent path.
+            Manager::Launchd => vec![
+                launchctl(&["unload", "-w", &path_arg(unit_path)]),
+                launchctl(&["load", "-w", &path_arg(unit_path)]),
+            ],
         }
     }
 
@@ -702,6 +710,11 @@ fn render_launchd_plist(exec: &Path, env: &[(String, String)], log_path: &Path) 
         "        <string>{}</string>\n",
         xml_escape(&exec.to_string_lossy())
     ));
+    // A launchd job must remain present when a GUI-owned node temporarily has
+    // the one-machine socket. Without this mode the duplicate exits 0, and
+    // KeepAlive.SuccessfulExit=false correctly (but permanently) leaves the
+    // service stopped after the GUI goes away.
+    s.push_str("        <string>--supervised</string>\n");
     s.push_str("    </array>\n");
 
     // Start at load/login/boot, and keep it alive — but not after a clean
@@ -1952,6 +1965,7 @@ mod tests {
         );
         assert!(plist.contains("<string>com.allmystuff.daemon</string>"));
         assert!(plist.contains("<string>/Users/u/.local/bin/allmystuff-serve</string>"));
+        assert!(plist.contains("<string>--supervised</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<string>/Users/u/Library/Logs/allmystuff.log</string>"));
         assert!(!plist.contains("EnvironmentVariables"));
@@ -2071,12 +2085,20 @@ mod tests {
         let plist = Path::new("/Users/u/Library/LaunchAgents/com.allmystuff.daemon.plist");
         assert_eq!(
             Manager::Launchd.install_cmds(Scope::User, plist),
-            vec![vec![
-                "launchctl",
-                "load",
-                "-w",
-                "/Users/u/Library/LaunchAgents/com.allmystuff.daemon.plist"
-            ]]
+            vec![
+                vec![
+                    "launchctl",
+                    "unload",
+                    "-w",
+                    "/Users/u/Library/LaunchAgents/com.allmystuff.daemon.plist"
+                ],
+                vec![
+                    "launchctl",
+                    "load",
+                    "-w",
+                    "/Users/u/Library/LaunchAgents/com.allmystuff.daemon.plist"
+                ],
+            ]
         );
     }
 

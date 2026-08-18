@@ -2291,7 +2291,29 @@ async fn update_apply() -> Result<Value, String> {
 /// because the process restarts.
 #[tauri::command]
 async fn update_relaunch(app: tauri::AppHandle) -> Result<(), String> {
-    allmystuff_updater::apply_now().map_err(|e| e.to_string())?;
+    let applied = allmystuff_updater::apply_now().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    if applied.is_some() {
+        // launchd caches a lightweight code requirement for a LaunchAgent's
+        // executable. Portable updates replace our ad-hoc-signed Mach-O and
+        // therefore change its cdhash; schedule a registration refresh before
+        // exiting or the next login launch is rejected with
+        // OS_REASON_CODESIGNING. A failed refresh must not strand an otherwise
+        // successfully applied update: startup diagnostics retry it below.
+        match schedule_macos_autostart_refresh(&app) {
+            Ok(true) => {
+                // The detached launchd helper survives this process exiting,
+                // refreshes the old job, and lets its RunAtLoad start the new
+                // binary. Calling `restart` here as well would race it.
+                app.exit(0);
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("couldn't refresh Start with computer after update: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = applied;
     app.restart()
 }
 
@@ -2544,45 +2566,47 @@ fn current_windows_user_sid() -> Result<String, String> {
     Ok(sid.to_string())
 }
 
-#[tauri::command]
-async fn service_install(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    // Release the medium-integrity transient node before the elevated
-    // installer starts its replacement. Older versions did this afterwards,
-    // allowing the GUI node and service session agent to race for one pipe.
+/// Transfer the one-machine node socket from a GUI-owned child to a service
+/// operation that starts a replacement. If the service fails to answer, put
+/// the transient node back so this machine does not disappear from the mesh.
+async fn service_start_with_handoff(
+    state: State<'_, AppState>,
+    verb: &'static str,
+) -> Result<Value, String> {
     state.node_child.lock().take();
-    let result = service_mutate("install").await;
-    let installed = result
+    let result = service_mutate(verb).await;
+    let started = result
         .as_ref()
         .ok()
         .and_then(|value| value.get("ok"))
         .and_then(Value::as_bool)
         == Some(true);
-    if installed && !wait_for_node_ready().await {
-        tracing::warn!(
-            "installed Windows host did not become ready within the startup grace window"
-        );
+    if started && !wait_for_node_ready().await {
+        tracing::warn!("service {verb} completed but its node did not become ready");
     }
-    if !installed || !NodeClient::probe().await {
-        // UAC cancellation or a failed service replacement should restore the
-        // temporary node that kept this machine available before the attempt.
-        // The same fallback covers a service that installs but never answers.
+    if !started || !NodeClient::probe().await {
         if let Ok(Some(child)) = ensure_node_running().await {
             state.node_child.lock().install(child);
         }
     }
     result
 }
+
 #[tauri::command]
-async fn service_start() -> Result<Value, String> {
-    service_mutate("start").await
+async fn service_install(state: State<'_, AppState>) -> Result<Value, String> {
+    service_start_with_handoff(state, "install").await
+}
+#[tauri::command]
+async fn service_start(state: State<'_, AppState>) -> Result<Value, String> {
+    service_start_with_handoff(state, "start").await
 }
 #[tauri::command]
 async fn service_stop() -> Result<Value, String> {
     service_mutate("stop").await
 }
 #[tauri::command]
-async fn service_restart() -> Result<Value, String> {
-    service_mutate("restart").await
+async fn service_restart(state: State<'_, AppState>) -> Result<Value, String> {
+    service_start_with_handoff(state, "restart").await
 }
 #[tauri::command]
 async fn service_uninstall() -> Result<Value, String> {
@@ -2651,6 +2675,172 @@ fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
         mgr.disable().map_err(|e| e.to_string())?;
     }
     Ok(mgr.is_enabled().unwrap_or(enabled))
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_AUTOSTART_LABEL: &str = "AllMyStuff";
+
+/// launchd says this when the executable at a loaded LaunchAgent path no
+/// longer satisfies the lightweight code requirement cached at registration.
+/// Portable updates intentionally replace that executable in place.
+#[cfg(any(target_os = "macos", test))]
+fn macos_autostart_needs_refresh(status: &str) -> bool {
+    status.contains("needs LWCR update") || status.contains("OS_REASON_CODESIGNING")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autostart_plist() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| {
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{MACOS_AUTOSTART_LABEL}.plist"))
+        })
+        .ok_or_else(|| "couldn't resolve the macOS home directory".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_update_relaunch_marker() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| {
+            home.join(".allmystuff")
+                .join("updates")
+                .join("show-after-autostart-refresh")
+        })
+        .ok_or_else(|| "couldn't resolve the macOS home directory".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_status_for(label: &str) -> Result<String, String> {
+    let uid = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .map_err(|e| format!("reading the macOS user id: {e}"))?;
+    if !uid.status.success() {
+        return Err("`id -u` failed while locating the macOS launchd domain".into());
+    }
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{label}")])
+        .output()
+        .map_err(|e| format!("querying the macOS login item: {e}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text)
+}
+
+/// Submit a one-shot helper as its own launchd job. A process cannot unload
+/// the job that owns it and then continue to reload that job: launchd kills
+/// the process tree during `unload`. The separate helper waits for this GUI to
+/// exit, refreshes the registration, and RunAtLoad starts the updated GUI.
+#[cfg(target_os = "macos")]
+fn schedule_macos_autostart_refresh(app: &tauri::AppHandle) -> Result<bool, String> {
+    let mgr = app.autolaunch();
+    if !mgr.is_enabled().map_err(|e| e.to_string())? {
+        return Ok(false);
+    }
+
+    // Rewrite the plugin-owned plist while this process is still alive. The
+    // helper only has to atomically swap launchd's in-memory registration.
+    mgr.enable().map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
+    let pid = std::process::id().to_string();
+    let label = format!("com.allmystuff.autostart-refresh-{pid}");
+    let submitted = std::process::Command::new("launchctl")
+        .args(["submit", "-l", &label, "--"])
+        .arg(exe)
+        .args(["--macos-autostart-refresh", &pid])
+        .status()
+        .map_err(|e| format!("submitting the macOS login-item refresh helper: {e}"))?;
+    if !submitted.success() {
+        return Err(format!("launchctl could not submit the refresh helper ({submitted})"));
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_autostart_refresh(parent_pid: &str) -> Result<(), String> {
+    use std::process::Stdio;
+
+    for _ in 0..200 {
+        let parent_alive = std::process::Command::new("/bin/kill")
+            .args(["-0", parent_pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !parent_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let parent_alive = std::process::Command::new("/bin/kill")
+        .args(["-0", parent_pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if parent_alive {
+        return Err("the previous AllMyStuff process did not exit within 10 seconds".into());
+    }
+
+    let plist = macos_autostart_plist()?;
+    let unload = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(&plist)
+        .status()
+        .map_err(|e| format!("unloading {}: {e}", plist.display()))?;
+    if !unload.success() {
+        return Err(format!(
+            "launchctl could not unload {} ({unload})",
+            plist.display()
+        ));
+    }
+
+    let marker = macos_update_relaunch_marker()?;
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&marker, [])
+        .map_err(|e| format!("writing {}: {e}", marker.display()))?;
+    let load = std::process::Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(&plist)
+        .status()
+        .map_err(|e| format!("loading {}: {e}", plist.display()))?;
+    if !load.success() {
+        let _ = std::fs::remove_file(marker);
+        return Err(format!(
+            "launchctl could not load {} ({load})",
+            plist.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Repair users updating from a build that did not refresh launchd itself.
+/// The new executable can still be reached by the updater's direct relaunch;
+/// once running, this clears the stale LWCR before the next login.
+#[cfg(target_os = "macos")]
+fn repair_macos_autostart_if_needed(app: &tauri::AppHandle) -> bool {
+    let Ok(status) = launchctl_status_for(MACOS_AUTOSTART_LABEL) else {
+        return false;
+    };
+    if !macos_autostart_needs_refresh(&status) {
+        return false;
+    }
+    match schedule_macos_autostart_refresh(app) {
+        Ok(true) => {
+            tracing::info!("scheduled repair of the macOS Start with computer registration");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!("couldn't repair the macOS Start with computer item: {e}");
+            false
+        }
+    }
 }
 
 /// Build the system-tray / menu-bar icon — the home AllMyStuff keeps while
@@ -2752,7 +2942,13 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
     // start-minimized launch never flashes. Show it now unless we should stay
     // hidden: a `--minimized` autostart launch with the pref on.
     let launched_minimized = std::env::args().any(|a| a == "--minimized");
-    let start_hidden = launched_minimized && wb.start_minimized();
+    #[cfg(target_os = "macos")]
+    let show_after_update = macos_update_relaunch_marker()
+        .ok()
+        .is_some_and(|marker| marker.exists() && std::fs::remove_file(marker).is_ok());
+    #[cfg(not(target_os = "macos"))]
+    let show_after_update = false;
+    let start_hidden = launched_minimized && wb.start_minimized() && !show_after_update;
     if start_hidden {
         tracing::info!("starting minimized to the tray (login item)");
     } else if let Some(win) = app.get_webview_window("main") {
@@ -2952,6 +3148,16 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(parent_pid) = process_arg_value("--macos-autostart-refresh") {
+        // Always exit successfully: `launchctl submit` restarts this helper on
+        // failure, which would turn a one-shot repair error into a tight loop.
+        if let Err(e) = run_macos_autostart_refresh(&parent_pid) {
+            eprintln!("AllMyStuff login-item refresh failed: {e}");
+        }
+        std::process::exit(0);
+    }
+
     #[cfg(windows)]
     if std::env::args().any(|arg| arg == "--service-bootstrap") {
         let verb = process_arg_value("--service-bootstrap").unwrap_or_else(|| "install".into());
@@ -3194,6 +3400,13 @@ fn main() {
                 tracing::warn!("couldn't create the tray icon: {e}");
             }
             apply_startup_behavior(app.handle());
+            #[cfg(target_os = "macos")]
+            if repair_macos_autostart_if_needed(app.handle()) {
+                // The detached helper will relaunch through the repaired
+                // RunAtLoad job. Stop setup before we spawn another node.
+                app.handle().exit(0);
+                return Ok(());
+            }
             let handle = app.handle().clone();
             let node = match NodeClient::new() {
                 Ok(n) => Arc::new(n),
@@ -3377,6 +3590,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_autostart_refresh_detects_stale_code_requirements() {
+        assert!(macos_autostart_needs_refresh(
+            "properties = needs LWCR update | managed LWCR | has LWCR"
+        ));
+        assert!(macos_autostart_needs_refresh(
+            "last exit reason = OS_REASON_CODESIGNING"
+        ));
+        assert!(!macos_autostart_needs_refresh(
+            "state = running\nproperties = managed LWCR | has LWCR"
+        ));
+    }
 
     #[test]
     fn query_encode_round_trips_popout_keys() {

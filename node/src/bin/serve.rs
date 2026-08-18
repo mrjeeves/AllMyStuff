@@ -233,6 +233,11 @@ fn main() -> ExitCode {
     let session_agent = std::env::args().skip(1).any(|a| a == "--session-agent");
     #[cfg(not(windows))]
     let session_agent = false;
+    // launchd starts the same portable binary as a supervised background
+    // process. If another healthy node owns the machine socket (normally the
+    // desktop app during a service handoff), stay alive and claim it later
+    // instead of exiting successfully and leaving launchd stopped forever.
+    let supervised = std::env::args().skip(1).any(|a| a == "--supervised");
 
     configure_service_environment();
 
@@ -254,7 +259,11 @@ fn main() -> ExitCode {
     // A console-session agent is supervised by the SCM process in Session 0.
     // It uses service relaunch semantics so an applied update exits and lets
     // that supervisor start the freshly replaced binary.
-    run_blocking(session_agent, session_agent, wait_for_shutdown_signal())
+    run_blocking(
+        session_agent,
+        session_agent || supervised,
+        wait_for_shutdown_signal(),
+    )
 }
 
 fn configure_service_environment() {
@@ -440,22 +449,22 @@ async fn run<F: Future<Output = ()>>(
             Err(e) => {
                 if wait_for_existing_owner && node_control::NodeClient::probe().await {
                     // A GUI-owned or CEC-owned node is healthy. This is not a
-                    // crash: remain as the service's supervised standby agent
+                    // crash: remain as the service's supervised standby node
                     // and claim the pipe when that owner goes away. Exiting
                     // here made the SCM supervisor relaunch us every second.
                     tracing::info!(
-                        "another healthy node owns the control socket; privileged agent standing by"
+                        "another healthy node owns the control socket; supervised node standing by"
                     );
                     while node_control::NodeClient::probe().await {
                         tokio::select! {
                             _ = shutdown.as_mut() => {
-                                tracing::info!("shutdown requested while standing by");
+                                tracing::info!("shutdown requested while supervised node was standing by");
                                 return ExitCode::SUCCESS;
                             }
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                         }
                     }
-                    tracing::info!("previous node stopped; privileged agent taking ownership");
+                    tracing::info!("previous node stopped; supervised node taking ownership");
                     continue;
                 }
                 tracing::info!("not starting a second node ({e:#})");

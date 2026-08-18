@@ -523,6 +523,18 @@ impl Manager {
         }
     }
 
+    /// The executable configured in the installed service definition. This is
+    /// the payload the service manager will actually launch — not whichever
+    /// `allmystuff-serve` happens to be beside the querying GUI or first on its
+    /// PATH. Status and update reconciliation must report this source of truth.
+    fn payload_path(self, scope: Scope, home: &Path) -> Option<PathBuf> {
+        let unit = std::fs::read(self.unit_path(scope, home)).ok()?;
+        match self {
+            Manager::Systemd => parse_systemd_exec_start(std::str::from_utf8(&unit).ok()?),
+            Manager::Launchd => parse_launchd_program_arguments(&unit),
+        }
+    }
+
     /// Commands to run after writing the unit: reload + enable + start.
     fn install_cmds(self, scope: Scope, unit_path: &Path) -> Vec<Vec<String>> {
         match self {
@@ -810,6 +822,37 @@ fn parse_launchctl_list(exit_code: i32, stdout: &str) -> (bool, bool) {
             .lines()
             .any(|line| line.trim_start().starts_with("\"PID\""));
     (loaded, running)
+}
+
+/// Read the first argv entry from the launchd plist we install. Using a real
+/// plist decoder keeps XML escaping and future binary-plist migrations out of
+/// the service-status contract.
+fn parse_launchd_program_arguments(plist: &[u8]) -> Option<PathBuf> {
+    let value = plist::Value::from_reader(std::io::Cursor::new(plist)).ok()?;
+    value
+        .as_dictionary()?
+        .get("ProgramArguments")?
+        .as_array()?
+        .first()?
+        .as_string()
+        .map(PathBuf::from)
+}
+
+/// Read the executable from the systemd unit format emitted by
+/// [`render_systemd_unit`]. Its `ExecStart` contains one path and no argv; the
+/// renderer quotes the whole value only when the path contains whitespace.
+fn parse_systemd_exec_start(unit: &str) -> Option<PathBuf> {
+    let value = unit
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("ExecStart="))?
+        .trim();
+    let path = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,9 +1497,11 @@ pub fn print_status_json(system: bool) -> Result<()> {
 }
 
 /// Structured service status: `{ platform, supported, manager, scope,
-/// installed, enabled, running, needs_privilege, … }`. `enabled`/`running` are
-/// booleans (null when not installed / indeterminate). On a platform we don't
-/// support, `supported` is false and the rest is omitted.
+/// installed, enabled, running, payload_version, payload_current,
+/// needs_privilege, … }`. `enabled`/`running` are booleans (null when not
+/// installed / indeterminate); payload fields describe the executable in the
+/// installed service definition. On a platform we don't support, `supported`
+/// is false and the rest is omitted.
 pub fn status_value(system: bool) -> Result<Value> {
     if cfg!(windows) {
         return Ok(win_status_value());
@@ -1481,6 +1526,13 @@ pub fn status_value(system: bool) -> Result<Value> {
             active: None,
         }
     };
+    let payload_version = installed
+        .then(|| manager.payload_path(scope, &home))
+        .flatten()
+        .and_then(|path| binary_version(&path));
+    let payload_current = payload_version
+        .as_deref()
+        .is_some_and(|version| version_at_least(version, env!("CARGO_PKG_VERSION")));
     Ok(json!({
         "platform": std::env::consts::OS,
         "supported": true,
@@ -1491,6 +1543,8 @@ pub fn status_value(system: bool) -> Result<Value> {
         "running": state.active.as_deref().map(active_is_running),
         "enabled_detail": state.enabled,
         "running_detail": state.active,
+        "payload_version": payload_version,
+        "payload_current": payload_current,
         "needs_privilege": scope == Scope::System,
     }))
 }
@@ -1513,7 +1567,7 @@ fn win_status_value() -> Value {
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("AllMyStuff")
         .join("service");
-    let payload_version = win_binary_version(&service_dir.join("allmystuff-serve.exe"));
+    let payload_version = binary_version(&service_dir.join("allmystuff-serve.exe"));
     let payload_current = payload_version
         .as_deref()
         .is_some_and(|version| version_at_least(version, env!("CARGO_PKG_VERSION")));
@@ -1541,7 +1595,11 @@ fn win_status_value() -> Value {
     })
 }
 
-fn win_binary_version(path: &Path) -> Option<String> {
+/// Ask the configured service payload for its own version. This is deliberately
+/// runtime-derived rather than inferred from the GUI or package version: a
+/// partial update can leave those at different releases, which is exactly the
+/// skew the component reconciler needs status to expose.
+fn binary_version(path: &Path) -> Option<String> {
     if !runnable(path) {
         return None;
     }
@@ -1550,7 +1608,11 @@ fn win_binary_version(path: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    parse_binary_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_binary_version(stdout: &str) -> Option<String> {
+    stdout
         .lines()
         .next()?
         .split_whitespace()
@@ -2144,6 +2206,73 @@ mod tests {
     }
 
     // ---- status parsers ----
+
+    #[test]
+    fn configured_payload_paths_round_trip_from_service_definitions() {
+        let systemd = render_systemd_unit(
+            Path::new("/opt/All My Stuff/allmystuff-serve"),
+            Scope::User,
+            &[],
+        );
+        assert_eq!(
+            parse_systemd_exec_start(&systemd),
+            Some(PathBuf::from("/opt/All My Stuff/allmystuff-serve"))
+        );
+
+        let launchd = render_launchd_plist(
+            Path::new("/Users/a&b/All My Stuff/allmystuff-serve"),
+            &[],
+            Path::new("/tmp/allmystuff.log"),
+        );
+        assert_eq!(
+            parse_launchd_program_arguments(launchd.as_bytes()),
+            Some(PathBuf::from("/Users/a&b/All My Stuff/allmystuff-serve"))
+        );
+
+        let mut binary_plist = plist::Dictionary::new();
+        binary_plist.insert(
+            "ProgramArguments".into(),
+            plist::Value::Array(vec![plist::Value::String(
+                "/Applications/AllMyStuff.app/Contents/MacOS/allmystuff-serve".into(),
+            )]),
+        );
+        let mut encoded = Vec::new();
+        plist::Value::Dictionary(binary_plist)
+            .to_writer_binary(&mut encoded)
+            .unwrap();
+        assert_eq!(
+            parse_launchd_program_arguments(&encoded),
+            Some(PathBuf::from(
+                "/Applications/AllMyStuff.app/Contents/MacOS/allmystuff-serve"
+            ))
+        );
+    }
+
+    #[test]
+    fn configured_payload_parsers_reject_missing_or_malformed_entries() {
+        assert_eq!(parse_systemd_exec_start("[Service]\nType=simple\n"), None);
+        assert_eq!(parse_systemd_exec_start("ExecStart=\n"), None);
+        assert_eq!(parse_launchd_program_arguments(b"not a plist"), None);
+        assert_eq!(
+            parse_launchd_program_arguments(
+                br#"<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn payload_version_parser_reads_the_binary_contract() {
+        assert_eq!(
+            parse_binary_version("allmystuff-serve 0.2.87\n"),
+            Some("0.2.87".into())
+        );
+        assert_eq!(
+            parse_binary_version("allmystuff-serve v1.4.0-beta.1\n"),
+            Some("1.4.0-beta.1".into())
+        );
+        assert_eq!(parse_binary_version(""), None);
+    }
 
     #[test]
     fn parse_systemctl_word_takes_first_line() {

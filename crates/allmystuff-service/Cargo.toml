@@ -20,4 +20,5 @@ path = "src/lib.rs"
 # unit/plist location + locating the node binary the service runs.
 anyhow = "1"
 dirs = { workspace = true }
+plist = "1"
 serde_json = { workspace = true }

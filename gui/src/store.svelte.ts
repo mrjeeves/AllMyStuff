@@ -15,6 +15,7 @@ import {
   scopedGrantId,
   type GrantRequest,
 } from "./catalog";
+import { reconcileCecOnlyCanons } from "./cec-provenance";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -2159,8 +2160,11 @@ class AppStore {
     // a node reached *only* through CEC plumbing is not an ordinary graph
     // device. If that same machine is also present on Local, a fleet, or a
     // user-created mesh, that independent relationship keeps it visible.
-    const supportOnly = new Set([...this.cecOnlyNodeCanons, ...cecCanons]);
-    this.cecOnlyNodeCanons = [...supportOnly].filter((canon) => !ordinaryCanons.has(canon));
+    this.cecOnlyNodeCanons = reconcileCecOnlyCanons(
+      this.cecOnlyNodeCanons,
+      cecCanons,
+      ordinaryCanons,
+    );
     // Settle the machine-wide grace once all networks are folded: a connected
     // reading on any mesh refreshes it; an explicit offline clears it only when
     // NO mesh reported the machine connected this poll.
@@ -2325,7 +2329,6 @@ class AppStore {
     // matched by the NODE a leg belongs to (not by capability id: a live
     // terminal leg's endpoints aren't catalog capabilities).
     const survivorCanons = new Set(this.catalog.nodes.map((n) => canonicalNodeId(n.id)));
-    this.cecOnlyNodeCanons = this.cecOnlyNodeCanons.filter((canon) => survivorCanons.has(canon));
     if (this.catalog.capabilities.some((c) => !survivorCanons.has(canonicalNodeId(c.node)))) {
       this.catalog.capabilities = this.catalog.capabilities.filter((c) =>
         survivorCanons.has(canonicalNodeId(c.node)),

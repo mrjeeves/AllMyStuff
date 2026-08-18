@@ -548,8 +548,8 @@ export interface PendingShare {
 }
 
 /** One person/fleet you're sharing with, gathered for the Sharing settings
- *  pane: who they are, which of their nodes you know, and every grant
- *  you've given them (with the node it's recorded on, for revocation). */
+ *  pane: who they are, which of their nodes you know, and every grant in both
+ *  directions (with the node carrying it). */
 export interface SharePartner {
   person: Person;
   nodes: MeshNode[];
@@ -611,6 +611,30 @@ function loadCecAliases(): Record<string, string> {
   }
 }
 
+export interface UpdateRepairFlow {
+  attempt: number;
+  total: number;
+  progress: number;
+  phase: "checking" | "repairing" | "waiting" | "done" | "failed";
+  title: string;
+  note: string;
+}
+
+const REMEMBERED_DEVICES_STORE_KEY = "ams.devices.remembered.v1";
+
+/** Device ids the user explicitly promoted from passive discovery to a known
+ *  device. Relationship/fleet/room state is already durable elsewhere; this
+ *  small list covers a useful machine that does not belong to any of those. */
+function loadRememberedDevices(): string[] {
+  try {
+    const raw = localStorage.getItem(REMEMBERED_DEVICES_STORE_KEY);
+    const value = raw ? JSON.parse(raw) : [];
+    return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 type UiMode = "normal" | "advanced";
 const UI_MODE_STORE_KEY = "allmystuff.uiMode.v1";
 
@@ -634,6 +658,8 @@ class AppStore {
   // ---- interaction state ------------------------------------------
   uiMode = $state<UiMode>(loadUiMode());
   selectedNodeId = $state<string | null>(null);
+  /** Passive discoveries the user explicitly chose to retain. */
+  rememberedDevices = $state<string[]>(loadRememberedDevices());
   /** A "centre the graph on this node" request. Bumped by [`focusNode`]; the
    *  graph watches the `seq` and pans to the node once per new request (so a
    *  repeat focus of the same node still re-centres). Null = nothing pending. */
@@ -1402,6 +1428,9 @@ class AppStore {
   updateApplied = $state<string | null>(null);
   componentVersions = $state<ComponentVersionRow[]>([]);
   componentBusy = $state<string | null>(null);
+  /** Full-app curtain while a post-update component repair converges. */
+  updateRepair = $state<UpdateRepairFlow | null>(null);
+  private updateRepairPromise: Promise<boolean> | null = null;
   /** The channel's latest release version, learned once (read-only) so the
    *  drawer can tell which of your fleet machines are behind it. Null until
    *  loaded; stays null in web mode / if the feed can't be reached. */
@@ -1711,6 +1740,12 @@ class AppStore {
     // The listener and forced launch check were started before hydration; now
     // read the resulting staged/install state for Settings and node cards.
     await this.loadUpdateStatus();
+    // A newly updated GUI is the authority for every bundled pin. Repair any
+    // backend/service/tool that did not move with it, including older installs
+    // whose component activation only partially succeeded. The routine is
+    // silent when everything already matches and shows a blocking progress
+    // curtain only when it actually has work to do.
+    await this.repairInstalledComponents();
     // Card-level update affordances need the channel version even when the
     // details drawer never mounts (Normal mode's default).
     void this.loadLatestRelease();
@@ -8365,7 +8400,11 @@ class AppStore {
   async leaveNetwork(configId: string) {
     // The local claiming mesh can't be left, only switched off — the node
     // refuses the remove too (and would re-join on the next ownership check).
-    if (this.isLocalClaimMesh({ network_id: configId })) {
+    const target =
+      this.networks.find((n) => n.config_id === configId || n.network_id === configId) ??
+      this.disabledNets.find((n) => n.id === configId || n.network_id === configId) ??
+      { network_id: configId };
+    if (this.isLocalClaimMesh(target)) {
       this.toast("warn", "Local can't be left — switch it off instead.");
       return;
     }
@@ -8378,7 +8417,7 @@ class AppStore {
       }
       // No toast — the mesh's row leaves the Meshes list (and its nodes drop
       // from the graph).
-      await this.refreshNetworks();
+      await this.refreshNetworkLists();
       // Re-derive the graph now so the left network's nodes drop immediately,
       // rather than lingering until the next 3 s poll happens to run (matches
       // toggleNetworkEnabled / restartNetwork, which both re-sync on change).
@@ -9326,17 +9365,21 @@ class AppStore {
 
   /** How many stored customers have gone stale (unused past
    *  {@link CEC_STALE_AFTER_S}) — the count on the "Remove stale" curate button. */
-  get cecStaleCount(): number {
+  cecCustomerIsStale(customer: CecPeer): boolean {
+    const renamed = !!this.cecAliases[customer.number]?.trim();
     const cutoff = Date.now() / 1000 - CEC_STALE_AFTER_S;
-    return this.cecCustomers.filter((c) => c.last_used && c.last_used < cutoff).length;
+    return !renamed && !!customer.last_used && customer.last_used < cutoff;
+  }
+
+  get cecStaleCount(): number {
+    return this.cecCustomers.filter((customer) => this.cecCustomerIsStale(customer)).length;
   }
 
   /** Curate the directory in one action: forget every customer that's cycled
    *  out (gone stale), instead of picking them off one by one. Drops each from
    *  the graph, same as a single Remove — the shared area stays (it's home). */
   async removeStaleCec() {
-    const cutoff = Date.now() / 1000 - CEC_STALE_AFTER_S;
-    const stale = this.cecCustomers.filter((c) => c.last_used && c.last_used < cutoff);
+    const stale = this.cecCustomers.filter((customer) => this.cecCustomerIsStale(customer));
     if (stale.length === 0) return;
     for (const c of stale) {
       if (!c.node) continue;
@@ -9386,6 +9429,55 @@ class AppStore {
     void this.loadCec();
   }
 
+  /** Whether a device has deliberate state worth preserving during a cleanup.
+   *  Passive mesh sightings remain "signals" until they gain a relationship,
+   *  fleet/CEC/room/attachment/route history, a deliberate name, or the user
+   *  explicitly keeps them. */
+  isKnownDevice(node: MeshNode): boolean {
+    if (node.kind === "this" || this.isMe(node.id)) return true;
+    if (node.relationship.kind !== "unclaimed") return true;
+    if (this.isFleetMember(node.id) || (!!node.owner && this.isMe(node.owner))) return true;
+    if (this.isCecCustomer(node.id)) return true;
+    if (this.rememberedDevices.some((id) => sameMachine(id, node.id))) return true;
+    if (node.hostname?.trim() && node.label.trim() !== node.hostname.trim()) return true;
+    if (
+      this.rooms.some(
+        (room) =>
+          (!!room.owner && sameMachine(room.owner, node.id)) ||
+          room.members.some((member) => sameMachine(member, node.id)),
+      )
+    ) return true;
+    if (
+      this.catalog.nodes.some(
+        (candidate) =>
+          this.isKvm(candidate) &&
+          !!candidate.kvm?.attachedTo &&
+          (sameMachine(candidate.id, node.id) || sameMachine(candidate.kvm.attachedTo, node.id)),
+      )
+    ) return true;
+    return this.catalog.routes.some(
+      (route) =>
+        sameMachine(this.capNodeOf(route.from), node.id) ||
+        sameMachine(this.capNodeOf(route.to), node.id),
+    );
+  }
+
+  /** Promote a passive discovery to the durable Known devices list. */
+  rememberDevice(nodeId: string) {
+    const canon = canonicalNodeId(nodeId);
+    if (this.rememberedDevices.some((id) => sameMachine(id, canon))) return;
+    this.rememberedDevices = [...this.rememberedDevices, canon];
+    this.persistRememberedDevices();
+  }
+
+  private persistRememberedDevices() {
+    try {
+      localStorage.setItem(REMEMBERED_DEVICES_STORE_KEY, JSON.stringify(this.rememberedDevices));
+    } catch {
+      /* private mode — the distinction lasts for this session */
+    }
+  }
+
   /** The per-node gear "Forget this node": drop it from the graph + roster,
    *  tear its session down, end any CEC session. Removes it locally at once so
    *  the graph reacts immediately; the next snapshot confirms.
@@ -9411,7 +9503,7 @@ class AppStore {
 
   /** The local half of Forget — session/route teardown + catalog sweep.
    *  Fleet members reach this only after their eviction went through. */
-  private async forgetNodeLocal(nodeId: string) {
+  private async forgetNodeLocal(nodeId: string, quiet = false): Promise<boolean> {
     // Drop any live routes we hold to it, then the backend teardown.
     const routes = this.catalog.routes.filter(
       (r) => sameMachine(this.capNodeOf(r.from), nodeId) || sameMachine(this.capNodeOf(r.to), nodeId),
@@ -9421,7 +9513,7 @@ class AppStore {
       await forgetNode(nodeId);
     } catch (e) {
       this.toast("warn", `Couldn't forget it: ${errMsg(e)}`);
-      return;
+      return false;
     }
     // Drop it (and any other view of the same machine) from the local graph.
     this.catalog.nodes = this.catalog.nodes.filter((n) => !sameMachine(n.id, nodeId));
@@ -9429,8 +9521,34 @@ class AppStore {
       (c) => !sameMachine(c.node, nodeId),
     );
     if (this.selectedNodeId && sameMachine(this.selectedNodeId, nodeId)) this.selectNode(null);
-    this.toast("ok", "Forgot this node");
-    void this.loadCec();
+    const kept = this.rememberedDevices.filter((id) => !sameMachine(id, nodeId));
+    if (kept.length !== this.rememberedDevices.length) {
+      this.rememberedDevices = kept;
+      this.persistRememberedDevices();
+    }
+    if (!quiet) {
+      this.toast("ok", "Forgot this node");
+      void this.loadCec();
+    }
+    return true;
+  }
+
+  /** Forget only passive discoveries. The caller presents the exact count and
+   *  confirmation; this re-checks the predicate at execution time so a node
+   *  that became known while the button was armed is never swept. */
+  async forgetDiscoveredDevices() {
+    const signals = this.catalog.nodes.filter(
+      (node) => node.kind !== "this" && !this.isMe(node.id) && !this.isKnownDevice(node),
+    );
+    let removed = 0;
+    for (const node of signals) {
+      if (this.isKnownDevice(node)) continue;
+      if (await this.forgetNodeLocal(node.id, true)) removed += 1;
+    }
+    if (removed > 0) {
+      this.toast("ok", `Forgot ${removed} discovered ${removed === 1 ? "signal" : "signals"}`);
+      void this.loadCec();
+    }
   }
 
   /** Open the "a new device wants to join" approval popup (the code grid). */
@@ -9579,20 +9697,156 @@ class AppStore {
     }
   }
 
-  async repairComponent(component: string) {
-    if (!isTauri()) return;
-    this.componentBusy = component;
+  /** Rows whose live component is still older than this build's pin. A newer
+   *  process is never downgraded; an unavailable required process is repaired. */
+  private componentsNeedingRepair(rows = this.componentVersions): ComponentVersionRow[] {
+    const clean = (version: string | null | undefined) => version?.replace(/^v/, "") ?? "";
+    return rows.filter((row) => {
+      const pinned = clean(row.pinned);
+      const current = clean(row.current);
+      return !!pinned && (!current || isOlderVersion(current, pinned));
+    });
+  }
+
+  private async refreshComponentVersions(): Promise<ComponentVersionRow[]> {
+    const status = await componentStatus();
+    if (status?.rows) this.componentVersions = status.rows;
+    return status?.rows ?? this.componentVersions;
+  }
+
+  /** Converge every installed component after an update. The initial attempt
+   *  is immediate; if the live version still has not moved, retries occur
+   *  after 1s, 3s, and 5s. Component repair commands are idempotent and each
+   *  pass re-detects reality, so a component that recovered is not touched
+   *  again. `forceComponent` is the Updates-tab Repair button's first pass. */
+  async repairInstalledComponents(
+    title = "Finishing the AllMyStuff update",
+    forceComponent: string | null = null,
+  ): Promise<boolean> {
+    if (!isTauri() || isMobile()) return true;
+    if (this.updateRepairPromise) return this.updateRepairPromise;
+
+    const run = async (): Promise<boolean> => {
+      const retryDelays = [0, 1_000, 3_000, 5_000];
+      const total = retryDelays.length;
+      let force = forceComponent;
+      let lastError = "";
+
+      for (let index = 0; index < total; index += 1) {
+        const attempt = index + 1;
+        if (retryDelays[index] > 0) {
+          const seconds = retryDelays[index] / 1_000;
+          this.updateRepair = {
+            attempt,
+            total,
+            progress: Math.round((index / total) * 100),
+            phase: "waiting",
+            title,
+            note: `The components have not reported the pinned versions yet. Trying again in ${seconds} ${seconds === 1 ? "second" : "seconds"}…`,
+          };
+          await new Promise((resolve) => setTimeout(resolve, retryDelays[index]));
+        }
+
+        this.updateRepair = this.updateRepair
+          ? {
+              attempt,
+              total,
+              progress: Math.round((index / total) * 100),
+              phase: "checking",
+              title,
+              note: "Checking the installed GUI, backend, mesh service, and optional tools…",
+            }
+          : null;
+
+        let rows = await this.refreshComponentVersions();
+        let repair = this.componentsNeedingRepair(rows);
+        if (force) {
+          const forced = rows.find((row) => row.id === force);
+          if (forced && !repair.some((row) => row.id === forced.id)) repair = [forced, ...repair];
+        }
+
+        // A routine launch with a completely aligned install never flashes a
+        // curtain. Once skew is found, every retry remains visible.
+        if (repair.length === 0) {
+          if (this.updateRepair) {
+            this.updateRepair = {
+              attempt,
+              total,
+              progress: 100,
+              phase: "done",
+              title,
+              note: "All installed components are current.",
+            };
+            await new Promise((resolve) => setTimeout(resolve, 650));
+          }
+          return true;
+        }
+
+        this.updateRepair = {
+          attempt,
+          total,
+          progress: Math.round(((index + 0.5) / total) * 100),
+          phase: "repairing",
+          title,
+          note: `Updating ${repair.map((row) => row.label).join(", ")}…`,
+        };
+
+        let forcedRepairFailed = false;
+        for (const row of repair) {
+          this.componentBusy = row.id;
+          try {
+            await componentRepair(row.id);
+          } catch (error) {
+            lastError = errMsg(error);
+            if (row.id === force) forcedRepairFailed = true;
+          }
+        }
+        this.componentBusy = null;
+        if (!forcedRepairFailed) force = null;
+
+        rows = await this.refreshComponentVersions();
+        if (!force && this.componentsNeedingRepair(rows).length === 0) {
+          this.updateRepair = {
+            attempt,
+            total,
+            progress: 100,
+            phase: "done",
+            title,
+            note: "All installed components are current.",
+          };
+          await new Promise((resolve) => setTimeout(resolve, 650));
+          return true;
+        }
+      }
+
+      const remaining = this.componentsNeedingRepair();
+      this.updateRepair = {
+        attempt: total,
+        total,
+        progress: 100,
+        phase: "failed",
+        title: "The update needs attention",
+        note: remaining.length
+          ? `${remaining.map((row) => row.label).join(", ")} did not reach the pinned version after four attempts.`
+          : lastError || "One or more installed components could not be verified.",
+      };
+      this.toast("warn", lastError || "Some installed components still need repair — open Settings → Updates");
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      return false;
+    };
+
+    this.updateRepairPromise = run();
     try {
-      await componentRepair(component);
-      this.toast("info", "Repair finished. Rechecking installed versions…");
-      // A backend/daemon repair may briefly restart the node socket.
-      await new Promise((resolve) => setTimeout(resolve, 900));
-      await this.loadUpdateStatus();
-    } catch (e) {
-      this.toast("warn", `Couldn't repair component: ${errMsg(e)}`);
+      return await this.updateRepairPromise;
     } finally {
       this.componentBusy = null;
+      this.updateRepair = null;
+      this.updateRepairPromise = null;
     }
+  }
+
+  async repairComponent(component: string) {
+    await this.repairInstalledComponents("Repairing installed components", component);
   }
 
   /** A background check reported in. Only the outcomes that mean "there is
@@ -10229,9 +10483,9 @@ class AppStore {
     }
   }
 
-  /** Everyone you're sharing with, one entry per person/fleet: their
-   *  nodes and every grant you've given them (with the node each grant is
-   *  recorded on). Drives the Sharing settings pane. */
+  /** Everyone you're sharing with, one entry per person/fleet: their nodes and
+   *  every grant in both directions. `isShareOutGrant` separates what this
+   *  fleet shares from what the other fleet shares in the Settings pane. */
   sharePartners = $derived.by((): SharePartner[] => {
     const map = new Map<string, SharePartner>();
     for (const n of this.catalog.nodes) {

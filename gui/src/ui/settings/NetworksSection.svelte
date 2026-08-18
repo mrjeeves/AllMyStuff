@@ -23,7 +23,6 @@
   let nameInput = $state("");
   let joinId = $state("");
   let joinVenue = $state(PUBLIC_VENUE_ID);
-  let mode = $state<"none" | "join">("none");
   let copied = $state("");
   // Transient inline confirmations (replace success toasts): the name Save
   // button flashes "Saved ✓", each Export button flashes "Exported ✓".
@@ -63,7 +62,6 @@
     await app.joinNetwork(joinId, [joinVenue]);
     joinId = "";
     joinVenue = PUBLIC_VENUE_ID;
-    mode = "none";
   }
   async function copyHandle(networkId: string) {
     try {
@@ -138,7 +136,6 @@
       <div class="sec-head">
         <h4>Your meshes — joined {app.normalNetworks.length}</h4>
         <div class="seg">
-          <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
         </div>
       </div>
@@ -148,7 +145,8 @@
         so it's never just “the” mesh. Share a mesh's handle to add a device to it.
       </p>
 
-      {#if mode === "join"}
+      <div class="join-box">
+        <h5>Join or create a mesh</h5>
         <div class="row">
           <input
             class="field"
@@ -163,8 +161,8 @@
           </select>
           <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A mesh is just a name you agree on — anyone who uses the same name <i>on the same venue</i> meets here. Paste an invite (Copy invite on the other device) and the venue comes with it; otherwise leave it blank for a memorable generated one and pick where it calls out (Public by default).</p>
-      {/if}
+        <p class="hint">Paste an invite and its venue comes with it. Otherwise enter a shared name, or leave it blank to generate a new memorable mesh.</p>
+      </div>
 
       <ul class="nets">
         <!-- CEC Support customer rooms (`cec-…`) are filtered out here: they're
@@ -227,6 +225,9 @@
               {/if}
             </div>
             <button class="btn small primary" onclick={() => app.toggleNetworkEnabled(c.id, true)}>{app.isLocalClaimMesh(c) ? "Turn on" : "Enable"}</button>
+            {#if !app.isLocalClaimMesh(c) && !app.isFleetMesh(c)}
+              <button class="btn small danger" title="Leave this disabled mesh and remove its saved configuration" onclick={() => app.leaveNetwork(c.id)}>Leave</button>
+            {/if}
           </li>
         {/each}
         {#if app.normalNetworks.length === 0 && app.disabledNets.length === 0}
@@ -403,10 +404,20 @@
     display: flex;
     gap: 0.3rem;
   }
-  .btn.on {
-    background: var(--accent-soft);
-    border-color: var(--accent);
-    color: var(--accent-ink);
+  .join-box {
+    margin: 0.75rem 0;
+    padding: 0.7rem;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+  }
+  .join-box h5 {
+    margin: 0 0 0.45rem;
+    font-size: 0.78rem;
+    color: var(--ink);
+  }
+  .join-box .hint {
+    margin-bottom: 0;
   }
   /* Transient "Saved ✓" / "Exported ✓" confirmation (replaces a success toast). */
   .btn.saved {

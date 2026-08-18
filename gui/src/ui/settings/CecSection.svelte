@@ -11,8 +11,8 @@
   // customer-side flow (answering the 3-choice prompt, the standing grant list)
   // is shown too, so a build that hosts can drive it from here.
   import { onMount } from "svelte";
-  import { app, CEC_STALE_AFTER_S } from "../../store.svelte";
-  import { isTauri, openCecWindow, type CecScope } from "../../tauri";
+  import { app } from "../../store.svelte";
+  import { isTauri, openCecWindow, type CecPeer, type CecScope } from "../../tauri";
 
   // `windowed` = this is the popped-out CEC Console window (rendered by
   // CecHost), so the pop-out button hides itself.
@@ -89,8 +89,8 @@
 
   /** Whether a connection has gone stale (unused past the threshold) — surfaced
    *  as a badge so the cleanup candidates stand out. */
-  function isStale(lastUsed: number): boolean {
-    return !!lastUsed && idleSeconds(lastUsed) > CEC_STALE_AFTER_S;
+  function isStale(customer: CecPeer): boolean {
+    return app.cecCustomerIsStale(customer);
   }
 
   /** "just now" / "4m" / "1h 12m" — how long a help-asker has been waiting.
@@ -317,7 +317,7 @@
       <ul class="rows">
         {#each customers as c (c.number)}
           {@const kvm = app.kvmTwin(c.node)}
-          <li class="row col" class:stale={isStale(c.last_used)}>
+          <li class="row col" class:stale={isStale(c)}>
             <div class="row-top">
               <span class="dot" class:on={c.online}></span>
               <span class="who">
@@ -344,7 +344,7 @@
                     {#if c.node === app.cecAutoOpenNode}
                       <span class="pending-tag">waiting for approval</span>
                     {/if}
-                    {#if isStale(c.last_used)}<span class="stale-tag">stale</span>{/if}
+                    {#if isStale(c)}<span class="stale-tag">stale</span>{/if}
                   </span>
                 {/if}
               </span>

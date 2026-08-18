@@ -33,9 +33,9 @@
 <div class="section">
   <h3>Sharing</h3>
   <p class="lead">
-    The people and fleets you're <b>connected</b> with. A grant is to the
-    person, not one machine — what you allow works to any of their devices —
-    and you can take back any grant, or the whole connection, any time.
+    See both sides of every connection: what <b>you share with them</b>, and
+    what <b>they share with you</b>. Grants apply to the person or fleet, while
+    the capability name shows which machine provides it.
   </p>
 
   <div class="new-share-row">
@@ -57,6 +57,8 @@
     <ul class="partners">
       {#each partners as p (p.person.id)}
         {@const expanded = open.includes(p.person.id)}
+        {@const sharedByYou = p.grants.filter(({ grant }) => app.isShareOutGrant(grant))}
+        {@const sharedWithYou = p.grants.filter(({ grant }) => !app.isShareOutGrant(grant))}
         <li class="partner">
           <button class="p-head" onclick={() => toggle(p.person.id)} aria-expanded={expanded}>
             <span class="chev" class:open={expanded} aria-hidden="true">▸</span>
@@ -64,8 +66,11 @@
             <span class="p-name">{p.person.name}</span>
             <span class="p-sums">
               <span class="sum">{p.nodes.length} device{p.nodes.length === 1 ? "" : "s"}</span>
-              <span class="sum" class:none={p.grants.length === 0}>
-                {p.grants.length === 0 ? "nothing allowed" : `${p.grants.length} grant${p.grants.length === 1 ? "" : "s"}`}
+              <span class="sum out" class:none={sharedByYou.length === 0}>
+                ↑ {sharedByYou.length} shared by you
+              </span>
+              <span class="sum in" class:none={sharedWithYou.length === 0}>
+                ↓ {sharedWithYou.length} shared with you
               </span>
             </span>
           </button>
@@ -85,15 +90,14 @@
               </div>
 
               <div class="p-block">
-                <h4>What they can do</h4>
-                {#if p.grants.length === 0}
+                <h4><span class="direction out">↑</span> You share with them</h4>
+                {#if sharedByYou.length === 0}
                   <p class="muted">
-                    Nothing — they can't reach any of your stuff until you allow
-                    something from one of their devices on the graph.
+                    Nothing from your devices is shared with them.
                   </p>
                 {:else}
                   <ul class="grants">
-                    {#each p.grants as { node: holder, grant: g } (g.id)}
+                    {#each sharedByYou as { node: holder, grant: g } (g.id)}
                       <li>
                         <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
                         <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
@@ -102,6 +106,23 @@
                           title="Take this back"
                           onclick={() => app.revokeGrant(holder.id, g.id)}
                         >✕</button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+
+              <div class="p-block incoming">
+                <h4><span class="direction in">↓</span> They share with you</h4>
+                {#if sharedWithYou.length === 0}
+                  <p class="muted">They aren't sharing anything from their devices with you.</p>
+                {:else}
+                  <ul class="grants inbound">
+                    {#each sharedWithYou as { grant: g } (g.id)}
+                      <li>
+                        <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
+                        <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
+                        <span class="received">available to you</span>
                       </li>
                     {/each}
                   </ul>
@@ -208,6 +229,8 @@
   .p-sums {
     margin-left: auto;
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 0.35rem;
   }
   .sum {
@@ -220,6 +243,14 @@
   }
   .sum.none {
     color: var(--ink-faint);
+  }
+  .sum.out:not(.none) {
+    color: var(--c-share-ink);
+    background: var(--c-share-soft);
+  }
+  .sum.in:not(.none) {
+    color: var(--ok);
+    background: var(--ok-soft);
   }
   .p-body {
     border-top: 1px solid var(--line);
@@ -236,6 +267,23 @@
     letter-spacing: 0.04em;
     color: var(--ink-faint);
     font-weight: 700;
+  }
+  .direction {
+    display: inline-grid;
+    place-items: center;
+    width: 1.15rem;
+    height: 1.15rem;
+    margin-right: 0.18rem;
+    border-radius: 50%;
+    font-size: 0.72rem;
+  }
+  .direction.out {
+    color: var(--c-share-ink);
+    background: var(--c-share-soft);
+  }
+  .direction.in {
+    color: var(--ok);
+    background: var(--ok-soft);
   }
   .nodes,
   .grants {
@@ -284,6 +332,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .received {
+    flex-shrink: 0;
+    color: var(--ok);
+    font-size: 0.66rem;
+    font-weight: 700;
   }
   .revoke {
     border: none;

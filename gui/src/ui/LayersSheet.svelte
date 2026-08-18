@@ -33,7 +33,7 @@
       key: "venue",
       title: "Venue",
       blurb:
-        "Where your devices meet — the signaling, STUN & TURN servers. Public by default; a Private Line is a venue that's just yours.",
+        "Where your devices meet: the signaling, STUN & TURN servers. Public by default; a Private Line is a venue that's just yours.",
     },
     {
       key: "mesh",
@@ -45,13 +45,13 @@
       key: "fleet",
       title: "Fleet",
       blurb:
-        "Every device you own, riding under your name — private and closed. This machine plus the rest of your own devices.",
+        "Every device you own, riding under your name: private and closed. This machine plus the rest of your own devices.",
     },
     {
       key: "share",
       title: "Sharing",
       blurb:
-        "Give one person one thing — any of their devices can use it, and you can take it back whenever you like.",
+        "Give one person one thing: any of their devices can use it, and you can take it back whenever you like.",
     },
   ];
 
@@ -166,16 +166,16 @@
       <section class="story">
         <p>
           Picture a school trip to a museum. The museum is the place everyone
-          meets — that's the {@render mark("venue", "Venue")} (the signal layer).
-          You arrive with your group, all wearing the same lanyard — that's the
+          meets: that's the {@render mark("venue", "Venue")} (the signal layer).
+          You arrive with your group, all wearing the same lanyard: that's the
           {@render mark("mesh", "Mesh")}: a name your devices call out so they
           find each other at the venue.
         </p>
         <p>
-          You carry your own backpack — your {@render mark("fleet", "Fleet")},
+          You carry your own backpack: your {@render mark("fleet", "Fleet")},
           the devices you own, private until you hand something over. And if a
           friend needs your umbrella, you lend it for the day and take it back
-          whenever — that's {@render mark("share", "Sharing")}: one person, one
+          whenever: that's {@render mark("share", "Sharing")}: one person, one
           thing, revocable any time.
         </p>
         <p class="rule">Same group (mesh) + same place (venue) = you can find each other.</p>
@@ -201,7 +201,7 @@
 
       <div class="expanded-head">
         <h3>The four layers, expanded</h3>
-        <p>Each piece above, in plain terms — hover any card, chip or highlighted word and the matching trio lights up:</p>
+        <p>Each piece above, in plain terms: hover any card, chip or highlighted word and the matching trio lights up:</p>
       </div>
 
       <div class="cards">

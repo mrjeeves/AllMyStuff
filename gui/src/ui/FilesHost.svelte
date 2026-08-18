@@ -42,7 +42,7 @@
 
   $effect(() => {
     const n = node;
-    if (n) void setWindowTitle(`${displayName(n)} — AllMyStuff files`);
+    if (n) void setWindowTitle(`${displayName(n)}: AllMyStuff files`);
   });
 </script>
 
@@ -52,21 +52,21 @@
   {:else if stage === "unsupported"}
     <div class="notice">
       <div class="glyph">🗂</div>
-      <p><b>{displayName(node!)}</b> doesn't advertise file browsing —
+      <p><b>{displayName(node!)}</b> doesn't advertise file browsing :
         it's probably running an older AllMyStuff. Update it and this
         window will pick it up.</p>
     </div>
   {:else if stage === "relationship"}
     <div class="notice">
       <div class="glyph">🔑</div>
-      <p><b>{displayName(node!)}</b> is here — resolving whether it's yours
+      <p><b>{displayName(node!)}</b> is here: resolving whether it's yours
         (fleet roster loading)… Files are <b>owner/fleet only</b>: if you
         haven't claimed this machine, do that from the graph first.</p>
     </div>
   {:else if stage === "presence"}
     <div class="notice">
       <div class="glyph">📡</div>
-      <p><b>{displayName(node!)}</b> is on the mesh — waiting for its
+      <p><b>{displayName(node!)}</b> is on the mesh: waiting for its
         AllMyStuff presence (its features and ownership) to land…</p>
     </div>
   {:else}

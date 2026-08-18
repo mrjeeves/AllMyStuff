@@ -145,7 +145,7 @@
 
   function memberNote(n: MeshNode | undefined): string | null {
     if (!n) return null;
-    if (!app.roomsSupported(n)) return "runs an older AllMyStuff — they won't see invites or chat";
+    if (!app.roomsSupported(n)) return "runs an older AllMyStuff: they won't see invites or chat";
     return null;
   }
 
@@ -334,7 +334,7 @@
         <span
           class="host-chip"
           class:mine={app.isRoomHost(room)}
-          title="The room's identity, roster and name live with its host. Rooms are stream-only — nothing is stored, here or anywhere — and sharing in one is scoped to the room: it never adds standing permissions."
+          title="The room's identity, roster and name live with its host. Rooms are stream-only: nothing is stored, here or anywhere: and sharing in one is scoped to the room: it never adds standing permissions."
         >
           🏠 {app.isRoomHost(room) ? "you host" : app.roomHostLabel(room)}
         </span>
@@ -350,7 +350,7 @@
             {app.roomAccess(room) === "open" ? "🔓 open" : "🔒 invite-only"}
           </button>
         {:else if app.roomAccess(room) === "open"}
-          <span class="access-chip open" title="Anyone with this room's id can join — copy the invite to pass it on">🔓 open</span>
+          <span class="access-chip open" title="Anyone with this room's id can join: copy the invite to pass it on">🔓 open</span>
         {/if}
         {#if callFor}
           <span class="timer" title="How long you've been in this call">{callFor}</span>
@@ -358,7 +358,7 @@
         <div class="head-spacer"></div>
         <button
           class="btn small"
-          title="Copy this room's id — anyone on a shared network pastes it under Rooms → Join with an id ({room.id})"
+          title="Copy this room's id: anyone on a shared network pastes it under Rooms → Join with an id ({room.id})"
           onclick={copyInvite}
         >
           {copied ? "✓ Copied" : "🔗 Copy invite"}
@@ -373,9 +373,9 @@
         {:else}
           <button
             class="btn small ghost mini"
-            title="Back to the graph — you stay in the room (everything keeps streaming)"
+            title="Back to the graph: you stay in the room (everything keeps streaming)"
             aria-label="Minimize the room"
-            onclick={() => app.closeRoomPanel()}>—</button
+            onclick={() => app.closeRoomPanel()}>−</button
           >
         {/if}
       </header>
@@ -427,7 +427,7 @@
                 </div>
               {:else}
                 <p class="chat-empty">
-                  No messages yet.{#if !app.backendConnected}&nbsp;(Demo mode — chat stays on this
+                  No messages yet.{#if !app.backendConnected}&nbsp;(Demo mode: chat stays on this
                     device.){/if}
                 </p>
               {/each}
@@ -490,7 +490,7 @@
                     <span class="r-who">{w.who}</span>
                     {#if w.machine}<span class="r-machine">· {w.machine}</span>{/if}
                     <span class="r-state" title={note ?? undefined}>
-                      {#if note}⚠ {!app.roomsSupported(m.node) ? "old app" : "unclaimed"}{:else if m.node?.online}invited — not in yet{:else}offline{/if}
+                      {#if note}⚠ {!app.roomsSupported(m.node) ? "old app" : "unclaimed"}{:else if m.node?.online}invited: not in yet{:else}offline{/if}
                     </span>
                     {#if app.isRoomHost(room)}
                       <button
@@ -567,7 +567,7 @@
               {:else}
                 <p class="files-empty">
                   Nothing shared yet. <b>Share a file</b> and everyone in the call can download
-                  it{#if !app.backendConnected}&nbsp;(demo mode — sharing needs the desktop app){/if}.
+                  it{#if !app.backendConnected}&nbsp;(demo mode: sharing needs the desktop app){/if}.
                 </p>
               {/each}
             </div>
@@ -581,7 +581,7 @@
             class="ctl"
             class:on={app.roomMic}
             onclick={() => app.toggleRoomMic()}
-            title="Talk to the room — your microphone to the members' speakers (m)"
+            title="Talk to the room: your microphone to the members' speakers (m)"
           >
             <span class="ctl-icon" class:slashed={!app.roomMic}>🎙</span>
             <span class="ctl-label">{app.roomMic ? "Mute" : "Unmute"}</span>
@@ -590,7 +590,7 @@
             class="ctl"
             class:on={app.roomCam}
             onclick={() => app.toggleRoomCam()}
-            title="Send your camera to the room — members see it as a live tile (v)"
+            title="Send your camera to the room: members see it as a live tile (v)"
           >
             <span class="ctl-icon" class:slashed={!app.roomCam}>📷</span>
             <span class="ctl-label">Camera</span>
@@ -604,7 +604,7 @@
               class:on={app.roomScreen}
               onclick={shareScreen}
               title={app.roomScreenSources.length > 1
-                ? "Share a screen with the room — pick which monitor"
+                ? "Share a screen with the room: pick which monitor"
                 : "Share this machine's screen with the room"}
             >
               <span class="ctl-icon">🖥</span>
@@ -625,7 +625,7 @@
             class="ctl"
             class:on={app.roomSound}
             onclick={() => app.toggleRoomSound()}
-            title="Share what this machine is playing (its system audio) — NOT your microphone"
+            title="Share what this machine is playing (its system audio): NOT your microphone"
           >
             <span class="ctl-icon">🔊</span>
             <span class="ctl-label">Share sound</span>
@@ -634,7 +634,7 @@
             class="ctl"
             class:on={app.roomControl}
             onclick={() => app.toggleRoomControl()}
-            title="Let members click and type on this machine (owner/fleet members only — others' input is dropped)"
+            title="Let members click and type on this machine (owner/fleet members only: others' input is dropped)"
           >
             <span class="ctl-icon">🕹</span>
             <span class="ctl-label">Share control</span>
@@ -642,7 +642,7 @@
           <button
             class="ctl"
             onclick={shareFiles}
-            title="Add files to the room's Shared Files — members can download them while you're here (it's not a file browser)"
+            title="Add files to the room's Shared Files: members can download them while you're here (it's not a file browser)"
           >
             <span class="ctl-icon">🗂</span>
             <span class="ctl-label">Share files</span>
@@ -655,7 +655,7 @@
             <span class="ctl-label">Chat</span>
             {#if unread > 0}<span class="ctl-badge">{unread}</span>{/if}
           </button>
-          <button class="ctl" class:lit={app.roomFilesOpen} onclick={toggleFiles} title="Shared Files — what's been shared into this call">
+          <button class="ctl" class:lit={app.roomFilesOpen} onclick={toggleFiles} title="Shared Files: what's been shared into this call">
             <span class="ctl-icon">🗂</span>
             <span class="ctl-label">Files</span>
             {#if sharedFiles.length > 0}<span class="ctl-badge">{sharedFiles.length}</span>{/if}
@@ -667,7 +667,7 @@
           </button>
         </div>
         <div class="bar-sep"></div>
-        <button class="leave" onclick={() => app.leaveRoom(room.id)} title="Hang up — your shares stop and members see you go">
+        <button class="leave" onclick={() => app.leaveRoom(room.id)} title="Hang up: your shares stop and members see you go">
           Leave
         </button>
       </footer>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The venues pill's dropdown — the sibling of the meshes menu, but for
+  // The venues pill's dropdown - the sibling of the meshes menu, but for
   // venues. It lists the merger of every live mesh's venues, each with an
   // on/off switch. A venue is on by default; turning one **off** is the user's
   // call (driving a mesh never does it), while enabling a mesh turns its venues
@@ -27,8 +27,8 @@
 
   {#if app.meshVenues().length === 0}
     <p class="menu-empty">
-      No venues yet — your meshes call out at
-      <button class="linkish" onclick={() => (close(), app.openSettings("venues"))}>their venues</button>.
+      No venues yet. Configure each mesh under
+      <button class="linkish" onclick={() => { close(); app.networksSubtab = "servers"; app.openSettings("networks"); }}>Meshes</button>.
     </p>
   {/if}
 
@@ -47,8 +47,8 @@
         aria-checked={on}
         aria-label="{on ? 'Switch off' : 'Switch on'} {v.label}"
         title={on
-          ? "Switch off — drop this venue's servers from every mesh that uses it"
-          : "Switch on — fold this venue's servers back in"}
+          ? "Switch off this venue"
+          : "Switch on this venue"}
         onclick={() => void app.toggleVenue(v.id, !on)}
       >
         <span class="knob"></span>
@@ -61,8 +61,9 @@
       class="btn small wide"
       onclick={() => {
         close();
-        app.openSettings("venues");
-      }}>⚙ Manage venues…</button
+        app.networksSubtab = "servers";
+        app.openSettings("networks");
+      }}>⚙ Mesh venues…</button
     >
   </div>
 </div>

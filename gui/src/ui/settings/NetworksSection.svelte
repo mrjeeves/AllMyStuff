@@ -1,12 +1,12 @@
 <script lang="ts">
-  // Meshes pane — the real, multi-network system.
-  //   • Status — this device's name, your meshes, and (per mesh) its members.
-  //   • Venue  — where a mesh calls out; reached by a mesh's "Venue" button.
+  // Meshes pane: the real, multi-network system.
+  //   • Status: your meshes and their members.
+  //   • Venues: where each mesh calls out.
   // Meshes here are fully open: any node that joins is admitted automatically,
   // so there's no approval queue. Who can mesh with you is shaped by private
-  // venues, the Fleet, and Sharing — not by approving devices one by one.
+  // venues, the Fleet, and Sharing: not by approving devices one by one.
   // The all-machines roster moved out to its own top-level Devices tab. The
-  // fleet's closed mesh shows here too, but as a link to its Fleet settings —
+  // fleet's closed mesh shows here too, but as a link to its Fleet settings -
   // you manage its devices there, not as a plain mesh roster.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
@@ -20,36 +20,20 @@
   // story), so the button would only ever fail there. Hide it.
   const canExport = !isMobile();
 
-  let nameInput = $state("");
   let joinId = $state("");
   let joinVenue = $state(PUBLIC_VENUE_ID);
   let copied = $state("");
-  // Transient inline confirmations (replace success toasts): the name Save
-  // button flashes "Saved ✓", each Export button flashes "Exported ✓".
-  let savedName = $state(false);
   let exported = $state("");
 
   const sub = $derived(app.networksSubtab);
-  const hostname = $derived(app.node(app.localId)?.hostname ?? "");
-  const trimmedName = $derived(nameInput.trim());
-  const namePreview = $derived(
-    trimmedName && trimmedName !== hostname ? `${trimmedName} (${hostname})` : hostname || trimmedName || "—",
-  );
   const rosterNet = $derived(app.networks.find((n) => n.config_id === app.rosterNetwork) ?? null);
 
   onMount(() => {
-    nameInput = app.identity?.label ?? "";
     void app.refreshNetworks();
     void app.loadNetworkConfigs();
     if (app.activeNetwork) void app.refreshRoster(app.activeNetwork.config_id);
   });
 
-  async function saveName() {
-    if (await app.setIdentityLabel(trimmedName)) {
-      savedName = true;
-      setTimeout(() => (savedName = false), 1500);
-    }
-  }
   async function exportNet(configId: string) {
     if (await app.exportNetwork(configId)) {
       exported = configId;
@@ -65,19 +49,19 @@
   }
   async function copyHandle(networkId: string) {
     try {
-      // The invite carries the mesh's venue(s) when they aren't Public —
+      // The invite carries the mesh's venue(s) when they aren't Public -
       // two devices joining the same name on different relay sets never
       // meet, with no error anywhere, so the handle alone isn't enough.
       await navigator.clipboard.writeText(app.meshInvite(networkId));
       copied = networkId;
       setTimeout(() => (copied = ""), 1500);
     } catch {
-      app.toast("warn", "Couldn't copy — select it by hand");
+      app.toast("warn", "Couldn't copy: select it by hand");
     }
   }
 
   // The fleet is a mesh, but THIS program treats it specially: you don't manage
-  // its devices here as a plain roster — you manage them in Fleet settings
+  // its devices here as a plain roster: you manage them in Fleet settings
   // (including leaving the fleet, which is how you leave its mesh). So the fleet
   // row links there instead of opening a member list.
   function goToFleet() {
@@ -105,44 +89,24 @@
     <h3>Meshes</h3>
     <div class="subtabs">
       <button class:active={sub === "status"} onclick={() => (app.networksSubtab = "status")}>Status</button>
-      <button class="venue-tab" class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+      <button class="venue-tab" class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venues</button>
     </div>
   </div>
 
   {#if sub === "servers"}
     <NetworkServers />
   {:else}
-    <!-- This device -->
-    <section class="block">
-      <h4>This device</h4>
-      <p class="hint">
-        Its name defaults to the machine name. Set an override and it shows as
-        <b>Name ({hostname || "hostname"})</b> everywhere.
-      </p>
-      <div class="row">
-        <input class="field" placeholder={hostname || "device name"} bind:value={nameInput} />
-        <button class="btn small primary" class:saved={savedName} onclick={saveName}>
-          {savedName ? "Saved ✓" : "Save"}
-        </button>
-      </div>
-      <div class="preview">Shows as <b>{namePreview}</b></div>
-      {#if app.identity?.device_id}
-        <div class="devid" title={app.identity.device_id}>id {app.identity.device_id.slice(0, 12)}…</div>
-      {/if}
-    </section>
-
     <!-- Your networks (with add/join + per-network handle) -->
     <section class="block">
       <div class="sec-head">
-        <h4>Your meshes — joined {app.normalNetworks.length}</h4>
+        <h4>Your meshes · {app.normalNetworks.length} joined</h4>
         <div class="seg">
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
         </div>
       </div>
       <input bind:this={importInput} type="file" accept=".json,application/json" hidden onchange={onImportFile} />
       <p class="hint">
-        You can be on as many networks as you like — devices on any of them show up,
-        so it's never just “the” mesh. Share a mesh's handle to add a device to it.
+        Devices on any joined mesh can appear here. Share an invite to add another device.
       </p>
 
       <div class="join-box">
@@ -150,7 +114,7 @@
         <div class="row">
           <input
             class="field"
-            placeholder="mesh name or invite — or leave blank to generate one"
+            placeholder="Mesh name or invite. Leave blank to generate one"
             bind:value={joinId}
             onkeydown={(e) => e.key === "Enter" && join()}
           />
@@ -161,7 +125,7 @@
           </select>
           <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">Paste an invite and its venue comes with it. Otherwise enter a shared name, or leave it blank to generate a new memorable mesh.</p>
+        <p class="hint">Invites include the mesh's venue.</p>
       </div>
 
       <ul class="nets">
@@ -174,27 +138,27 @@
                  own thing: no device roster here, just a link to Fleet settings
                  where you manage its devices, owner, key and security. The
                  owner-set venue stays (it has no other home); everything else
-                 about the fleet — including leaving it — lives over there. -->
+                 about the fleet: including leaving it: lives over there. -->
             <li class="fleet">
               <button class="net-main" title="Manage your fleet in Fleet settings" onclick={goToFleet}>
                 <span class="net-name">{app.meshLabel(n)}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
                 <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
               </button>
               {#if app.isFleetOwner}
-                <button class="btn small" title="Choose where the fleet calls out (its venue) — owner only" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+                <button class="btn small" title="Choose where the fleet calls out (its venue): owner only" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
               {/if}
               <button class="btn small primary" onclick={goToFleet}>Manage in Fleet settings →</button>
             </li>
           {:else if app.isLocalClaimMesh(n)}
             <!-- The node-owned local claiming mesh: the mDNS passthrough for
-                 claiming and local pairing. Not a mesh you manage — no venue
+                 claiming and local pairing. Not a mesh you manage: no venue
                  (it's LAN-only by construction), no invites, no member list,
                  and no Leave (the node would just re-join it). The only
                  control it has is on/off. -->
             <li class="claim">
               <div class="net-main plain">
-                <span class="net-name">{app.meshLabel(n)}<span class="badge claim-badge" title="The built-in LAN-only mesh other devices use to find this one for claiming and pairing — mDNS only, never leaves your network">📡 local</span>{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
-                <span class="net-sub">mDNS passthrough for claiming and local pairing — this LAN only, nothing to configure</span>
+                <span class="net-name">{app.meshLabel(n)}<span class="badge claim-badge" title="The built-in LAN-only mesh other devices use to find this one for claiming and pairing: mDNS only, never leaves your network">📡 local</span>{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
+                <span class="net-sub">mDNS passthrough for claiming and local pairing: this LAN only, nothing to configure</span>
               </div>
               <button class="btn small" title="Switch Local and pairing off (turn it back on here or from the pill menu)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Turn off</button>
             </li>
@@ -204,7 +168,7 @@
                 <span class="net-name">{app.meshLabel(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
                 <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
               </button>
-              <button class="btn small" title="Copy this mesh's invite to add a device — it carries the mesh's venue, so the other device lands on the same relays" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy invite"}</button>
+              <button class="btn small" title="Copy this mesh's invite to add a device: it carries the mesh's venue, so the other device lands on the same relays" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy invite"}</button>
               {#if canExport}
                 <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
               {/if}
@@ -219,9 +183,9 @@
             <div class="net-main">
               <span class="net-name">{app.isLocalClaimMesh(c) ? "Local" : networkDisplayName(c)}<span class="badge off-badge">{app.isLocalClaimMesh(c) ? "off" : "disabled"}</span></span>
               {#if app.isLocalClaimMesh(c)}
-                <span class="net-sub">switched off — this device can't be found for claiming or local pairing</span>
+                <span class="net-sub">switched off: this device can't be found for claiming or local pairing</span>
               {:else}
-                <span class="net-sub">{c.network_id} · kept for later — devices there can't see you</span>
+                <span class="net-sub">{c.network_id} · kept for later: devices there can't see you</span>
               {/if}
             </div>
             <button class="btn small primary" onclick={() => app.toggleNetworkEnabled(c.id, true)}>{app.isLocalClaimMesh(c) ? "Turn on" : "Enable"}</button>
@@ -231,7 +195,7 @@
           </li>
         {/each}
         {#if app.normalNetworks.length === 0 && app.disabledNets.length === 0}
-          <li class="empty">No networks yet — create one, or join with a handle from another device.</li>
+          <li class="empty">No networks yet: create one, or join with a handle from another device.</li>
         {/if}
       </ul>
     </section>
@@ -240,17 +204,12 @@
     <section class="block">
       <h4>Add a device</h4>
       <p class="hint">
-        Machines aren't added by hand — install AllMyStuff on the other device
-        and join this mesh with its invite (Copy invite above). The invite
-        carries the mesh's venue when it isn't Public, so both devices call out
-        at the same relays — the usual reason two devices "never meet" is
-        joining the same name on different venues. Meshes are open, so it's
-        admitted automatically and shows up here and on the graph on its own.
+        Install AllMyStuff on the other device, then join this mesh with its invite.
       </p>
     </section>
 
-    <!-- Members of the selected mesh. Meshes are fully open — any node that
-         joins is admitted automatically — so there's no approval queue here,
+    <!-- Members of the selected mesh. Meshes are fully open: any node that
+         joins is admitted automatically: so there's no approval queue here,
          just who's on it. The fleet mesh never lands here: its row links to
          Fleet settings rather than selecting a member list. -->
     {#if rosterNet && !app.isFleetMesh(rosterNet) && !app.isLocalClaimMesh(rosterNet)}
@@ -267,7 +226,7 @@
             </li>
           {/each}
           {#if app.roster.length === 0}
-            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this mesh — it shows up here on its own.</li>
+            <li class="empty">No devices have joined this mesh.</li>
           {/if}
         </ul>
       </section>
@@ -386,15 +345,6 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);
   }
-  .preview {
-    font-size: 0.8rem;
-    color: var(--ink-soft);
-  }
-  .devid {
-    font-size: 0.72rem;
-    color: var(--ink-faint);
-    margin-top: 0.2rem;
-  }
   .sec-head {
     display: flex;
     align-items: center;
@@ -508,7 +458,7 @@
   .btn.danger {
     color: var(--danger);
   }
-  /* The fleet mesh — marked in the fleet concept's green. */
+  /* The fleet mesh: marked in the fleet concept's green. */
   .nets li.fleet {
     box-shadow: inset 0 0 0 1.5px var(--c-fleet-soft);
   }
@@ -516,7 +466,7 @@
     color: var(--c-fleet-ink);
     background: var(--c-fleet-soft);
   }
-  /* The local claiming mesh — node-owned, on/off only, so its main area is
+  /* The local claiming mesh: node-owned, on/off only, so its main area is
      informational rather than a roster selector. */
   .net-main.plain {
     cursor: default;

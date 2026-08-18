@@ -145,7 +145,7 @@
   <!-- Making a room: name it, choose how it admits, pick who's in it. -->
   <div class="draft">
     <p class="hint">
-      A room is a call between machines, and <b>you host the rooms you make</b> — their
+      A room is a call between machines, and <b>you host the rooms you make</b>: their
       identity and roster are this device's. Start one with just this node and invite
       machines later.
     </p>
@@ -217,10 +217,10 @@
         <div class="r-main">
           <div class="r-name">
             🪩 {r.name}
-            {#if app.roomAccess(r) === "open"}<span class="r-open" title="Open room — anyone with its id can join">🔓</span>{/if}
+            {#if app.roomAccess(r) === "open"}<span class="r-open" title="Open room: anyone with its id can join">🔓</span>{/if}
             {#if joined}<span class="in-dot" title="You're in this room"></span>{/if}
             {#if unread > 0}<span class="unread" title="Unread chat">{unread}</span>{/if}
-            {#if knocks > 0}<span class="knock-badge" title="{knocks} asking to join — open the room to admit them">{knocks} asking</span>{/if}
+            {#if knocks > 0}<span class="knock-badge" title="{knocks} asking to join: open the room to admit them">{knocks} asking</span>{/if}
           </div>
           <div class="r-sub">
             {app.isRoomHost(r) ? "hosted by you" : `hosted by ${app.roomHostLabel(r)}`}
@@ -265,7 +265,7 @@
                 <span class="rm-icon" aria-hidden="true">⏏</span>
                 <span class="rm-text">
                   <span class="rm-label">Leave call</span>
-                  <span class="rm-sub">hang up — the room stays listed</span>
+                  <span class="rm-sub">hang up: the room stays listed</span>
                 </span>
               </button>
             {/if}

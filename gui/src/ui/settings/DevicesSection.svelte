@@ -1,9 +1,9 @@
 <script lang="ts">
-  // Devices — the all-machines roster: every machine you've seen, know, or
+  // Devices: the all-machines roster: every machine you've seen, know, or
   // remember across all your meshes, and which network(s) each one rides. Its
   // own top-level settings tab now (it used to be a hidden sub-tab under
   // Meshes). The point: you're joined to however many networks, and a device
-  // may be on only some of them — so this makes the overlap explicit rather
+  // may be on only some of them: so this makes the overlap explicit rather
   // than pretending it's one flat mesh.
   import { app } from "../../store.svelte";
   import { displayName, isAppNode } from "../../types";
@@ -20,7 +20,7 @@
   const discoveredSignals = $derived(devices.filter((node) => !app.isKnownDevice(node)));
 
   // The device's mesh id (pubkey), trimmed to a glanceable hash with the full
-  // value on hover — shown grey under the display name.
+  // value on hover: shown grey under the display name.
   const shortHash = (id: string) => (id.length > 20 ? `${id.slice(0, 10)}…${id.slice(-6)}` : id);
 
   function relLabel(n: MeshNode): { text: string; cls: string } {
@@ -74,7 +74,7 @@
       {#if n.networks && n.networks.length}
         {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
       {:else}
-        <span class="net-chip none">—</span>
+        <span class="net-chip none">None</span>
       {/if}
     </div>
     {#if signal}
@@ -96,9 +96,8 @@
 <div class="devices">
   <h3>Devices</h3>
   <p class="lead">
-    Known devices are protected from batch cleanup. Passive mesh sightings stay
-    under <b>Discovered signals</b> until you keep them or establish a
-    relationship through claiming, sharing, a room, or a KVM attachment.
+    Known devices are kept during signal cleanup. Unrecognized sightings appear
+    under <b>Discovered signals</b>.
   </p>
 
   <div class="list-head">
@@ -116,7 +115,7 @@
     </div>
     {#if discoveredSignals.length > 0}
       <button class="flush" class:armed={flushArmed} onclick={flushSignals}>
-        {flushArmed ? `Forget all ${discoveredSignals.length} — sure?` : `Forget all ${discoveredSignals.length}`}
+        {flushArmed ? `Confirm forgetting ${discoveredSignals.length}` : `Forget all ${discoveredSignals.length}`}
       </button>
     {/if}
   </div>

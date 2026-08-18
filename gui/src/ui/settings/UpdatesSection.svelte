@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Updates pane — drives the `allmystuff-updater` (its own release feed, not
+  // Updates pane: drives the `allmystuff-updater` (its own release feed, not
   // the daemon's): toggle auto-update, pick a channel + apply policy, see
   // what's staged, and check / apply on demand.
   import { onMount } from "svelte";
@@ -10,7 +10,7 @@
   const pkg = $derived(s?.install_kind === "package_manager");
   const web = !isTauri();
   // The phone/tablet shell: the App Store owns updates there, so this pane
-  // renders as a plain About — no updater controls, and no updater invokes
+  // renders as a plain About: no updater controls, and no updater invokes
   // (the commands aren't registered in the mobile crate).
   const mobile = isMobile();
   // The running build's version, for the mobile About line. (On the phone
@@ -57,7 +57,7 @@
       </div>
     </section>
   {:else if web}
-    <p class="hint">Update controls appear in the desktop app — this is the in-browser preview.</p>
+    <p class="hint">Update controls are available in the desktop app.</p>
   {:else if !s}
     <p class="hint">Reading update status…</p>
   {:else}
@@ -83,7 +83,7 @@
     <section class="block components">
       <div class="component-intro">
         <b>Installed components</b>
-        <span class="hint">Live process versions are separate, so a partial update cannot hide behind the GUI version.</span>
+        <span class="hint">Current and pinned versions for each running component.</span>
       </div>
       {#if app.componentVersions.length === 0}
         <p class="hint">Reading component versions…</p>
@@ -114,11 +114,7 @@
     {#if pkg}
       <section class="block">
         <p class="notice">
-          This copy of AllMyStuff can't replace its own files — it was installed
-          through a package manager (Homebrew, apt, Chocolatey, Scoop), or into a
-          location that needs an administrator to write to. It still checks for
-          new releases and will tell you when one lands; installing it is done
-          the same way you installed AllMyStuff.
+          Update this copy with its package manager or original installer.
         </p>
       </section>
     {:else}
@@ -224,7 +220,7 @@
     margin: 0 0 0.4rem;
     font-size: 1.2rem;
   }
-  /* Inline result of the last "Check now" — replaces the old toast. */
+  /* Inline result of the last "Check now": replaces the old toast. */
   .check-result {
     font-size: 0.82rem;
     font-weight: 600;

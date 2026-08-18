@@ -106,14 +106,14 @@
   <div class="eff-row">
     <span class="k">Resolution</span>
     <span class="req">{reqRes}</span>
-    <span class="eff-val">{w && h ? `${w}×${h}` : "—"}</span>
+    <span class="eff-val">{w && h ? `${w}×${h}` : "Not reported"}</span>
   </div>
 
   <div class="eff-row">
     <span class="k">Frame rate</span>
     <span class="req">{reqFps}</span>
     <span class="eff-val">
-      {fps ? `${fps}/s` : "—"}
+      {fps ? `${fps}/s` : "Not reported"}
       {#if dials && dials.fpsTarget}<span class="sub">target {dials.fpsTarget}</span>{/if}
     </span>
   </div>
@@ -122,7 +122,7 @@
     <span class="k">Bitrate</span>
     <span class="req">{reqRate}</span>
     <span class="eff-val">
-      {mbps ? `${fmtMbps(mbps)} Mbps` : "—"}<span class="sub">received</span>
+      {mbps ? `${fmtMbps(mbps)} Mbps` : "Not reported"}<span class="sub">received</span>
       {#if dials && dials.targetBitrateBps}
         <span class="sub strong"
           >target {fmtMbps(dials.targetBitrateBps / 1e6)}{#if dials.ceilingBps} · ceiling {fmtMbps(
@@ -135,8 +135,8 @@
 
   <div class="eff-row">
     <span class="k">Codec</span>
-    <span class="req">—</span>
-    <span class="eff-val">{dials?.codec || transport || "—"}</span>
+    <span class="req">None</span>
+    <span class="eff-val">{dials?.codec || transport || "Not reported"}</span>
   </div>
 
   <div class="eff-row">
@@ -147,8 +147,8 @@
 
   <div class="eff-row">
     <span class="k">Encoder</span>
-    <span class="req">—</span>
-    <span class="eff-val">{dials?.encoderLabel || "—"}</span>
+    <span class="req">None</span>
+    <span class="eff-val">{dials?.encoderLabel || "Not reported"}</span>
   </div>
 
   {#if !dials}

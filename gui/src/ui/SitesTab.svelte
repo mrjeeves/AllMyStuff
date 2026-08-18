@@ -79,7 +79,7 @@
                     >
                     <button
                       class="btn small ghost s-x"
-                      title="Unmap — stop proxying it here"
+                      title="Unmap: stop proxying it here"
                       aria-label="Unmap"
                       onclick={() => app.unmapSite(group.node.id, site.id)}>✕</button
                     >
@@ -116,7 +116,7 @@
                 <span
                   class="svc-dot"
                   class:on={site.online}
-                  title={site.online ? "Service is responding" : "Service isn't responding — it's offline"}
+                  title={site.online ? "Service is responding" : "Service isn't responding: it's offline"}
                 ></span>
                 {site.name}<span class="s-port">:{site.port}</span>
               </span>
@@ -156,7 +156,7 @@
     {#if portsOpen}
       {#if app.myListening.length === 0}
         <p class="hint faint">
-          No listening services found{app.backendConnected ? "" : " (demo)"} — start a local
+          No listening services found{app.backendConnected ? "" : " (demo)"}: start a local
           server and it'll appear here to expose.
         </p>
       {:else}

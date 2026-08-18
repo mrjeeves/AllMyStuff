@@ -175,11 +175,11 @@
                 disabled={!avail}
                 title={avail
                   ? c.requires
-                    ? `${c.label} — needs Video to map focus`
+                    ? `${c.label}: needs Video to map focus`
                     : c.popout
                       ? `${c.label} (opens a popout)`
                       : c.label
-                  : (app.shareCapReason(sender, c.key) ?? `${c.label} — not offered by this device`)}
+                  : (app.shareCapReason(sender, c.key) ?? `${c.label}: not offered by this device`)}
                 onclick={() => toggleCap(c.key)}
               >
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
@@ -266,7 +266,7 @@
           {@render fleetPicker()}
           <p class="note">
             ⓘ This grants the receiving fleet's machines the buttons to open the
-            sender's consoles — it doesn't open a connection. Both parties can
+            sender's consoles: it doesn't open a connection. Both parties can
             revoke any time.
           </p>
         </section>

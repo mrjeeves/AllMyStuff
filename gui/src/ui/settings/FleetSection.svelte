@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Fleet pane — the "Owned" roster: the devices you've claimed, linked by a
+  // Fleet pane: the "Owned" roster: the devices you've claimed, linked by a
   // single shared key gossiped between them. For now this only groups your
   // machines internally; a later edition lets you hand that key to other
   // things.
@@ -18,11 +18,11 @@
   // One membership truth, shared with the graph and the drawer: the backend's
   // `in_fleet`. So the settings pane can't say "no fleet" while the drawer says
   // you're in one. A keyless member (claimed, awaiting its key) is in a fleet
-  // too — it just has no key block to show.
+  // too: it just has no key block to show.
   const hasFleet = $derived(app.inFleet);
   const hasKey = $derived(!!fleet?.key);
   // Membership is the permission: you can leave, and kick others, while this
-  // device is in the fleet — the same single flag.
+  // device is in the fleet: the same single flag.
   const selfIsMember = $derived(app.inFleet);
 
   let revealed = $state(false);
@@ -47,12 +47,12 @@
   //
   // The owner stages hub toggles on the member rows, then signs the whole
   // shape in one governance transition (`fleet_set_hubs`). Every member's
-  // daemon (≥ 0.2.36) converges onto it via the signed log — nothing to
+  // daemon (≥ 0.2.36) converges onto it via the signed log: nothing to
   // configure per device. Draft state mirrors the fleet-name editor:
   // seeded from the converged roster unless the user is mid-edit.
 
   /** Canonical pubkey half of a device id (mirror of the backend's
-   *  `pubkey_part` — base32 has no dash, so everything past the first
+   *  `pubkey_part`: base32 has no dash, so everything past the first
    *  dash is display suffix). */
   const canon = (id: string) => id.split("-")[0];
 
@@ -102,7 +102,7 @@
     redundancyDraft = governedRedundancy;
   }
 
-  // Remote claiming by code — the WAN path behind the public-claims toggle.
+  // Remote claiming by code: the WAN path behind the public-claims toggle.
   // Slow by nature (joins a randomized rendezvous network and waits for the
   // device to appear), so it carries its own busy + error state.
   let claimCode = $state("");
@@ -163,7 +163,7 @@
   }
 
   // Resolve a roster device id to its display name the same way the graph and
-  // drawer do — by *canonical* machine match, not a strict id equality. A
+  // drawer do: by *canonical* machine match, not a strict id equality. A
   // roster id can be a different form of the same machine's id (bare pubkey vs
   // display id), so the strict lookup missed it and the name vanished.
   function nodeLabel(device: string): string {
@@ -181,7 +181,7 @@
     return nodeLabel(m.device) || m.label || m.device.slice(0, 12);
   }
 
-  // "View on the graph" — the explicit way out of Settings to a device. Clicking
+  // "View on the graph": the explicit way out of Settings to a device. Clicking
   // a row no longer yanks you to the graph; this dedicated button does. It
   // resolves the roster id to the live node first (a roster id is often a
   // different *form* of the same machine's id than the graph lays out under, so
@@ -193,8 +193,8 @@
   // Roles are layered: promote stages a member up to Manager, then a Manager to
   // co-owner, with a matching step-down. The mesh layer (MyOwnMesh's closed-
   // network governance) is the authority, so the buttons are gated to exactly
-  // what it enforces — only an owner can grant or withdraw a manager or owner,
-  // and an owner or manager can evict a member — and we just float the signed
+  // what it enforces: only an owner can grant or withdraw a manager or owner,
+  // and an owner or manager can evict a member: and we just float the signed
   // proposal for the daemon to ratify.
   function promoteToManager(device: string) {
     void app.grantFleetRole(device, "manager");
@@ -215,7 +215,7 @@
   // The fleet is a closed network underneath; enrolling an authenticator on
   // this device tells the daemon to refuse a fleet governance change (kind
   // flip, owner grant/revoke) without a fresh code. It guards *this device's*
-  // signing key for the fleet — it doesn't replace the shared fleet key.
+  // signing key for the fleet: it doesn't replace the shared fleet key.
   let mfaEnrolled = $state(false);
   let mfaBusy = $state(false);
   let mfaError = $state<string | null>(null);
@@ -266,9 +266,7 @@
 <div class="section">
   <h3>Fleet</h3>
   <p class="lead">
-    The devices you've <b>claimed</b> are linked into a fleet by a shared key,
-    gossiped between them as an “Owned” roster. Today the key groups your
-    machines internally; later you'll be able to hand it to other things.
+    Your claimed devices and their fleet roles.
   </p>
 
   {#snippet claimingBlock()}
@@ -285,13 +283,8 @@
         <span>Allow claiming over the public mesh</span>
       </label>
       <p class="hint">
-        Applies to <b>this device only</b> — it's never synced and can't be
-        turned on remotely. <b>Off (default):</b> claiming works while this
-        machine and the device share a local network; discovery rides mDNS on
-        the LAN and touches no public infrastructure. <b>On:</b> this machine
-        can claim remote devices by <i>claim code</i> — and while itself
-        claimable it publishes a claim code of its own (see its log) instead
-        of sitting on a public meeting point anyone could watch.
+        This device only. Leave this off for LAN claiming. Turn it on to claim
+        a remote device with its claim code.
       </p>
       {#if app.publicClaims}
         <div class="claim-code-row">
@@ -316,17 +309,14 @@
           <div class="mfa-status err" role="alert">⚠ {claimErr}</div>
         {/if}
         <p class="hint">
-          Enter the code shown on the device (its web page, screen, or service
-          log). The claim meets on a private, randomized rendezvous derived
-          from that code — unguessable to anyone who doesn't hold it — and the
-          rendezvous is torn down again as soon as the claim lands.
+          Enter the code shown by the remote device.
         </p>
       {/if}
     </section>
   {/snippet}
 
   {#if hasFleet}
-    <!-- Whose fleet this is — the owning *person's* name, which leads. It's not
+    <!-- Whose fleet this is: the owning *person's* name, which leads. It's not
          the fleet's mesh id (that's the word-salad network name over in Meshes),
          and it's not a device name: the owner *machines* are marked ★ Owner in
          the device list below (they're fleet owners too, just identified by
@@ -346,17 +336,14 @@
           />
         {:else}
           <!-- Non-owners can't change it, but they (and everyone in the mesh)
-               see it — plain text, not a greyed-out field. -->
+               see it: plain text, not a greyed-out field. -->
           <div class="name-value" class:unnamed={!app.fleetName}>
             {app.fleetName || "Unnamed owner"}
           </div>
         {/if}
       </div>
       <p class="hint">
-        The name of the <b>person</b> who owns this fleet. It leads everywhere —
-        the graph's “{app.fleetName || "Your"}{app.fleetName ? "'s" : ""} fleet”
-        band, and new rooms default to it. (The fleet's <i>mesh</i> name — its id
-        for networks — lives under Meshes.)
+        The owner's name appears on the graph and in new rooms.
         {#if !app.isFleetOwner} Only the fleet owner can change it.{/if}
       </p>
     </section>
@@ -372,14 +359,12 @@
           <button class="btn small" onclick={() => (revealed = !revealed)}>{revealed ? "Hide" : "Reveal"}</button>
           <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
         </div>
-        <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+        <p class="hint">Every fleet device holds this key. Keep it private.</p>
       </section>
     {:else}
       <section class="block">
         <p class="hint">
-          This device has been claimed into a fleet but is still waiting on its
-          owner to hand over the shared key. It'll join the rest of the fleet
-          once the owner is reachable; you can leave below in the meantime.
+          Waiting for the fleet owner to provide the shared key.
         </p>
       </section>
     {/if}
@@ -410,7 +395,7 @@
             <div class="m-actions">
               <button
                 class="role-btn"
-                title="Show this device on the graph — leaves Settings, then selects and centres it"
+                title="Show this device on the graph: leaves Settings, then selects and centres it"
                 onclick={() => viewOnGraph(m.device)}
               >
                 🔍 View
@@ -420,7 +405,7 @@
                   class="role-btn hub-toggle"
                   class:hub-on={isHubDraft(m.device)}
                   title={isHubDraft(m.device)
-                    ? "Staged as an infra hub — sign the shape below to apply"
+                    ? "Staged as an infra hub: sign the shape below to apply"
                     : "Stage this device as an infra hub: hubs full-mesh each other and carry the rest of the fleet, so spokes keep a couple of links instead of one per device. Pick always-on boxes."}
                   onclick={() => toggleHub(m.device)}
                 >
@@ -432,7 +417,7 @@
                    or withdraw managers and owners; a manager (controller) can
                    only evict a member; a member changes nothing. Evicting an
                    owner outright needs every owner's consent, so it isn't
-                   offered — step an owner down to manager first, then evict. -->
+                   offered: step an owner down to manager first, then evict. -->
               {#if !isSelf}
                 {@const iOwn = app.myFleetRole === "owner"}
                 {@const iManage = iOwn || app.myFleetRole === "manager"}
@@ -441,17 +426,17 @@
                     <button
                       class="kick"
                       class:armed={armed === m.device}
-                      title="Evict this KVM from the fleet — KVMs are fixed-role appliances and cannot be promoted or demoted"
+                      title="Evict this KVM from the fleet: KVMs are fixed-role appliances and cannot be promoted or demoted"
                       onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
                     >
-                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                      {armed === m.device ? "Evict: sure?" : "Evict"}
                     </button>
                   {/if}
                 {:else if isOwner}
                   {#if iOwn}
                     <button
                       class="role-btn down"
-                      title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent, so step them down first.)"
+                      title="Step this co-owner back down to manager: they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent, so step them down first.)"
                       onclick={() => demoteToManager(m.device)}
                     >
                       ⤓ Make manager
@@ -461,14 +446,14 @@
                   {#if iOwn}
                     <button
                       class="role-btn up"
-                      title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner."
+                      title="Promote this manager to a co-owner: full fleet authority alongside you. Only an owner can make an owner."
                       onclick={() => promoteToOwner(m.device)}
                     >
                       ★ Make owner
                     </button>
                     <button
                       class="role-btn down"
-                      title="Withdraw this manager back to a plain member — they keep fleet membership but lose authority to admit members."
+                      title="Withdraw this manager back to a plain member: they keep fleet membership but lose authority to admit members."
                       onclick={() => demoteToMember(m.device)}
                     >
                       ⤓ Make member
@@ -476,17 +461,17 @@
                     <button
                       class="kick"
                       class:armed={armed === m.device}
-                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      title="Evict this device from the fleet: a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
                       onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
                     >
-                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                      {armed === m.device ? "Evict: sure?" : "Evict"}
                     </button>
                   {/if}
                 {:else}
                   {#if iOwn}
                     <button
                       class="role-btn up"
-                      title="Promote this member to a manager — they can admit members. Promote again afterwards to make them a co-owner. (Only an owner can promote.)"
+                      title="Promote this member to a manager: they can admit members. Promote again afterwards to make them a co-owner. (Only an owner can promote.)"
                       onclick={() => promoteToManager(m.device)}
                     >
                       ★ Make manager
@@ -496,10 +481,10 @@
                     <button
                       class="kick"
                       class:armed={armed === m.device}
-                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      title="Evict this device from the fleet: a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
                       onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
                     >
-                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                      {armed === m.device ? "Evict: sure?" : "Evict"}
                     </button>
                   {/if}
                 {/if}
@@ -525,29 +510,21 @@
       <h4>⬢ Connection shape</h4>
       {#if governedTopo === null}
         <p class="hint">
-          Full mesh (default): every device connects to every other — fine
-          for a handful of machines, N² links as the fleet grows.
+          Full mesh: every device connects directly to every other device.
           {#if app.isFleetOwner}
-            Toggle <b>⬢ Hub</b> on your always-on boxes above to move the
-            fleet onto a hub tier: hubs carry the traffic, everything else
-            keeps just a couple of links. Members need mesh daemon 0.2.36+
-            (it self-updates).
+            Mark always-on devices as <b>⬢ Hub</b> to reduce connections in a large fleet.
           {/if}
         </p>
       {:else if governedTopo.kind === "hubs"}
         <p class="hint">
-          Hub tier, signed by the owner: {governedHubs.length}
-          hub{governedHubs.length === 1 ? "" : "s"} carry the fleet — hubs
-          full-mesh each other, every other device keeps
-          {governedRedundancy ?? 2} hub
-          link{(governedRedundancy ?? 2) === 1 ? "" : "s"}. Every member's
-          daemon follows this automatically.
+          {governedHubs.length} hub{governedHubs.length === 1 ? "" : "s"}; each
+          other device keeps {governedRedundancy ?? 2} hub
+          link{(governedRedundancy ?? 2) === 1 ? "" : "s"}.
         </p>
       {:else if governedTopo.kind === "full_mesh"}
         <p class="hint">
-          Full mesh, signed by the owner — every device connects to every
-          other. {#if app.isFleetOwner}Toggle <b>⬢ Hub</b> on members above
-            to move to a hub tier.{/if}
+          Every device connects directly to every other device.
+          {#if app.isFleetOwner} Mark members as <b>⬢ Hub</b> to use a hub tier.{/if}
         </p>
       {:else}
         <p class="hint">Owner-signed shape: {governedTopo.kind}.</p>
@@ -572,7 +549,7 @@
             </label>
           {:else}
             <span class="hint-inline">
-              No hubs staged — signing returns the fleet to full mesh.
+              No hubs staged: signing returns the fleet to full mesh.
             </span>
           {/if}
           <button class="btn small primary" onclick={() => void applyHubs()}>
@@ -591,10 +568,7 @@
       <section class="block mfa-block">
         <h4>🛡️ Fleet security · authenticator</h4>
         <p class="hint">
-          A per-device second factor. When enrolled, this device won't author
-          or co-sign a fleet governance change without a fresh code from your
-          authenticator app. It guards <b>this device's</b> signing key for the
-          fleet — it doesn't replace the shared fleet key above.
+          Require an authenticator code when this device signs fleet changes.
         </p>
 
         {#if mfaEnrolled}
@@ -638,7 +612,7 @@
           <div class="mfa-enroll">
             <p class="mfa-enroll-lead">
               <b>Add this to your authenticator app now, and save the recovery
-              codes</b> — they won't be shown again.
+              codes</b>: they won't be shown again.
             </p>
             <div class="mfa-kv"><span>Secret</span><code>{mfaEnrollResult.secret}</code></div>
             <div class="mfa-kv"><span>otpauth URI</span><code class="wrap">{mfaEnrollResult.otpauth_uri}</code></div>
@@ -670,11 +644,10 @@
             title="Remove this device from the fleet (its owner is released too)"
             onclick={() => confirmThen("leave", () => void app.leaveFleet())}
           >
-            {armed === "leave" ? "Leave the fleet — sure?" : "Leave the fleet"}
+            {armed === "leave" ? "Leave the fleet: sure?" : "Leave the fleet"}
           </button>
           <span class="hint">
-            Leaving (or being kicked) drops the shared key here and releases
-            ownership — the device goes back to unclaimed.
+            Leaving removes this device's fleet key and ownership.
           </span>
         </div>
       </section>
@@ -684,10 +657,7 @@
       <div class="empty-orb">🔗</div>
       <div class="empty-title">No fleet yet</div>
       <p class="hint center">
-        Claim a device that's offering itself for adoption — open it from the
-        graph and choose <b>Claim this device</b>. It and this machine will be
-        linked under a fresh shared key, and the rest of your claimed devices
-        join the same fleet.
+        Select a claimable device on the graph and choose <b>Claim this device</b>.
       </p>
     </section>
 
@@ -774,7 +744,7 @@
   .name-input:disabled {
     opacity: 0.6;
   }
-  /* The non-owner, read-only rendering of the fleet name — plain, legible
+  /* The non-owner, read-only rendering of the fleet name: plain, legible
      text so the name is unmistakably visible (not a greyed field). */
   .name-value {
     flex: 1;
@@ -828,7 +798,7 @@
   .members li.owner {
     box-shadow: inset 2px 0 0 var(--c-fleet);
   }
-  /* The identity is display-only now — clicking it no longer yanks you out to
+  /* The identity is display-only now: clicking it no longer yanks you out to
      the graph. The explicit "View" button in the actions does that instead. */
   .m-id-wrap {
     flex: 1;
@@ -851,7 +821,7 @@
     gap: 0.35rem;
     flex-shrink: 0;
   }
-  /* Role controls — one layer at a time. "Up" (promote) is additive, in the
+  /* Role controls: one layer at a time. "Up" (promote) is additive, in the
      fleet's green; "down" (withdraw) is a quiet, neutral step-back, so adding
      and removing a layer read as the same kind of action in opposite directions
      rather than promote-vs-danger. */
@@ -889,7 +859,7 @@
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
   }
-  /* Manager — distinct from the gold owner, in the fleet's green. */
+  /* Manager: distinct from the gold owner, in the fleet's green. */
   .mgr-tag {
     font-size: 0.62rem;
     font-weight: 700;
@@ -900,7 +870,7 @@
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
   }
-  /* Infra hub — the accent family, so shape reads apart from authority. */
+  /* Infra hub: the accent family, so shape reads apart from authority. */
   .hub-tag {
     font-size: 0.62rem;
     font-weight: 700;

@@ -20,7 +20,7 @@
   /** "123 456 789" — the spaced support number a customer reads out. */
   function groupNumber(n: string): string {
     const d = (n || "").replace(/\D/g, "");
-    return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "—";
+    return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "Unknown";
   }
 
   /** "just now" / "4m" / "1h 12m" — how long a hand has been up. */
@@ -95,7 +95,7 @@
 <div class="help">
   <label
     class="watch"
-    title="Join the shared help queue and see customers who press Ask for help. Saved — stays on across restarts."
+    title="Join the shared help queue and see customers who press Ask for help. Saved: stays on across restarts."
   >
     <input
       type="checkbox"
@@ -113,7 +113,7 @@
   {:else if app.cecHelpWaiting.length === 0}
     <p class="notice listening">
       <span class="live-dot" aria-hidden="true"></span>
-      Listening — no one is asking right now.
+      Listening: no one is asking right now.
     </p>
   {:else}
     <ul class="rows">
@@ -155,7 +155,7 @@
               <button
                 class="answer"
                 disabled={app.cecDialing}
-                title="Answer — connect and open their screen once they approve"
+                title="Answer: connect and open their screen once they approve"
                 onclick={() => void app.answerHelp(w.node, shownName)}
               >
                 Answer
@@ -177,7 +177,7 @@
                 <button
                   class="chat-btn"
                   disabled={app.cecDialing}
-                  title="Chat — connect and message this customer (without taking their screen)"
+                  title="Chat: connect and message this customer (without taking their screen)"
                   onclick={() => void app.chatWithCustomer(w.node)}
                 >
                   💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
@@ -249,7 +249,7 @@
                 class="reopen"
                 class:on={c.online}
                 disabled={app.cecDialing}
-                title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
+                title={c.online ? "Reconnect and open their screen" : "Try to reconnect: they must be online and approve"}
                 onclick={() => void app.reconnectCec(c.node)}
               >
                 {c.online ? "Open" : "Reconnect"}
@@ -267,7 +267,7 @@
                 <button
                   class="chat-btn"
                   disabled={app.cecDialing}
-                  title="Chat — connect and message this customer (without taking their screen)"
+                  title="Chat: connect and message this customer (without taking their screen)"
                   onclick={() => void app.chatWithCustomer(c.node)}
                 >
                   💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}

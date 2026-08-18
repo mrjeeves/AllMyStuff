@@ -1,9 +1,6 @@
 <script lang="ts">
-  // Per-network "Venue" pane. A mesh calls out at one or more venues — named
-  // signaling / STUN / TURN sets — and its effective servers are their union.
-  // The primary UI is a venue picker; the raw signaling/STUN/TURN editor is
-  // kept as an "Edit servers directly" escape hatch (still writing through
-  // `updateNetworkServers`, exactly as before).
+  // Every venue choice is scoped to one mesh. The overview makes that mapping
+  // visible before the selected mesh's venue and server controls.
   import { app } from "../../store.svelte";
   import { type TurnEntry } from "../../types";
   import {
@@ -20,12 +17,9 @@
   let turn = $state<TurnEntry[]>([]);
   let saving = $state(false);
   let advanced = $state(false);
-  let saveAsName = $state("");
-  // Transient inline confirmations (replace success toasts).
   let saved = $state(false);
-  let venueSaved = $state(false);
 
-  // The local claiming mesh never shows here: it has no venue — it's the
+  // The local claiming mesh never shows here: it has no venue. It is the
   // LAN-only mDNS passthrough for claiming and local pairing, and the node
   // refuses config edits to it anyway.
   const configs = $derived(app.networkConfigs.filter((c) => !app.isLocalClaimMesh(c)));
@@ -35,11 +29,18 @@
     return cfg && !app.isLocalClaimMesh(cfg) ? cfg : undefined;
   });
   const venues = $derived(app.venues);
-  // The venue(s) this mesh currently uses (by its wire id). Picking one is the
-  // common case; until bridging ships, "current" is the first of them.
+  // The venue assigned to the selected mesh.
   const chosen = $derived(selected ? app.venuesForNetwork(selected.network_id) : []);
   const chosenIds = $derived(new Set(chosen.map((v) => v.id)));
-  const currentLabel = $derived(chosen.map((v) => v.label).join(", ") || "—");
+  const currentLabel = $derived(chosen.map((v) => v.label).join(", ") || "Custom servers");
+  const venueGroups = $derived.by(() => {
+    const groups = new Map<string, typeof configs>();
+    for (const config of configs) {
+      const label = app.venuesForNetwork(config.network_id).map((venue) => venue.label).join(", ") || "Custom servers";
+      groups.set(label, [...(groups.get(label) ?? []), config]);
+    }
+    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
+  });
 
   // (Re)load the raw editor when the selected network changes (or its config
   // first arrives). Editing in place afterward isn't clobbered by reloads.
@@ -63,10 +64,6 @@
     await app.setNetworkVenues(selectedId, [venueId]);
   }
 
-  function manageVenues() {
-    app.settingsTab = "venues";
-  }
-
   function applyDefaults() {
     signaling = [MYOWNMESH_SIGNALING];
     stun = [MYOWNMESH_STUN];
@@ -86,27 +83,29 @@
     }
   }
 
-  function saveAsVenue() {
-    if (!selectedId) return;
-    const name = saveAsName.trim();
-    if (!name) {
-      app.toast("warn", "Name the venue first");
-      return;
-    }
-    const v = app.saveServersAsVenue(selectedId, name);
-    if (v) {
-      saveAsName = "";
-      venueSaved = true;
-      setTimeout(() => (venueSaved = false), 1600);
-    }
-  }
 </script>
 
 <div class="servers">
   {#if configs.length === 0}
-    <p class="hint">No networks to configure yet — create or join one under Status.</p>
+    <p class="hint">Create or join a mesh under Status to configure its venue.</p>
   {:else}
-    <!-- Network picker -->
+    <section class="overview">
+      <h4>Meshes by venue</h4>
+      <div class="venue-groups">
+        {#each venueGroups as [label, meshes] (label)}
+          <div class="venue-group">
+            <span class="venue-name">{label}</span>
+            <div>
+              {#each meshes as mesh (mesh.id)}
+                <button class="mesh-link" onclick={() => (app.serversNetwork = mesh.id)}>{app.meshLabel(mesh)}</button>
+              {/each}
+            </div>
+          </div>
+        {/each}
+      </div>
+    </section>
+
+    <div class="configure-label">Configure a mesh</div>
     <div class="picker">
       {#each configs as c (c.id)}
         <button class="pick" class:active={selectedId === c.id} onclick={() => (app.serversNetwork = c.id)}>
@@ -117,16 +116,14 @@
 
     {#if selected}
       <p class="lead">
-        <b>{app.meshLabel(selected)}</b> calls out at <b>{currentLabel}</b>. A
-        venue is a named set of signaling / STUN / TURN servers — picking one
-        reconnects the mesh through it.
+        <b>{app.meshLabel(selected)}</b> uses <b>{currentLabel}</b>. Changing it
+        reconnects only this mesh.
       </p>
 
       <!-- Venue picker -->
       <section class="grp">
         <div class="grp-head">
           <h4>Venue</h4>
-          <button class="btn small" onclick={manageVenues}>Manage venues →</button>
         </div>
         <div class="venues">
           {#each venues as v (v.id)}
@@ -140,9 +137,6 @@
           {/each}
         </div>
 
-        <!-- Multi-venue tease — deliberately inert until bridging ships. -->
-        <button class="add-venue" disabled title="One mesh across several venues — coming soon">＋ add another venue — coming soon</button>
-        <p class="tease">one mesh across several venues — venue bridging is on the way</p>
       </section>
 
       <!-- Advanced: today's raw editor, preserved as an escape hatch. -->
@@ -153,9 +147,8 @@
         </button>
         {#if advanced}
           <p class="lead">
-            Set this mesh's signaling / STUN / TURN by hand. Both ends must share a
-            signaling relay to find each other; STUN/TURN handle NAT. Saving
-            reconnects the mesh. Tip: capture these as a reusable venue below.
+            Set this mesh's signaling, STUN, and TURN servers. Saving reconnects
+            this mesh.
           </p>
 
           <!-- Signaling -->
@@ -170,7 +163,7 @@
                 <button class="x" title="Remove" onclick={() => (signaling = signaling.filter((_, j) => j !== i))}>✕</button>
               </div>
             {/each}
-            {#if signaling.length === 0}<p class="empty">None — peers fall back to the built-in public relays (less reliable).</p>{/if}
+            {#if signaling.length === 0}<p class="empty">None. Peers fall back to the built-in public relays.</p>{/if}
           </div>
 
           <!-- STUN -->
@@ -206,17 +199,12 @@
                 </div>
               </div>
             {/each}
-            {#if turn.length === 0}<p class="empty">None — symmetric-NAT / CGNAT peers may fail to connect.</p>{/if}
+            {#if turn.length === 0}<p class="empty">None. Peers behind symmetric NAT or CGNAT may fail to connect.</p>{/if}
           </div>
 
           <div class="actions">
             <button class="btn small" onclick={applyDefaults}>Reset to MyOwnMesh defaults</button>
-            <button class="btn small primary" class:saved disabled={saving} onclick={save}>{saved ? "Saved ✓ — reconnecting" : saving ? "Saving…" : "Save & reconnect"}</button>
-          </div>
-
-          <div class="save-as">
-            <input class="field" placeholder="Save these servers as a venue named…" bind:value={saveAsName} />
-            <button class="btn small" class:saved={venueSaved} onclick={saveAsVenue}>{venueSaved ? "Saved ✓" : "Save as a venue"}</button>
+            <button class="btn small primary" class:saved disabled={saving} onclick={save}>{saved ? "Saved ✓. Reconnecting" : saving ? "Saving…" : "Save & reconnect"}</button>
           </div>
         {/if}
       </section>
@@ -228,6 +216,19 @@
   .servers {
     padding-top: 0.6rem;
   }
+  .overview {
+    padding-bottom: 0.8rem;
+    margin-bottom: 0.8rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .overview h4 { margin: 0 0 0.5rem; }
+  .venue-groups { display: grid; gap: 0.4rem; }
+  .venue-group { display: grid; grid-template-columns: minmax(7rem, 0.7fr) minmax(0, 1.3fr); gap: 0.6rem; align-items: start; padding: 0.55rem 0.65rem; border-radius: var(--r-sm); background: var(--surface-2); }
+  .venue-name { color: var(--c-venue-ink); font-size: 0.8rem; font-weight: 700; }
+  .venue-group > div { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .mesh-link { border: 1px solid var(--line-strong); border-radius: var(--r-pill); background: var(--surface); color: var(--ink); padding: 0.18rem 0.5rem; font: inherit; font-size: 0.72rem; }
+  .mesh-link:hover { border-color: var(--c-venue); }
+  .configure-label { margin-bottom: 0.35rem; color: var(--ink-faint); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
   /* Transient "Saved ✓" confirmation (replaces a success toast). */
   .btn.saved {
     color: var(--ok);
@@ -331,25 +332,6 @@
     background: var(--c-venue-soft);
     border-color: var(--c-venue);
   }
-  .add-venue {
-    margin-top: 0.45rem;
-    width: 100%;
-    border: 1px dashed var(--line-strong);
-    background: transparent;
-    color: var(--ink-faint);
-    border-radius: var(--r-sm);
-    padding: 0.45rem;
-    font-size: 0.8rem;
-    font-weight: 600;
-    opacity: 0.55;
-    cursor: default;
-  }
-  .tease {
-    font-size: 0.7rem;
-    color: var(--ink-faint);
-    text-align: center;
-    margin: 0.25rem 0 0;
-  }
   .adv {
     margin-top: 0.2rem;
   }
@@ -436,15 +418,13 @@
     border-top: 1px solid var(--line);
     padding-top: 0.8rem;
   }
-  .save-as {
-    display: flex;
-    gap: 0.4rem;
-    margin-top: 0.6rem;
-  }
   .hint {
     font-size: 0.78rem;
     color: var(--ink-soft);
     margin: 0 0 0.5rem;
     line-height: 1.45;
+  }
+  @media (max-width: 560px) {
+    .venue-group { grid-template-columns: 1fr; }
   }
 </style>

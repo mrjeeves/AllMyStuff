@@ -54,7 +54,7 @@
   });
 
   $effect(() => {
-    if (room) void setWindowTitle(`${room.name} — AllMyStuff room`);
+    if (room) void setWindowTitle(`${room.name}: AllMyStuff room`);
   });
 
   // No longer in the room (left via the panel, removed by the host, the
@@ -71,9 +71,9 @@
     <div class="notice">
       <div class="glyph">🪩</div>
       {#if room}
-        <p>Joining <b>{room.name}</b> — connecting to the mesh…</p>
+        <p>Joining <b>{room.name}</b>: connecting to the mesh…</p>
       {:else}
-        <p>Waiting for this room to land — if you were just invited, its
+        <p>Waiting for this room to land: if you were just invited, its
           details are still on their way over the mesh…</p>
       {/if}
     </div>

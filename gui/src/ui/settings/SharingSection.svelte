@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Sharing pane — every person/fleet you're connected with: which of
+  // Sharing pane: every person/fleet you're connected with: which of
   // their machines you can see, and exactly what you've allowed them
   // (grants apply to the *person*, so anything you grant works to any of
   // their devices). Each grant can be taken back one at a time, or the
@@ -33,9 +33,7 @@
 <div class="section">
   <h3>Sharing</h3>
   <p class="lead">
-    See both sides of every connection: what <b>you share with them</b>, and
-    what <b>they share with you</b>. Grants apply to the person or fleet, while
-    the capability name shows which machine provides it.
+    Review what <b>you share with them</b> and what <b>they share with you</b>.
   </p>
 
   <div class="new-share-row">
@@ -48,9 +46,7 @@
     <div class="empty">
       <div class="glyph">🤝</div>
       <p>
-        You aren't sharing with anyone yet. Open a device on the graph that
-        belongs to someone else and mark it
-        <i>“I'm sharing with its owner”</i> to start.
+        You aren't sharing with anyone yet. Select a device on the graph to start.
       </p>
     </div>
   {:else}
@@ -133,10 +129,10 @@
                 <button
                   class="btn small stop"
                   class:armed={armed === p.person.id}
-                  title="Rescind the whole connection — every grant goes, and any connection riding one stops"
+                  title="Rescind the whole connection: every grant goes, and any connection riding one stops"
                   onclick={() => stopSharing(p.person.id)}
                 >
-                  {armed === p.person.id ? "Stop sharing — sure?" : `Stop sharing with ${p.person.name}`}
+                  {armed === p.person.id ? "Stop sharing: sure?" : `Stop sharing with ${p.person.name}`}
                 </button>
               </div>
             </div>
@@ -161,7 +157,7 @@
   .new-share-row {
     margin: 0 0 1.1rem;
   }
-  /* The builder's entry point — the sharing concept's violet, matching the
+  /* The builder's entry point: the sharing concept's violet, matching the
      Start Share button inside the flow. */
   .new-share.primary {
     background: linear-gradient(180deg, var(--c-share-ink), var(--c-share));

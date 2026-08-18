@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Always On — keep this machine on the mesh without the app open (an OS
+  // Always On: keep this machine on the mesh without the app open (an OS
   // background service: systemd / launchd / the Windows SCM), and keep the app
   // itself a click away in the tray (close / minimize to the notification area
   // or menu bar). The service half delegates to `allmystuff service …`; the
@@ -17,7 +17,7 @@
   const loaded = $derived(svc != null);
   // All three desktop OSes have a service layer, so `supported` reflects the
   // platform. The GUI manages the service in-process (no separate CLI), so
-  // there's no "can't reach the tool" state — it's just supported or not.
+  // there's no "can't reach the tool" state: it's just supported or not.
   const supported = $derived(svc?.supported === true);
   const unsupported = $derived(loaded && svc?.supported !== true);
   const reachable = $derived(supported);
@@ -25,7 +25,7 @@
   const running = $derived(svc?.running === true);
   const enabled = $derived(svc?.enabled === true);
 
-  // Platform-aware wording so the copy reads right on each OS — derived from
+  // Platform-aware wording so the copy reads right on each OS: derived from
   // the CLI's reported manager when we have it, else from the platform.
   const isMac = $derived(svc?.platform === "macos");
   const trayWord = $derived(isMac ? "menu bar" : "system tray");
@@ -40,7 +40,7 @@
           : "background",
   );
   const statusWord = $derived(
-    !reachable ? "—" : !installed ? "Off" : running ? "Running" : "Stopped",
+    !reachable ? "Unavailable" : !installed ? "Off" : running ? "Running" : "Stopped",
   );
 
   const autostartOn = $derived(app.autostartEnabled === true);
@@ -72,14 +72,13 @@
 <div class="section">
   <h3>Always On</h3>
   <p class="lead">
-    Keep this machine on the mesh without the app open — and keep AllMyStuff itself a click away
-    in the {trayWord}.
+    Keep this machine available when the window is closed.
   </p>
 
   {#if web}
     <section class="block">
       <p class="notice">
-        These controls live in the desktop app — this is the in-browser preview.
+        These controls live in the desktop app: this is the in-browser preview.
       </p>
     </section>
   {:else}
@@ -107,8 +106,7 @@
         <span>
           <b>Start minimized</b>
           <span class="hint">
-            When it starts with your computer, open straight to the {trayWord} instead of showing
-            the window.
+            Open in the {trayWord} instead of showing the window.
           </span>
         </span>
       </label>
@@ -126,8 +124,7 @@
         <span>
           <b>Closing keeps it running</b>
           <span class="hint">
-            The window's close button hides AllMyStuff to the {trayWord}; its icon there brings it
-            back. Quit from the {trayWord} icon's menu to exit for real.
+            Close the window without quitting AllMyStuff.
           </span>
         </span>
       </label>
@@ -150,9 +147,7 @@
         <div class="grow">
           <div class="title">Run as a background service</div>
           <div class="hint">
-            Beyond starting with your computer, install a {serviceKind} service so this machine stays
-            on the mesh even when you're logged out — serving its screen, files and terminal to peers,
-            and keeping itself (and the mesh daemon) up to date on its own.
+            Install a {serviceKind} service to stay available while logged out.
           </div>
         </div>
         <span class="pill" class:on={running} class:idle={installed && !running}>{statusWord}</span>
@@ -162,7 +157,7 @@
         <p class="fineprint">Reading service status…</p>
       {:else if unsupported}
         <p class="fineprint">
-          A background service isn't available on {platformLabel(svc?.platform)} — you can still run
+          A background service isn't available on {platformLabel(svc?.platform)}: you can still run
           <code>allmystuff serve</code> by hand.
         </p>
       {:else if !installed}
@@ -205,8 +200,7 @@
         <span>
           <b>Write verbose debug logs</b>
           <span class="hint">
-            Off by default. Applies after the app or backend restarts and stays on this machine;
-            environment overrides still take priority.
+            Applies after the app or backend restarts.
           </span>
         </span>
       </label>

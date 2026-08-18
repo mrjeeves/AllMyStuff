@@ -668,7 +668,7 @@
   class="popout"
   class:driving={controlActive}
   role="application"
-  aria-label="Popped-out video{sourceCap ? ` — ${sourceCap.label}` : ''}"
+  aria-label="Popped-out video{sourceCap ? `: ${sourceCap.label}` : ''}"
   tabindex={controlActive ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={(e) => onPointerButton(e, true)}
@@ -687,7 +687,7 @@
       <div class="title">{sourceCap?.label ?? "Video"}</div>
       <div class="note">
         {#if ended}
-          The stream ended{ownsRoute ? " — the machine may be offline" : " — the sender stopped sharing"}.
+          The stream ended{ownsRoute ? ": the machine may be offline" : ": the sender stopped sharing"}.
         {:else if hostStatus?.detail}
           {hostStatus.detail}
         {:else if hostStatus}
@@ -699,7 +699,7 @@
     </div>
   {:else if ended}
     <div class="ended-banner">
-      The stream ended{ownsRoute ? "" : " — the sender stopped sharing"}.
+      The stream ended{ownsRoute ? "" : ": the sender stopped sharing"}.
     </div>
   {:else if hostStatus}
     <div class="ended-banner">{hostStatus.detail ?? hostStatus.state.replaceAll("_", " ")}</div>
@@ -719,7 +719,7 @@
         <button
           class="pill"
           class:tuned={openPill === "live"}
-          title="What this stream is actually doing — requested picks vs the live effective reality"
+          title="What this stream is actually doing: requested picks vs the live effective reality"
           onclick={(e) => {
             e.stopPropagation();
             openPill = openPill === "live" ? null : "live";
@@ -743,7 +743,7 @@
       </span>
     {/if}
     {#if controlActive}
-      <span class="chip ctl" title="A live control route lets you click and type here — hovering this window is what aims your keyboard at it">🕹 control</span>
+      <span class="chip ctl" title="A live control route lets you click and type here: hovering this window is what aims your keyboard at it">🕹 control</span>
     {/if}
     <span class="spacer"></span>
     {#if ownsRoute}
@@ -797,7 +797,7 @@
       <button
         class="pill"
         class:tuned={fsrShow}
-        title="Edge-adaptive upscaling with text-biased sharpening when the stream is smaller than the window — replaces the browser's soft bilinear stretch"
+        title="Edge-adaptive upscaling with text-biased sharpening when the stream is smaller than the window: replaces the browser's soft bilinear stretch"
         onpointerdown={(e) => e.stopPropagation()}
         onpointerup={(e) => e.stopPropagation()}
         onclick={(e) => {
@@ -820,8 +820,8 @@
         title={pointerLocked || nativePointerLocked
           ? "Release the mouse (Esc)"
           : relativeMouse
-            ? "Relative mouse is armed — click the screen to capture"
-          : "Capture the mouse — relative motion for a fullscreen app or game"}
+            ? "Relative mouse is armed: click the screen to capture"
+          : "Capture the mouse: relative motion for a fullscreen app or game"}
         aria-label="Relative mouse"
         aria-pressed={pointerLocked || nativePointerLocked}
         onpointerdown={(e) => e.stopPropagation()}

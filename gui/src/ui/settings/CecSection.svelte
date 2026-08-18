@@ -1,13 +1,13 @@
 <script lang="ts">
-  // CEC Support — the technician's help-desk tab. Secret: it only appears once
+  // CEC Support: the technician's help-desk tab. Secret: it only appears once
   // this install is in the CEC context (see SettingsPanel + App.cecRevealed).
   //
   // The technician fills in their Agent Name (the name a customer sees in the
   // "*so-and-so* is trying to connect" prompt), types the number the customer
-  // read out, and connects — the customer then appears on the device graph as
+  // read out, and connects: the customer then appears on the device graph as
   // an ordinary peer with the normal screen/control features, gated by the
   // customer approving this technician. The dialed customers are listed below
-  // from CEC state (not a graph group — the CEC mesh is Silent, no roster). The
+  // from CEC state (not a graph group: the CEC mesh is Silent, no roster). The
   // customer-side flow (answering the 3-choice prompt, the standing grant list)
   // is shown too, so a build that hosts can drive it from here.
   import { onMount } from "svelte";
@@ -22,19 +22,19 @@
   const status = $derived(app.cecStatusInfo);
 
   // Keep the dialed customers' online state live only while the console is open
-  // — refcounted in the store, so nothing polls once every CEC surface is gone.
+  //: refcounted in the store, so nothing polls once every CEC surface is gone.
   onMount(() => app.watchCecPresence());
   const requests = $derived(app.cecRequests);
   const grants = $derived(app.cecGrantList);
 
-  // The customers this technician has dialed — the live CEC connections, read
+  // The customers this technician has dialed: the live CEC connections, read
   // from CEC state (`cec_dialed`), most-recently-used first so active ones stay
   // on top and stale ones sink to where they're easy to prune. Each is an
   // ordinary graph peer; there is no "fleet group" to filter the graph by (the
   // CEC mesh is Silent, no roster).
   const customers = $derived(app.cecCustomersByRecent);
 
-  // Inline rename: which row (by number — stable even before a node id is
+  // Inline rename: which row (by number: stable even before a node id is
   // discovered) is being labelled, and the draft.
   let editingKey = $state<string | null>(null);
   let aliasDraft = $state("");
@@ -59,12 +59,12 @@
     forever: "Auto-Approve Forever",
   };
 
-  /** The customer's number as their mesh reads it — `123 456 789`, matching the
+  /** The customer's number as their mesh reads it: `123 456 789`, matching the
    *  Silent room's label ("CEC Support …"). Falls back to the raw string if it
    *  isn't the expected 9 digits. */
   function groupNumber(n: string): string {
     const d = (n || "").replace(/\D/g, "");
-    return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "—";
+    return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "Unknown";
   }
 
   /** Seconds since a connection was last used (dialed, or its console session
@@ -73,7 +73,7 @@
     return Math.max(0, Math.round(Date.now() / 1000 - (lastUsed || 0)));
   }
 
-  /** "used just now" / "used 12m ago" / "used 3d ago" — the time-since-last-used
+  /** "used just now" / "used 12m ago" / "used 3d ago": the time-since-last-used
    *  metric so a technician can tell active connections from stale ones. */
   function lastUsedLabel(lastUsed: number): string {
     if (!lastUsed) return "used recently";
@@ -87,13 +87,13 @@
     return `used ${d}d ago`;
   }
 
-  /** Whether a connection has gone stale (unused past the threshold) — surfaced
+  /** Whether a connection has gone stale (unused past the threshold): surfaced
    *  as a badge so the cleanup candidates stand out. */
   function isStale(customer: CecPeer): boolean {
     return app.cecCustomerIsStale(customer);
   }
 
-  /** "just now" / "4m" / "1h 12m" — how long a help-asker has been waiting.
+  /** "just now" / "4m" / "1h 12m": how long a help-asker has been waiting.
    *  Kept short: it sits inline on the queue card. */
   function waitingLabel(askedAt: number): string {
     const s = Math.max(0, Math.round(Date.now() / 1000 - (askedAt || 0)));
@@ -103,7 +103,7 @@
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
 
-  /** The "(HOSTNAME)" tail for a card's name — the match-up key: the
+  /** The "(HOSTNAME)" tail for a card's name: the match-up key: the
    *  customer's waiting screen shows the same name (hostname) pair, so the
    *  technician can pair a card with a caller word for word. Empty when the
    *  hostname is unknown or would just repeat the shown name. */
@@ -126,23 +126,20 @@
 <div class="section">
   <h3>CEC Support</h3>
   <p class="lead">
-    Remote help, one number at a time. Enter your agent name and the number the
-    customer read out — they appear on your device graph and in the list below,
-    and you can view or control their screen once they approve.
+    Connect to customers by support number.
   </p>
 
   {#if web}
     <section class="block">
-      <p class="notice">These controls live in the desktop app — this is the in-browser preview.</p>
+      <p class="notice">These controls live in the desktop app: this is the in-browser preview.</p>
     </section>
   {/if}
 
-  <!-- Agent name — the identity the customer sees -->
+  <!-- Agent name: the identity the customer sees -->
   <section class="block">
     <div class="title">Agent name</div>
     <p class="hint">
-      This is the name the customer sees in "<i>{app.cecAgentName || "so-and-so"}</i> is trying to
-      connect to your computer." Use something they'll recognise as you or CEC.
+      Customers see this name when you connect.
     </p>
     <input
       class="field"
@@ -153,7 +150,7 @@
     />
   </section>
 
-  <!-- Pop the console out into its own window — the technician's whole
+  <!-- Pop the console out into its own window: the technician's whole
        help-desk surface on its own screen while the main window keeps the
        device graph. Hidden inside the popout itself (nothing to pop). -->
   {#if !windowed && !web}
@@ -186,17 +183,17 @@
     </form>
   </section>
 
-  <!-- Asking for help — customers waving on the global help room, longest-
+  <!-- Asking for help: customers waving on the global help room, longest-
        waiting first (it's a queue). Strictly opt-in: a default install is
        never on that room; the node only joins it when "Watch the help queue"
        is turned on here (inside the secret tab), and the daemon persists the
        membership so the toggle's state survives restarts. Control answers a
-       waver by dialing their own number mesh — the normal approval still
+       waver by dialing their own number mesh: the normal approval still
        gates everything. -->
   <section class="block">
     <div class="head">
       <div class="title">Asking for help</div>
-      <label class="watch-toggle" title="Join the global help room and see customers who press Ask for help. Saved — stays on across restarts.">
+      <label class="watch-toggle" title="Join the global help room and see customers who press Ask for help. Saved: stays on across restarts.">
         <input
           type="checkbox"
           checked={app.cecHelpWatching}
@@ -207,20 +204,16 @@
     </div>
     {#if !app.cecHelpWatching}
       <p class="notice">
-        Turn on <b>Watch the help queue</b> to see customers who press
-        <b>Ask for help</b> in their CEC Support app. Until then this machine
-        stays off the shared help room entirely.
+        Turn this on to see customers asking for help.
       </p>
     {:else if app.cecHelpWaiting.length === 0}
       <p class="notice listening">
         <span class="live-dot" aria-hidden="true"></span>
-        Listening — no one is asking right now. A raised hand lands here
-        within a couple of seconds.
+        Listening. No one is asking right now.
       </p>
     {:else}
       <p class="hint">
-        These customers pressed <b>Ask for help</b> and are waiting right now.
-        <b>Control</b> answers them — they approve you, then their screen opens.
+        <b>Control</b> asks for approval and opens the customer's screen.
       </p>
       <ul class="rows">
         {#each app.cecHelpWaiting as w (w.node)}
@@ -241,7 +234,7 @@
               <button
                 class="btn small primary"
                 disabled={app.cecDialing}
-                title="Answer them — connect and open their screen once they approve"
+                title="Answer them: connect and open their screen once they approve"
                 onclick={() => void app.answerHelp(w.node, shownName)}
               >
                 Control
@@ -249,7 +242,7 @@
               {#if kvm}
                 <!-- A raised hand from a KVM: alongside the console, its
                      manufacturer web Site is one tap away via the graph. No
-                     chat door - a KVM appliance isn't someone to chat with. -->
+                     chat door: a KVM appliance isn't someone to chat with. -->
                 <button
                   class="btn small"
                   title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
@@ -261,7 +254,7 @@
                 <button
                   class="btn small"
                   disabled={app.cecDialing}
-                  title="Chat — connect and message them without taking their screen"
+                  title="Chat: connect and message them without taking their screen"
                   onclick={() => void app.chatWithCustomer(w.node)}
                 >
                   💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
@@ -274,7 +267,7 @@
     {/if}
   </section>
 
-  <!-- Client meshes — the customers this technician has dialed. Each is the
+  <!-- Client meshes: the customers this technician has dialed. Each is the
        customer's own private Silent mesh, kept here (and out of the Meshes tab)
        so client connections are managed apart from your own. Sorted most-recent
        first; a "stale" badge flags connections gone unused, and each can be
@@ -295,7 +288,7 @@
         <span class="dot busy"></span>
         <span class="who">
           <b>Dialing {groupNumber(app.cecDialingNumber)}…</b>
-          <span class="sub">Finding that number on the support area — this can take a moment.</span>
+          <span class="sub">Finding that number. This can take a moment.</span>
         </span>
         <button class="btn small danger" onclick={() => void app.cancelCecDial()}>Cancel</button>
       </div>
@@ -303,16 +296,12 @@
     {#if customers.length === 0}
       {#if !app.cecDialingNumber}
         <p class="notice">
-          No machines yet. Dial a number above — the machines you connect to stay
-          here so you can reconnect with one tap.
+          No saved customers. Connect with a support number above.
         </p>
       {/if}
     {:else}
       <p class="hint">
-        Every machine you've connected to stays here, most recently used first.
-        <b>Control</b> does the whole thing — connects and opens their screen;
-        the customer re-approves only if their access has lapsed. Rename one to
-        something you'll recognise, and remove the ones that have cycled out.
+        Saved customers appear with the most recently used first.
       </p>
       <ul class="rows">
         {#each customers as c (c.number)}
@@ -367,7 +356,7 @@
                   <button
                     class="btn small primary"
                     disabled={app.cecDialing}
-                    title="Connect and open their screen — the customer approves unless their standing access still covers you"
+                    title="Connect and open their screen: the customer approves unless their standing access still covers you"
                     onclick={() => void app.reconnectCec(c.node)}
                   >
                     Control
@@ -387,7 +376,7 @@
                   <button
                     class="btn small"
                     disabled={app.cecDialing}
-                    title="Chat — connect and message them without taking their screen"
+                    title="Chat: connect and message them without taking their screen"
                     onclick={() => void app.chatWithCustomer(c.node)}
                   >
                     💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
@@ -416,8 +405,8 @@
       <div class="title">Your support number</div>
       {#if status?.number}
         <p class="hint">
-          Your number is <code>{groupNumber(status.number)}</code> — read it to the technician
-          if they ask, or just press <b>Ask for help</b> and they'll see you in the queue.
+          Your number is <code>{groupNumber(status.number)}</code>. Read it to the technician
+          or press <b>Ask for help</b>.
         </p>
       {/if}
 
@@ -483,7 +472,7 @@
     margin: 0 0 0.3rem;
     font-size: 1.1rem;
   }
-  /* The big pop-out button — full width, right under the agent name, so the
+  /* The big pop-out button: full width, right under the agent name, so the
      technician can lift the whole console onto its own screen. */
   .popout {
     display: flex;
@@ -646,12 +635,12 @@
     color: var(--ink-soft);
     line-height: 1.5;
   }
-  /* The "(HOSTNAME)" tail — quieter than the name it follows, same line. */
+  /* The "(HOSTNAME)" tail: quieter than the name it follows, same line. */
   .who .host {
     font-weight: 400;
     color: var(--ink-soft);
   }
-  /* The empty-queue "we're live" state: a breathing dot, calm not urgent —
+  /* The empty-queue "we're live" state: a breathing dot, calm not urgent -
      shows the watch is real even when nobody's waving. */
   .notice.listening {
     display: flex;
@@ -698,12 +687,12 @@
     padding: 0.32rem 0.5rem;
     font-size: 0.85rem;
   }
-  /* The in-flight dial row + waiting-for-approval badge — a connect attempt is
+  /* The in-flight dial row + waiting-for-approval badge: a connect attempt is
      visible from the first click through to the customer's decision. */
   .pending-row {
     border: 1px dashed var(--accent);
   }
-  /* A customer waving on the help room — accented like the pending dial (both
+  /* A customer waving on the help room: accented like the pending dial (both
      are "something live is waiting on a human"), solid to read as a queue. */
   .row.asking {
     border: 1px solid var(--accent);
@@ -741,7 +730,7 @@
     vertical-align: middle;
   }
 
-  /* The stale marker — a connection unused past the threshold, the cleanup
+  /* The stale marker: a connection unused past the threshold, the cleanup
      candidate. The row gets a dashed danger outline and a small badge. */
   .stale-tag {
     display: inline-block;

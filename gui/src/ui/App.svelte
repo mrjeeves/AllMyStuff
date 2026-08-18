@@ -164,7 +164,7 @@
           e.stopPropagation();
           app.netMenuOpen = !app.netMenuOpen;
         }}
-        title="Your meshes — switch them on or off, or open mesh settings"
+        title="Your meshes: switch them on or off, or open mesh settings"
         aria-haspopup="menu"
         aria-expanded={app.netMenuOpen}
       >
@@ -225,8 +225,8 @@
            re-join from the parked config, a clean transport restart for when
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
-      <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
-      <button class="btn refresh" class:spinning={refreshSpin} onclick={refresh} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
+      <button class="btn help" onclick={() => (infoOpen = true)} title="How it works: the layers of connection" aria-label="How it works">?</button>
+      <button class="btn refresh" class:spinning={refreshSpin} onclick={refresh} title="Restart mesh: reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
       </button>

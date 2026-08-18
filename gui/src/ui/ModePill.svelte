@@ -21,7 +21,7 @@
    *  dropdown shows and whether it's a bandwidth-heavy tier (the Studio
    *  flavors, which gate behind the one-time warning). */
   const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean }> = [
-    { key: "balanced", label: "Balanced", blurb: "Stability first — the safe default", heavy: false },
+    { key: "balanced", label: "Balanced", blurb: "Stability first: the safe default", heavy: false },
     { key: "game", label: "Game", blurb: "Latency first, GDR healing", heavy: false },
     { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true },
     {
@@ -255,7 +255,7 @@
           <span class="mi-check" aria-hidden="true">{experimental ? "✓" : ""}</span>
           <span class="mi-text">
             <span class="mi-label">Experimental{#if experimental}<span class="mi-tag labs">labs on</span>{/if}</span>
-            <span class="mi-blurb">Field-trial speedups — off by default, safe to toggle live</span>
+            <span class="mi-blurb">Field-trial speedups: off by default, safe to toggle live</span>
           </span>
         </button>
       {/if}
@@ -290,7 +290,7 @@
       </h3>
       {#if studioPrompt === "studio-ll"}
         <p>
-          Lossless sends <strong>every pixel exactly</strong> over HEVC —
+          Lossless sends <strong>every pixel exactly</strong> over HEVC :
           bandwidth follows what's on screen: near-zero when idle, tens of
           Mbps for desktop work, and it can spike far higher on busy video.
           It needs capable hardware on both machines; anywhere it can't run,
@@ -299,7 +299,7 @@
       {/if}
       <p>
         Studio streams at maximum fidelity and can use <strong>150 Mbps
-        and up</strong> — it's built for a fast local network. It runs
+        and up</strong>: it's built for a fast local network. It runs
         wherever you turn it on, so on a slow or metered connection expect
         stutter until you lower the Rate.
       </p>

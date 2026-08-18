@@ -75,7 +75,7 @@
 
   {#if app.normalNetworks.length === 0 && app.normalDisabledNets.length === 0}
     <p class="menu-empty">
-      No meshes yet — join or import one from
+      No meshes yet: join or import one from
       <button class="linkish" onclick={() => (close(), app.openSettings("networks"))}>Settings</button>.
     </p>
   {/if}
@@ -86,12 +86,12 @@
     <div class="row" class:fleet={fleetMesh} class:off={!m.on}>
       <span class="row-dot" class:live={m.on}></span>
       <div class="row-main">
-        <div class="row-name">{m.label}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}{#if claimMesh}<span class="local-tag" title="The built-in LAN-only mesh for claiming and local pairing — on/off only, never leaves your network">📡 local</span>{/if}</div>
+        <div class="row-name">{m.label}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}{#if claimMesh}<span class="local-tag" title="The built-in LAN-only mesh for claiming and local pairing: on/off only, never leaves your network">📡 local</span>{/if}</div>
         <div class="row-sub">
           {#if claimMesh}
-            {m.on ? "claiming & local pairing — this LAN only" : "off — not discoverable for claiming or pairing"}
+            {m.on ? "claiming & local pairing: this LAN only" : "off: not discoverable for claiming or pairing"}
           {:else}
-            {m.on ? m.live?.network_id : "disabled — kept for later"}
+            {m.on ? m.live?.network_id : "disabled: kept for later"}
           {/if}
         </div>
       </div>
@@ -100,8 +100,8 @@
              network your fleet rides on. Leave the fleet to leave this mesh. -->
         <span
           class="lock"
-          title="This is your fleet mesh — it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
-          aria-label="Fleet mesh — locked"
+          title="This is your fleet mesh: it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
+          aria-label="Fleet mesh: locked"
         >🔒</span>
       {:else}
         <button
@@ -110,7 +110,7 @@
           role="switch"
           aria-checked={m.on}
           aria-label="{m.on ? 'Disable' : 'Enable'} {m.label}"
-          title={m.on ? "Disable — leave this mesh but keep it for later" : "Enable — re-join this mesh"}
+          title={m.on ? "Disable: leave this mesh but keep it for later" : "Enable: re-join this mesh"}
           onclick={() => app.toggleNetworkEnabled(m.configId, !m.on)}
         >
           <span class="knob"></span>

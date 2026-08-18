@@ -1,12 +1,12 @@
 <script lang="ts">
-  // The unified settings panel — the home for everything that used to be
+  // The unified settings panel - the home for everything that used to be
   // scattered across the "Networks" and "Add machine" sheets, plus the new
   // Updates and Fleet panes. A left tab rail, a content area on the right;
   // the top-bar gear opens it, the Networks button deep-links to a pane.
   import { app, type SettingsTab } from "../store.svelte";
   import { isMobile } from "../tauri";
+  import ThisDeviceSection from "./settings/ThisDeviceSection.svelte";
   import NetworksSection from "./settings/NetworksSection.svelte";
-  import VenuesSection from "./settings/VenuesSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
@@ -15,29 +15,26 @@
   import CecSection from "./settings/CecSection.svelte";
   import DangerSection from "./settings/DangerSection.svelte";
 
-  // Ordered to match the model's flow — venue → mesh → fleet → sharing — the
-  // same sequence the "How it connects" explainer teaches. Devices (the
-  // all-machines roster) sits right under Sharing.
   const tabs = $derived<{ id: SettingsTab; label: string; icon: string }[]>([
-    { id: "venues", label: "Venues", icon: "📡" },
-    { id: "networks", label: "Meshes", icon: "🌐" },
+    { id: "this_device", label: "This Device", icon: "💻" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
+    { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "devices", label: "Devices", icon: "🖥" },
-    // The secret CEC Support tab — only present once this install is in the
+    // The secret CEC Support tab - only present once this install is in the
     // technician context (unlocked, or the node reports a CEC role). Placed
     // near the end so it never crowds the everyday tabs.
     ...(app.cecRevealed ? [{ id: "cec" as SettingsTab, label: "CEC Support", icon: "🛟" }] : []),
     // "Always On" is desktop-only: it manages an OS background service
     // (systemd / launchd / the Windows SCM) and window/tray behaviour, none of
-    // which exist on the phone/tablet — where the backend doesn't even register
+    // which exist on the phone/tablet - where the backend doesn't even register
     // those commands. Until there's a mobile background service to offer, drop
     // the whole tab there rather than show controls that can never answer.
     ...(isMobile()
       ? []
       : [{ id: "always_on" as SettingsTab, label: "Always On", icon: "♾️" }]),
     // On the phone/tablet the App Store owns updates, so the pane is a plain
-    // "About" (see UpdatesSection) — the nav entry matches.
+    // "About" (see UpdatesSection) - the nav entry matches.
     { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
     ...(!isMobile() ? [{ id: "danger" as SettingsTab, label: "Danger Zone", icon: "⚠️" }] : []),
   ]);
@@ -76,10 +73,10 @@
     </nav>
 
     <section class="content">
-      {#if app.settingsTab === "networks"}
+      {#if app.settingsTab === "this_device"}
+        <ThisDeviceSection />
+      {:else if app.settingsTab === "networks"}
         <NetworksSection />
-      {:else if app.settingsTab === "venues"}
-        <VenuesSection />
       {:else if app.settingsTab === "fleet"}
         <FleetSection />
       {:else if app.settingsTab === "sharing"}
@@ -194,7 +191,7 @@
   }
 
   /* Phone-width windows: the side rail would squeeze the section content
-     into a sliver, so the panel stacks — the rail becomes a horizontal,
+     into a sliver, so the panel stacks - the rail becomes a horizontal,
      scrollable tab strip across the top and the content takes the full
      width below it. Same DOM, pure CSS. */
   @media (max-width: 700px) {
@@ -207,7 +204,7 @@
       align-items: center;
       gap: 0.3rem;
       padding: 0.55rem 0.6rem;
-      /* The ✕ floats in the panel's top-right corner — keep the strip's
+      /* The ✕ floats in the panel's top-right corner - keep the strip's
          tail from scrolling underneath it. */
       padding-right: 3rem;
       border-right: none;

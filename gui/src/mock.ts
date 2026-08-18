@@ -178,17 +178,17 @@ export function demoCatalog(): Catalog {
           // Share-OUT: you've let Alex's fleet open My MacBook's screen + terminal
           // (scoped to "this" device), so "What Alex can do" lists them and
           // Manage share pre-fills Video + Terminal.
-          { id: "g-out-screen", media: "display", role: "provide", capability: "this:screen", label: "My MacBook — see its screen" },
-          { id: "g-out-term", media: "generic", role: "provide", capability: "this:terminal", label: "My MacBook — use its terminal" },
+          { id: "g-out-screen", media: "display", role: "provide", capability: "this:screen", label: "My MacBook: see its screen" },
+          { id: "g-out-term", media: "generic", role: "provide", capability: "this:terminal", label: "My MacBook: use its terminal" },
           // What Alex's fleet shared back with you: their laptop's consoles, so
           // its card + drawer light up the Remote / Files / Terminal / Sites
           // buttons. Provide = they provide their screen; you consume into them
           // for control. Scoped to alex's caps so only this device unlocks.
-          { id: "g-alex-screen", media: "display", role: "provide", capability: "alex:screen", label: "Alex's laptop — see its screen" },
-          { id: "g-alex-control", media: "input", role: "consume", capability: "alex:control", label: "Alex's laptop — control it" },
-          { id: "g-alex-files", media: "storage", role: "both", capability: "alex:files", label: "Alex's laptop — use its files" },
-          { id: "g-alex-term", media: "generic", role: "provide", capability: "alex:terminal", label: "Alex's laptop — use its terminal" },
-          { id: "g-alex-sites", media: "generic", role: "provide", capability: "alex:sites", label: "Alex's laptop — reach its sites" },
+          { id: "g-alex-screen", media: "display", role: "provide", capability: "alex:screen", label: "Alex's laptop: see its screen" },
+          { id: "g-alex-control", media: "input", role: "consume", capability: "alex:control", label: "Alex's laptop: control it" },
+          { id: "g-alex-files", media: "storage", role: "both", capability: "alex:files", label: "Alex's laptop: use its files" },
+          { id: "g-alex-term", media: "generic", role: "provide", capability: "alex:terminal", label: "Alex's laptop: use its terminal" },
+          { id: "g-alex-sites", media: "generic", role: "provide", capability: "alex:sites", label: "Alex's laptop: reach its sites" },
         ],
       },
     },

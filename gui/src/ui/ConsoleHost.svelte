@@ -63,7 +63,7 @@
 
   $effect(() => {
     const n = app.consoleNode;
-    if (n) void setWindowTitle(`${displayName(n)} — AllMyStuff console`);
+    if (n) void setWindowTitle(`${displayName(n)}: AllMyStuff console`);
   });
 </script>
 
@@ -73,20 +73,20 @@
   {:else if attempted}
     <div class="notice">
       <div class="glyph">🚫</div>
-      <p>Couldn't open a console for this machine — see the message that just
+      <p>Couldn't open a console for this machine: see the message that just
         popped for the reason. Close this window and try again from the graph.</p>
     </div>
   {:else if stage === "relationship"}
     <div class="notice">
       <div class="glyph">🔗</div>
-      <p><b>{displayName(node!)}</b> is here — resolving whether it's yours
+      <p><b>{displayName(node!)}</b> is here: resolving whether it's yours
         (fleet roster loading)… If this machine was never claimed or shared,
         do that from the graph first and this window will pick it up.</p>
     </div>
   {:else if stage === "presence"}
     <div class="notice">
       <div class="glyph">📡</div>
-      <p><b>{displayName(node!)}</b> is on the mesh — waiting for its
+      <p><b>{displayName(node!)}</b> is on the mesh: waiting for its
         AllMyStuff presence (its devices and ownership) to land…</p>
     </div>
   {:else}

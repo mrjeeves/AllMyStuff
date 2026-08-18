@@ -298,8 +298,8 @@ export const CEC_STALE_AFTER_S = 7 * 24 * 60 * 60;
 
 /** Which pane the settings panel is showing. */
 export type SettingsTab =
+  | "this_device"
   | "networks"
-  | "venues"
   | "devices"
   | "fleet"
   | "sharing"
@@ -671,7 +671,7 @@ class AppStore {
    *  it's showing. The top-bar gear opens it; the Networks button deep-links
    *  to the networks pane. */
   settingsOpen = $state(false);
-  settingsTab = $state<SettingsTab>("networks");
+  settingsTab = $state<SettingsTab>("this_device");
   // ---- CEC Support (technician-side remote help desk) --------------
   //
   // The secret CEC tab and its state. The tab is a purely manual show/hide,
@@ -1673,13 +1673,13 @@ class AppStore {
     // same person wondering why their other device's console stopped typing.
     await onControlRefused((e) => {
       const who = this.node(e.from)?.label ?? shortId(e.from);
-      this.toast("warn", `Refused ${e.plane} from ${who} — not on this machine's fleet roster`);
+      this.toast("warn", `Refused ${e.plane} from ${who}: not on this machine's fleet roster`);
     });
     // A fleet peer asked this machine to reboot: tell whoever is sitting
     // here why the OS is about to go down.
     await onDeviceRestart((e) => {
       const who = this.node(e.from)?.label ?? shortId(e.from);
-      this.toast("warn", `Restarting this device — asked by ${who}`);
+      this.toast("warn", `Restarting this device: asked by ${who}`);
     });
     await onDriveMount((e) => {
       const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
@@ -1961,7 +1961,7 @@ class AppStore {
         const who = node?.label ?? (peer ? shortId(peer) : "a device");
         this.toast(
           "warn",
-          `Can't reach ${who} directly — this mesh needs a TURN relay (mesh settings → Servers)`,
+          `Can't reach ${who} directly: this mesh needs a TURN relay (mesh settings → Servers)`,
         );
       }
     }
@@ -2739,7 +2739,7 @@ class AppStore {
   startCapConnect(capId: string) {
     this.dragFrom = capId;
     const c = this.capability(capId);
-    this.toast("info", `Connecting ${c?.label ?? "this"} — tap where it should go`);
+    this.toast("info", `Connecting ${c?.label ?? "this"}: tap where it should go`);
   }
 
   cancelConnect() {
@@ -3029,7 +3029,7 @@ class AppStore {
 
   private sharedFolderLabel(grant: Grant): string {
     const label = grant.label?.trim() || "Shared folder";
-    const marker = " — share ";
+    const marker = ": share ";
     const at = label.indexOf(marker);
     return at >= 0 ? label.slice(at + marker.length) || "Shared folder" : label;
   }
@@ -3075,7 +3075,7 @@ class AppStore {
 
   private sharedSiteLabel(grant: Grant): string {
     const label = grant.label?.trim() || "Shared site";
-    const marker = " — share ";
+    const marker = ": share ";
     const at = label.indexOf(marker);
     return at >= 0 ? label.slice(at + marker.length) || "Shared site" : label;
   }
@@ -3140,7 +3140,7 @@ class AppStore {
       case "files":
         return `${who} isn't offering file browsing (older AllMyStuff, or it's turned off)`;
       case "sites":
-        return `${who} isn't exposing any sites — host a service on it first`;
+        return `${who} isn't exposing any sites: host a service on it first`;
       default:
         return `${who} can't share that`;
     }
@@ -3214,7 +3214,7 @@ class AppStore {
         media,
         role,
         capability,
-        label: `${senderLabel} — ${what}`,
+        label: `${senderLabel}: ${what}`,
       };
     };
     const mk = (media: MediaKind, role: GrantRole, suffix: string, what: string): Grant =>
@@ -3317,7 +3317,7 @@ class AppStore {
     }
     // The receiver is another fleet — not one of your own machines.
     if (this.isMyDevice(receiver)) {
-      this.toast("warn", "Share with another fleet — the receiver can't be your own device");
+      this.toast("warn", "Share with another fleet: the receiver can't be your own device");
       return 0;
     }
     const recv = this.node(receiver);
@@ -3679,7 +3679,7 @@ class AppStore {
   private consoleAllowed(node: MeshNode | undefined, nodeId: string): node is MeshNode {
     if (!node) {
       // Say so — a silent refusal here reads as "the button does nothing".
-      this.toast("warn", "That machine isn't on the graph yet — give it a beat and try again");
+      this.toast("warn", "That machine isn't on the graph yet: give it a beat and try again");
       return false;
     }
     if (nodeId === this.localId) {
@@ -3781,7 +3781,7 @@ class AppStore {
         const n = this.consoleVideoInputs(this.consoleNodeId).length;
         clientLog(
           `[console] no video input to wire for ${shortId(this.consoleNodeId)} yet ` +
-            `(${n} candidate${n === 1 ? "" : "s"} in catalog) — waiting for the capability`,
+            `(${n} candidate${n === 1 ? "" : "s"} in catalog): waiting for the capability`,
         );
       }
       return;
@@ -3802,7 +3802,7 @@ class AppStore {
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
     if (!sink) {
       clientLog(
-        `[console] no local ${inp.media} sink to receive ${shortId(inp.node)}'s stream — ` +
+        `[console] no local ${inp.media} sink to receive ${shortId(inp.node)}'s stream: ` +
           `this machine can't consume it`,
       );
       return;
@@ -4455,7 +4455,7 @@ class AppStore {
         return;
       }
       if (!this.terminalAllowed(node)) {
-        this.toast("warn", `Terminals are owner/fleet only — ${node.label} isn't yours`);
+        this.toast("warn", `Terminals are owner/fleet only: ${node.label} isn't yours`);
         return;
       }
     }
@@ -4561,7 +4561,7 @@ class AppStore {
       return;
     }
     if (!this.filesAllowed(node)) {
-      this.toast("warn", `Files are owner/fleet only — ${node.label} isn't yours`);
+      this.toast("warn", `Files are owner/fleet only: ${node.label} isn't yours`);
       return;
     }
     if (isTauri() && !isMobile()) {
@@ -5201,14 +5201,14 @@ class AppStore {
   /** Seed the Sites tab with demo data in web mode (no scan to run). */
   private seedDemoSites() {
     this.myListening = [
-      { id: "tcp:5173", name: "HTTP", port: 5173, kind: "http", scheme: "http", loopback: true, process: "vite", title: "My Project — Dev" },
+      { id: "tcp:5173", name: "HTTP", port: 5173, kind: "http", scheme: "http", loopback: true, process: "vite", title: "My Project: Dev" },
       { id: "tcp:8000", name: "HTTP", port: 8000, kind: "http", scheme: "http", loopback: true, process: "python", title: "" },
       { id: "tcp:22", name: "SSH", port: 22, kind: "ssh", scheme: "ssh", loopback: false, process: "sshd", title: "" },
     ];
     // tcp:5173 is live (a row in `myListening`); tcp:3000 is exposed but no
     // longer listening — it shows in "Exposed from this machine" with a red
     // dot, demoing the offline case.
-    this.exposedSites = { "tcp:5173": "My Project — Dev", "tcp:3000": "Grafana" };
+    this.exposedSites = { "tcp:5173": "My Project: Dev", "tcp:3000": "Grafana" };
   }
 
   /** The default name to offer when exposing a discovered service: the page
@@ -5865,7 +5865,7 @@ class AppStore {
       const current = (version.rsp.data?.current ?? "").trim();
       const latest = (version.rsp.data?.latest ?? "").trim();
       if (latest && latest !== current) {
-        this.toast("info", `Installing ${latest} on the KVM — this takes a few minutes`);
+        this.toast("info", `Installing ${latest} on the KVM: this takes a few minutes`);
         const update = await this.kvmApi(nodeId, port, "/api/application/update", {
           method: "POST",
           body: {},
@@ -6109,7 +6109,7 @@ class AppStore {
     const node = this.node(nodeId);
     if (!node || !this.isKvm(node)) return;
     if (!this.kvmAllowed(node)) {
-      this.toast("warn", `KVM controls are owner/fleet only — ${node.label} isn't yours`);
+      this.toast("warn", `KVM controls are owner/fleet only: ${node.label} isn't yours`);
       return;
     }
     if (this.backendConnected) {
@@ -6136,7 +6136,7 @@ class AppStore {
     const node = this.node(nodeId);
     if (!node || !this.isKvm(node)) return;
     if (!this.kvmAllowed(node)) {
-      this.toast("warn", `KVM controls are owner/fleet only — ${node.label} isn't yours`);
+      this.toast("warn", `KVM controls are owner/fleet only: ${node.label} isn't yours`);
       return;
     }
     if (this.backendConnected) {
@@ -6213,7 +6213,7 @@ class AppStore {
     const node = this.node(nodeId);
     if (!node || !this.isKvm(node)) return;
     if (!this.kvmOwnerControls(node)) {
-      this.toast("warn", `Mesh membership is fleet-owner only — ${node.label} isn't yours to move`);
+      this.toast("warn", `Mesh membership is fleet-owner only: ${node.label} isn't yours to move`);
       return;
     }
     const id = networkId.trim().toLowerCase();
@@ -6241,11 +6241,11 @@ class AppStore {
     const node = this.node(nodeId);
     if (!node || !this.isKvm(node)) return;
     if (!this.kvmOwnerControls(node)) {
-      this.toast("warn", `Mesh membership is fleet-owner only — ${node.label} isn't yours to move`);
+      this.toast("warn", `Mesh membership is fleet-owner only: ${node.label} isn't yours to move`);
       return;
     }
     if (this.kvmMeshIsFleet(networkId)) {
-      this.toast("warn", "The fleet mesh can't be removed — unclaim the device instead");
+      this.toast("warn", "The fleet mesh can't be removed: unclaim the device instead");
       return;
     }
     if (this.backendConnected) {
@@ -6274,7 +6274,7 @@ class AppStore {
     const node = this.node(nodeId);
     if (!node || !this.isKvm(node)) return;
     if (!this.kvmOwnerControls(node)) {
-      this.toast("warn", `Unclaiming is fleet-owner only — ${node.label} isn't yours`);
+      this.toast("warn", `Unclaiming is fleet-owner only: ${node.label} isn't yours`);
       return;
     }
     const where = node.kvm?.joiningMesh;
@@ -6288,7 +6288,7 @@ class AppStore {
         this.toast(
           "info",
           where
-            ? `${node.label} is resetting — it'll reappear claimable on ${where}`
+            ? `${node.label} is resetting: it'll reappear claimable on ${where}`
             : `${node.label} is resetting to its joining mesh`,
         );
       });
@@ -6312,7 +6312,7 @@ class AppStore {
       };
       this.reconcileFleetRelationships();
     }
-    this.toast("info", `${node.label} unclaimed — it's offering itself for adoption again`);
+    this.toast("info", `${node.label} unclaimed: it's offering itself for adoption again`);
   }
 
   // ---- managing a device's exposure (this machine *or* a fleet member) ---
@@ -6411,7 +6411,7 @@ class AppStore {
     // as a bare-pubkey id, while our `localId` is the display id.
     const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
     if (n.owner && !ownedByMe) {
-      this.toast("warn", `${n.label} is owned by another device — you can't take it`);
+      this.toast("warn", `${n.label} is owned by another device: you can't take it`);
       return;
     }
     if (!n.claimable && !ownedByMe) {
@@ -6590,7 +6590,7 @@ class AppStore {
       return;
     }
     await claimViaCode(code);
-    this.toast("ok", "Device claimed — it's joining your fleet now");
+    this.toast("ok", "Device claimed: it's joining your fleet now");
   }
 
   /** Put *this* device into (or out of) claim mode so another of your
@@ -6609,7 +6609,7 @@ class AppStore {
         const now = (await setClaimable(on)) ?? on;
         if (me) me.claimable = now;
         if (on && !now) {
-          this.toast("warn", "This device is in a fleet — leave it first to offer it for adoption.");
+          this.toast("warn", "This device is in a fleet: leave it first to offer it for adoption.");
         } else {
           this.toast(
             now ? "info" : "ok",
@@ -6911,8 +6911,8 @@ class AppStore {
     this.toast(
       "ok",
       access === "open"
-        ? `Made the open room “${clean}” — anyone you give its id can join`
-        : `Made the room “${clean}” — you host it`,
+        ? `Made the open room “${clean}”: anyone you give its id can join`
+        : `Made the room “${clean}”: you host it`,
     );
     this.broadcastRoom(room, this.inviteMessage(room));
   }
@@ -6997,7 +6997,7 @@ class AppStore {
     this.toast(
       "ok",
       access === "open"
-        ? `“${room.name}” is now open — its id is the invite`
+        ? `“${room.name}” is now open: its id is the invite`
         : `“${room.name}” is invite-only again`,
     );
     this.broadcastRoom(room, this.inviteMessage(room));
@@ -7089,7 +7089,7 @@ class AppStore {
       await this.startRoomScope(room);
       this.roomJoinedAt = { ...this.roomJoinedAt, [roomId]: Date.now() };
       this.presenceAdd(roomId, canonicalNodeId(this.localId));
-      this.callLog(`join ${roomId} — announcing presence to ${room.members.length - 1} member(s)`);
+      this.callLog(`join ${roomId}: announcing presence to ${room.members.length - 1} member(s)`);
       this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
       void emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId });
       // Re-announce any files we were already offering here (a rejoin), so
@@ -7452,7 +7452,7 @@ class AppStore {
     if (!this.backendConnected) {
       const n = (this.roomMyShares[room.id]?.length ?? 0) + 1;
       this.addMyShares(room.id, [{ token: `demo_${Date.now().toString(36)}`, name: `shared-file-${n}.txt`, size: 1024 * n }]);
-      this.toast("info", "Demo mode — sharing files needs the desktop app on a live mesh");
+      this.toast("info", "Demo mode: sharing files needs the desktop app on a live mesh");
       return;
     }
     const paths = await pickFilesToShare();
@@ -7525,7 +7525,7 @@ class AppStore {
   async downloadSharedFile(from: string, file: SharedFileMeta) {
     if (this.isMe(from)) return; // your own file already lives here
     if (!this.backendConnected) {
-      this.toast("info", "Demo mode — downloading shared files needs the desktop app");
+      this.toast("info", "Demo mode: downloading shared files needs the desktop app");
       return;
     }
     const existing = this.sharedDownloads[file.token];
@@ -7693,7 +7693,7 @@ class AppStore {
       }
       case "join": {
         this.callLog(
-          `recv join from ${senderLabel} for ${msg.room}${existing ? "" : " — unknown room, ignored"}`,
+          `recv join from ${senderLabel} for ${msg.room}${existing ? "" : ": unknown room, ignored"}`,
         );
         if (existing) {
           const knewThem = (this.roomPresence[existing.id] ?? []).includes(sender);
@@ -7810,7 +7810,7 @@ class AppStore {
             ...this.roomKnocks,
             [existing.id]: [...cur, { from: sender, label: senderLabel, at: Date.now() }],
           };
-          this.toast("info", `${senderLabel} asks to join “${existing.name}” — admit them from the room`);
+          this.toast("info", `${senderLabel} asks to join “${existing.name}”: admit them from the room`);
         }
         break;
       }
@@ -7889,11 +7889,11 @@ class AppStore {
       return false;
     }
     if (this.isMe(host)) {
-      this.toast("warn", "That's one of this device's own rooms — but not on its list anymore");
+      this.toast("warn", "That's one of this device's own rooms: but not on its list anymore");
       return false;
     }
     if (!this.backendConnected) {
-      this.toast("info", "Demo mode — knocking needs the desktop app on a live mesh");
+      this.toast("info", "Demo mode: knocking needs the desktop app on a live mesh");
       return false;
     }
     if (!this.pendingKnocks.includes(id)) {
@@ -7902,10 +7902,10 @@ class AppStore {
     const sent = await roomSend([host], { room: id, kind: "knock" });
     if (sent === 0) {
       this.pendingKnocks = this.pendingKnocks.filter((r) => r !== id);
-      this.toast("warn", "Couldn't reach the room's host — are you on a shared network?");
+      this.toast("warn", "Couldn't reach the room's host: are you on a shared network?");
       return false;
     }
-    this.toast("ok", "Asked to join — if the room is open you'll be let straight in");
+    this.toast("ok", "Asked to join: if the room is open you'll be let straight in");
     return true;
   }
 
@@ -7978,7 +7978,7 @@ class AppStore {
     if (!cur.includes(member)) {
       this.roomPresence = { ...this.roomPresence, [roomId]: [...cur, member] };
       this.callLog(
-        `presence +${this.roomWho(member).who} in ${roomId} — ${(this.roomPresence[roomId] ?? []).length} present`,
+        `presence +${this.roomWho(member).who} in ${roomId}: ${(this.roomPresence[roomId] ?? []).length} present`,
       );
     }
   }
@@ -7989,7 +7989,7 @@ class AppStore {
     this.roomPresence = { ...this.roomPresence, [roomId]: cur.filter((m) => m !== member) };
     if (had) {
       this.callLog(
-        `presence -${this.roomWho(member).who} from ${roomId} — ${(this.roomPresence[roomId] ?? []).length} present`,
+        `presence -${this.roomWho(member).who} from ${roomId}: ${(this.roomPresence[roomId] ?? []).length} present`,
       );
     }
   }
@@ -8068,41 +8068,41 @@ class AppStore {
     const members = this.roomMemberNodes;
     const present = this.roomPresence[roomId] ?? [];
     this.callLog(
-      `wire "${channel}" (${media}) from ${from.label} — ${members.length} member(s) on the roster`,
+      `wire "${channel}" (${media}) from ${from.label}: ${members.length} member(s) on the roster`,
     );
     for (const { id, node } of members) {
       const who = node?.label ?? shortId(id);
       // Each gate below is a place media silently went nowhere while chat
       // sailed through (chat fans out to the roster regardless of these).
       if (!node) {
-        this.callLog(`  ${who}: skip — never seen on the graph (no presence advert yet)`);
+        this.callLog(`  ${who}: skip: never seen on the graph (no presence advert yet)`);
         continue;
       }
       if (!isAppNode(node)) {
-        this.callLog(`  ${who}: skip — not running AllMyStuff`);
+        this.callLog(`  ${who}: skip: not running AllMyStuff`);
         continue;
       }
       if (!node.online) {
-        this.callLog(`  ${who}: skip — reads offline (node.online=false — the gate chat ignores)`);
+        this.callLog(`  ${who}: skip: reads offline (node.online=false: the gate chat ignores)`);
         continue;
       }
       if (!present.some((member) => sameMachine(member, id))) {
-        this.callLog(`  ${who}: skip — not currently in the call`);
+        this.callLog(`  ${who}: skip: not currently in the call`);
         continue;
       }
       const sink = matchEndpoint(this.catalog, node.id, media, "consume");
       if (!sink) {
-        this.callLog(`  ${who}: skip — advertises no ${media} sink to receive on`);
+        this.callLog(`  ${who}: skip: advertises no ${media} sink to receive on`);
         continue;
       }
       const leg = this.roomConnect(roomId, from.id, sink.id);
       if (!leg) {
-        this.callLog(`  ${who}: skip — route ${from.id} → ${sink.id} failed validateRoute`);
+        this.callLog(`  ${who}: skip: route ${from.id} → ${sink.id} failed validateRoute`);
         continue;
       }
       if (leg.created) this.legsOf(roomId)[channel].push(leg.id);
       this.callLog(
-        `  ${who}: wired → ${sink.id} (${leg.created ? "new route — offer fired to the daemon" : "route already live"})`,
+        `  ${who}: wired → ${sink.id} (${leg.created ? "new route: offer fired to the daemon" : "route already live"})`,
       );
       wired += 1;
     }
@@ -8158,7 +8158,7 @@ class AppStore {
     const n = legs[channel].length;
     for (const id of legs[channel]) void this.disconnect(id);
     legs[channel] = [];
-    if (n) this.callLog(`drop "${channel}" — tore down ${n} leg(s) in ${roomId}`);
+    if (n) this.callLog(`drop "${channel}": tore down ${n} leg(s) in ${roomId}`);
   }
 
   /** Rooms persist on this device (like the graph's relationships, the
@@ -8297,7 +8297,7 @@ class AppStore {
         }
         venueIds = ids;
       } else {
-        this.toast("warn", "That invite's venue part didn't parse — joining by name alone");
+        this.toast("warn", "That invite's venue part didn't parse: joining by name alone");
         typed = typed.slice(0, hash).trim();
       }
     }
@@ -8405,7 +8405,7 @@ class AppStore {
       this.disabledNets.find((n) => n.id === configId || n.network_id === configId) ??
       { network_id: configId };
     if (this.isLocalClaimMesh(target)) {
-      this.toast("warn", "Local can't be left — switch it off instead.");
+      this.toast("warn", "Local can't be left: switch it off instead.");
       return;
     }
     try {
@@ -8557,7 +8557,7 @@ class AppStore {
     await settle(280);
     mark(2, "ok");
 
-    if (failed > 0) this.toast("warn", "Some meshes couldn't reconnect — open the meshes menu to retry");
+    if (failed > 0) this.toast("warn", "Some meshes couldn't reconnect: open the meshes menu to retry");
 
     // Let the green "Connected" sit a beat, then fade the panel away.
     await settle(1000);
@@ -8636,7 +8636,7 @@ class AppStore {
   ): Promise<boolean> {
     const cfg = this.networkConfig(configId);
     if (!cfg) {
-      this.toast("warn", "That network isn't loaded — reopen Settings");
+      this.toast("warn", "That network isn't loaded: reopen Settings");
       return false;
     }
     // The fleet's venue is owner-defined and owner-broadcast: members and
@@ -8644,14 +8644,14 @@ class AppStore {
     // venues editor included) lets a non-owner change the fleet mesh's servers
     // — the owner's next broadcast would just overwrite it anyway.
     if (this.isFleetMesh(cfg) && !this.isFleetOwner) {
-      this.toast("warn", "The fleet's venue is set by the fleet owner — you ride the owner's choice.");
+      this.toast("warn", "The fleet's venue is set by the fleet owner: you ride the owner's choice.");
       return false;
     }
     // The local claiming mesh has no servers to set — it's the LAN-only mDNS
     // passthrough for claiming and local pairing. The node refuses the write
     // too; refusing here keeps venue sweeps quiet instead of toasting errors.
     if (this.isLocalClaimMesh(cfg)) {
-      this.toast("warn", "Local has no venue — it's LAN-only by design.");
+      this.toast("warn", "Local has no venue: it's LAN-only by design.");
       return false;
     }
     const next: NetworkConfigFull = {
@@ -8940,9 +8940,9 @@ class AppStore {
   // ---- settings · approvals · fleet · updates ---------------------
 
   /** Open the unified settings panel on a given pane. The top-bar gear opens
-   *  it on Networks; the Networks button deep-links here too. Refreshes the
+   *  it on This Device; the Networks button deep-links to Meshes. Refreshes the
    *  pane data so it's never stale on open. */
-  openSettings(tab: SettingsTab = "networks") {
+  openSettings(tab: SettingsTab = "this_device") {
     this.settingsTab = tab;
     this.settingsOpen = true;
     void this.refreshNetworks().then(() => {
@@ -9147,7 +9147,7 @@ class AppStore {
     if (pending) this.cecRequests = pending;
     const dialed = await cecDialed();
     if (dialed) this.cecCustomers = dialed;
-    else clientLog("[cec] dialed-list fetch failed — keeping the last snapshot");
+    else clientLog("[cec] dialed-list fetch failed: keeping the last snapshot");
     // The help queue: same failure discipline — null keeps the last snapshot.
     // The fetch itself is what first joins the global help room, so opening
     // the CEC tab is enough to start hearing the beacons.
@@ -9224,7 +9224,7 @@ class AppStore {
     opts?: { chatOnly?: boolean },
   ): Promise<boolean> {
     if (!this.cecAgentName.trim()) {
-      this.toast("warn", "Set your Agent Name first — the customer sees it");
+      this.toast("warn", "Set your Agent Name first: the customer sees it");
       return false;
     }
     const byNode = "node" in target;
@@ -9247,8 +9247,8 @@ class AppStore {
         ),
       ]);
       if (r?.node) {
-        clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
-        this.toast("ok", `Connecting to ${display} — waiting for them to approve`);
+        clientLog(`[cec] dial ok: customer node ${r.node}; waiting for approval`);
+        this.toast("ok", `Connecting to ${display}: waiting for them to approve`);
         this.cecAutoOpenNode = r.node;
         this.cecAutoOpenChatOnly = opts?.chatOnly ?? false;
         void this.pullSessionSnapshot();
@@ -9259,7 +9259,7 @@ class AppStore {
       return true;
     } catch (e) {
       const msg = errMsg(e);
-      clientLog(`[cec] dial FAILED — ${msg}`);
+      clientLog(`[cec] dial FAILED: ${msg}`);
       if (msg.includes("cancelled") || msg.includes("canceled")) {
         this.toast("ok", "Stopped dialing");
       } else {
@@ -9334,7 +9334,7 @@ class AppStore {
     if (tries <= 0) {
       this.toast(
         "warn",
-        "They approved, but their machine hasn't appeared on the graph yet — press Control again",
+        "They approved, but their machine hasn't appeared on the graph yet: press Control again",
       );
       return;
     }
@@ -9830,7 +9830,7 @@ class AppStore {
           ? `${remaining.map((row) => row.label).join(", ")} did not reach the pinned version after four attempts.`
           : lastError || "One or more installed components could not be verified.",
       };
-      this.toast("warn", lastError || "Some installed components still need repair — open Settings → Updates");
+      this.toast("warn", lastError || "Some installed components still need repair: open Settings → Updates");
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       return false;
     };
@@ -10372,19 +10372,19 @@ class AppStore {
     if (!o) return null;
     switch (o.outcome) {
       case "staged":
-        return `Update ${o.version} downloaded — applies on next launch`;
+        return `Update ${o.version} downloaded: applies on next launch`;
       case "up_to_date":
         return "You're on the latest version";
       case "policy_blocked":
         return `${o.latest} is available but held by your auto-apply setting`;
       case "manual_update_available":
-        return `${o.latest} is available, but this install can't update itself — update it the way you installed it`;
+        return `${o.latest} is available, but this install can't update itself: update it the way you installed it`;
       case "package_manager":
-        return "Installed via a package manager — update through it";
+        return "Installed via a package manager: update through it";
       case "disabled":
         return "Auto-update is off";
       case "not_due":
-        return "Checked recently — try again shortly";
+        return "Checked recently: try again shortly";
       default:
         return null;
     }

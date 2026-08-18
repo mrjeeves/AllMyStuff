@@ -151,7 +151,7 @@
       </label>
       <label>
         Drive letter
-        <input bind:value={pendingShared.mount} placeholder="Auto — next available" aria-label="Drive letter or mount point" />
+        <input bind:value={pendingShared.mount} placeholder="Auto: next available" aria-label="Drive letter or mount point" />
       </label>
       <div class="form-actions">
         <button type="button" class="quiet" onclick={() => (pendingShared = null)}>Cancel</button>
@@ -231,7 +231,7 @@
       </label>
       <label>
         Drive letter
-        <input bind:value={pending.mount} placeholder="Auto — next available" aria-label="Drive letter or mount point" />
+        <input bind:value={pending.mount} placeholder="Auto: next available" aria-label="Drive letter or mount point" />
       </label>
       <div class="form-actions">
         <button type="button" class="quiet" onclick={() => (pending = null)}>Cancel</button>

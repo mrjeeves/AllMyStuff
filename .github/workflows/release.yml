@@ -76,6 +76,14 @@ jobs:
           [[ "$got_gui_pkg"   == "$EXPECTED" ]] || fail "gui/package.json version is $got_gui_pkg, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
           echo "Manifest versions match tag $TAG ($EXPECTED)."
 
+      # Mobile embeds MyOwnMesh as Rust git dependencies while desktop/node
+      # consume the same release as a sidecar. Keep its committed lock on the
+      # exact `.myownmesh-rev` tag so one platform cannot silently ship an
+      # older mesh implementation.
+      - name: Verify suite pins match the committed locks
+        shell: bash
+        run: bash ./scripts/sync-pinned-locks.sh --check
+
       # The Tauri GUI links the webkit/GTK stack, and both it and the headless
       # node binary link the media stack (ALSA via cpal, PipeWire/gbm via xcap,
       # xkbcommon via enigo). The bare CLI needs none of it, but installing

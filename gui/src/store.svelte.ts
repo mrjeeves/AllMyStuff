@@ -93,6 +93,7 @@ import {
   onFileProgress,
   onFileSaved,
   onKvmMedia,
+  onBackendReady,
   onMeshEvent,
   openFilesWindow,
   pickFilesToShare,
@@ -1686,6 +1687,14 @@ class AppStore {
         this.clockSkew = null;
         this.toast("ok", "This device's clock is back in sync with the network");
       }
+    });
+    // The native event pump reconnects independently of the webview. An owner
+    // handoff can therefore happen while `backendConnected` is still true;
+    // rehydrate on the explicit local-backend edge so local inventory and all
+    // node-backed state follow the new owner instead of depending on boot
+    // order. Register before the first pull so no post-mount edge is missed.
+    await onBackendReady(() => {
+      void this.recoverBackendConnection();
     });
     await this.hydrateFromBackend();
     await this.loadIdentity();

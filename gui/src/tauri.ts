@@ -2365,6 +2365,15 @@ export async function onSubscription(
   );
 }
 
+/** The native event pump has connected (or reconnected) to the current shared
+ *  node owner. Unlike the mesh subscription status, this fires for a local
+ *  node process handoff even when the mesh itself remained `live`. */
+export async function onBackendReady(cb: () => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<Record<string, never>>("allmystuff://backend-ready", () => cb());
+}
+
 // ---- networks · identity · roster -------------------------------------
 //
 // Unlike the graph commands above (which degrade to null in web mode), these

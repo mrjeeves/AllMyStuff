@@ -2142,6 +2142,31 @@ enum PinnedNodeAction {
     Spawn,
 }
 
+/// Which owner CEC Support should give first refusal when no shared-node
+/// socket answers yet.  On Windows both applications are automatic services;
+/// during boot the canonical AllMyStuff service can be healthy while its
+/// interactive-session agent is still being created.  Treating that short
+/// gap as "no owner" lets CEC's bundled fallback win permanently, so the
+/// resulting node version and lifecycle depend on service start order.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinnedStartupAction {
+    AwaitCanonicalService,
+    SpawnBundledNode,
+}
+
+#[cfg(any(windows, test))]
+fn pinned_startup_action(
+    canonical_service_automatic: bool,
+    canonical_service_active: bool,
+) -> PinnedStartupAction {
+    if canonical_service_automatic || canonical_service_active {
+        PinnedStartupAction::AwaitCanonicalService
+    } else {
+        PinnedStartupAction::SpawnBundledNode
+    }
+}
+
 /// Decide whether CEC Support may reuse or create the shared node.
 ///
 /// CEC's Windows service runs as LocalSystem in Session 0. It may use an
@@ -2176,6 +2201,68 @@ fn windows_process_session(pid: u32) -> Result<u32> {
         );
     }
     Ok(session_id)
+}
+
+/// Whether the canonical Always-On service is already starting/running and
+/// therefore deserves a brief chance to publish its interactive node before a
+/// consumer starts a bundled fallback. Query access is available to ordinary
+/// users; an absent, disabled, or stopped manual service adds no startup delay.
+#[cfg(windows)]
+fn canonical_allmystuff_service_deserves_grace() -> bool {
+    use windows_service::service::{ServiceAccess, ServiceStartType, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return false;
+    };
+    let Ok(service) = manager.open_service(
+        "AllMyStuff",
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) else {
+        return false;
+    };
+    let automatic = service
+        .query_config()
+        .is_ok_and(|config| config.start_type == ServiceStartType::AutoStart);
+    let active = service.query_status().is_ok_and(|status| {
+        matches!(
+            status.current_state,
+            ServiceState::StartPending
+                | ServiceState::Running
+                | ServiceState::ContinuePending
+                | ServiceState::PausePending
+                | ServiceState::Paused
+        )
+    });
+    // An automatic service may still report Stopped in the narrow interval
+    // before SCM schedules it during boot. That is precisely the boot-order
+    // race this grace closes. A disabled/manual stopped service adds no delay.
+    pinned_startup_action(automatic, active) == PinnedStartupAction::AwaitCanonicalService
+}
+
+/// Let an already-active canonical service win the one-node pipe. This is
+/// deliberately bounded: if its session agent really is broken, CEC's bundled
+/// node still takes over after the same ten-second grace used elsewhere for a
+/// node that is known to be starting.
+#[cfg(windows)]
+async fn await_canonical_allmystuff_node() -> bool {
+    if !canonical_allmystuff_service_deserves_grace() {
+        return false;
+    }
+    tracing::info!(
+        "canonical AllMyStuff service is active; waiting for its interactive node before starting the CEC Support fallback"
+    );
+    for _ in 0..50 {
+        if NodeClient::probe().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tracing::warn!(
+        "canonical AllMyStuff service did not publish an interactive node during startup grace; using the CEC Support fallback"
+    );
+    false
 }
 
 #[cfg(windows)]
@@ -2456,6 +2543,21 @@ async fn ensure_node_running_impl(
     #[cfg(windows)]
     if let Some((caller_pid, caller_session_id)) = caller {
         pinned_node_action(caller_session_id, None)?;
+        if await_canonical_allmystuff_node().await {
+            let (node_pid, node_session_id) = windows_node_process_session().await?;
+            pinned_node_action(caller_session_id, Some(node_session_id))?;
+            tracing::info!(
+                caller_pid,
+                caller_session_id,
+                node_pid,
+                node_session_id,
+                "CEC Support deferred to the canonical AllMyStuff startup owner"
+            );
+            if let Some(pin) = pin {
+                converge_reused_node(pin).await;
+            }
+            return Ok(None);
+        }
         tracing::info!(
             caller_pid,
             caller_session_id,
@@ -2751,5 +2853,23 @@ mod tests {
                 "disk {disk:?} cannot satisfy the pin, so a bare restart would spin"
             );
         }
+    }
+
+    #[test]
+    fn cec_defers_to_an_active_canonical_service_during_boot() {
+        assert_eq!(
+            pinned_startup_action(false, true),
+            PinnedStartupAction::AwaitCanonicalService
+        );
+        assert_eq!(
+            // SCM can still report an automatic service stopped in the small
+            // interval before scheduling it at boot. It gets the same grace.
+            pinned_startup_action(true, false),
+            PinnedStartupAction::AwaitCanonicalService
+        );
+        assert_eq!(
+            pinned_startup_action(false, false),
+            PinnedStartupAction::SpawnBundledNode
+        );
     }
 }

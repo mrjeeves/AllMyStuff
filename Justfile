@@ -188,6 +188,13 @@ gui-check:
 # engine), then the GUI typecheck/build.
 check: fmt-check lint test node-check gui-check
 
+# Resolve and verify every Cargo dependency represented by a suite pin. Today
+# that is the mobile workspace's embedded MyOwnMesh graph; desktop/node consume
+# MyOwnMesh as a release sidecar and therefore have no Cargo lock entry.
+[doc("Update Cargo locks from the suite pin files and verify they agree.")]
+pin-locks:
+    @bash ./scripts/sync-pinned-locks.sh
+
 # Cut a release: bump every crate's version (+ the GUI/node sub-workspaces),
 # commit, push, then push the `v{{VERSION}}` tag to trigger the workflow.
 # Mirrors MyOwnMesh / MyOwnLLM — the user runs `just release 0.2.0` and the
@@ -208,6 +215,7 @@ check: fmt-check lint test node-check gui-check
 [doc("Cut a release: bump versions, commit, push, tag to trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
+    @bash ./scripts/sync-pinned-locks.sh
     @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; then \
         git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; \
         git commit -m "chore(release): {{VERSION}}"; \

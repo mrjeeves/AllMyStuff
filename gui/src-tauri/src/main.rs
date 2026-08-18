@@ -2898,6 +2898,15 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
+        // A successful subscription is also the authoritative "this GUI can
+        // talk to the current node owner" edge.  The owner may have restarted
+        // while the front-end still had `backendConnected = true`; without a
+        // new edge the Svelte store never re-scanned this machine and could
+        // retain the previous owner's empty/stale local inventory forever.
+        // Initial delivery is harmless (startup hydration is idempotent), and
+        // every later delivery closes that owner-handoff gap without polling a
+        // hardware scan every three seconds.
+        let _ = app.emit("allmystuff://backend-ready", json!({}));
         while let Some(ev) = rx.recv().await {
             match ev {
                 NodeEvent::Emit { event, payload } => {

@@ -67,7 +67,9 @@
   // the graph on a stale advert.
   const graphNodes = $derived.by((): MeshNode[] =>
     app.catalog.nodes.filter(
-      (n) => n.kind === "this" || n.online || app.standingOf(n).ownedByMe,
+      (n) =>
+        !app.isCecOnlyNode(n) &&
+        (n.kind === "this" || n.online || app.standingOf(n).ownedByMe),
     ),
   );
 
@@ -112,11 +114,6 @@
         : "Your devices";
 
   function fleetKeyOf(n: MeshNode): { key: string; label: string } {
-    // A CEC customer a technician dialed is just an ordinary mesh peer here:
-    // the shared support area feeds the catalog only links this daemon
-    // actually holds (never its customer roster), so a dialed customer shows
-    // while the session lives and drops off with it. It groups by its own
-    // standing like any other peer; the CEC tab is where customers live.
     // Group by the authoritative `standing()` — the same roster-driven verdict
     // the drawer and every claim/fleet button read — NOT the node's stored
     // `relationship.kind` or its self-advertised `owner`. Those are stale: an
@@ -133,7 +130,7 @@
       // "This" anchors your group while it's genuinely in a fleet, owns other
       // machines, or is the only device on the graph; otherwise a fleet-less
       // local device drops to "Unknown fleet" rather than a group of one.
-      const ownsOthers = app.catalog.nodes.some(
+      const ownsOthers = graphNodes.some(
         (m) => m.id !== n.id && app.standingOf(m).ownedByMe,
       );
       // "Alone" means alone ON THE GRAPH — hidden offline strangers don't
@@ -1924,7 +1921,7 @@
       <div class="list-scroll" bind:this={listScroll}>
         {#if filteredListGroups.length === 0}
           <div class="list-noresults" aria-live="polite">
-            {#if app.catalog.nodes.length === 0}
+            {#if graphNodes.length === 0}
               <div class="list-noresults-orb">🧦</div>
               <div class="list-noresults-title">Getting your stuff together…</div>
               <div class="list-noresults-sub">Scanning this machine and waiting for peers to appear.</div>
@@ -2006,7 +2003,7 @@
     </div>
   {/if}
 
-  {#if app.catalog.nodes.length === 0 && !isList}
+  {#if graphNodes.length === 0 && !isList}
     <div class="empty" aria-live="polite">
       <div class="empty-orb">🧦</div>
       <div class="empty-title">Getting your stuff together…</div>

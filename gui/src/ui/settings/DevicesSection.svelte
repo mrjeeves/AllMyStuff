@@ -11,7 +11,7 @@
 
   // This device first, then the rest by name.
   const devices = $derived(
-    [...app.catalog.nodes].sort((a, b) => {
+    app.catalog.nodes.filter((node) => !app.isCecOnlyNode(node)).sort((a, b) => {
       const rank = (n: MeshNode) => (n.kind === "this" ? 0 : 1);
       return rank(a) - rank(b) || a.label.localeCompare(b.label);
     }),

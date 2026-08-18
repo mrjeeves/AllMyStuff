@@ -15,6 +15,7 @@ import {
   scopedGrantId,
   type GrantRequest,
 } from "./catalog";
+import { reconcileCecOnlyCanons } from "./cec-provenance";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -707,6 +708,11 @@ class AppStore {
    *  customer is an ordinary peer with no special grouping (the CEC mesh is
    *  Silent, so there is no roster to build a "fleet" from). */
   cecCustomers = $state<CecPeer[]>([]);
+  /** Canonical ids whose only current graph provenance is a managed CEC
+   *  support network. The catalog retains these nodes so an approved support
+   *  console can resolve its capabilities, but the ordinary device graph must
+   *  not turn the support subsystem into visible mesh membership. */
+  private cecOnlyNodeCanons = $state<string[]>([]);
   /** The technician's private customer labels (customer number → alias),
    *  persisted GUI-side. Lets a tech name a customer something they'll remember
    *  ("Dr Kim's front desk") independent of the machine's own hostname. */
@@ -1170,6 +1176,13 @@ class AppStore {
       net?.network_id === CEC_ASK_NETWORK_ID ||
       /^cec-\d{9}$/.test(net?.network_id ?? "")
     );
+  }
+
+  /** True when the machine is currently known only through CEC Support's
+   *  managed transport. It stays in the catalog for the support console, but
+   *  is deliberately absent from the normal node graph. */
+  isCecOnlyNode(node: MeshNode): boolean {
+    return this.cecOnlyNodeCanons.includes(canonicalNodeId(node.id));
   }
 
   /** Your meshes minus the CEC Support area — what the Meshes list actually
@@ -2039,6 +2052,8 @@ class AppStore {
     // machine flaps offline on the next poll.
     const activeCanons = new Set<string>();
     const offlineCanons = new Set<string>();
+    const cecCanons = new Set<string>();
+    const ordinaryCanons = new Set<string>();
     for (const net of nets) {
       const netName = this.meshLabel(net);
       // The CEC Support area never contributes its ROSTER: hundreds of
@@ -2084,6 +2099,9 @@ class AppStore {
           joins.push({ networkId: net.config_id, networkName: netName, peer: p });
           continue;
         }
+        const provenanceCanon = canonicalNodeId(p.device_id);
+        if (cecArea) cecCanons.add(provenanceCanon);
+        else ordinaryCanons.add(provenanceCanon);
         addNet(p.device_id, netName);
         const e = live.get(p.device_id) ?? {
           label: p.label?.trim() || shortId(p.device_id),
@@ -2132,9 +2150,21 @@ class AppStore {
         }
         live.set(p.device_id, e);
       }
-      for (const r of roster) addNet(r.device_id, netName);
+      for (const r of roster) {
+        ordinaryCanons.add(canonicalNodeId(r.device_id));
+        addNet(r.device_id, netName);
+      }
       rosterAll.push(...roster);
     }
+    // Support peers remain in the catalog for the dedicated CEC console, but
+    // a node reached *only* through CEC plumbing is not an ordinary graph
+    // device. If that same machine is also present on Local, a fleet, or a
+    // user-created mesh, that independent relationship keeps it visible.
+    this.cecOnlyNodeCanons = reconcileCecOnlyCanons(
+      this.cecOnlyNodeCanons,
+      cecCanons,
+      ordinaryCanons,
+    );
     // Settle the machine-wide grace once all networks are folded: a connected
     // reading on any mesh refreshes it; an explicit offline clears it only when
     // NO mesh reported the machine connected this poll.

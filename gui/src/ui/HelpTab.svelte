@@ -57,6 +57,9 @@
   // read). `editingKey` is the number being edited.
   let editingKey = $state<string | null>(null);
   let aliasDraft = $state("");
+  // Two-step removal in the card's action row. The first click arms only
+  // that customer; a second click within 3.5 seconds performs the removal.
+  let removeArmed = $state<string | null>(null);
   function startRename(number: string) {
     editingKey = number;
     aliasDraft = app.cecAliases[number] ?? "";
@@ -74,6 +77,17 @@
   function cancelRename() {
     editingKey = null;
     aliasDraft = "";
+  }
+  function removeCustomer(c: CecPeer) {
+    if (removeArmed === c.node) {
+      removeArmed = null;
+      void app.removeCecCustomer(c.node);
+      return;
+    }
+    removeArmed = c.node;
+    setTimeout(() => {
+      if (removeArmed === c.node) removeArmed = null;
+    }, 3500);
   }
 
   // The machines this technician has dialed before, grouped under the live
@@ -93,6 +107,33 @@
 </script>
 
 <div class="help">
+  <form
+    class="dial"
+    aria-label="Connect to a customer by number"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void app.dialCec();
+    }}
+  >
+    <input
+      class="dial-input"
+      type="text"
+      inputmode="numeric"
+      autocomplete="off"
+      spellcheck="false"
+      placeholder="Customer number"
+      aria-label="Customer number"
+      bind:value={app.cecNumberDraft}
+    />
+    <button
+      class="dial-btn"
+      type="submit"
+      disabled={app.cecDialing || !app.cecNumberDraft.trim()}
+    >
+      {app.cecDialing ? "Connecting…" : "Connect"}
+    </button>
+  </form>
+
   <label
     class="watch"
     title="Join the shared help queue and see customers who press Ask for help. Saved: stays on across restarts."
@@ -274,6 +315,17 @@
                 </button>
               {/if}
             {/if}
+            <button
+              class="trash-btn"
+              class:armed={removeArmed === c.node}
+              aria-label={removeArmed === c.node ? `Confirm forgetting ${name}` : `Forget ${name}`}
+              title={removeArmed === c.node
+                ? `Click again to forget ${name}`
+                : `Forget ${name} and remove this saved connection`}
+              onclick={() => removeCustomer(c)}
+            >
+              {removeArmed === c.node ? "Confirm?" : "🗑 Remove"}
+            </button>
           </div>
         {/if}
       </li>
@@ -307,6 +359,41 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
+  }
+  .dial {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.4rem;
+  }
+  .dial-input {
+    min-width: 0;
+    padding: 0.48rem 0.55rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .dial-input:focus {
+    outline: 2px solid var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .dial-btn {
+    border: none;
+    border-radius: var(--r-sm);
+    padding: 0.45rem 0.65rem;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .dial-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .watch {
     display: flex;
@@ -377,6 +464,29 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+  }
+  .trash-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.28rem 0.6rem;
+    background: transparent;
+    color: var(--ink-faint);
+    font: inherit;
+    font-size: 0.74rem;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .trash-btn:hover {
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+  .trash-btn.armed {
+    background: var(--danger);
+    color: #fff;
+    border-color: var(--danger);
   }
   .row-actions {
     display: flex;

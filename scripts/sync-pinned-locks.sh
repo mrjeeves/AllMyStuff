@@ -40,11 +40,12 @@ if [[ "$MODE" == "sync" ]] && ! lock_matches_pin; then
 fi
 
 [[ -f "$LOCK" ]] || fail "$LOCK is missing"
-mapfile -t sources < <(grep 'source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=' "$LOCK" || true)
-((${#sources[@]} > 0)) || fail "$LOCK contains no pinned MyOwnMesh packages"
-for source in "${sources[@]}"; do
+source_count=0
+while IFS= read -r source; do
+  source_count=$((source_count + 1))
   [[ "$source" == *"?tag=${PIN}#"* ]] \
     || fail "$LOCK disagrees with .myownmesh-rev ($PIN): $source"
-done
+done < <(grep 'source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=' "$LOCK" || true)
+((source_count > 0)) || fail "$LOCK contains no pinned MyOwnMesh packages"
 
 echo "pinned Cargo locks agree with MyOwnMesh $PIN"

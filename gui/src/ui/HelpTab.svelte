@@ -57,6 +57,9 @@
   // read). `editingKey` is the number being edited.
   let editingKey = $state<string | null>(null);
   let aliasDraft = $state("");
+  // Two-step removal in the card's action row. The first click arms only
+  // that customer; a second click within 3.5 seconds performs the removal.
+  let removeArmed = $state<string | null>(null);
   function startRename(number: string) {
     editingKey = number;
     aliasDraft = app.cecAliases[number] ?? "";
@@ -74,6 +77,17 @@
   function cancelRename() {
     editingKey = null;
     aliasDraft = "";
+  }
+  function removeCustomer(c: CecPeer) {
+    if (removeArmed === c.node) {
+      removeArmed = null;
+      void app.removeCecCustomer(c.node);
+      return;
+    }
+    removeArmed = c.node;
+    setTimeout(() => {
+      if (removeArmed === c.node) removeArmed = null;
+    }, 3500);
   }
 
   // The machines this technician has dialed before, grouped under the live
@@ -253,14 +267,6 @@
               </span>
             {/if}
           </div>
-          <button
-            class="trash-btn"
-            aria-label={`Forget ${name}`}
-            title={`Forget ${name} and remove this saved connection`}
-            onclick={() => void app.removeCecCustomer(c.node)}
-          >
-            🗑
-          </button>
         </div>
         {#if editingKey !== c.number}
           <!-- Bottom action row, same layout as the queue cards - and the
@@ -309,6 +315,17 @@
                 </button>
               {/if}
             {/if}
+            <button
+              class="trash-btn"
+              class:armed={removeArmed === c.node}
+              aria-label={removeArmed === c.node ? `Confirm forgetting ${name}` : `Forget ${name}`}
+              title={removeArmed === c.node
+                ? `Click again to forget ${name}`
+                : `Forget ${name} and remove this saved connection`}
+              onclick={() => removeCustomer(c)}
+            >
+              {removeArmed === c.node ? "Confirm?" : "🗑 Remove"}
+            </button>
           </div>
         {/if}
       </li>
@@ -450,19 +467,26 @@
   }
   .trash-btn {
     flex-shrink: 0;
-    align-self: flex-start;
-    border: none;
+    border: 1px solid var(--line-strong);
     border-radius: var(--r-sm);
-    padding: 0.25rem 0.35rem;
+    padding: 0.28rem 0.6rem;
     background: transparent;
     color: var(--ink-faint);
     font: inherit;
+    font-size: 0.74rem;
+    font-weight: 700;
     line-height: 1;
     cursor: pointer;
   }
   .trash-btn:hover {
     background: var(--danger-soft);
     color: var(--danger);
+    border-color: var(--danger);
+  }
+  .trash-btn.armed {
+    background: var(--danger);
+    color: #fff;
+    border-color: var(--danger);
   }
   .row-actions {
     display: flex;

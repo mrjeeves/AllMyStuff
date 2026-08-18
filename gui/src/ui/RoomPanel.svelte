@@ -136,12 +136,6 @@
 
   const awayMembers = $derived(room ? app.roomMemberNodes.filter((m) => !inRoom(m.id)) : []);
 
-  /** Nothing leaves this machine right now — the only time the muted-call
-   *  reassurance is true (and shown). */
-  const sendingNothing = $derived(
-    !app.roomMic && !app.roomCam && !app.roomScreen && !app.roomSound && !app.roomControl,
-  );
-
   function initials(who: string): string {
     const words = who.replace(/\(.*?\)/g, "").trim().split(/[\s·]+/).filter(Boolean);
     const a = words[0]?.[0] ?? "?";
@@ -413,13 +407,6 @@
                 {@render personTile(p, false)}
               {/each}
             </div>
-            {#if sendingNothing}
-              <p class="stage-note">
-                Nothing leaves this machine — mic, camera and screen stay off until you switch
-                them on below.{#if presentPeople.length === 1 && awayMembers.length === 0}&nbsp;It's
-                  just you so far: invite a machine from <b>People</b>, or copy the invite.{/if}
-              </p>
-            {/if}
           {/if}
         </div>
 
@@ -530,10 +517,6 @@
                   {/each}
                 </div>
               {/if}
-              <p class="fine">
-                Sharing here is <b>scoped to the room</b> and <b>stream-only</b> — nothing is
-                stored, it all ends when you leave, and nobody gains a standing permission.
-              </p>
             </div>
           </aside>
         {/if}
@@ -587,11 +570,6 @@
                   it{#if !app.backendConnected}&nbsp;(demo mode — sharing needs the desktop app){/if}.
                 </p>
               {/each}
-              <p class="fine">
-                The room's host hosts this <b>list</b> — a file stays here while the person who
-                shared it is in the call. Downloads come <b>straight from them</b>, never through
-                the host, and it's read-only: nobody browses or edits anyone's disk.
-              </p>
             </div>
           </aside>
         {/if}
@@ -1062,17 +1040,6 @@
   .mic-state.live {
     filter: drop-shadow(0 0 4px oklch(0.8 0.17 150 / 0.8));
   }
-  .stage-note {
-    flex-shrink: 0;
-    margin: 0;
-    text-align: center;
-    font-size: 0.74rem;
-    color: var(--ink-faint);
-  }
-  .stage-note b {
-    color: var(--ink-soft);
-  }
-
   /* ---- right-side panels (chat · people) ---- */
   .side {
     width: 17.5rem;
@@ -1282,10 +1249,6 @@
     color: var(--ink-faint);
     line-height: 1.45;
   }
-  .fine b {
-    color: var(--ink-soft);
-  }
-
   /* ---- the bottom control bar ---- */
   .bar {
     border-top: 1px solid var(--line);

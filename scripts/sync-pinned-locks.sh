@@ -26,7 +26,14 @@ for package in myownmesh myownmesh-core; do
     || fail "$MANIFEST does not pin $package to .myownmesh-rev ($PIN)"
 done
 
-if [[ "$MODE" == "sync" ]]; then
+lock_matches_pin() {
+  [[ -f "$LOCK" ]] || return 1
+  grep -q 'source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=' "$LOCK" \
+    && ! grep 'source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=' "$LOCK" \
+      | grep -Fvq "?tag=${PIN}#"
+}
+
+if [[ "$MODE" == "sync" ]] && ! lock_matches_pin; then
   # Cargo resolves all crates from this tagged git source together, including
   # the transitive services/signaling/updater packages recorded in the lock.
   cargo update --manifest-path "$MANIFEST" -p myownmesh -p myownmesh-core

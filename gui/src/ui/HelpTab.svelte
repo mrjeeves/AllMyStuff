@@ -93,6 +93,33 @@
 </script>
 
 <div class="help">
+  <form
+    class="dial"
+    aria-label="Connect to a customer by number"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void app.dialCec();
+    }}
+  >
+    <input
+      class="dial-input"
+      type="text"
+      inputmode="numeric"
+      autocomplete="off"
+      spellcheck="false"
+      placeholder="Customer number"
+      aria-label="Customer number"
+      bind:value={app.cecNumberDraft}
+    />
+    <button
+      class="dial-btn"
+      type="submit"
+      disabled={app.cecDialing || !app.cecNumberDraft.trim()}
+    >
+      {app.cecDialing ? "Connecting…" : "Connect"}
+    </button>
+  </form>
+
   <label
     class="watch"
     title="Join the shared help queue and see customers who press Ask for help. Saved: stays on across restarts."
@@ -226,6 +253,14 @@
               </span>
             {/if}
           </div>
+          <button
+            class="trash-btn"
+            aria-label={`Forget ${name}`}
+            title={`Forget ${name} and remove this saved connection`}
+            onclick={() => void app.removeCecCustomer(c.node)}
+          >
+            🗑
+          </button>
         </div>
         {#if editingKey !== c.number}
           <!-- Bottom action row, same layout as the queue cards - and the
@@ -308,6 +343,41 @@
     flex-direction: column;
     gap: 0.6rem;
   }
+  .dial {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.4rem;
+  }
+  .dial-input {
+    min-width: 0;
+    padding: 0.48rem 0.55rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .dial-input:focus {
+    outline: 2px solid var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .dial-btn {
+    border: none;
+    border-radius: var(--r-sm);
+    padding: 0.45rem 0.65rem;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .dial-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
   .watch {
     display: flex;
     align-items: center;
@@ -377,6 +447,22 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+  }
+  .trash-btn {
+    flex-shrink: 0;
+    align-self: flex-start;
+    border: none;
+    border-radius: var(--r-sm);
+    padding: 0.25rem 0.35rem;
+    background: transparent;
+    color: var(--ink-faint);
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .trash-btn:hover {
+    background: var(--danger-soft);
+    color: var(--danger);
   }
   .row-actions {
     display: flex;

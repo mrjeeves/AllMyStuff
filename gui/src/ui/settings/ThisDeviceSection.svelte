@@ -17,7 +17,9 @@
   );
   const userMeshes = $derived(app.normalNetworks.filter((network) => !app.isLocalClaimMesh(network)));
   const onlinePeers = $derived(
-    app.catalog.nodes.filter((peer) => !app.isMe(peer.id) && peer.online),
+    app.catalog.nodes.filter(
+      (peer) => !app.isMe(peer.id) && peer.online && !app.isCecOnlyNode(peer),
+    ),
   );
   const connections = $derived.by(() => {
     if (!node) return [];
@@ -30,6 +32,7 @@
       if (!outgoing && !incoming) return [];
       const peerId = outgoing ? to.node : from.node;
       const peer = app.machineByAnyId(peerId);
+      if (peer && app.isCecOnlyNode(peer)) return [];
       return [{
         id: route.id,
         direction: outgoing ? "To" : "From",

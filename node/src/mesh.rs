@@ -373,6 +373,12 @@ pub struct Mesh {
     /// ProfileRequest`]), so a held-down refresh can't hammer a peer. See
     /// [`Mesh::allow_profile_request`].
     profile_req: Mutex<HashMap<String, ProfileReqState>>,
+    /// Bounded repair attempts for Local peers stuck at `sighted`. A plain
+    /// `network_connect_peer` is a no-op when an Open-network Sighted row
+    /// already owns a WebRTC session, so those rows need an in-place reconnect;
+    /// this ledger prevents a genuinely-gone mDNS record from being prodded on
+    /// every graph poll forever.
+    local_claim_repairs: Mutex<HashMap<String, LocalClaimRepair>>,
     /// Per-route Opus decoders for inbound lane audio (stateful across
     /// frames; dropped with the route).
     audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
@@ -1221,6 +1227,18 @@ const CEC_CONNECT_ATTEMPT_TTL: std::time::Duration = std::time::Duration::from_s
 /// acknowledgement without making the KVM persist handshake transport state.
 const CEC_CONNECT_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
 
+const LOCAL_CLAIM_REPAIR_DELAYS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
+
+#[derive(Clone, Copy)]
+struct LocalClaimRepair {
+    attempts: usize,
+    last: Instant,
+}
+
 struct State {
     session: Option<Session>,
     /// Primary network — the fallback for route control/media when we don't
@@ -1423,6 +1441,7 @@ impl Mesh {
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
             self_update_inflight: AtomicBool::new(false),
             offer_first_seen: Mutex::new(HashMap::new()),
+            local_claim_repairs: Mutex::new(HashMap::new()),
             last_status: Mutex::new(("unknown".into(), None)),
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
@@ -2035,31 +2054,46 @@ impl Mesh {
             };
             // The LAN claim rendezvous is an application directory, but its
             // claimable presence still rides the normal app channel. A newly
-            // discovered peer can remain only `sighted` (no WebRTC session),
-            // which deadlocks discovery: the claimer cannot see the profile
-            // that would tell it to claim, and therefore has no UI action that
-            // would dial the peer. While *this* device is offering itself,
-            // explicitly open an unpinned link to every sighted LAN peer. The
-            // normal connection event sends our freshly-restamped profile as
-            // soon as the link opens. Re-running this during peer refresh also
-            // covers a potential claimer that joins the LAN after claim mode
-            // was enabled.
+            // discovered peer can remain only `sighted`, which deadlocks
+            // discovery: the claimer cannot receive the profile that would
+            // tell it to claim. While *this* device is offering itself, give
+            // each continuously-Sighted LAN peer a bounded in-place repair
+            // window. The connection event sends our freshly-restamped profile
+            // on this exact network as soon as the link opens.
             if network == LOCAL_CLAIM_NETWORK_ID {
                 let sighted = local_claim_sighted_peers(peers);
                 self.state.lock().local_claim_sighted = sighted.clone();
                 local_claim_peers = Some(sighted.clone());
                 if self.ownership.claimable() {
-                    for peer in local_claim_link_candidates(peers) {
+                    let candidates = local_claim_link_candidates(peers);
+                    let candidate_set = candidates.iter().cloned().collect::<HashSet<_>>();
+                    self.local_claim_repairs
+                        .lock()
+                        .retain(|peer, _| candidate_set.contains(peer));
+                    for peer in candidates {
+                        if !local_claim_repair_due(
+                            &mut self.local_claim_repairs.lock(),
+                            &peer,
+                            Instant::now(),
+                        ) {
+                            continue;
+                        }
+                        // `network_connect_peer` cannot repair an Open-network
+                        // Sighted row that already owns a stalled WebRTC
+                        // session: the daemon correctly treats connect as
+                        // idempotent and returns without another offer. A
+                        // targeted in-place reconnect forces a fresh ICE offer
+                        // while preserving the peer and every other LAN link.
                         let _ = self
                             .client
-                            .request(&Request::NetworkConnectPeer {
+                            .request(&Request::NetworkReconnect {
                                 network: network.clone(),
-                                peer,
-                                pin: false,
-                                wait_ms: 0,
+                                peer: Some(peer),
                             })
                             .await;
                     }
+                } else {
+                    self.local_claim_repairs.lock().clear();
                 }
             }
             // A peer's link class landing (or flipping — an ICE-restart
@@ -2346,7 +2380,7 @@ impl Mesh {
             // Still run the claim-status check (it sanitizes stale fleet
             // residue and refreshes the UI); the broadcasts inside are
             // no-ops with no networks to send on.
-            self.ownership_check(None).await;
+            self.ownership_check(None, None).await;
             self.emit_status("no_network", None);
         } else {
             // Every AllMyStuff channel on *every* network. Presence + the
@@ -2367,7 +2401,7 @@ impl Mesh {
             self.refresh_peer_networks().await;
             // App-load trigger of the claim-status check: sanitize stale
             // fleet residue, then assert presence + roster to everyone.
-            self.ownership_check(None).await;
+            self.ownership_check(None, None).await;
             self.emit_status("live", None);
         }
 
@@ -3097,6 +3131,7 @@ impl Mesh {
                             if !gated {
                                 let mesh = self.clone();
                                 let device = device.to_string();
+                                let approved_network = event_network.to_string();
                                 crate::spawn(async move {
                                     // Record which network this peer just went
                                     // live on *before* anything is sent to it
@@ -3105,7 +3140,8 @@ impl Mesh {
                                     // sharing only a secondary mesh falls back
                                     // to the primary network and is dropped.
                                     mesh.refresh_peer_networks().await;
-                                    mesh.ownership_check(Some(&device)).await;
+                                    mesh.ownership_check(Some(&device), Some(&approved_network))
+                                        .await;
                                 });
                             }
                         }
@@ -3465,7 +3501,7 @@ impl Mesh {
                                 "is new to us"
                             }
                         );
-                        self.ownership_check(Some(&from)).await;
+                        self.ownership_check(Some(&from), Some(&network)).await;
                         // (The old "re-beacon the help room at whoever just
                         // came up" nudge lived here. A raised hand is
                         // asking-room *membership* now — the engine's own
@@ -8243,7 +8279,7 @@ impl Mesh {
                         "claim accepted: {} now owns this device",
                         short_id(from.as_str())
                     );
-                    self.ownership_check(None).await;
+                    self.ownership_check(None, None).await;
                     // Push our own owned roster now so this device's GUI knows
                     // it's claimed (in a fleet) immediately — before the owner's
                     // `FleetKey` handoff lands. Without this, an owned-but-keyless
@@ -8432,7 +8468,7 @@ impl Mesh {
                 .await;
         }
         self.refresh_fleet_authorization().await;
-        self.ownership_check(None).await;
+        self.ownership_check(None, None).await;
     }
 
     /// Re-stamp the live presence profile's owner/claimable from the store
@@ -9241,7 +9277,7 @@ impl Mesh {
             .await;
         // And re-sync our ownership/fleet view + its exposed sites while we're
         // here.
-        self.ownership_check(Some(pubkey_part(&peer))).await;
+        self.ownership_check(Some(pubkey_part(&peer)), None).await;
         let _ = self.site_remote_list(peer).await;
         Ok(())
     }
@@ -9386,6 +9422,9 @@ impl Mesh {
     /// another of your machines can adopt it. Re-advertises immediately.
     pub async fn set_claimable(self: &Arc<Self>, on: bool) -> Result<bool, String> {
         self.ownership.set_claim_mode(on);
+        // A deliberate new claim-mode transition starts a fresh bounded repair
+        // window for any LAN peer that is still stuck at Sighted.
+        self.local_claim_repairs.lock().clear();
         // Claim-rendezvous membership follows claim mode (the claim-code
         // network only exists while claimable with public claims on).
         self.ensure_claim_networks().await;
@@ -9434,7 +9473,11 @@ impl Mesh {
     /// the two sides converge on the event itself; there is no heartbeat — and
     /// **broadcast** on the local triggers: session start, a claim/release,
     /// and fleet membership changes.
-    pub async fn ownership_check(self: &Arc<Self>, peer: Option<&str>) {
+    pub async fn ownership_check(
+        self: &Arc<Self>,
+        peer: Option<&str>,
+        arrival_network: Option<&str>,
+    ) {
         if self.local_node_id().is_none() {
             return;
         }
@@ -9453,7 +9496,11 @@ impl Mesh {
         match peer {
             Some(peer) => {
                 tracing::debug!("ownership check → {}", short_id(peer));
-                self.send_presence_to(peer).await;
+                if let Some(network) = arrival_network {
+                    self.send_presence_to_on_network(peer, network).await;
+                } else {
+                    self.send_presence_to(peer).await;
+                }
             }
             None => {
                 self.broadcast_presence().await;
@@ -10298,29 +10345,39 @@ impl Mesh {
     /// targeted half of `broadcast_presence`, for a peer that just
     /// connected or restarted and so has never heard us.
     async fn send_presence_to(&self, peer: &str) {
+        let Some(network) = self.network_for_peer(peer) else {
+            return;
+        };
+        self.send_presence_to_on_network(peer, &network).await;
+    }
+
+    /// Targeted presence on the network that produced the connection event.
+    /// A multi-homed peer may already have an older route in `peer_networks`;
+    /// using that arbitrary route here can scope a Local claim advert as
+    /// `false` on an ordinary mesh even though the Local session just became
+    /// usable. The event's authenticated network is the authoritative route
+    /// for this one reply.
+    async fn send_presence_to_on_network(&self, peer: &str, network: &str) {
         let profile = { self.state.lock().profile.clone() };
         let Some(mut profile) = profile else { return };
         // Same send-time stamp as `broadcast_presence` — a passive
         // clock-skew sample for the receiver.
         profile.sent_at = unix_now_ms();
-        let Some(network) = self.network_for_peer(peer) else {
-            return;
-        };
         // On a CEC room, the profile goes only to peers with a deliberate
         // CEC relationship — the targeted mirror of `broadcast_presence`
         // skipping the rooms entirely. (A session peer normally implies the
         // relationship already; this also covers strangers inherited from a
         // pre-gate session.)
-        if crate::cec::is_cec_network(&network) && !self.cec.relationship_with(peer) {
+        if crate::cec::is_cec_network(network) && !self.cec.relationship_with(peer) {
             return;
         }
         // Same per-network claimable scoping as `broadcast_presence`.
-        profile.claimable = profile.claimable && self.claimable_advertised_on(&network);
+        profile.claimable = profile.claimable && self.claimable_advertised_on(network);
         if let Ok(payload) = serde_json::to_value(&profile) {
             let _ = self
                 .client
                 .request(&Request::ChannelSendTo {
-                    network,
+                    network: network.to_string(),
                     channel: CHANNEL_PRESENCE.to_string(),
                     peer: pubkey_part(peer).to_string(),
                     payload,
@@ -16397,11 +16454,10 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
     }
 }
 
-/// Peers that the LAN claim rendezvous has discovered but has not opened a
-/// session to yet. Claimable presence is an AllMyStuff app frame, so `sighted`
-/// alone is not enough to make a device appear in another machine's Claim UI.
-/// Canonicalize here because the daemon's peer id may carry a device suffix
-/// while `network_connect_peer` addresses the identity pubkey.
+/// Peers the LAN claim rendezvous discovered but whose session has not reached
+/// application traffic. Claimable presence is an AllMyStuff frame, so
+/// `sighted` alone is not enough to make a device appear in another machine's
+/// Claim UI. Canonicalize because reconnect addresses the identity pubkey.
 fn local_claim_link_candidates(peers: &[Value]) -> Vec<String> {
     peers
         .iter()
@@ -16409,6 +16465,37 @@ fn local_claim_link_candidates(peers: &[Value]) -> Vec<String> {
         .filter_map(|peer| peer.get("device_id").and_then(Value::as_str))
         .map(|peer| pubkey_part(peer).to_string())
         .collect()
+}
+
+/// Admit at most three automatic repairs for one continuously-Sighted Local
+/// peer: immediately, then after 3 s, then after 10 s. Leaving Sighted removes
+/// the ledger entry in `refresh_peer_networks`, so a later genuine regression
+/// receives a new window. This keeps a stale mDNS row quiet while still riding
+/// out the short one-way startup races seen on Windows adapters.
+fn local_claim_repair_due(
+    repairs: &mut HashMap<String, LocalClaimRepair>,
+    peer: &str,
+    now: Instant,
+) -> bool {
+    let Some(repair) = repairs.get_mut(peer) else {
+        repairs.insert(
+            peer.to_string(),
+            LocalClaimRepair {
+                attempts: 1,
+                last: now,
+            },
+        );
+        return true;
+    };
+    if repair.attempts >= LOCAL_CLAIM_REPAIR_DELAYS.len() {
+        return false;
+    }
+    if now.duration_since(repair.last) < LOCAL_CLAIM_REPAIR_DELAYS[repair.attempts] {
+        return false;
+    }
+    repair.attempts += 1;
+    repair.last = now;
+    true
 }
 
 /// The authenticated identities the LAN-only daemon currently knows through
@@ -17713,7 +17800,7 @@ mod tests {
     }
 
     #[test]
-    fn local_claim_links_dial_only_sighted_peers() {
+    fn local_claim_repairs_only_sighted_peers() {
         use serde_json::json;
         let peers = vec![
             // The observed field case: mDNS knows the machine, but there is no
@@ -17732,6 +17819,38 @@ mod tests {
             local_claim_link_candidates(&peers),
             vec!["claimable-peer".to_string()]
         );
+    }
+
+    #[test]
+    fn local_claim_repairs_are_bounded_and_backed_off() {
+        let mut repairs = HashMap::new();
+        let start = Instant::now();
+        assert!(local_claim_repair_due(&mut repairs, "peer", start));
+        assert!(!local_claim_repair_due(
+            &mut repairs,
+            "peer",
+            start + Duration::from_secs(2)
+        ));
+        assert!(local_claim_repair_due(
+            &mut repairs,
+            "peer",
+            start + Duration::from_secs(3)
+        ));
+        assert!(!local_claim_repair_due(
+            &mut repairs,
+            "peer",
+            start + Duration::from_secs(12)
+        ));
+        assert!(local_claim_repair_due(
+            &mut repairs,
+            "peer",
+            start + Duration::from_secs(13)
+        ));
+        assert!(!local_claim_repair_due(
+            &mut repairs,
+            "peer",
+            start + Duration::from_secs(60)
+        ));
     }
 
     #[test]

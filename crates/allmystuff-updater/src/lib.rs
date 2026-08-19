@@ -4,7 +4,7 @@
 //! like `myownmesh update`, but self-contained — it keeps its own state
 //! under `~/.allmystuff/` and never links the mesh engine.
 //!
-//! **Three** binaries move in lockstep, the same trio the installer drops
+//! **Four** binaries move in lockstep, the complete suite the installer drops
 //! side by side, each shipped as `<stem>-<platform>.{tar.gz,zip}` with a
 //! mandatory `.sha256` sidecar (and, once release signing is configured, a
 //! `.minisig` detached signature):
@@ -41,10 +41,12 @@
 //!   2. [`apply_pending_if_any`] (called first thing in `main`) atomically
 //!      renames the staged binaries over the installed ones.
 //!
-//! The CLI is the required half: if its swap fails, the error is surfaced.
-//! GUI/node failures remain best-effort so they never block boot, but every
-//! unapplied artifact stays in the locked pending manifest for the role that
-//! owns its installed path. A service therefore cannot consume a GUI update
+//! The CLI is always required. Running as a loose desktop GUI marks that
+//! directory as a complete-suite install, so every sibling is required and a
+//! missing component is repaired. Minimal consumers update only roles they
+//! already own. Every unapplied artifact stays in the locked pending manifest
+//! for the role that owns its installed path. A service therefore cannot
+//! consume a GUI update
 //! it could not apply. Each half carries its own downgrade guard so a stale
 //! marker can never roll a binary back, and so a half that lagged a previous
 //! partial update catches up.
@@ -546,8 +548,8 @@ fn apply_pending() -> Result<Option<String>> {
         let _ = std::fs::remove_file(&pending);
         return Ok(None);
     }
-    // CLI first (the required half), then GUI / node (best-effort).
-    artifacts.sort_by_key(|a| if a.kind.is_required() { 0 } else { 1 });
+    // A loose desktop install requires the complete suite.
+    artifacts.sort_by_key(|a| if artifact_required_here(a.kind) { 0 } else { 1 });
 
     let mut applied: Vec<&'static str> = Vec::new();
     let mut remaining = Vec::new();
@@ -572,7 +574,7 @@ fn apply_pending() -> Result<Option<String>> {
             // manifest here is what stranded split installs.
             Ok(false) => remaining.push(art),
             Err(e) => {
-                if art.kind.is_required() {
+                if artifact_required_here(art.kind) {
                     // Keep the marker so the next launch retries rather than
                     // silently dropping the update and reporting success.
                     return Err(e);
@@ -612,7 +614,7 @@ fn artifact_needs_apply(kind: ArtifactKind, target_version: &str) -> bool {
 /// when there's nothing installed to replace (e.g. a staged GUI on a
 /// CLI-only host).
 fn apply_one(art: &StagedArtifact) -> Result<bool> {
-    let Some(target) = installed_path(art.kind) else {
+    let Some(target) = artifact_target_path(art.kind) else {
         return Ok(false);
     };
     let staged_dir = art
@@ -639,6 +641,29 @@ fn apply_one(art: &StagedArtifact) -> Result<bool> {
 /// copies (portable / `curl | sh` installs) still swap as before.
 fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
     resolve_installed_path(kind).filter(|p| !path_in_os_bundle(p))
+}
+
+/// A loose desktop GUI marks its directory as a complete-suite install.
+/// Return the promised sibling target even when it is currently missing.
+fn desktop_suite_target_from_current(current: &Path, kind: ArtifactKind) -> Option<PathBuf> {
+    if path_in_os_bundle(current)
+        || current.file_name()?.to_string_lossy() != ArtifactKind::Gui.bin_name()
+    {
+        return None;
+    }
+    Some(current.parent()?.join(kind.bin_name()))
+}
+
+fn desktop_suite_target(kind: ArtifactKind) -> Option<PathBuf> {
+    desktop_suite_target_from_current(&std::env::current_exe().ok()?, kind)
+}
+
+fn artifact_target_path(kind: ArtifactKind) -> Option<PathBuf> {
+    installed_path(kind).or_else(|| desktop_suite_target(kind))
+}
+
+fn artifact_required_here(kind: ArtifactKind) -> bool {
+    kind.is_required() || desktop_suite_target(kind).is_some()
 }
 
 /// Whether `path` lives inside an OS application bundle the updater must not
@@ -947,7 +972,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// Whether the half `kind` should be brought to `latest`. False when it
 /// isn't installed on this host; otherwise the per-artifact downgrade guard.
 fn artifact_needs_update(kind: ArtifactKind, latest: &str) -> bool {
-    if installed_path(kind).is_none() {
+    if artifact_target_path(kind).is_none() {
         return false;
     }
     artifact_needs_apply(kind, latest)
@@ -1606,9 +1631,9 @@ async fn stage_release(
             .find(|a| a["name"].as_str() == Some(&asset_name));
 
         // The CLI is the required half — its asset must be present and must
-        // download. The GUI/node halves are best-effort: a missing asset
-        // (older release) or a transient download error logs and continues so
-        // a sibling hiccup never blocks the CLI update.
+        // download. In a loose desktop install every suite asset is required.
+        // Minimal consumers keep non-owned artifacts best-effort, so a sibling
+        // they do not own never blocks their update.
         let staged_one = async {
             let asset =
                 asset.ok_or_else(|| Error::msg(format!("release has no asset {asset_name}")))?;
@@ -1629,7 +1654,7 @@ async fn stage_release(
                 }));
                 staged.push(kind);
             }
-            Err(e) if kind.is_required() => return Err(e),
+            Err(e) if artifact_required_here(kind) => return Err(e),
             Err(e) => {
                 tracing::warn!(
                     "self-update: staging the {} half failed ({e}); skipping it",
@@ -1985,6 +2010,22 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn loose_gui_owns_and_repairs_every_suite_sibling() {
+        let root = Path::new("C:/AMS");
+        let gui = root.join(ArtifactKind::Gui.bin_name());
+        for kind in ALL_ARTIFACTS {
+            assert_eq!(
+                desktop_suite_target_from_current(&gui, kind),
+                Some(root.join(kind.bin_name()))
+            );
+        }
+        let cli = root.join(ArtifactKind::Cli.bin_name());
+        assert!(desktop_suite_target_from_current(&cli, ArtifactKind::Serve).is_none());
+        let bundled = Path::new("/Applications/AllMyStuff.app/Contents/MacOS")
+            .join(ArtifactKind::Gui.bin_name());
+        assert!(desktop_suite_target_from_current(&bundled, ArtifactKind::Serve).is_none());
+    }
     #[test]
     fn empty_baked_pubkey_is_treated_as_unconfigured() {
         // CI exports ALLMYSTUFF_RELEASE_PUBKEY unconditionally, so an unset repo

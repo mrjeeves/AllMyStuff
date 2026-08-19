@@ -257,6 +257,11 @@ pub struct FileVolume {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FileEvent {
+    /// Query filesystem usage for a scoped native-drive route. Answered with
+    /// `QuotaInfo` or `Err`.
+    Quota {
+        req: u64,
+    },
     /// List mounted filesystem roots. Used by the KVM virtual-media picker so
     /// a remote removable disk is reachable without guessing its drive letter.
     Volumes {
@@ -349,6 +354,12 @@ pub enum FileEvent {
         req: u64,
         volumes: Vec<FileVolume>,
     },
+    /// Filesystem usage returned by `Quota`.
+    QuotaInfo {
+        req: u64,
+        used: u64,
+        total: u64,
+    },
     /// Metadata returned by `Stat`.
     Metadata {
         req: u64,
@@ -385,7 +396,8 @@ impl FileEvent {
     /// it reads as `0` — it is dropped before this is consulted anyway.
     pub fn req(&self) -> u64 {
         match self {
-            FileEvent::Volumes { req }
+            FileEvent::Quota { req }
+            | FileEvent::Volumes { req }
             | FileEvent::List { req, .. }
             | FileEvent::Read { req, .. }
             | FileEvent::Stat { req, .. }
@@ -398,6 +410,7 @@ impl FileEvent {
             | FileEvent::Delete { req, .. }
             | FileEvent::Entries { req, .. }
             | FileEvent::VolumeList { req, .. }
+            | FileEvent::QuotaInfo { req, .. }
             | FileEvent::Metadata { req, .. }
             | FileEvent::Chunk { req, .. }
             | FileEvent::Ok { req }
@@ -1155,6 +1168,7 @@ mod tests {
     #[test]
     fn file_frame_round_trips_each_event() {
         let events = [
+            FileEvent::Quota { req: 11 },
             FileEvent::List {
                 req: 1,
                 path: "~".into(),
@@ -1205,6 +1219,11 @@ mod tests {
             FileEvent::Err {
                 req: 10,
                 reason: "no such file".into(),
+            },
+            FileEvent::QuotaInfo {
+                req: 12,
+                used: 40,
+                total: 100,
             },
         ];
         for event in events {

@@ -111,6 +111,7 @@ pub async fn run(
                     }
                 }
                 // The node restarted or the event stream dropped — end cleanly.
+                Some(NodeEvent::Upgrade) => {}
                 Some(NodeEvent::Restart) | None => break,
             },
 

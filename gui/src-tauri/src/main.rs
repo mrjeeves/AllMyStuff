@@ -3127,6 +3127,15 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
                 NodeEvent::Emit { event, payload } => {
                     let _ = app.emit(&event, payload);
                 }
+                NodeEvent::Upgrade => {
+                    match allmystuff_updater::update_now().await {
+                        Ok(outcome) => {
+                            tracing::info!("fleet GUI upgrade completed: {outcome:?}")
+                        }
+                        Err(e) => tracing::warn!("fleet GUI upgrade failed: {e}"),
+                    }
+                    app.restart();
+                }
                 NodeEvent::Restart => app.restart(), // never returns
             }
         }

@@ -630,7 +630,7 @@ if (-not $NoGui) {
         if (Try-ReleaseGui) {
             $guiInstalled = $true
         } else {
-            Warn "GUI binary not installed; a bare 'allmystuff' will print a hint until it is. Re-run the installer later, or build it from gui\."
+            throw "Full AllMyStuff install failed: the GUI binary was not installed."
         }
     } elseif ($DryRun) {
         Log "(dry-run) would install the GUI binary ($guiAsset) next to allmystuff"
@@ -648,7 +648,7 @@ if ($installedFromRelease) {
     if (Try-ReleaseServe) {
         $serveInstalled = $true
     } else {
-        Warn "Node binary not installed; 'allmystuff serve' will print a hint until it is."
+        throw "Full AllMyStuff install failed: allmystuff-serve was not installed."
     }
 } elseif ($DryRun) {
     Log "(dry-run) would install the node binary ($serveAsset) next to allmystuff"
@@ -676,7 +676,7 @@ if ($NoAmst) {
     if (Try-ReleaseAmst) {
         $amstInstalled = $true
     } else {
-        Warn "amst not installed from the release; for it on its own use scripts\install-amst.ps1."
+        throw "Full AllMyStuff install failed: amst was not installed."
     }
 } else {
     if (Build-AmstFromSource) {

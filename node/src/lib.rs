@@ -187,6 +187,11 @@ pub trait UiSink: Send + Sync + 'static {
     /// fire-and-forget, and headless sinks should be too.
     fn emit(&self, event: &str, payload: serde_json::Value);
 
+    /// Ask an attached desktop owner to update in its own install context,
+    /// then relaunch. Services and bundled nodes cannot reliably find a
+    /// per-user GUI. Headless sinks have no desktop owner and ignore this.
+    fn upgrade_host(&self) {}
+
     /// Relaunch the host process onto a freshly-applied self-update (the
     /// fleet "upgrade this machine" path). The GUI restarts its webview app;
     /// the headless node re-execs itself. Never returns.

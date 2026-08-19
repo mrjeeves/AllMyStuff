@@ -72,6 +72,8 @@ struct WireResponse {
 pub enum NodeEvent {
     /// A `UiSink::emit` — one named event + its JSON payload.
     Emit { event: String, payload: Value },
+    /// Desktop lifecycle signal; terminal clients ignore it.
+    Upgrade,
     /// The node is re-execing onto a staged update.
     Restart,
 }

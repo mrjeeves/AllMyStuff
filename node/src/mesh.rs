@@ -8715,18 +8715,27 @@ impl Mesh {
                 // upgrade lands — exactly how a claim confirms by re-advert.
                 let sink = self.sink.clone();
                 crate::spawn(async move {
-                    match allmystuff_updater::update_now().await {
+                    let node_updated = match allmystuff_updater::update_now().await {
                         Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
                             tracing::info!(
                                 "self-update applied {to} ({}) — restarting",
                                 components.join("+")
                             );
-                            sink.restart();
+                            true
                         }
                         Ok(other) => {
-                            tracing::info!("upgrade request: nothing to do ({other:?})")
+                            tracing::info!("node upgrade request: nothing to do ({other:?})");
+                            false
                         }
-                        Err(e) => tracing::warn!("upgrade request failed: {e}"),
+                        Err(e) => {
+                            tracing::warn!("node upgrade request failed: {e}");
+                            false
+                        }
+                    };
+                    sink.upgrade_host();
+                    if node_updated {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        sink.restart();
                     }
                 });
             }
@@ -13267,6 +13276,16 @@ impl Mesh {
                         self.send_file_event(frame.route.clone(), from.to_string(), reply);
                     }
                 }
+                FileEvent::Quota { req } if !mapped => {
+                    self.send_file_event(
+                        frame.route.clone(),
+                        from.to_string(),
+                        FileEvent::Err {
+                            req: *req,
+                            reason: "quota is only available on a scoped drive route".into(),
+                        },
+                    );
+                }
                 FileEvent::Volumes { req } if mapped => {
                     self.send_file_event(
                         frame.route.clone(),
@@ -13278,7 +13297,8 @@ impl Mesh {
                         },
                     );
                 }
-                FileEvent::Volumes { .. }
+                FileEvent::Quota { .. }
+                | FileEvent::Volumes { .. }
                 | FileEvent::List { .. }
                 | FileEvent::Read { .. }
                 | FileEvent::Stat { .. }
@@ -13440,6 +13460,7 @@ impl Mesh {
                 let terminal = matches!(
                     event,
                     FileEvent::Entries { .. }
+                        | FileEvent::QuotaInfo { .. }
                         | FileEvent::Metadata { .. }
                         | FileEvent::Ok { .. }
                         | FileEvent::Err { .. }
@@ -17408,7 +17429,8 @@ fn append_chunk(path: &Path, data: &[u8], first: bool) -> std::io::Result<()> {
 fn is_viewer_file_request(event: &FileEvent) -> bool {
     matches!(
         event,
-        FileEvent::Volumes { .. }
+        FileEvent::Quota { .. }
+            | FileEvent::Volumes { .. }
             | FileEvent::List { .. }
             | FileEvent::Read { .. }
             | FileEvent::Stat { .. }
@@ -17596,6 +17618,7 @@ mod tests {
     #[test]
     fn volume_inventory_is_a_viewer_file_request() {
         assert!(is_viewer_file_request(&FileEvent::Volumes { req: 7 }));
+        assert!(is_viewer_file_request(&FileEvent::Quota { req: 8 }));
         assert!(!is_viewer_file_request(&FileEvent::VolumeList {
             req: 7,
             volumes: Vec::new(),

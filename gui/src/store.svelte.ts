@@ -555,6 +555,9 @@ export interface SharePartner {
   person: Person;
   nodes: MeshNode[];
   grants: { node: MeshNode; grant: Grant }[];
+  /** Authoritative directional projections when supplied by the node. */
+  sharedByYou: { node: MeshNode; grant: Grant }[];
+  sharedWithYou: { node: MeshNode; grant: Grant }[];
 }
 
 /** A graph with nothing in it — the starting point under the real backend,
@@ -655,6 +658,9 @@ class AppStore {
   // catalog is only a stand-in for the browser/preview build (no Tauri
   // backend) so the marketing page is never blank.
   catalog = $state<Catalog>(isTauri() ? emptyCatalog() : demoCatalog());
+  /** Node-owned durable shares, including their authoritative authoring
+   *  direction. Relationships retain the compatible union used by routing. */
+  private durableShares = $state<Share[]>([]);
 
   // ---- interaction state ------------------------------------------
   uiMode = $state<UiMode>(loadUiMode());
@@ -2913,7 +2919,10 @@ class AppStore {
    *  sending side of a share. You can't share someone else's stuff. */
   isMyDevice(id: string | null): boolean {
     if (!id) return false;
-    const n = this.node(id);
+    // Persisted grants intentionally scope capabilities to canonical bare
+    // pubkeys, while graph nodes normally use MyOwnMesh's display suffix.
+    // Ownership is machine identity, not exact presentation spelling.
+    const n = this.nodeByCanonical(id);
     if (!n) return false;
     const st = this.standingOf(n);
     return st.mine || st.self;
@@ -3007,10 +3016,9 @@ class AppStore {
     const recv = this.node(receiverNodeId);
     if (!recv || recv.relationship.kind !== "shared") return [];
     const pid = recv.relationship.person.id;
-    const grants: Grant[] = [];
-    for (const n of this.catalog.nodes) {
-      if (n.relationship.kind === "shared" && n.relationship.person.id === pid) grants.push(...n.relationship.grants);
-    }
+    const grants = this.sharePartners
+      .find((partner) => partner.person.id === pid)
+      ?.sharedByYou.map(({ grant }) => grant) ?? [];
     const sc = canonicalNodeId(senderId);
     const forSender = (g: Grant) => !!g.capability && this.capNodeOf(g.capability) === sc;
     const out: ShareCap[] = [];
@@ -3038,21 +3046,18 @@ class AppStore {
     const personId = recv.relationship.person.id;
     const sender = canonicalNodeId(senderId);
     const mounts = new Map<string, SharedFolderMount>();
-    for (const node of this.catalog.nodes) {
-      if (
-        node.relationship.kind !== "shared" ||
-        node.relationship.person.id !== personId
-      ) continue;
-      for (const grant of node.relationship.grants) {
-        if (grant.media !== "storage" || !grant.capability) continue;
-        if (this.capNodeOf(grant.capability) !== sender) continue;
-        const marker = ":folder:";
-        const at = grant.capability.indexOf(marker);
-        if (at < 0) continue;
-        const id = grant.capability.slice(at + marker.length);
-        if (!id || id.includes(":")) continue;
-        mounts.set(id, { id, label: this.sharedFolderLabel(grant), path: "" });
-      }
+    const grants = this.sharePartners
+      .find((partner) => partner.person.id === personId)
+      ?.sharedByYou.map(({ grant }) => grant) ?? [];
+    for (const grant of grants) {
+      if (grant.media !== "storage" || !grant.capability) continue;
+      if (this.capNodeOf(grant.capability) !== sender) continue;
+      const marker = ":folder:";
+      const at = grant.capability.indexOf(marker);
+      if (at < 0) continue;
+      const id = grant.capability.slice(at + marker.length);
+      if (!id || id.includes(":")) continue;
+      mounts.set(id, { id, label: this.sharedFolderLabel(grant), path: "" });
     }
     return [...mounts.values()].sort((a, b) => a.label.localeCompare(b.label));
   }
@@ -3077,27 +3082,27 @@ class AppStore {
     const advertised = new Map((source.sites ?? []).map((site) => [site.id, site]));
     const selected = new Map<string, SiteAdvert>();
     let legacyAll = false;
-    for (const node of this.catalog.nodes) {
-      if (node.relationship.kind !== "shared" || node.relationship.person.id !== personId) continue;
-      for (const grant of node.relationship.grants) {
-        if (grant.media !== "generic" || !grant.capability || this.capNodeOf(grant.capability) !== sender) continue;
-        if (grant.capability.endsWith(":sites")) {
-          legacyAll = true;
-          continue;
-        }
-        const marker = ":site:";
-        const at = grant.capability.indexOf(marker);
-        if (at < 0) continue;
-        const id = grant.capability.slice(at + marker.length);
-        if (!id) continue;
-        const known = advertised.get(id);
-        selected.set(id, known ?? {
-          id,
-          label: this.sharedSiteLabel(grant),
-          port: sitePort(id),
-          scheme: "",
-        });
+    const grants = this.sharePartners
+      .find((partner) => partner.person.id === personId)
+      ?.sharedByYou.map(({ grant }) => grant) ?? [];
+    for (const grant of grants) {
+      if (grant.media !== "generic" || !grant.capability || this.capNodeOf(grant.capability) !== sender) continue;
+      if (grant.capability.endsWith(":sites")) {
+        legacyAll = true;
+        continue;
       }
+      const marker = ":site:";
+      const at = grant.capability.indexOf(marker);
+      if (at < 0) continue;
+      const id = grant.capability.slice(at + marker.length);
+      if (!id) continue;
+      const known = advertised.get(id);
+      selected.set(id, known ?? {
+        id,
+        label: this.sharedSiteLabel(grant),
+        port: sitePort(id),
+        scheme: "",
+      });
     }
     if (legacyAll) return [...advertised.values()].sort((a, b) => a.port - b.port);
     return [...selected.values()].sort((a, b) => a.port - b.port);
@@ -10491,6 +10496,10 @@ class AppStore {
    *  and defaulting the peer to unclaimed. The node is the source of truth;
    *  this never overrides a device you own. */
   private applyDurableShares(shares: Share[]) {
+    // Keep the empty set too: a full snapshot that removes the final share
+    // must clear the UI's directional source of truth rather than retaining a
+    // stale previous snapshot.
+    this.durableShares = shares;
     if (!shares.length) return;
     const byPerson = new Map(shares.map((s) => [s.person.id, s]));
     for (const n of this.catalog.nodes) {
@@ -10513,15 +10522,21 @@ class AppStore {
     }
   }
 
-  /** Everyone you're sharing with, one entry per person/fleet: their nodes and
-   *  every grant in both directions. `isShareOutGrant` separates what this
-   *  fleet shares from what the other fleet shares in the Settings pane. */
+  /** Everyone you're sharing with, one entry per person/fleet. New nodes carry
+   *  the persisted outbound/inbound split; older nodes fall back to capability
+   *  ownership inference for compatibility. */
   sharePartners = $derived.by((): SharePartner[] => {
     const map = new Map<string, SharePartner>();
     for (const n of this.catalog.nodes) {
       if (n.relationship.kind !== "shared") continue;
       const share = n.relationship;
-      const p = map.get(share.person.id) ?? { person: share.person, nodes: [], grants: [] };
+      const p = map.get(share.person.id) ?? {
+        person: share.person,
+        nodes: [],
+        grants: [],
+        sharedByYou: [],
+        sharedWithYou: [],
+      };
       // Dedupe by the keys the Sharing list renders with (node id, grant id):
       // a grant is to the *person*, so the same grant id is recorded on each of
       // their devices — collecting them raw gives a duplicate key per grant and
@@ -10532,6 +10547,33 @@ class AppStore {
         if (!p.grants.some((x) => x.grant.id === g.id)) p.grants.push({ node: n, grant: g });
       }
       map.set(share.person.id, p);
+    }
+    for (const partner of map.values()) {
+      const durable = this.durableShares.find((share) => share.person.id === partner.person.id);
+      const hasDirection = durable?.out_grants !== undefined && durable.in_grants !== undefined;
+      const holderFor = (grant: Grant) =>
+        partner.grants.find((row) => row.grant.id === grant.id)?.node ?? partner.nodes[0];
+      const rows = (grants: Grant[]) => grants.map((grant) => ({ node: holderFor(grant), grant }));
+      if (hasDirection && durable) {
+        partner.sharedByYou = rows(durable.out_grants ?? []);
+        partner.sharedWithYou = rows(durable.in_grants ?? []);
+        // Preserve an optimistic row until the command's fresh snapshot
+        // arrives. Anything not in either authoritative set was just added
+        // locally and can use the legacy classifier briefly.
+        const known = new Set([
+          ...partner.sharedByYou.map(({ grant }) => grant.id),
+          ...partner.sharedWithYou.map(({ grant }) => grant.id),
+        ]);
+        for (const row of partner.grants) {
+          if (known.has(row.grant.id)) continue;
+          (this.isShareOutGrant(row.grant)
+            ? partner.sharedByYou
+            : partner.sharedWithYou).push(row);
+        }
+      } else {
+        partner.sharedByYou = partner.grants.filter(({ grant }) => this.isShareOutGrant(grant));
+        partner.sharedWithYou = partner.grants.filter(({ grant }) => !this.isShareOutGrant(grant));
+      }
     }
     return [...map.values()].sort((a, b) => a.person.name.localeCompare(b.person.name));
   });

@@ -1524,7 +1524,7 @@
           {#if normalMode && st.app}
             {n.hostname?.trim() || n.label}
           {:else if st.shared}
-            shared with {st.shared.name}
+            Shares Active
           {:else if !st.app}
             on the mesh · not running AllMyStuff
           {:else if n.summary}

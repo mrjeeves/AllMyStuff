@@ -48,6 +48,11 @@ jobs:
       ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.ALLMYSTUFF_RELEASE_PUBKEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A manual rebuild must compile the requested immutable release,
+          # not whichever commit happens to be at the tip of the dispatching
+          # branch. Tag pushes already resolve github.ref to the same tag.
+          ref: ${{ inputs.tag || github.ref }}
 
       # Guard against the "tag says v0.2.0, binary reports 0.1.5" trap. The
       # CLI binary embeds CARGO_PKG_VERSION (via [workspace.package].version)
@@ -90,7 +95,9 @@ jobs:
       # everything here covers all three build steps in one place.
       - name: Linux deps
         if: runner.os == 'Linux'
+        timeout-minutes: 20
         run: |
+          set -euo pipefail
           # Ubuntu 22.04 ships PipeWire 0.3.48, whose headers are too old
           # for the libspa 0.9 bindings xcap's screen capture pulls in —
           # bindgen generates spa_video_info_raw without the `flags` field
@@ -101,9 +108,27 @@ jobs:
           # doesn't need this — it runs on ubuntu-latest (24.04), whose
           # stock headers are new enough; that asymmetry is why CI stayed
           # green while the release broke.
-          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
-          sudo apt-get update
-          sudo apt-get install -y \
+          # GitHub's hosted x86_64 image puts an Azure mirror first in this
+          # mirror list. When that endpoint stops responding, apt can hang on
+          # one Packages file indefinitely instead of reaching the official
+          # fallback. Keep the fallback and remove only the unhealthy mirror.
+          if [[ -f /etc/apt/apt-mirrors.txt ]] && \
+             grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+
+          # add-apt-repository refreshes every apt source by default. Suppress
+          # that implicit, unbounded refresh and perform one explicit update
+          # with retries and transport timeouts instead.
+          sudo add-apt-repository -y --no-update ppa:pipewire-debian/pipewire-upstream
+          apt_options=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          sudo apt-get "${apt_options[@]}" update
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get "${apt_options[@]}" install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libssl-dev libasound2-dev xdg-utils \
             libpipewire-0.3-dev libxkbcommon-dev libgbm-dev

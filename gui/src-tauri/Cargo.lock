@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "serde",
  "serde_json",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "serde",
  "serde_json",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "serde",
  "serde_json",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
@@ -161,7 +161,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "allmystuff-graph",
  "dirs 5.0.1",
@@ -171,16 +171,17 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "plist",
  "serde_json",
 ]
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -191,10 +192,11 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.86"
+version = "0.2.88"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
+ "fs2",
  "hex",
  "minisign-verify",
  "reqwest 0.12.28",
@@ -1929,6 +1931,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

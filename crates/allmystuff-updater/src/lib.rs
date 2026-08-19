@@ -41,22 +41,26 @@
 //!   2. [`apply_pending_if_any`] (called first thing in `main`) atomically
 //!      renames the staged binaries over the installed ones.
 //!
-//! The CLI is the required half: if its swap fails, the staged marker is
-//! **kept** and the error surfaced so the next launch retries rather than
-//! reporting a phantom success. The GUI and node halves are best-effort —
-//! a host without one installed just updates the others. Each half carries
-//! its own downgrade guard so a stale marker can never roll a binary back,
-//! and so a half that lagged a previous partial update catches up.
+//! The CLI is the required half: if its swap fails, the error is surfaced.
+//! GUI/node failures remain best-effort so they never block boot, but every
+//! unapplied artifact stays in the locked pending manifest for the role that
+//! owns its installed path. A service therefore cannot consume a GUI update
+//! it could not apply. Each half carries its own downgrade guard so a stale
+//! marker can never roll a binary back, and so a half that lagged a previous
+//! partial update catches up.
 //!
 //! Package-manager installs (Homebrew, dpkg/apt, MSI) are detected and
 //! left to the OS updater.
 
 pub mod policy;
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use policy::{compare_semver, policy_allows, ApplyPolicy};
@@ -435,8 +439,9 @@ impl ArtifactKind {
 
 /// Apply any staged update before real work starts. Idempotent; a
 /// best-effort (GUI/node) failure is logged and swallowed so an update
-/// problem never blocks boot, but a failed *CLI* swap leaves the marker in
-/// place to retry next launch. Call this first in `main`.
+/// problem never blocks boot. Every artifact that was not applied remains in
+/// the shared manifest for its owning role; a failed CLI swap additionally
+/// surfaces the error. Call this first in `main`.
 pub fn apply_pending_if_any() {
     cleanup_old_replaced_binaries();
     if let Err(e) = apply_pending() {
@@ -460,6 +465,50 @@ struct StagedArtifact {
     archive: PathBuf,
 }
 
+fn lock_pending_state() -> Result<File> {
+    let updates = updates_dir()?;
+    std::fs::create_dir_all(&updates)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(updates.join("pending.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn write_pending_artifacts(
+    pending: &Path,
+    version: &str,
+    artifacts: &[StagedArtifact],
+) -> Result<()> {
+    if artifacts.is_empty() {
+        match std::fs::remove_file(pending) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let artifacts = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "kind": artifact.kind.as_str(),
+                "path": artifact.archive.to_string_lossy(),
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        pending,
+        serde_json::to_string_pretty(&json!({
+            "version": version,
+            "artifacts": artifacts,
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn parse_pending_artifacts(doc: &serde_json::Value) -> Vec<StagedArtifact> {
     let mut out = Vec::new();
     if let Some(arts) = doc["artifacts"].as_array() {
@@ -480,6 +529,10 @@ fn parse_pending_artifacts(doc: &serde_json::Value) -> Vec<StagedArtifact> {
 }
 
 fn apply_pending() -> Result<Option<String>> {
+    // GUI, CLI, and service roles share one updater home. Serialize manifest
+    // mutation so each role can acknowledge only the artifacts it can
+    // actually reach without racing another role's rewrite.
+    let _pending_lock = lock_pending_state()?;
     let pending = updates_dir()?.join("pending.json");
     if !pending.exists() {
         return Ok(None);
@@ -497,14 +550,15 @@ fn apply_pending() -> Result<Option<String>> {
     artifacts.sort_by_key(|a| if a.kind.is_required() { 0 } else { 1 });
 
     let mut applied: Vec<&'static str> = Vec::new();
-    for art in &artifacts {
+    let mut remaining = Vec::new();
+    for art in artifacts {
         // Per-artifact downgrade guard: only swap a half that's actually
         // behind, so a stale marker can't roll one back and a half that
         // lagged a previous partial update still catches up.
         if !artifact_needs_apply(art.kind, &target_version) {
             continue;
         }
-        match apply_one(art) {
+        match apply_one(&art) {
             Ok(true) => {
                 applied.push(art.kind.as_str());
                 // Stamp the version we just installed for the half that has
@@ -512,9 +566,11 @@ fn apply_pending() -> Result<Option<String>> {
                 // later check knows they're current.
                 record_artifact_version(art.kind, &target_version);
             }
-            // Nothing installed to replace (e.g. a staged GUI on a host that
-            // has no GUI) — not an error.
-            Ok(false) => {}
+            // This role cannot resolve the target (most importantly, the
+            // protected service seeing a per-user GUI artifact). Leave that
+            // artifact pending for its actual owner; consuming the whole
+            // manifest here is what stranded split installs.
+            Ok(false) => remaining.push(art),
             Err(e) => {
                 if art.kind.is_required() {
                     // Keep the marker so the next launch retries rather than
@@ -522,11 +578,18 @@ fn apply_pending() -> Result<Option<String>> {
                     return Err(e);
                 }
                 tracing::warn!("self-update: {} apply skipped: {e}", art.kind.as_str());
+                remaining.push(art);
             }
         }
     }
 
-    let _ = std::fs::remove_file(&pending);
+    write_pending_artifacts(&pending, &target_version, &remaining)?;
+    if !remaining.is_empty() {
+        tracing::info!(
+            "self-update {target_version}: {} artifact(s) remain pending for another installed role",
+            remaining.len()
+        );
+    }
     if applied.is_empty() {
         return Ok(None);
     }
@@ -1588,6 +1651,10 @@ async fn stage_release(
         }));
     }
 
+    // A GUI and service can finish the same check close together. Serialize
+    // the shared manifest write with apply so neither observes or removes a
+    // half-written ownership document.
+    let _pending_lock = lock_pending_state()?;
     std::fs::write(
         updates_dir()?.join("pending.json"),
         serde_json::to_string_pretty(&serde_json::json!({
@@ -2080,6 +2147,49 @@ mod tests {
             arts[2].archive,
             std::path::PathBuf::from("/u/0.1.16/allmystuff-serve")
         );
+    }
+
+    #[test]
+    fn a_role_cannot_consume_another_roles_pending_artifact() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_path = std::env::var_os("PATH");
+        let old_gui = std::env::var_os("ALLMYSTUFF_GUI_BIN");
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+        std::env::set_var("PATH", "");
+        std::env::remove_var("ALLMYSTUFF_GUI_BIN");
+
+        let updates = tmp.path().join("updates");
+        std::fs::create_dir_all(updates.join("0.2.89")).unwrap();
+        let pending = updates.join("pending.json");
+        std::fs::write(
+            &pending,
+            serde_json::to_string_pretty(&json!({
+                "version": "0.2.89",
+                "artifacts": [{
+                    "kind": "gui",
+                    "path": updates.join("0.2.89/allmystuff-gui.zip"),
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(apply_pending().unwrap(), None);
+        let retained: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pending).unwrap()).unwrap();
+        assert_eq!(retained["version"], "0.2.89");
+        assert_eq!(retained["artifacts"][0]["kind"], "gui");
+
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match old_gui {
+            Some(value) => std::env::set_var("ALLMYSTUFF_GUI_BIN", value),
+            None => std::env::remove_var("ALLMYSTUFF_GUI_BIN"),
+        }
+        std::env::remove_var("ALLMYSTUFF_HOME");
     }
 
     #[test]

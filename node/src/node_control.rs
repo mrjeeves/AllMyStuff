@@ -149,6 +149,95 @@ pub struct NodeRequest {
 /// stream instead of a one-shot command.
 pub const SUBSCRIBE_EVENTS: &str = "__subscribe_events";
 
+/// Process environment naming who owns the lifecycle of this node process.
+///
+/// CEC Support carries an AllMyStuff node so a machine with no AllMyStuff
+/// install still works. That copy is a fallback, not a peer owner: once the
+/// real AllMyStuff app or service starts it must be able to take the single
+/// machine socket without depending on process start order.
+pub const RUNTIME_OWNER_ENV: &str = "ALLMYSTUFF_RUNTIME_OWNER";
+
+/// The explicit lifecycle owner advertised over the local control socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeOwner {
+    /// A node launched by an installed AllMyStuff app/service. Canonical and
+    /// never displaced by another local client.
+    AllMyStuffInstalled,
+    /// The sidecar CEC Support launches when no canonical runtime is present.
+    /// It keeps the machine reachable, but yields when AllMyStuff arrives.
+    CecSupportBundled,
+}
+
+impl RuntimeOwner {
+    pub fn current() -> Self {
+        match std::env::var(RUNTIME_OWNER_ENV).as_deref() {
+            Ok("cec-support-bundled") => Self::CecSupportBundled,
+            _ => Self::AllMyStuffInstalled,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllMyStuffInstalled => "all-my-stuff-installed",
+            Self::CecSupportBundled => "cec-support-bundled",
+        }
+    }
+
+    const fn yields_to(self, requested: Self) -> bool {
+        matches!(
+            (self, requested),
+            (Self::CecSupportBundled, Self::AllMyStuffInstalled)
+        )
+    }
+}
+
+/// Runtime ownership plus the graceful-shutdown channel owned by
+/// `allmystuff-serve`. Kept out of `Mesh`: this is local process arbitration,
+/// not mesh state, and must never cross the network.
+#[derive(Clone)]
+pub struct RuntimeControl {
+    owner: RuntimeOwner,
+    yield_tx: mpsc::Sender<()>,
+}
+
+impl RuntimeControl {
+    pub fn new(owner: RuntimeOwner, yield_tx: mpsc::Sender<()>) -> Self {
+        Self { owner, yield_tx }
+    }
+
+    fn status(&self) -> Value {
+        json!({
+            "owner": self.owner,
+            "yieldable": self.owner == RuntimeOwner::CecSupportBundled,
+        })
+    }
+
+    fn request_takeover(&self, requested: RuntimeOwner) -> Value {
+        if !self.owner.yields_to(requested) {
+            return json!({
+                "accepted": false,
+                "owner": self.owner,
+                "requested_owner": requested,
+                "reason": "canonical-owner",
+            });
+        }
+
+        // Let the one-shot response reach the requester before the serve loop
+        // starts its clean shutdown and releases the socket.
+        let tx = self.yield_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(()).await;
+        });
+        json!({
+            "accepted": true,
+            "owner": self.owner,
+            "requested_owner": requested,
+        })
+    }
+}
+
 /// One engine event as it travels the event connection — either an
 /// `emit(event, payload)` from the [`UiSink`], or the relaunch signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,6 +700,7 @@ pub async fn serve(
     disabled: Arc<DisabledNetworks>,
     broadcaster: Broadcaster,
     event_rx: mpsc::UnboundedReceiver<NodeEvent>,
+    runtime: RuntimeControl,
 ) -> Result<()> {
     // Drain the engine's ordered event queue out to every subscribed client.
     tokio::spawn(fan_out(event_rx, broadcaster.clone()));
@@ -628,8 +718,11 @@ pub async fn serve(
         let client = client.clone();
         let disabled = disabled.clone();
         let broadcaster = broadcaster.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, mesh, client, disabled, broadcaster).await {
+            if let Err(e) =
+                handle_connection(stream, mesh, client, disabled, broadcaster, runtime).await
+            {
                 tracing::debug!("node control connection ended: {e:#}");
             }
         });
@@ -644,6 +737,7 @@ async fn handle_connection(
     client: Arc<ControlClient>,
     disabled: Arc<DisabledNetworks>,
     broadcaster: Broadcaster,
+    runtime: RuntimeControl,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.split();
     let Some((tag, body)) = read_frame(&mut reader).await? else {
@@ -659,7 +753,7 @@ async fn handle_connection(
         return run_event_writer(writer, broadcaster).await;
     }
 
-    let out = dispatch(&mesh, &client, &disabled, req).await;
+    let out = dispatch(&mesh, &client, &disabled, &runtime, req).await;
     match out {
         DispatchOut::Json(v) => {
             let body = serde_json::to_vec(&WireResponse::ok(v))?;
@@ -752,6 +846,7 @@ pub async fn dispatch(
     mesh: &Arc<Mesh>,
     client: &Arc<ControlClient>,
     disabled: &Arc<DisabledNetworks>,
+    runtime: &RuntimeControl,
     req: NodeRequest,
 ) -> DispatchOut {
     let a = &req.args;
@@ -767,6 +862,11 @@ pub async fn dispatch(
 
     match req.cmd.as_str() {
         // ---- this machine ------------------------------------------------
+        "runtime_owner" => DispatchOut::Json(runtime.status()),
+        "yield_runtime" => {
+            let requested: RuntimeOwner = try_arg!(arg(a, "requested_owner"));
+            DispatchOut::Json(runtime.request_takeover(requested))
+        }
         "scan_self" => {
             let me = mesh
                 .resolve_local_id()
@@ -2169,6 +2269,48 @@ pub async fn ensure_node_running_pinned(pin: Option<&str>) -> Result<Option<Node
     ensure_node_running_impl(pin, true).await
 }
 
+/// Ask a live CEC-bundled fallback to release the machine socket for an
+/// installed AllMyStuff runtime. Older nodes do not implement the ownership
+/// commands and are simply reused; after CEC Support pins the release carrying
+/// this contract, the handoff is explicit and deterministic.
+pub async fn take_over_bundled_runtime() -> bool {
+    let Ok(client) = NodeClient::new() else {
+        return false;
+    };
+    let status = match client.request("runtime_owner", json!({})).await {
+        Ok(status) => status,
+        Err(_) => return false,
+    };
+    let owner = serde_json::from_value::<RuntimeOwner>(status["owner"].clone()).ok();
+    if owner != Some(RuntimeOwner::CecSupportBundled) {
+        return false;
+    }
+    let accepted = client
+        .request(
+            "yield_runtime",
+            json!({ "requested_owner": RuntimeOwner::AllMyStuffInstalled }),
+        )
+        .await
+        .ok()
+        .and_then(|value| value["accepted"].as_bool())
+        == Some(true);
+    if !accepted {
+        return false;
+    }
+
+    tracing::info!(
+        "CEC Support's bundled node accepted the runtime handoff; waiting for the machine socket"
+    );
+    for _ in 0..50 {
+        if !NodeClient::probe().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::warn!("CEC Support accepted the runtime handoff but kept the machine socket");
+    false
+}
+
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PinnedNodeAction {
@@ -2552,26 +2694,36 @@ async fn ensure_node_running_impl(
     let _ = require_interactive_windows_node;
 
     if NodeClient::probe().await {
-        #[cfg(windows)]
-        if let Some((caller_pid, caller_session_id)) = caller {
-            let (node_pid, node_session_id) = windows_node_process_session().await?;
-            pinned_node_action(caller_session_id, Some(node_session_id))?;
-            tracing::info!(
-                caller_pid,
-                caller_session_id,
-                node_pid,
-                node_session_id,
-                "CEC Support is reusing an interactive AllMyStuff node"
-            );
+        // Installed AllMyStuff is the canonical runtime. If CEC Support is
+        // currently keeping the machine alive with its bundled fallback, ask
+        // it to step aside cleanly, then continue into our normal spawn path.
+        // CEC callers never make this request; they reuse whichever canonical
+        // AMS runtime is already present.
+        let handed_off = !require_interactive_windows_node && take_over_bundled_runtime().await;
+        if handed_off {
+            tracing::info!("installed AllMyStuff is taking runtime ownership from CEC Support");
+        } else {
+            #[cfg(windows)]
+            if let Some((caller_pid, caller_session_id)) = caller {
+                let (node_pid, node_session_id) = windows_node_process_session().await?;
+                pinned_node_action(caller_session_id, Some(node_session_id))?;
+                tracing::info!(
+                    caller_pid,
+                    caller_session_id,
+                    node_pid,
+                    node_session_id,
+                    "CEC Support is reusing an interactive AllMyStuff node"
+                );
+            }
+            tracing::info!("existing allmystuff node found on the control socket");
+            // A node we didn't spawn is already serving. Bring it up to the pin —
+            // both halves of it: the binary on disk, and the process actually
+            // running. See converge_reused_node.
+            if let Some(pin) = pin {
+                converge_reused_node(pin).await;
+            }
+            return Ok(None);
         }
-        tracing::info!("existing allmystuff node found on the control socket");
-        // A node we didn't spawn is already serving. Bring it up to the pin —
-        // both halves of it: the binary on disk, and the process actually
-        // running. See converge_reused_node.
-        if let Some(pin) = pin {
-            converge_reused_node(pin).await;
-        }
-        return Ok(None);
     }
 
     #[cfg(windows)]
@@ -2614,6 +2766,9 @@ async fn ensure_node_running_impl(
     tracing::info!(?bin, "spawning allmystuff node");
 
     let mut cmd = Command::new(&bin);
+    if require_interactive_windows_node {
+        cmd.env(RUNTIME_OWNER_ENV, RuntimeOwner::CecSupportBundled.as_str());
+    }
     cmd.stdin(Stdio::null());
     // Unix: the child inherits our stdout/stderr, so its logs stream into the
     // same terminal (`just dev` / `allmystuff serve`).
@@ -2904,6 +3059,42 @@ mod tests {
         assert_eq!(
             pinned_startup_action(false, false),
             PinnedStartupAction::SpawnBundledNode
+        );
+    }
+
+    #[tokio::test]
+    async fn cec_fallback_yields_only_to_installed_allmystuff() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fallback = RuntimeControl::new(RuntimeOwner::CecSupportBundled, tx);
+        let accepted = fallback.request_takeover(RuntimeOwner::AllMyStuffInstalled);
+        assert_eq!(accepted["accepted"], true);
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the fallback should signal a graceful shutdown")
+            .expect("the shutdown sender should remain alive");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let canonical = RuntimeControl::new(RuntimeOwner::AllMyStuffInstalled, tx);
+        let refused = canonical.request_takeover(RuntimeOwner::AllMyStuffInstalled);
+        assert_eq!(refused["accepted"], false);
+        assert_eq!(refused["reason"], "canonical-owner");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
+            "canonical AMS must never yield its runtime"
+        );
+    }
+
+    #[test]
+    fn runtime_owner_wire_names_are_stable() {
+        assert_eq!(
+            serde_json::to_value(RuntimeOwner::AllMyStuffInstalled).unwrap(),
+            json!("all-my-stuff-installed")
+        );
+        assert_eq!(
+            serde_json::to_value(RuntimeOwner::CecSupportBundled).unwrap(),
+            json!("cec-support-bundled")
         );
     }
 }

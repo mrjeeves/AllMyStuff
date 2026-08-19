@@ -639,9 +639,11 @@ fn render_systemd_unit(exec: &Path, scope: Scope, env: &[(String, String)]) -> S
     s.push_str("\n[Service]\n");
     s.push_str("Type=simple\n");
     // The node binary *is* the whole behaviour — it spawns the myownmesh
-    // daemon itself, so the unit needs no subcommand argument.
+    // daemon itself. Supervised mode keeps the canonical service alive while
+    // a temporary GUI/CEC node owns the socket, and lets it perform the
+    // explicit CEC-fallback takeover when that contract is available.
     s.push_str(&format!(
-        "ExecStart={}\n",
+        "ExecStart={} --supervised\n",
         systemd_quote(&exec.to_string_lossy())
     ));
     s.push_str("Restart=on-failure\n");
@@ -839,18 +841,18 @@ fn parse_launchd_program_arguments(plist: &[u8]) -> Option<PathBuf> {
 }
 
 /// Read the executable from the systemd unit format emitted by
-/// [`render_systemd_unit`]. Its `ExecStart` contains one path and no argv; the
-/// renderer quotes the whole value only when the path contains whitespace.
+/// [`render_systemd_unit`]. The executable may be quoted when its path contains
+/// whitespace and is followed by the fixed `--supervised` argument.
 fn parse_systemd_exec_start(unit: &str) -> Option<PathBuf> {
     let value = unit
         .lines()
         .map(str::trim)
         .find_map(|line| line.strip_prefix("ExecStart="))?
         .trim();
-    let path = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        &value[1..value.len() - 1]
+    let path = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.split_once('"')?.0
     } else {
-        value
+        value.split_whitespace().next()?
     };
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
@@ -1962,10 +1964,11 @@ mod tests {
             Scope::User,
             &[],
         );
-        assert!(unit.contains("ExecStart=/home/u/.local/bin/allmystuff-serve\n"));
+        assert!(unit.contains("ExecStart=/home/u/.local/bin/allmystuff-serve --supervised\n"));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("KillSignal=SIGTERM"));
-        // No subcommand argument — the node binary is the whole behaviour.
+        // No subcommand argument — the node binary is the whole behaviour;
+        // `--supervised` only controls ownership handoff/lifetime.
         assert!(!unit.contains("allmystuff-serve serve"));
         // User scope must not carry system-only directives.
         assert!(!unit.contains("DynamicUser"));
@@ -2002,7 +2005,7 @@ mod tests {
             Scope::User,
             &env(&[("MYOWNMESH_HOME", "/home/u/My Mesh")]),
         );
-        assert!(unit.contains("ExecStart=\"/opt/My Apps/allmystuff-serve\"\n"));
+        assert!(unit.contains("ExecStart=\"/opt/My Apps/allmystuff-serve\" --supervised\n"));
         assert!(unit.contains("Environment=\"MYOWNMESH_HOME=/home/u/My Mesh\""));
     }
 

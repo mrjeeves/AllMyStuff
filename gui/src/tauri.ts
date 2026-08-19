@@ -383,10 +383,14 @@ export async function nativeDriveMappings(): Promise<DriveMappingState[]> {
   return value.mappings ?? [];
 }
 
-export async function unmapNativeDrive(mapping: string): Promise<void> {
+export async function unmapNativeDrive(
+  mapping: string,
+  source: string,
+  target: string,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("drive_unmap", { mapping });
+  await invoke("drive_unmap", { mapping, source, target });
 }
 
 /** Share a folder on `source` — whichever machine of mine holds it — and get

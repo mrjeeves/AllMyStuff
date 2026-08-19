@@ -199,10 +199,18 @@ async fn drive_mappings(state: State<'_, AppState>) -> Result<serde_json::Value,
 }
 
 #[tauri::command]
-async fn drive_unmap(state: State<'_, AppState>, mapping: String) -> Result<(), String> {
+async fn drive_unmap(
+    state: State<'_, AppState>,
+    mapping: String,
+    source: Option<String>,
+    target: Option<String>,
+) -> Result<(), String> {
     state
         .node
-        .request("drive_unmap", json!({ "mapping": mapping }))
+        .request(
+            "drive_unmap",
+            json!({ "mapping": mapping, "source": source, "target": target }),
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -3126,6 +3134,15 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
             match ev {
                 NodeEvent::Emit { event, payload } => {
                     let _ = app.emit(&event, payload);
+                }
+                NodeEvent::Upgrade => {
+                    match allmystuff_updater::update_now().await {
+                        Ok(outcome) => {
+                            tracing::info!("fleet GUI upgrade completed: {outcome:?}")
+                        }
+                        Err(e) => tracing::warn!("fleet GUI upgrade failed: {e}"),
+                    }
+                    app.restart();
                 }
                 NodeEvent::Restart => app.restart(), // never returns
             }

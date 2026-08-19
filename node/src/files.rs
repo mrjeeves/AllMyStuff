@@ -196,6 +196,7 @@ impl FilesPlane {
             event,
             FileEvent::Entries { .. }
                 | FileEvent::VolumeList { .. }
+                | FileEvent::QuotaInfo { .. }
                 | FileEvent::Metadata { .. }
                 | FileEvent::Ok { .. }
                 | FileEvent::Err { .. }
@@ -224,6 +225,16 @@ fn run_op(
     root: Option<&Path>,
 ) -> Option<FileEvent> {
     match event {
+        FileEvent::Quota { req } => Some(match root {
+            Some(root) => match filesystem_quota(root) {
+                Ok((used, total)) => FileEvent::QuotaInfo { req, used, total },
+                Err(reason) => FileEvent::Err { req, reason },
+            },
+            None => FileEvent::Err {
+                req,
+                reason: "quota is only available on a scoped drive route".into(),
+            },
+        }),
         FileEvent::Volumes { req } => {
             let inv = allmystuff_inventory::scan();
             Some(FileEvent::VolumeList {
@@ -324,6 +335,12 @@ fn run_op(
             None
         }
     }
+}
+
+fn filesystem_quota(path: &Path) -> Result<(u64, u64), String> {
+    let total = fs2::total_space(path).map_err(|error| error.to_string())?;
+    let available = fs2::available_space(path).map_err(|error| error.to_string())?;
+    Ok((total.saturating_sub(available.min(total)), total))
 }
 
 fn reply(req: u64, r: Result<(), String>) -> FileEvent {
@@ -946,6 +963,18 @@ mod tests {
             events.as_slice(),
             [FileEvent::Entries { path, home, entries, .. }]
                 if path == "/" && home == "/" && entries.iter().any(|e| e.name == "docs")
+        ));
+
+        let events = drain(plane.handle_in_root(
+            "mapped-1",
+            FileEvent::Quota { req: 4 },
+            Some(root.clone()),
+        ));
+        assert!(matches!(
+            events.as_slice(),
+            [FileEvent::QuotaInfo {
+                req: 4, used, total
+            }] if used <= total && *total > 0
         ));
 
         let events = drain(plane.handle_in_root(

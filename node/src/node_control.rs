@@ -245,6 +245,8 @@ impl RuntimeControl {
 pub enum NodeEvent {
     /// A `UiSink::emit` — one named event + its JSON payload.
     Emit { event: String, payload: Value },
+    /// An attached desktop must update in the GUI's own install context.
+    Upgrade,
     /// The node is re-execing onto a staged update (`UiSink::restart`).
     Restart,
 }
@@ -563,6 +565,10 @@ impl UiSink for SocketSink {
             event: event.to_string(),
             payload,
         });
+    }
+
+    fn upgrade_host(&self) {
+        let _ = self.tx.send(NodeEvent::Upgrade);
     }
 
     fn restart(&self) -> ! {
@@ -1003,7 +1009,16 @@ pub async fn dispatch(
         "drive_mappings" => DispatchOut::Json(mesh.drive_mappings()),
         "drive_unmap" => {
             let mapping: String = try_arg!(arg(a, "mapping"));
-            json_result(mesh.drive_unmap(mapping).await)
+            let source: Option<String> = try_arg!(opt(a, "source"));
+            let target: Option<String> = try_arg!(opt(a, "target"));
+            json_result(
+                mesh.drive_unmap(
+                    mapping,
+                    source.unwrap_or_default(),
+                    target.unwrap_or_default(),
+                )
+                .await,
+            )
         }
         // Shared folders — the file half of a person-to-person share. The
         // sharer mints an id for a folder (`folder_share`) and pins a grant to
@@ -2698,13 +2713,22 @@ async fn ensure_node_running_impl(
     #[cfg(not(windows))]
     let _ = require_interactive_windows_node;
 
+    let mut replacement: Option<(PathBuf, NodeSource)> = None;
     if NodeClient::probe().await {
         // Installed AllMyStuff is the canonical runtime. If CEC Support is
         // currently keeping the machine alive with its bundled fallback, ask
         // it to step aside cleanly, then continue into our normal spawn path.
         // CEC callers never make this request; they reuse whichever canonical
         // AMS runtime is already present.
-        let handed_off = !require_interactive_windows_node && take_over_bundled_runtime().await;
+        if !require_interactive_windows_node {
+            replacement = find_node_binary();
+            if replacement.is_none() {
+                tracing::warn!(
+                    "full AllMyStuff has no usable allmystuff-serve replacement; keeping the CEC Support fallback alive"
+                );
+            }
+        }
+        let handed_off = replacement.is_some() && take_over_bundled_runtime().await;
         if handed_off {
             tracing::info!("installed AllMyStuff is taking runtime ownership from CEC Support");
         } else {
@@ -2756,7 +2780,7 @@ async fn ensure_node_running_impl(
         );
     }
 
-    let (bin, source) = find_node_binary().ok_or_else(|| {
+    let (bin, source) = replacement.or_else(find_node_binary).ok_or_else(|| {
         anyhow!(
             "couldn't find the `allmystuff-serve` node binary — it normally ships beside \
              this app; put it on PATH or run `allmystuff serve` yourself"
@@ -2975,6 +2999,11 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<NodeEvent>(&restart).unwrap(),
             NodeEvent::Restart
+        ));
+        let upgrade = serde_json::to_vec(&NodeEvent::Upgrade).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<NodeEvent>(&upgrade).unwrap(),
+            NodeEvent::Upgrade
         ));
     }
 

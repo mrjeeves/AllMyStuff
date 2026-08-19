@@ -706,6 +706,18 @@ impl RemoteDavFs {
 }
 
 impl DavFileSystem for RemoteDavFs {
+    fn get_quota(&self) -> FsFuture<'_, (u64, Option<u64>)> {
+        async move {
+            let events = self.request(|req| FileEvent::Quota { req }).await?;
+            match events.into_iter().next() {
+                Some(FileEvent::QuotaInfo { used, total, .. }) => Ok((used, Some(total))),
+                Some(FileEvent::Err { reason, .. }) => Err(map_remote_error(&reason)),
+                _ => Err(FsError::GeneralFailure),
+            }
+        }
+        .boxed()
+    }
+
     fn open<'a>(
         &'a self,
         path: &'a DavPath,

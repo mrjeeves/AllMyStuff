@@ -639,7 +639,8 @@ if [ "$INSTALL_GUI" = "true" ]; then
     if try_release_gui; then
       GUI_INSTALLED=true
     else
-      warn "GUI binary not installed; a bare 'allmystuff' will print a hint until it is. Re-run the installer later, or build it from gui/."
+      err "Full AllMyStuff install failed: the GUI binary was not installed."
+      exit 1
     fi
   elif [ "$DRY_RUN" = "true" ]; then
     log "(dry-run) would install the GUI binary ($GUI_ASSET) next to allmystuff"
@@ -659,7 +660,8 @@ if [ "$INSTALLED_FROM_RELEASE" = "true" ]; then
   if try_release_serve; then
     SERVE_INSTALLED=true
   else
-    warn "Node binary not installed; 'allmystuff serve' will print a hint until it is. Re-run the installer later, or build node/."
+    err "Full AllMyStuff install failed: allmystuff-serve was not installed."
+    exit 1
   fi
 elif [ "$DRY_RUN" = "true" ]; then
   log "(dry-run) would install the node binary ($SERVE_ASSET) next to allmystuff"
@@ -687,7 +689,8 @@ elif [ "$INSTALLED_FROM_RELEASE" = "true" ]; then
   if try_release_amst; then
     AMST_INSTALLED=true
   else
-    warn "amst not installed from the release; for it on its own use scripts/install-amst.sh."
+    err "Full AllMyStuff install failed: amst was not installed."
+    exit 1
   fi
 else
   if build_amst_from_source; then

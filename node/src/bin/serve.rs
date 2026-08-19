@@ -408,8 +408,10 @@ async fn run<F: Future<Output = ()>>(
     wait_for_existing_owner: bool,
     shutdown: F,
 ) -> ExitCode {
+    let runtime_owner = node_control::RuntimeOwner::current();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        runtime_owner = runtime_owner.as_str(),
         "allmystuff node starting"
     );
 
@@ -447,6 +449,14 @@ async fn run<F: Future<Output = ()>>(
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => {
+                if runtime_owner == node_control::RuntimeOwner::AllMyStuffInstalled
+                    && node_control::take_over_bundled_runtime().await
+                {
+                    tracing::info!(
+                        "CEC Support released its bundled runtime; installed AllMyStuff is taking the machine socket"
+                    );
+                    continue;
+                }
                 if wait_for_existing_owner && node_control::NodeClient::probe().await {
                     // A GUI-owned or CEC-owned node is healthy. This is not a
                     // crash: remain as the service's supervised standby node
@@ -516,6 +526,7 @@ async fn run<F: Future<Output = ()>>(
     // park store the server's `network_set_enabled` command needs.
     let broadcaster = node_control::new_broadcaster();
     let (event_tx, event_rx) = node_control::event_channel();
+    let (runtime_yield_tx, mut runtime_yield_rx) = tokio::sync::mpsc::channel(1);
     let disabled = Arc::new(DisabledNetworks::load());
     let sink = SocketSink::new(
         Arc::new(LogSink {
@@ -544,6 +555,7 @@ async fn run<F: Future<Output = ()>>(
                 disabled,
                 broadcaster,
                 event_rx,
+                node_control::RuntimeControl::new(runtime_owner, runtime_yield_tx),
             )
             .await
             {
@@ -578,8 +590,12 @@ async fn run<F: Future<Output = ()>>(
 
     // Run until asked to stop. Holding `mesh` and `daemon` in scope keeps the
     // pump alive and the supervised daemon running for the node's whole life.
-    shutdown.await;
-    tracing::info!("shutdown requested — stopping");
+    tokio::select! {
+        _ = shutdown.as_mut() => tracing::info!("shutdown requested — stopping"),
+        Some(()) = runtime_yield_rx.recv() => tracing::info!(
+            "installed AllMyStuff requested ownership — gracefully releasing the CEC Support fallback runtime"
+        ),
+    }
 
     // Take the child out of the supervisor's hands and drop it here, killing
     // the daemon we spawned (if any) — the supervisor never respawns after

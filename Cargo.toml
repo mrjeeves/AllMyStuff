@@ -69,6 +69,7 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 dirs = "5"
+fs2 = "0.4"
 
 # Compact transport encoding for audio frames over the mesh channel.
 base64 = "0.22"

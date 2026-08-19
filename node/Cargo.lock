@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.87"
+version = "0.2.88"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",

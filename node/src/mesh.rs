@@ -569,10 +569,7 @@ fn new_drive_mapping_id() -> Result<String, String> {
     let mut random = [0u8; 16];
     getrandom::getrandom(&mut random)
         .map_err(|error| format!("couldn't create a drive mapping id: {error}"))?;
-    Ok(random
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn drive_reconnect_store_path() -> Option<PathBuf> {
@@ -580,10 +577,7 @@ fn drive_reconnect_store_path() -> Option<PathBuf> {
 }
 
 fn drive_relationship_store_path() -> Option<PathBuf> {
-    Some(
-        allmystuff_protocol::myownmesh_state_dir()?
-            .join("allmystuff-drive-relationships.json"),
-    )
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drive-relationships.json"))
 }
 
 fn drive_forget_store_path() -> Option<PathBuf> {
@@ -601,7 +595,8 @@ fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconne
         .enumerate()
         .map(|(index, mut mapping)| {
             if mapping.mapping.is_empty() {
-                mapping.mapping = new_drive_mapping_id().unwrap_or_else(|_| format!("legacy-{index}"));
+                mapping.mapping =
+                    new_drive_mapping_id().unwrap_or_else(|_| format!("legacy-{index}"));
             }
             (format!("saved:{index}"), mapping)
         })
@@ -2344,6 +2339,22 @@ impl Mesh {
         // WebDAV server is gone. Only mappings carrying our private lease
         // marker are touched; ordinary user/network drives are never swept.
         self.drive_mounts.cleanup_stale().await;
+        // A partially-written lease can lose its registry marker while the
+        // receiver's durable reconnect record and Windows mapping survive.
+        // That record is equally strong ownership proof, so clear those known
+        // letters before reconnecting them to fresh loopback listeners.
+        let saved_mounts = self
+            .drive_reconnects
+            .lock()
+            .values()
+            .filter(|mapping| !mapping.mount.is_empty())
+            .map(|mapping| mapping.mount.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for mount in saved_mounts {
+            if let Err(error) = self.drive_mounts.remove_known(&mount).await {
+                tracing::warn!("couldn't clear saved native drive {mount}: {error}");
+            }
+        }
 
         // Spawn the media forwarders now that we're on a runtime (see
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
@@ -3747,11 +3758,7 @@ impl Mesh {
                                 .as_ref()
                                 .map(|pull| pull.mapping.clone())
                                 .filter(|mapping| !mapping.is_empty())
-                                .or_else(|| {
-                                    drive
-                                        .as_ref()
-                                        .and_then(|offer| offer.mapping.clone())
-                                })
+                                .or_else(|| drive.as_ref().and_then(|offer| offer.mapping.clone()))
                                 .filter(|mapping| !mapping.is_empty())
                                 .unwrap_or_else(|| route.id.clone());
                             let reconnect = accepted_drive_pull
@@ -3787,8 +3794,7 @@ impl Mesh {
                                     .insert(route.id.clone(), reconnect);
                                 self.persist_drive_reconnects();
                             }
-                            if let (Some(offer), Some(me)) =
-                                (drive.as_ref(), self.local_node_id())
+                            if let (Some(offer), Some(me)) = (drive.as_ref(), self.local_node_id())
                             {
                                 self.record_drive_relationship(DriveRelationship {
                                     mapping,
@@ -4968,12 +4974,12 @@ impl Mesh {
         };
         self.files.map_root(&route.id, root.clone());
         let label = if label.trim().is_empty() {
-                root.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Remote drive".into())
-            } else {
-                label.trim().to_string()
-            };
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Remote drive".into())
+        } else {
+            label.trim().to_string()
+        };
         let mount = mount.trim().to_string();
         self.record_drive_relationship(DriveRelationship {
             mapping: mapping.clone(),
@@ -5851,6 +5857,20 @@ impl Mesh {
 
     async fn forget_drive_local(self: &Arc<Self>, mapping: &str) -> Option<DriveRelationship> {
         let relationship = self.remove_drive_relationship(mapping);
+        if let Some(relationship) = relationship.as_ref() {
+            let me = self.local_node_id().unwrap_or_default();
+            let receives_here =
+                relationship.target.is_empty() || same_node(&relationship.target, &me);
+            if receives_here && !relationship.mount.is_empty() {
+                if let Err(error) = self.drive_mounts.remove_known(&relationship.mount).await {
+                    tracing::warn!(
+                        "couldn't remove native drive {} for mapping {}: {error}",
+                        relationship.mount,
+                        mapping
+                    );
+                }
+            }
+        }
         let forgotten_routes = {
             let mut reconnects = self.drive_reconnects.lock();
             let routes = reconnects
@@ -8577,8 +8597,7 @@ impl Mesh {
                 label,
                 mount,
             } => {
-                let Some(existing) = self.drive_relationships.lock().get(&mapping).cloned()
-                else {
+                let Some(existing) = self.drive_relationships.lock().get(&mapping).cloned() else {
                     return;
                 };
                 self.record_drive_relationship(DriveRelationship {
@@ -11908,12 +11927,7 @@ impl Mesh {
                     let target_node = to_node.clone();
                     crate::spawn(async move {
                         match mounts
-                            .mount(
-                                mesh.clone(),
-                                route_id.clone(),
-                                drive.label,
-                                drive.mount,
-                            )
+                            .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
                             .await
                         {
                             Ok(info) => {
@@ -19164,7 +19178,10 @@ mod tests {
             legacy.folder, None,
             "pre-folder reconnect records still load"
         );
-        assert!(legacy.mapping.is_empty(), "older records gain an id at store load");
+        assert!(
+            legacy.mapping.is_empty(),
+            "older records gain an id at store load"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -19193,13 +19210,11 @@ mod tests {
             &relationships
         ));
         assert_eq!(
-            super::load_drive_relationships(&relationships_path)
-                .get("mapping-1"),
+            super::load_drive_relationships(&relationships_path).get("mapping-1"),
             Some(&relationship)
         );
 
-        let pending =
-            std::collections::HashMap::from([("mapping-1".into(), "desktop".into())]);
+        let pending = std::collections::HashMap::from([("mapping-1".into(), "desktop".into())]);
         assert!(super::persist_drive_forgets(&forgets_path, &pending));
         assert_eq!(super::load_drive_forgets(&forgets_path), pending);
 

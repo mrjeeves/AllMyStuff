@@ -65,6 +65,33 @@ impl DriveMounts {
         cleanup_stale_native_mounts().await;
     }
 
+    /// Remove a native mount that belongs to AllMyStuff even when its live
+    /// route has already disappeared. Windows can retain the `net use` entry
+    /// after the in-memory mount task is gone; the private registry lease is
+    /// the proof that lets us clean that half without touching another app's
+    /// drive mapping.
+    pub async fn remove_known(&self, mount: &str) -> Result<(), String> {
+        let active_route = self
+            .active
+            .lock()
+            .iter()
+            .find(|(_, active)| active.info.mount.eq_ignore_ascii_case(mount))
+            .map(|(route, _)| route.clone());
+        if let Some(route) = active_route {
+            self.stop(&route);
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            remove_known_native_mount(mount).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = mount;
+            Ok(())
+        }
+    }
+
     pub async fn mount(
         &self,
         mesh: Arc<Mesh>,
@@ -315,6 +342,31 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     Err(format!(
         "Windows is still releasing {mount}; AllMyStuff will retry"
     ))
+}
+
+#[cfg(windows)]
+async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
+    let mount = normalize_requested_mount(mount)?
+        .ok_or_else(|| "the saved drive mapping has no drive letter".to_string())?;
+    let letter = mount.trim_end_matches(':');
+    let marker = format!(
+        r"{}\Software\AllMyStuff\MappedDrives\{letter}",
+        drive_registry_root()?
+    );
+    let port = crate::child_process::command("reg.exe")
+        .args(["query", &marker, "/v", "Port"])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_registry_dword(&output.stdout))
+        .and_then(|port| u16::try_from(port).ok());
+    tracing::info!("removing saved AllMyStuff drive mapping {mount}");
+    // The persisted mapping relationship is itself ownership proof. Do not
+    // require the auxiliary registry lease: a partial/crashed label write can
+    // lose that marker while Windows still retains the WebDAV drive.
+    let _ = unmount_native(&mount).await;
+    clear_native_label(&mount, port).await
 }
 
 async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {

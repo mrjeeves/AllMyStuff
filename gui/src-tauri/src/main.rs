@@ -199,10 +199,18 @@ async fn drive_mappings(state: State<'_, AppState>) -> Result<serde_json::Value,
 }
 
 #[tauri::command]
-async fn drive_unmap(state: State<'_, AppState>, mapping: String) -> Result<(), String> {
+async fn drive_unmap(
+    state: State<'_, AppState>,
+    mapping: String,
+    source: Option<String>,
+    target: Option<String>,
+) -> Result<(), String> {
     state
         .node
-        .request("drive_unmap", json!({ "mapping": mapping }))
+        .request(
+            "drive_unmap",
+            json!({ "mapping": mapping, "source": source, "target": target }),
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok(())

@@ -1009,7 +1009,16 @@ pub async fn dispatch(
         "drive_mappings" => DispatchOut::Json(mesh.drive_mappings()),
         "drive_unmap" => {
             let mapping: String = try_arg!(arg(a, "mapping"));
-            json_result(mesh.drive_unmap(mapping).await)
+            let source: Option<String> = try_arg!(opt(a, "source"));
+            let target: Option<String> = try_arg!(opt(a, "target"));
+            json_result(
+                mesh.drive_unmap(
+                    mapping,
+                    source.unwrap_or_default(),
+                    target.unwrap_or_default(),
+                )
+                .await,
+            )
         }
         // Shared folders — the file half of a person-to-person share. The
         // sharer mints an id for a folder (`folder_share`) and pins a grant to

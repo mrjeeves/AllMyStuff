@@ -4850,8 +4850,11 @@ class AppStore {
   }
 
   async unmapDrive(mappingId: string) {
+    const known = this.driveRelationships.find(
+      (mapping) => mapping.mapping === mappingId,
+    );
     try {
-      await unmapNativeDrive(mappingId);
+      await unmapNativeDrive(mappingId, known?.source ?? "", known?.target ?? "");
       this.driveRelationships = this.driveRelationships.filter(
         (mapping) => mapping.mapping !== mappingId,
       );

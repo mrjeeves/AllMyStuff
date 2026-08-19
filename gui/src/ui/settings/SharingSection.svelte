@@ -53,8 +53,8 @@
     <ul class="partners">
       {#each partners as p (p.person.id)}
         {@const expanded = open.includes(p.person.id)}
-        {@const sharedByYou = p.grants.filter(({ grant }) => app.isShareOutGrant(grant))}
-        {@const sharedWithYou = p.grants.filter(({ grant }) => !app.isShareOutGrant(grant))}
+        {@const sharedByYou = p.sharedByYou}
+        {@const sharedWithYou = p.sharedWithYou}
         <li class="partner">
           <button class="p-head" onclick={() => toggle(p.person.id)} aria-expanded={expanded}>
             <span class="chev" class:open={expanded} aria-hidden="true">▸</span>

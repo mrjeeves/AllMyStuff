@@ -45,6 +45,12 @@ export interface Grant {
 export interface Share {
   person: Person;
   grants: Grant[];
+  /** Grants authored on this device: what this person may do with my stuff.
+   *  Present on node snapshots from 0.2.89 onward; older nodes expose only
+   *  the compatible `grants` union above. */
+  out_grants?: Grant[];
+  /** Grants authored by the other person: what I may do with their stuff. */
+  in_grants?: Grant[];
 }
 
 /** NanoKVM JSON response envelope. HTTP success alone is not enough: `code`

@@ -103,11 +103,10 @@
         ) ?? null
       : null,
   );
-  const grants = $derived(partner?.grants ?? []);
-  // Only the share-*out* grants belong here — what this fleet can do with MY
-  // devices. The share-in grants (consoles of *theirs* I may open) are read off
-  // their own card, not listed as "what they can do".
-  const outGrants = $derived(grants.filter(({ grant: g }) => app.isShareOutGrant(g)));
+  // Only grants authored here belong under "What X can do". The node snapshot
+  // now preserves that direction explicitly; older nodes use the store's
+  // backward-compatible classifier.
+  const outGrants = $derived(partner?.sharedByYou ?? []);
   /** Whether the capability list is expanded — starts folded so the drawer
    *  leads with the relationship, not a wall of devices. */
   let stuffOpen = $state(false);
@@ -395,7 +394,7 @@
             {#if !st.app}
               <span class="pill soft">not on AllMyStuff</span>
             {:else if st.shared}
-              <span class="pill guest">shared with {st.shared.name}</span>
+              <span class="pill guest">Shares Active</span>
             {:else if st.inFleet || (st.mine && !st.self)}
               <span class="pill mine">yours</span>
             {:else if st.kind === "claimable"}

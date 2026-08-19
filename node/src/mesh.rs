@@ -6034,10 +6034,10 @@ impl Mesh {
             .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
             .collect();
         let routes: Vec<_> = session.routes().collect();
-        // Durable shares (person + unioned grants) so the GUI reclassifies a
-        // peer as *shared* with its grants across a restart, rather than
-        // forgetting them and defaulting to unclaimed.
-        let shares = self.shares.shares();
+        // Durable shares retain the compatible union used to reclassify peers,
+        // plus the authoritative outbound/inbound split the sharing UI renders.
+        // Do not make the GUI reconstruct authorship from capability ids.
+        let shares = self.shares.snapshots();
         json!({
             "ready": true,
             "me": me,

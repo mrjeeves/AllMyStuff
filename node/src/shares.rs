@@ -51,6 +51,18 @@ struct PersistedShare {
     in_grants: Vec<Grant>,
 }
 
+/// GUI-facing view of one durable share. `grants` preserves the existing
+/// union consumed by older clients and graph hydration; the directional sets
+/// carry the source-of-truth split the sharing UI needs to say what I shared
+/// versus what the other person shared.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareSnapshot {
+    pub person: Person,
+    pub grants: Vec<Grant>,
+    pub out_grants: Vec<Grant>,
+    pub in_grants: Vec<Grant>,
+}
+
 /// The durable part of the record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Persisted {
@@ -106,6 +118,26 @@ impl Shares {
     pub fn shares(&self) -> Vec<Share> {
         let i = self.inner.lock();
         i.shares.iter().map(project).collect()
+    }
+
+    /// Every share for a control snapshot, retaining authoring direction.
+    ///
+    /// The old GUI inferred direction from the capability's device id after
+    /// [`Self::shares`] flattened the sets. That became lossy as soon as
+    /// canonical mesh ids and display ids diverged, and it can never classify
+    /// an unscoped legacy grant. Keep the union for compatibility, while
+    /// exposing the already-persisted directional truth alongside it.
+    pub fn snapshots(&self) -> Vec<ShareSnapshot> {
+        let i = self.inner.lock();
+        i.shares
+            .iter()
+            .map(|share| ShareSnapshot {
+                person: share.person.clone(),
+                grants: union_grants(share),
+                out_grants: share.out_grants.clone(),
+                in_grants: share.in_grants.clone(),
+            })
+            .collect()
     }
 
     /// The person a peer node belongs to, if it's part of a share — the hook
@@ -478,6 +510,29 @@ mod tests {
         // Both directions present in the one Share the catalog gate sees.
         assert_eq!(projected[0].grants.len(), 2);
         assert_eq!(projected[0].person.id, alex().id);
+    }
+
+    #[test]
+    fn snapshot_preserves_share_direction_with_compatible_union() {
+        let sh = memory();
+        let node = NodeId::from("alex");
+        let outbound = screen_to_alex();
+        sh.grant(&alex(), &node, outbound.clone());
+        let inbound = Grant::scoped(
+            &alex().id,
+            MediaKind::Video,
+            GrantRole::Provide,
+            None,
+            "Send their camera",
+        );
+        sh.record_inbound(&alex(), &node, vec![inbound.clone()]);
+
+        let snapshots = sh.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].out_grants, vec![outbound.clone()]);
+        assert_eq!(snapshots[0].in_grants, vec![inbound.clone()]);
+        assert!(snapshots[0].grants.contains(&outbound));
+        assert!(snapshots[0].grants.contains(&inbound));
     }
 
     #[test]

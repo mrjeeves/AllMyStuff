@@ -1000,6 +1000,11 @@ pub async fn dispatch(
             json_result(mesh.drive_map_from(source, root, label, mount).await)
         }
         "native_drives" => DispatchOut::Json(json!(mesh.native_drives())),
+        "drive_mappings" => DispatchOut::Json(mesh.drive_mappings()),
+        "drive_unmap" => {
+            let mapping: String = try_arg!(arg(a, "mapping"));
+            json_result(mesh.drive_unmap(mapping).await)
+        }
         // Shared folders — the file half of a person-to-person share. The
         // sharer mints an id for a folder (`folder_share`) and pins a grant to
         // its capability; the receiver opens it by that id at a mount point of

@@ -106,7 +106,7 @@
 <div class="drive-panel">
   {#if mappings.length}
     <div class="drive-list">
-      {#each mappings as mapping (mapping.route.id)}
+      {#each mappings as mapping (mapping.id)}
         <div class="drive-row">
           <span class="drive-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -117,15 +117,17 @@
             <strong>{mapping.drive}</strong>
             <span>
               {#if mapping.direction === "out"}
-                Available on {mapping.machine}
+                Mapped to {mapping.machine}{mapping.mount ? ` as ${mapping.mount}` : ""}{mapping.status === "unavailable" ? " · Unavailable" : ""}
               {:else if mapping.status === "mounted"}
                 From {mapping.machine} · Mounted as {mapping.mount}
+              {:else if mapping.status === "unavailable"}
+                From {mapping.machine}{mapping.mount ? ` · ${mapping.mount}` : ""} · Unavailable
               {:else}
                 From {mapping.machine} · Connecting…
               {/if}
             </span>
           </div>
-          <button class="remove" title="Remove mapped drive" onclick={() => app.unmapDrive(mapping.route.id)}>×</button>
+          <button class="remove" title="Remove mapped drive from both machines" onclick={() => app.unmapDrive(mapping.id)}>×</button>
         </div>
       {/each}
     </div>

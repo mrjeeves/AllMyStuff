@@ -30,7 +30,12 @@ AllMyStuff route (direct, STUN, or TURN).
 - The drive-letter field defaults to **Auto — next available**. A user may
   enter a particular `X:` instead. Enter, click-away, or Map Drive completes
   the form.
-- Unmap tears down both the Windows drive and its mesh route.
+- A mapping is still one-way, but both affected machines show the same source,
+  destination, label, mount point, and availability in every Drives surface.
+  Creating the reverse direction is a second explicit mapping, not a default.
+- Remove Mapping records one durable removal on both machines, then tears down
+  the native drive and its mesh route. If one machine is asleep, the online
+  machine retries that removal when its peer returns.
 
 ## Architecture
 
@@ -45,16 +50,19 @@ source machine                                      receiving machine
                                                    └─────────────────────────┘
 ```
 
-One mapping is a unique `Storage` route:
+One mapping has a stable mapping ID and a `Storage` route:
 
 ```text
-<source>:drive-map:<nonce> → <receiver>:storage-in
+<source>:drive-map:<mapping-id> → <receiver>:storage-in
 ```
 
-The route offer carries only a friendly label and requested receiver mount.
-The absolute source path never crosses signaling. Before offering, the source
-canonicalizes the chosen path and binds it locally to the unique route id.
-Multiple folders between the same pair therefore remain independent.
+Both endpoints persist the mapping ID and its display relationship. The
+receiver additionally persists the reconnect information required to restore
+its OS mount. After the mount succeeds, it reports the actual selected drive
+letter or mount point to the source, so both interfaces display the same name
+and destination. Before offering, the source canonicalizes the chosen path and
+binds it locally to the mapping's route. Multiple folders between the same pair
+therefore remain independent.
 
 The native adapter adds metadata and random-access read/write operations to
 `FileEvent`. Replies for OS filesystem calls use a dedicated per-request
@@ -71,9 +79,13 @@ room shared-file downloads, and their permissions remain separate.
    D when Auto), and runs `net use <letter> http://localhost:<port>/
    /persistent:no`.
 4. Explorer WebDAV requests become scoped FileEvents over the active route.
-5. Route teardown aborts the listener, cancels in-flight RPCs, runs `net use
-   <letter> /delete /y`, and forgets the source root.
-6. If native mounting fails, the receiver tears the route down instead of
+5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and runs
+   `net use <letter> /delete /y`, but retains the relationship and reconnect
+   intent. Both interfaces show it as unavailable until the peer returns.
+6. Explicit removal deletes the relationship and reconnect intent on both
+   endpoints. A crash-safe pending removal is retried until the peer confirms
+   it, preventing a sleeping Windows machine from recreating an orphan drive.
+7. If native mounting fails, the receiver tears the route down instead of
    showing a live connection line for a drive Windows cannot use.
 
 ## KVM install and firmware media
@@ -126,8 +138,8 @@ computer. That invariant is enforced in both the picker and the node backend.
   Pretending a native dialog on this PC could browse another PC was rejected;
   so was temporarily exposing an entire remote disk merely to feed a picker.
 - The receiver chooses Auto at activation because only it knows which drive
-  letters are actually free. The route metadata may continue to say Auto on
-  the source; the receiver's OS remains authoritative.
+  letters are actually free. It reports that result to the source for display;
+  the receiver's OS remains authoritative.
 
 ## Verification
 
@@ -136,7 +148,10 @@ computer. That invariant is enforced in both the picker and the node backend.
 - Test offer metadata round-tripping and multiple unique folder routes.
 - On Windows, map a folder both directions, verify the letter appears in
   Explorer, read/write/seek/rename/delete with native programs, and confirm
-  Unmap removes it.
+  each one-way relationship appears on both machines.
+- Take either endpoint offline, remove the relationship from the other, bring
+  it back, and confirm the pending removal clears the native drive and cannot
+  be resurrected by reconnect.
 - Repeat over forced TURN and while disconnecting mid-read.
 - Verify fleet, Files-share, and CECSupport-consent admission separately.
 - Verify ISO boot, raw USB installer boot, and firmware/BIOS media on both

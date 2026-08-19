@@ -189,6 +189,25 @@ async fn drive_map_from(
     Ok(())
 }
 
+#[tauri::command]
+async fn drive_mappings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("drive_mappings", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn drive_unmap(state: State<'_, AppState>, mapping: String) -> Result<(), String> {
+    state
+        .node
+        .request("drive_unmap", json!({ "mapping": mapping }))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Share a folder on `source` — whichever machine of mine holds it — and
 /// return the id it minted. The share builder pins its grant to that id, so
 /// the path stays on the machine that owns the disk.
@@ -3260,6 +3279,8 @@ fn main() {
             connect_route,
             drive_map,
             drive_map_from,
+            drive_mappings,
+            drive_unmap,
             folder_share_from,
             folder_open,
             folder_open_on,

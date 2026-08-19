@@ -84,6 +84,8 @@ import {
   linkStatus,
   mapNativeDrive,
   mapNativeDriveFrom,
+  nativeDriveMappings,
+  unmapNativeDrive,
   pickKvmMediaImage,
   stageKvmMedia as stageKvmMediaNative,
   unmountKvmMedia as unmountKvmMediaNative,
@@ -91,6 +93,7 @@ import {
   onControlRefused,
   onDeviceRestart,
   onDriveMount,
+  onDriveState,
   onFileProgress,
   onFileSaved,
   onKvmMedia,
@@ -217,6 +220,7 @@ import {
   type ServiceActionResult,
   type ServiceStatus,
   type SessionSnapshot,
+  type DriveMappingState,
   type WindowBehavior,
 } from "./tauri";
 import {
@@ -952,6 +956,8 @@ class AppStore {
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
   driveMounts = $state<Record<string, { label: string; mount: string }>>({});
+  /** Durable one-way mapping relationships mirrored by both affected nodes. */
+  driveRelationships = $state<DriveMappingState[]>([]);
   /** The resolved host-side terminal session id per terminal route id, from
    *  the snapshot (the host echoes it on `Accept` for a shared shell). A
    *  terminal tab reads it to label which shell it's on and to re-query the
@@ -1700,6 +1706,9 @@ class AppStore {
       const who = this.node(e.from)?.label ?? shortId(e.from);
       this.toast("warn", `Restarting this device: asked by ${who}`);
     });
+    await onDriveState((mappings) => {
+      this.driveRelationships = mappings;
+    });
     await onDriveMount((e) => {
       const who = this.nodeByCanonical(e.from)?.label ?? shortId(e.from);
       if (e.error) {
@@ -2383,6 +2392,13 @@ class AppStore {
     const scan = await scanSelf();
     if (!scan) return;
     this.backendConnected = true;
+    try {
+      this.driveRelationships = await nativeDriveMappings();
+    } catch {
+      // The node can finish taking over its socket immediately after scan.
+      // Backend recovery calls this method again, and live changes also arrive
+      // through the drive-state listener registered before the first scan.
+    }
 
     const prevId = this.localId;
     const newId = scan.node_id || "this";
@@ -4633,6 +4649,7 @@ class AppStore {
   }
 
   get driveMappings(): Array<{
+    id: string;
     route: Route;
     direction: "in" | "out";
     drive: string;
@@ -4640,9 +4657,10 @@ class AppStore {
     host: string;
     target: string;
     mount: string;
-    status: "connecting" | "mounted" | "shared";
+    status: "connecting" | "mounted" | "shared" | "unavailable";
   }> {
     const out = [] as Array<{
+      id: string;
       route: Route;
       direction: "in" | "out";
       drive: string;
@@ -4650,10 +4668,43 @@ class AppStore {
       host: string;
       target: string;
       mount: string;
-      status: "connecting" | "mounted" | "shared";
+      status: "connecting" | "mounted" | "shared" | "unavailable";
     }>;
+    for (const mapping of this.driveRelationships) {
+      const source = this.capNodeOf(mapping.source);
+      const target = this.capNodeOf(mapping.target);
+      const direction = this.isMe(target) ? "in" : "out";
+      const other = direction === "in" ? source : target;
+      const routeActive = !!mapping.route && this.catalog.routes.some((route) => route.id === mapping.route);
+      const liveStatus = routeActive ? mapping.status : "unavailable";
+      out.push({
+        id: mapping.mapping,
+        route: {
+          id: mapping.route || `mapping:${mapping.mapping}`,
+          from: `${source}:drive-map:${mapping.mapping}`,
+          to: `${target}:storage-in`,
+          media: "storage",
+          drive: { label: mapping.label, mount: mapping.mount },
+        },
+        direction,
+        drive: mapping.label || "Mapped drive",
+        machine: this.machineByAnyId(other)?.label ?? shortId(other),
+        host: source,
+        target,
+        mount: mapping.mount,
+        status:
+          liveStatus === "mounted"
+            ? "mounted"
+            : routeActive || liveStatus === "connected"
+              ? direction === "out"
+                ? "shared"
+                : "connecting"
+              : "unavailable",
+      });
+    }
     for (const route of this.catalog.routes) {
       if (route.media !== "storage" || !route.to.endsWith(":storage-in")) continue;
+      if (out.some((mapping) => mapping.route.id === route.id)) continue;
       const from = this.capability(route.from);
       const to = this.capability(route.to);
       const fromNode = from?.node ?? this.capNodeOf(route.from);
@@ -4663,6 +4714,7 @@ class AppStore {
       const mount = mounted?.mount ?? route.drive?.mount ?? "";
       if (this.isMe(toNode)) {
         out.push({
+          id: route.id,
           route,
           direction: "in",
           drive: driveLabel,
@@ -4674,6 +4726,7 @@ class AppStore {
         });
       } else if (this.isMe(fromNode)) {
         out.push({
+          id: route.id,
           route,
           direction: "out",
           drive: driveLabel,
@@ -4796,8 +4849,16 @@ class AppStore {
     }
   }
 
-  unmapDrive(routeId: string) {
-    void this.disconnect(routeId);
+  async unmapDrive(mappingId: string) {
+    try {
+      await unmapNativeDrive(mappingId);
+      this.driveRelationships = this.driveRelationships.filter(
+        (mapping) => mapping.mapping !== mappingId,
+      );
+      this.toast("ok", "Drive mapping removed from both machines");
+    } catch (error) {
+      this.toast("warn", errMsg(error));
+    }
   }
 
   /** Open one files *session* to `hostNodeId`: a generic route from the

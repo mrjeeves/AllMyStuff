@@ -143,6 +143,16 @@ pub struct Mesh {
     drive_reconnects: Mutex<HashMap<String, DriveReconnect>>,
     /// Crash-safe backing store for the receiver-owned mapping intents.
     drive_reconnect_path: Option<PathBuf>,
+    /// The display/control half of native mappings, persisted on both affected
+    /// machines. The filesystem mount is still one-way; this mirror is what
+    /// lets both UIs explain the same relationship and remove it durably.
+    drive_relationships: Mutex<HashMap<String, DriveRelationship>>,
+    drive_relationship_path: Option<PathBuf>,
+    /// Forget requests that have not yet been acknowledged by the other
+    /// endpoint (mapping id -> peer). Retried from presence so removing an
+    /// offline mapping cannot leave its Windows half orphaned forever.
+    drive_forgets: Mutex<HashMap<String, String>>,
+    drive_forget_path: Option<PathBuf>,
     /// Old route ids currently being rebuilt, so repeated presence adverts do
     /// not launch duplicate offers for the same native drive.
     drive_reconnect_inflight: Mutex<std::collections::HashSet<String>>,
@@ -494,6 +504,7 @@ type FolderMintReply = Option<Result<(String, String), String>>;
 /// a fresh incarnation after sleep or an app restart.
 #[derive(Clone)]
 struct DrivePullRequest {
+    mapping: String,
     source: String,
     root: String,
     label: String,
@@ -511,6 +522,10 @@ struct DrivePullWaiter {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DriveReconnect {
+    /// Stable identity shared with the source. Older stores gain one when
+    /// loaded and publish it on their next reconnect.
+    #[serde(default)]
+    mapping: String,
     source: String,
     root: String,
     label: String,
@@ -527,8 +542,52 @@ struct PersistedDriveReconnects {
     mappings: Vec<DriveReconnect>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DriveRelationship {
+    mapping: String,
+    source: String,
+    target: String,
+    label: String,
+    mount: String,
+    #[serde(default)]
+    route: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedDriveRelationships {
+    #[serde(default)]
+    mappings: Vec<DriveRelationship>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedDriveForgets {
+    #[serde(default)]
+    pending: HashMap<String, String>,
+}
+
+fn new_drive_mapping_id() -> Result<String, String> {
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|error| format!("couldn't create a drive mapping id: {error}"))?;
+    Ok(random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn drive_reconnect_store_path() -> Option<PathBuf> {
     Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drives.json"))
+}
+
+fn drive_relationship_store_path() -> Option<PathBuf> {
+    Some(
+        allmystuff_protocol::myownmesh_state_dir()?
+            .join("allmystuff-drive-relationships.json"),
+    )
+}
+
+fn drive_forget_store_path() -> Option<PathBuf> {
+    Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drive-forgets.json"))
 }
 
 fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconnect> {
@@ -540,8 +599,62 @@ fn load_drive_reconnects(path: &Option<PathBuf>) -> HashMap<String, DriveReconne
         .mappings
         .into_iter()
         .enumerate()
-        .map(|(index, mapping)| (format!("saved:{index}"), mapping))
+        .map(|(index, mut mapping)| {
+            if mapping.mapping.is_empty() {
+                mapping.mapping = new_drive_mapping_id().unwrap_or_else(|_| format!("legacy-{index}"));
+            }
+            (format!("saved:{index}"), mapping)
+        })
         .collect()
+}
+
+fn load_drive_relationships(path: &Option<PathBuf>) -> HashMap<String, DriveRelationship> {
+    let persisted: PersistedDriveRelationships = path
+        .as_ref()
+        .map(|path| crate::persist::load_json(path))
+        .unwrap_or_default();
+    persisted
+        .mappings
+        .into_iter()
+        .filter(|mapping| !mapping.mapping.is_empty())
+        .map(|mapping| (mapping.mapping.clone(), mapping))
+        .collect()
+}
+
+fn persist_drive_relationships(
+    path: &Option<PathBuf>,
+    mappings: &HashMap<String, DriveRelationship>,
+) -> bool {
+    let Some(path) = path else { return true };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut mappings = mappings.values().cloned().collect::<Vec<_>>();
+    mappings.sort_by(|a, b| a.mapping.cmp(&b.mapping));
+    let persisted = PersistedDriveRelationships { mappings };
+    match serde_json::to_string_pretty(&persisted) {
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn load_drive_forgets(path: &Option<PathBuf>) -> HashMap<String, String> {
+    path.as_ref()
+        .map(|path| crate::persist::load_json::<PersistedDriveForgets>(path).pending)
+        .unwrap_or_default()
+}
+
+fn persist_drive_forgets(path: &Option<PathBuf>, pending: &HashMap<String, String>) -> bool {
+    let Some(path) = path else { return true };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(&PersistedDriveForgets {
+        pending: pending.clone(),
+    }) {
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
+        Err(_) => false,
+    }
 }
 
 fn persist_drive_reconnects(
@@ -1385,6 +1498,27 @@ impl Mesh {
         let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
         let drive_reconnect_path = drive_reconnect_store_path();
         let drive_reconnects = load_drive_reconnects(&drive_reconnect_path);
+        let drive_relationship_path = drive_relationship_store_path();
+        let mut drive_relationships = load_drive_relationships(&drive_relationship_path);
+        let drive_forget_path = drive_forget_store_path();
+        let drive_forgets = load_drive_forgets(&drive_forget_path);
+        // Upgrade receiver-only records from older builds into the shared
+        // display model immediately. The source learns the same id on the next
+        // reconnect offer; until then this side can still explain its OS drive.
+        for reconnect in drive_reconnects.values() {
+            drive_relationships
+                .entry(reconnect.mapping.clone())
+                .or_insert_with(|| DriveRelationship {
+                    mapping: reconnect.mapping.clone(),
+                    source: reconnect.source.clone(),
+                    target: String::new(),
+                    label: reconnect.label.clone(),
+                    mount: reconnect.mount.clone(),
+                    route: String::new(),
+                });
+        }
+        let _ = persist_drive_reconnects(&drive_reconnect_path, &drive_reconnects);
+        let _ = persist_drive_relationships(&drive_relationship_path, &drive_relationships);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -1407,6 +1541,10 @@ impl Mesh {
             drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
             drive_reconnect_path,
+            drive_relationships: Mutex::new(drive_relationships),
+            drive_relationship_path,
+            drive_forgets: Mutex::new(drive_forgets),
+            drive_forget_path,
             drive_reconnect_inflight: Mutex::new(std::collections::HashSet::new()),
             kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
@@ -3411,6 +3549,7 @@ impl Mesh {
                     // on every advert is safe: active routes and in-flight
                     // reconnects are both filtered inside.
                     self.reconnect_drive_pulls(node_id.as_str());
+                    self.retry_drive_forgets(node_id.as_str()).await;
                     // Self-heal the fleet: if a device we still list as a fleet
                     // member now advertises a *positively different* owner, it
                     // has been re-claimed — evict it so the roster reflects
@@ -3604,8 +3743,20 @@ impl Mesh {
                             })
                         };
                         if authorized && is_mapped_drive_route(route) {
+                            let mapping = accepted_drive_pull
+                                .as_ref()
+                                .map(|pull| pull.mapping.clone())
+                                .filter(|mapping| !mapping.is_empty())
+                                .or_else(|| {
+                                    drive
+                                        .as_ref()
+                                        .and_then(|offer| offer.mapping.clone())
+                                })
+                                .filter(|mapping| !mapping.is_empty())
+                                .unwrap_or_else(|| route.id.clone());
                             let reconnect = accepted_drive_pull
                                 .map(|pull| DriveReconnect {
+                                    mapping: pull.mapping,
                                     source: pull.source,
                                     root: pull.root,
                                     label: if pull.label.is_empty() {
@@ -3622,6 +3773,7 @@ impl Mesh {
                                 .or_else(|| {
                                     let offer = drive.as_ref()?;
                                     Some(DriveReconnect {
+                                        mapping: mapping.clone(),
                                         source: pubkey_part(from.as_str()).to_string(),
                                         root: offer.root.clone()?,
                                         label: offer.label.clone(),
@@ -3634,6 +3786,18 @@ impl Mesh {
                                     .lock()
                                     .insert(route.id.clone(), reconnect);
                                 self.persist_drive_reconnects();
+                            }
+                            if let (Some(offer), Some(me)) =
+                                (drive.as_ref(), self.local_node_id())
+                            {
+                                self.record_drive_relationship(DriveRelationship {
+                                    mapping,
+                                    source: from.to_string(),
+                                    target: me,
+                                    label: offer.label.clone(),
+                                    mount: offer.mount.clone(),
+                                    route: route.id.clone(),
+                                });
                             }
                         }
                         // CEC screen gate: a customer only lets a dialed
@@ -4753,7 +4917,8 @@ impl Mesh {
         label: String,
         mount: String,
     ) -> Result<String, String> {
-        self.drive_map_requested(target, root, label, mount, None)
+        let mapping = new_drive_mapping_id()?;
+        self.drive_map_requested(target, root, label, mount, None, Some(mapping))
             .await
     }
 
@@ -4764,6 +4929,7 @@ impl Mesh {
         label: String,
         mount: String,
         request: Option<String>,
+        mapping: Option<String>,
     ) -> Result<String, String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let target = pubkey_part(&node_of(&target)).to_string();
@@ -4787,13 +4953,11 @@ impl Mesh {
         if !root.is_dir() {
             return Err("choose a drive or folder".into());
         }
-        let mut random = [0u8; 8];
-        getrandom::getrandom(&mut random)
-            .map_err(|error| format!("couldn't create a drive route: {error}"))?;
-        let nonce = random
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mapping = match mapping.filter(|mapping| !mapping.is_empty()) {
+            Some(mapping) => mapping,
+            None => new_drive_mapping_id()?,
+        };
+        let nonce = mapping.clone();
         let from = format!("{me}:drive-map:{nonce}");
         let to = format!("{target}:storage-in");
         let route = Route {
@@ -4803,16 +4967,27 @@ impl Mesh {
             media: MediaKind::Storage,
         };
         self.files.map_root(&route.id, root.clone());
-        let drive = DriveRouteOffer {
-            label: if label.trim().is_empty() {
+        let label = if label.trim().is_empty() {
                 root.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Remote drive".into())
             } else {
                 label.trim().to_string()
-            },
+            };
+        let mount = mount.trim().to_string();
+        self.record_drive_relationship(DriveRelationship {
+            mapping: mapping.clone(),
+            source: me.clone(),
+            target: target.clone(),
+            label: label.clone(),
+            mount: mount.clone(),
+            route: route.id.clone(),
+        });
+        let drive = DriveRouteOffer {
+            label,
+            mapping: Some(mapping.clone()),
             root: Some(root.to_string_lossy().into_owned()),
-            mount: mount.trim().to_string(),
+            mount,
             request,
         };
         let message = {
@@ -4828,6 +5003,7 @@ impl Mesh {
             )
         };
         if let Err(error) = self.send_control(&target, &message).await {
+            self.remove_drive_relationship(&mapping);
             self.files.stop(&route.id);
             if let Some(session) = self.state.lock().session.as_mut() {
                 let _ = session.teardown(&route.id);
@@ -5126,6 +5302,19 @@ impl Mesh {
         label: String,
         mount: String,
     ) -> Result<(), String> {
+        let mapping = new_drive_mapping_id()?;
+        self.drive_map_from_requested(source, root, label, mount, mapping)
+            .await
+    }
+
+    async fn drive_map_from_requested(
+        self: &Arc<Self>,
+        source: String,
+        root: String,
+        label: String,
+        mount: String,
+        mapping: String,
+    ) -> Result<(), String> {
         let source = pubkey_part(&node_of(&source)).to_string();
         if source.is_empty()
             || self
@@ -5148,6 +5337,7 @@ impl Mesh {
         self.drive_pull_tokens.lock().insert(
             request.clone(),
             DrivePullRequest {
+                mapping: mapping.clone(),
                 source: source.clone(),
                 root: root.clone(),
                 label: label.clone(),
@@ -5164,6 +5354,7 @@ impl Mesh {
                     label,
                     mount,
                     request: request.clone(),
+                    mapping,
                 }),
             )
             .await
@@ -5199,6 +5390,18 @@ impl Mesh {
         folder: String,
         mount: String,
     ) -> Result<(), String> {
+        let mapping = new_drive_mapping_id()?;
+        self.folder_open_requested(source, folder, mount, mapping)
+            .await
+    }
+
+    async fn folder_open_requested(
+        self: &Arc<Self>,
+        source: String,
+        folder: String,
+        mount: String,
+        mapping: String,
+    ) -> Result<(), String> {
         let source = pubkey_part(&node_of(&source)).to_string();
         if source.is_empty()
             || self
@@ -5224,6 +5427,7 @@ impl Mesh {
         self.drive_pull_tokens.lock().insert(
             request.clone(),
             DrivePullRequest {
+                mapping: mapping.clone(),
                 source: source.clone(),
                 root: String::new(),
                 label: String::new(),
@@ -5239,6 +5443,7 @@ impl Mesh {
                     folder,
                     mount,
                     request: request.clone(),
+                    mapping,
                 }),
             )
             .await
@@ -5428,6 +5633,7 @@ impl Mesh {
         folder_id: String,
         mount: String,
         request: String,
+        mapping: String,
     ) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let target = pubkey_part(&node_of(&target)).to_string();
@@ -5466,14 +5672,29 @@ impl Mesh {
         // escapes and deleting the root are refused exactly as for a mapped
         // drive.
         self.files.map_root(&route.id, root);
+        let mapping = if mapping.is_empty() {
+            new_drive_mapping_id()?
+        } else {
+            mapping
+        };
+        let mount = mount.trim().to_string();
+        self.record_drive_relationship(DriveRelationship {
+            mapping: mapping.clone(),
+            source: me.clone(),
+            target: target.clone(),
+            label: label.clone(),
+            mount: mount.clone(),
+            route: route.id.clone(),
+        });
         let drive = DriveRouteOffer {
             label,
+            mapping: Some(mapping.clone()),
             // No root on the wire, ever. A mapped drive sends one so the
             // receiver can re-request it on reconnect; a folder is re-opened
             // by its id instead, which is the whole reason the path stays
             // here.
             root: None,
-            mount: mount.trim().to_string(),
+            mount,
             request: Some(request),
         };
         let message = {
@@ -5489,6 +5710,7 @@ impl Mesh {
             )
         };
         if let Err(error) = self.send_control(&target, &message).await {
+            self.remove_drive_relationship(&mapping);
             self.files.stop(&route.id);
             if let Some(session) = self.state.lock().session.as_mut() {
                 let _ = session.teardown(&route.id);
@@ -5509,6 +5731,180 @@ impl Mesh {
         if !persist_drive_reconnects(&self.drive_reconnect_path, &mappings) {
             tracing::error!("couldn't save native drive mappings");
         }
+    }
+
+    fn persist_drive_relationships(&self) {
+        let mappings = self.drive_relationships.lock();
+        if !persist_drive_relationships(&self.drive_relationship_path, &mappings) {
+            tracing::error!("couldn't save shared native drive state");
+        }
+    }
+
+    fn persist_drive_forgets(&self) {
+        let pending = self.drive_forgets.lock();
+        if !persist_drive_forgets(&self.drive_forget_path, &pending) {
+            tracing::error!("couldn't save pending native drive removals");
+        }
+    }
+
+    async fn retry_drive_forgets(&self, peer: &str) {
+        let pending = self
+            .drive_forgets
+            .lock()
+            .iter()
+            .filter(|(_, target)| same_node(target, peer))
+            .map(|(mapping, _)| mapping.clone())
+            .collect::<Vec<_>>();
+        for mapping in pending {
+            let _ = self
+                .send_control(
+                    peer,
+                    &ControlMessage::App(AppControl::ForgetDrive { mapping }),
+                )
+                .await;
+        }
+    }
+
+    fn record_drive_relationship(&self, mut mapping: DriveRelationship) {
+        mapping.source = pubkey_part(&node_of(&mapping.source)).to_string();
+        mapping.target = pubkey_part(&node_of(&mapping.target)).to_string();
+        let mut relationships = self.drive_relationships.lock();
+        if let Some(existing) = relationships.get(&mapping.mapping) {
+            if mapping.label.is_empty() {
+                mapping.label = existing.label.clone();
+            }
+            if mapping.mount.is_empty() {
+                mapping.mount = existing.mount.clone();
+            }
+            if mapping.route.is_empty() {
+                mapping.route = existing.route.clone();
+            }
+            if mapping.source.is_empty() {
+                mapping.source = existing.source.clone();
+            }
+            if mapping.target.is_empty() {
+                mapping.target = existing.target.clone();
+            }
+        }
+        relationships.insert(mapping.mapping.clone(), mapping);
+        drop(relationships);
+        self.persist_drive_relationships();
+        self.emit_drive_relationships();
+    }
+
+    fn remove_drive_relationship(&self, mapping: &str) -> Option<DriveRelationship> {
+        let removed = self.drive_relationships.lock().remove(mapping);
+        if removed.is_some() {
+            self.persist_drive_relationships();
+            self.emit_drive_relationships();
+        }
+        removed
+    }
+
+    pub fn drive_mappings(&self) -> Value {
+        let me = self.local_node_id().unwrap_or_default();
+        let active_mounts = self.drive_mounts.list();
+        let state = self.state.lock();
+        let session = state.session.as_ref();
+        let mut mappings = self
+            .drive_relationships
+            .lock()
+            .values()
+            .cloned()
+            .map(|mut mapping| {
+                if mapping.target.is_empty() {
+                    mapping.target = pubkey_part(&me).to_string();
+                }
+                let active = !mapping.route.is_empty()
+                    && session
+                        .and_then(|session| session.route(&mapping.route))
+                        .is_some_and(|route| route.is_active());
+                let mounted = active_mounts
+                    .iter()
+                    .find(|mount| mount.route == mapping.route);
+                if let Some(mounted) = mounted {
+                    mapping.mount = mounted.mount.clone();
+                }
+                json!({
+                    "mapping": mapping.mapping,
+                    "source": mapping.source,
+                    "target": mapping.target,
+                    "label": mapping.label,
+                    "mount": mapping.mount,
+                    "route": mapping.route,
+                    "status": if mounted.is_some() { "mounted" } else if active { "connected" } else { "unavailable" },
+                })
+            })
+            .collect::<Vec<_>>();
+        mappings.sort_by(|a, b| {
+            a.get("mapping")
+                .and_then(Value::as_str)
+                .cmp(&b.get("mapping").and_then(Value::as_str))
+        });
+        json!({ "mappings": mappings })
+    }
+
+    fn emit_drive_relationships(&self) {
+        self.sink
+            .emit("allmystuff://drive-state", self.drive_mappings());
+    }
+
+    async fn forget_drive_local(self: &Arc<Self>, mapping: &str) -> Option<DriveRelationship> {
+        let relationship = self.remove_drive_relationship(mapping);
+        let forgotten_routes = {
+            let mut reconnects = self.drive_reconnects.lock();
+            let routes = reconnects
+                .iter()
+                .filter(|(_, reconnect)| reconnect.mapping == mapping)
+                .map(|(route, _)| route.clone())
+                .collect::<Vec<_>>();
+            reconnects.retain(|_, reconnect| reconnect.mapping != mapping);
+            routes
+        };
+        if !forgotten_routes.is_empty() {
+            self.persist_drive_reconnects();
+        }
+        let route = relationship
+            .as_ref()
+            .filter(|relationship| !relationship.route.is_empty())
+            .map(|relationship| relationship.route.clone())
+            .or_else(|| forgotten_routes.into_iter().next());
+        if let Some(route) = route {
+            let _ = self.disconnect(route).await;
+        }
+        relationship
+    }
+
+    /// Remove one user mapping from either affected machine. Route teardown
+    /// alone means "temporarily unavailable"; this command shares the durable
+    /// forget intent with the other endpoint before either side can reconnect
+    /// the Windows drive behind the user's back.
+    pub async fn drive_unmap(self: &Arc<Self>, mapping: String) -> Result<(), String> {
+        let relationship = self
+            .forget_drive_local(&mapping)
+            .await
+            .ok_or("that drive mapping is no longer known")?;
+        let me = self.local_node_id().unwrap_or_default();
+        let peer = if same_node(&relationship.source, &me) {
+            relationship.target
+        } else {
+            relationship.source
+        };
+        if !peer.is_empty() {
+            self.drive_forgets
+                .lock()
+                .insert(mapping.clone(), peer.clone());
+            self.persist_drive_forgets();
+            // Best effort now; a sleeping/offline peer is retried from its
+            // next presence advert and the tombstone remains until its ack.
+            let _ = self
+                .send_control(
+                    &peer,
+                    &ControlMessage::App(AppControl::ForgetDrive { mapping }),
+                )
+                .await;
+        }
+        Ok(())
     }
 
     /// Rebuild receiver-initiated drive routes whose source has returned with
@@ -5560,14 +5956,20 @@ impl Mesh {
                         tokio::time::sleep(Duration::from_millis(retry_delay)).await;
                     }
                     let result = if let Some(folder) = intent.folder.clone() {
-                        mesh.folder_open(intent.source.clone(), folder, intent.mount.clone())
-                            .await
+                        mesh.folder_open_requested(
+                            intent.source.clone(),
+                            folder,
+                            intent.mount.clone(),
+                            intent.mapping.clone(),
+                        )
+                        .await
                     } else {
-                        mesh.drive_map_from(
+                        mesh.drive_map_from_requested(
                             intent.source.clone(),
                             intent.root.clone(),
                             intent.label.clone(),
                             intent.mount.clone(),
+                            intent.mapping.clone(),
                         )
                         .await
                     };
@@ -7994,6 +8396,34 @@ impl Mesh {
             return;
         }
 
+        let drive_relationship_peer = match &message {
+            AppControl::ForgetDrive { mapping } => self
+                .drive_relationships
+                .lock()
+                .get(mapping)
+                .map(|relationship| {
+                    same_node(&relationship.source, from.as_str())
+                        || same_node(&relationship.target, from.as_str())
+                })
+                // A repeated forget after a lost acknowledgement is harmless:
+                // there is no state left to mutate, but the original endpoint
+                // still needs its ack so it can retire the durable tombstone.
+                .unwrap_or(true),
+            AppControl::DriveMounted { mapping, .. } => self
+                .drive_relationships
+                .lock()
+                .get(mapping)
+                .is_some_and(|relationship| {
+                    same_node(&relationship.source, from.as_str())
+                        || same_node(&relationship.target, from.as_str())
+                }),
+            AppControl::ForgetDriveAck { mapping } => self
+                .drive_forgets
+                .lock()
+                .get(mapping)
+                .is_some_and(|peer| same_node(peer, from.as_str())),
+            _ => false,
+        };
         let authorized = if matches!(
             &message,
             AppControl::MapDrive { .. } | AppControl::StageKvmMedia { .. }
@@ -8008,6 +8438,13 @@ impl Mesh {
             // is there a live grant over *this* folder — against the id in the
             // message, which isn't readable from here.
             true
+        } else if matches!(
+            &message,
+            AppControl::ForgetDrive { .. }
+                | AppControl::ForgetDriveAck { .. }
+                | AppControl::DriveMounted { .. }
+        ) {
+            drive_relationship_peer
         } else {
             self.sender_may_control(from.as_str())
         };
@@ -8025,7 +8462,22 @@ impl Mesh {
                 label,
                 mount,
                 request,
+                mapping,
             } => {
+                if self
+                    .drive_forgets
+                    .lock()
+                    .get(&mapping)
+                    .is_some_and(|peer| same_node(peer, from.as_str()))
+                {
+                    let _ = self
+                        .send_control(
+                            from.as_str(),
+                            &ControlMessage::App(AppControl::ForgetDrive { mapping }),
+                        )
+                        .await;
+                    return;
+                }
                 tracing::info!(
                     "native drive requested by {} from {}",
                     short_id(from.as_str()),
@@ -8034,7 +8486,14 @@ impl Mesh {
                 let mesh = self.clone();
                 crate::spawn(async move {
                     if let Err(error) = mesh
-                        .drive_map_requested(from.to_string(), root, label, mount, Some(request))
+                        .drive_map_requested(
+                            from.to_string(),
+                            root,
+                            label,
+                            mount,
+                            Some(request),
+                            Some(mapping),
+                        )
                         .await
                     {
                         tracing::warn!("native drive request failed: {error}");
@@ -8045,7 +8504,22 @@ impl Mesh {
                 folder,
                 mount,
                 request,
+                mapping,
             } => {
+                if self
+                    .drive_forgets
+                    .lock()
+                    .get(&mapping)
+                    .is_some_and(|peer| same_node(peer, from.as_str()))
+                {
+                    let _ = self
+                        .send_control(
+                            from.as_str(),
+                            &ControlMessage::App(AppControl::ForgetDrive { mapping }),
+                        )
+                        .await;
+                    return;
+                }
                 tracing::info!(
                     "shared folder {folder} requested by {}",
                     short_id(from.as_str())
@@ -8053,7 +8527,7 @@ impl Mesh {
                 let mesh = self.clone();
                 crate::spawn(async move {
                     if let Err(error) = mesh
-                        .folder_map_requested(from.to_string(), folder, mount, request)
+                        .folder_map_requested(from.to_string(), folder, mount, request, mapping)
                         .await
                     {
                         // Refusals land here rather than on the wire on
@@ -8081,6 +8555,39 @@ impl Mesh {
                     if let Err(error) = mesh.folder_open(source, folder, mount).await {
                         tracing::warn!("fleet shared-folder mount failed: {error}");
                     }
+                });
+            }
+            AppControl::ForgetDrive { mapping } => {
+                let _ = self.forget_drive_local(&mapping).await;
+                let _ = self
+                    .send_control(
+                        from.as_str(),
+                        &ControlMessage::App(AppControl::ForgetDriveAck { mapping }),
+                    )
+                    .await;
+            }
+            AppControl::ForgetDriveAck { mapping } => {
+                if self.drive_forgets.lock().remove(&mapping).is_some() {
+                    self.persist_drive_forgets();
+                }
+            }
+            AppControl::DriveMounted {
+                mapping,
+                route,
+                label,
+                mount,
+            } => {
+                let Some(existing) = self.drive_relationships.lock().get(&mapping).cloned()
+                else {
+                    return;
+                };
+                self.record_drive_relationship(DriveRelationship {
+                    mapping,
+                    source: existing.source,
+                    target: existing.target,
+                    label,
+                    mount,
+                    route,
                 });
             }
             AppControl::ShareFolder {
@@ -11383,6 +11890,7 @@ impl Mesh {
                         .and_then(|live| live.drive.clone())
                         .unwrap_or(DriveRouteOffer {
                             label: "Remote drive".into(),
+                            mapping: None,
                             root: None,
                             mount: String::new(),
                             request: None,
@@ -11391,9 +11899,21 @@ impl Mesh {
                     let mounts = self.drive_mounts.clone();
                     let route_id = route.id.clone();
                     let request = drive.request.clone();
+                    let mapping = drive
+                        .mapping
+                        .clone()
+                        .filter(|mapping| !mapping.is_empty())
+                        .unwrap_or_else(|| route_id.clone());
+                    let source_node = from_node.clone();
+                    let target_node = to_node.clone();
                     crate::spawn(async move {
                         match mounts
-                            .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
+                            .mount(
+                                mesh.clone(),
+                                route_id.clone(),
+                                drive.label,
+                                drive.mount,
+                            )
                             .await
                         {
                             Ok(info) => {
@@ -11406,6 +11926,25 @@ impl Mesh {
                                     intent.mount = info.mount.clone();
                                 }
                                 mesh.persist_drive_reconnects();
+                                mesh.record_drive_relationship(DriveRelationship {
+                                    mapping: mapping.clone(),
+                                    source: source_node.clone(),
+                                    target: target_node,
+                                    label: info.label.clone(),
+                                    mount: info.mount.clone(),
+                                    route: route_id.clone(),
+                                });
+                                let _ = mesh
+                                    .send_control(
+                                        &source_node,
+                                        &ControlMessage::App(AppControl::DriveMounted {
+                                            mapping: mapping.clone(),
+                                            route: route_id.clone(),
+                                            label: info.label.clone(),
+                                            mount: info.mount.clone(),
+                                        }),
+                                    )
+                                    .await;
                                 tracing::info!(
                                     "route {} active — native drive {} mounted from {}",
                                     route_id,
@@ -18567,6 +19106,7 @@ mod tests {
         ));
         let path = Some(dir.join("allmystuff-drives.json"));
         let intent = super::DriveReconnect {
+            mapping: "mapping-1".into(),
             source: "source-key".into(),
             root: "/Volumes/Install Media".into(),
             label: "Windows installer".into(),
@@ -18597,6 +19137,7 @@ mod tests {
         ));
         let path = Some(dir.join("allmystuff-drives.json"));
         let intent = super::DriveReconnect {
+            mapping: "mapping-folder".into(),
             source: "source-key".into(),
             root: String::new(),
             label: "Family photos".into(),
@@ -18623,6 +19164,44 @@ mod tests {
             legacy.folder, None,
             "pre-folder reconnect records still load"
         );
+        assert!(legacy.mapping.is_empty(), "older records gain an id at store load");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drive_relationships_and_pending_forgets_are_crash_safe() {
+        let dir = std::env::temp_dir().join(format!(
+            "amst-drive-relationships-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        let relationships_path = Some(dir.join("allmystuff-drive-relationships.json"));
+        let forgets_path = Some(dir.join("allmystuff-drive-forgets.json"));
+        let relationship = super::DriveRelationship {
+            mapping: "mapping-1".into(),
+            source: "laptop".into(),
+            target: "desktop".into(),
+            label: "Laptop Documents".into(),
+            mount: "Z:".into(),
+            route: "route:live".into(),
+        };
+        let relationships =
+            std::collections::HashMap::from([("mapping-1".into(), relationship.clone())]);
+        assert!(super::persist_drive_relationships(
+            &relationships_path,
+            &relationships
+        ));
+        assert_eq!(
+            super::load_drive_relationships(&relationships_path)
+                .get("mapping-1"),
+            Some(&relationship)
+        );
+
+        let pending =
+            std::collections::HashMap::from([("mapping-1".into(), "desktop".into())]);
+        assert!(super::persist_drive_forgets(&forgets_path, &pending));
+        assert_eq!(super::load_drive_forgets(&forgets_path), pending);
 
         let _ = std::fs::remove_dir_all(dir);
     }

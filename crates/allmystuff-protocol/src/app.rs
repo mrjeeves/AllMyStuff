@@ -709,6 +709,11 @@ pub enum AppControl {
         #[serde(default)]
         mount: String,
         request: String,
+        /// Stable identity of the user's mapping intent. Route ids describe
+        /// one live connection incarnation; this id survives reconnects so
+        /// both affected machines can show and remove the same one-way map.
+        #[serde(default)]
+        mapping: String,
     },
     /// Open one **shared folder** on this machine as a native drive on the
     /// authenticated requester — the person-to-person twin of `MapDrive`.
@@ -732,6 +737,8 @@ pub enum AppControl {
         #[serde(default)]
         mount: String,
         request: String,
+        #[serde(default)]
+        mapping: String,
     },
     /// Ask one of the requester's own fleet machines to mount a folder that a
     /// third-party fleet shared with the requester. The destination asks the
@@ -744,6 +751,24 @@ pub enum AppControl {
         source: String,
         folder: String,
         #[serde(default)]
+        mount: String,
+    },
+    /// One endpoint explicitly removed a native mapping. This is separate
+    /// from route teardown: a route can disappear because a laptop slept,
+    /// while removing the mapping is durable user intent shared by both ends.
+    ForgetDrive { mapping: String },
+    /// Confirmation that the other endpoint persisted the forget. Until this
+    /// arrives, the requester retains and retries its tombstone when the peer
+    /// returns, preventing an offline laptop from resurrecting an orphan map.
+    ForgetDriveAck { mapping: String },
+    /// The receiving OS finished mounting the mapping and reports the actual
+    /// mount it selected (for example `Z:` when the request said Auto). The
+    /// source stores this display-only mirror so every Drives surface tells
+    /// the same story without turning the filesystem mapping bidirectional.
+    DriveMounted {
+        mapping: String,
+        route: String,
+        label: String,
         mount: String,
     },
     /// Ask one of *my own* machines to start sharing one of its folders, and
@@ -961,6 +986,10 @@ pub struct TerminalSessionInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveRouteOffer {
     pub label: String,
+    /// Stable user-intent id shared by the source and receiver. Optional for
+    /// rolling compatibility; peers without it fall back to the route id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<String>,
     /// Canonical path on the source. Absent on older senders; those mappings
     /// remain live-only and cannot be rebuilt by the receiver after restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1511,6 +1540,70 @@ mod tests {
         assert!(s.contains("\"kind\":\"upgrade\""));
         let back: ControlMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn drive_mapping_identity_and_lifecycle_round_trip() {
+        let request = ControlMessage::App(AppControl::MapDrive {
+            root: "C:\\Users\\Tracy\\Documents".into(),
+            label: "Laptop Documents".into(),
+            mount: "Z:".into(),
+            request: "request-1".into(),
+            mapping: "mapping-1".into(),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"mapping\":\"mapping-1\""));
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+            request
+        );
+
+        for message in [
+            AppControl::DriveMounted {
+                mapping: "mapping-1".into(),
+                route: "route-1".into(),
+                label: "Laptop Documents".into(),
+                mount: "Z:".into(),
+            },
+            AppControl::ForgetDrive {
+                mapping: "mapping-1".into(),
+            },
+            AppControl::ForgetDriveAck {
+                mapping: "mapping-1".into(),
+            },
+        ] {
+            let message = ControlMessage::App(message);
+            let encoded = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ControlMessage>(&encoded).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn drive_mapping_identity_accepts_older_requests_and_offers() {
+        let old_request = serde_json::json!({
+            "t": "app",
+            "kind": "map_drive",
+            "root": "C:\\Work",
+            "label": "Work",
+            "mount": "W:",
+            "request": "old-request"
+        });
+        let decoded: ControlMessage = serde_json::from_value(old_request).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMessage::App(AppControl::MapDrive { mapping, .. }) if mapping.is_empty()
+        ));
+
+        let old_offer = serde_json::json!({
+            "label": "Work",
+            "root": "C:\\Work",
+            "mount": "W:"
+        });
+        let decoded: DriveRouteOffer = serde_json::from_value(old_offer).unwrap();
+        assert_eq!(decoded.mapping, None);
     }
 
     #[test]

@@ -366,6 +366,29 @@ export async function mapNativeDriveFrom(
   await invoke("drive_map_from", { source, root, label, mount });
 }
 
+export interface DriveMappingState {
+  mapping: string;
+  source: string;
+  target: string;
+  label: string;
+  mount: string;
+  route: string;
+  status: "mounted" | "connected" | "unavailable";
+}
+
+export async function nativeDriveMappings(): Promise<DriveMappingState[]> {
+  if (!isTauri()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  const value = await invoke<{ mappings?: DriveMappingState[] }>("drive_mappings");
+  return value.mappings ?? [];
+}
+
+export async function unmapNativeDrive(mapping: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("drive_unmap", { mapping });
+}
+
 /** Share a folder on `source` — whichever machine of mine holds it — and get
  *  back the id it minted. The share builder pins its grant to that id; the
  *  path never leaves the machine that owns the disk. */
@@ -1166,6 +1189,15 @@ export interface DriveMountEvent {
   label?: string;
   requested?: boolean;
   error?: string | null;
+}
+export async function onDriveState(
+  cb: (mappings: DriveMappingState[]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ mappings?: DriveMappingState[] }>("allmystuff://drive-state", (e) =>
+    cb(e.payload.mappings ?? []),
+  );
 }
 export async function onDriveMount(
   cb: (e: DriveMountEvent) => void,

@@ -63,10 +63,8 @@ mod pcm_b64 {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(text.as_bytes())
             .map_err(serde::de::Error::custom)?;
-        Ok(bytes
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect())
+        let (samples, _) = bytes.as_chunks::<2>();
+        Ok(samples.iter().copied().map(i16::from_le_bytes).collect())
     }
 }
 

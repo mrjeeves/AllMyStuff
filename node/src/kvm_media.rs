@@ -275,7 +275,7 @@ struct MacRangeReader {
 impl MacRangeReader {
     async fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), String> {
         const BLOCK: u64 = 256 * 1024;
-        if offset % BLOCK != 0 || output.is_empty() || output.len() > BLOCK as usize {
+        if !offset.is_multiple_of(BLOCK) || output.is_empty() || output.len() > BLOCK as usize {
             return Err("KVM requested an unsupported raw-disk range".into());
         }
         if self.worker.is_finished() {
@@ -707,11 +707,15 @@ async fn read_source_range(
 /// Ordinary HTTP fallback for site relays that cannot carry a WebSocket
 /// Upgrade. The KVM long-polls for work and receives range replies as raw
 /// request bodies, so the media remains lazy and resumable over TURN.
-async fn stream_remote_http(
+struct RemoteHttpRequest<'a> {
     local_port: u16,
-    session: &str,
-    manifest: &str,
+    session: &'a str,
+    manifest: &'a str,
     len: u64,
+}
+
+async fn stream_remote_http(
+    request: RemoteHttpRequest<'_>,
     file: &mut Option<tokio::fs::File>,
     #[cfg(target_os = "macos")] range: &mut Option<MacRangeReader>,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -722,7 +726,10 @@ async fn stream_remote_http(
         .timeout(std::time::Duration::from_secs(35))
         .build()
         .map_err(|error| format!("couldn't start the KVM media fallback: {error}"))?;
-    let base = format!("http://127.0.0.1:{local_port}/api/storage/remote-media/session");
+    let base = format!(
+        "http://127.0.0.1:{}/api/storage/remote-media/session",
+        request.local_port
+    );
     let mut opened = false;
     let mut retry = std::time::Duration::from_millis(300);
 
@@ -730,7 +737,7 @@ async fn stream_remote_http(
         if *stop_rx.borrow() {
             let _ = client
                 .delete(&base)
-                .query(&[("session", session)])
+                .query(&[("session", request.session)])
                 .send()
                 .await;
             return Ok(());
@@ -741,7 +748,7 @@ async fn stream_remote_http(
                 response = client
                     .post(&base)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(manifest.to_owned())
+                    .body(request.manifest.to_owned())
                     .send() => response,
             };
             match response {
@@ -770,7 +777,7 @@ async fn stream_remote_http(
         let response = tokio::select! {
             _ = stop_rx.changed() => continue,
             response = client.get(format!("{base}/next"))
-                .query(&[("session", session)])
+                .query(&[("session", request.session)])
                 .send() => response,
         };
         let response = match response {
@@ -817,7 +824,7 @@ async fn stream_remote_http(
                 let end = message.offset.checked_add(message.length as u64);
                 if message.length == 0
                     || message.length > REMOTE_MEDIA_MAX_READ
-                    || end.is_none_or(|end| end > len)
+                    || end.is_none_or(|end| end > request.len)
                 {
                     return Err("KVM requested an invalid remote-media range".into());
                 }
@@ -837,7 +844,7 @@ async fn stream_remote_http(
                         _ = stop_rx.changed() => continue 'poll,
                         response = client
                             .post(format!("{base}/reply"))
-                            .query(&[("session", session), ("id", reply_id.as_str())])
+                            .query(&[("session", request.session), ("id", reply_id.as_str())])
                             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                             .body(data.clone())
                             .send() => response,
@@ -945,10 +952,12 @@ async fn stream_remote(
                             "KVM remote-media WebSocket unavailable ({error}); using HTTP fallback"
                         );
                         let result = stream_remote_http(
-                            local_port,
-                            &provider_session,
-                            &manifest,
-                            len,
+                            RemoteHttpRequest {
+                                local_port,
+                                session: &provider_session,
+                                manifest: &manifest,
+                                len,
+                            },
                             &mut file,
                             #[cfg(target_os = "macos")]
                             &mut range,
@@ -1075,10 +1084,12 @@ async fn stream_remote(
                     "KVM remote-media WebSocket closed before mounting; using HTTP fallback"
                 );
                 let result = stream_remote_http(
-                    local_port,
-                    &provider_session,
-                    &manifest,
-                    len,
+                    RemoteHttpRequest {
+                        local_port,
+                        session: &provider_session,
+                        manifest: &manifest,
+                        len,
+                    },
                     &mut file,
                     #[cfg(target_os = "macos")]
                     &mut range,

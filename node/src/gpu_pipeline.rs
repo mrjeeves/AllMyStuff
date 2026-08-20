@@ -555,7 +555,8 @@ mod tests {
                 let bright = (row as u32).is_multiple_of(2) == i.is_multiple_of(2);
                 let v = if bright { 220u8 } else { 40u8 };
                 let line = &mut bgra[row * (w as usize) * 4..][..(w as usize) * 4];
-                for px in line.chunks_exact_mut(4) {
+                let (pixels, _) = line.as_chunks_mut::<4>();
+                for px in pixels {
                     px[0] = v;
                     px[1] = v;
                     px[2] = v;

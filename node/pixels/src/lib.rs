@@ -13,7 +13,8 @@ pub fn scale_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     for (y, drow) in out.chunks_exact_mut(dw * 4).enumerate() {
         let sy = y * sh / dh;
         let srow = &src[sy * sw * 4..][..sw * 4];
-        for (dst, &sx) in drow.chunks_exact_mut(4).zip(&xmap) {
+        let (pixels, _) = drow.as_chunks_mut::<4>();
+        for (dst, &sx) in pixels.iter_mut().zip(&xmap) {
             dst.copy_from_slice(&srow[sx..sx + 4]);
         }
     }
@@ -31,7 +32,8 @@ pub fn scale_rgba_to_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<
     for (y, drow) in out.chunks_exact_mut(dw * 3).enumerate() {
         let sy = y * sh / dh;
         let srow = &src[sy * sw * 4..][..sw * 4];
-        for (dst, &sx) in drow.chunks_exact_mut(3).zip(&xmap) {
+        let (pixels, _) = drow.as_chunks_mut::<3>();
+        for (dst, &sx) in pixels.iter_mut().zip(&xmap) {
             dst.copy_from_slice(&srow[sx..sx + 3]);
         }
     }
@@ -232,7 +234,9 @@ pub fn bgra_to_rgba_into(src: &[u8], src_pitch: usize, w: usize, h: usize, dst: 
     for row in 0..h {
         let s = &src[row * src_pitch..][..w * 4];
         let d = &mut dst[row * w * 4..][..w * 4];
-        for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+        let (dst_pixels, _) = d.as_chunks_mut::<4>();
+        let (src_pixels, _) = s.as_chunks::<4>();
+        for (dp, sp) in dst_pixels.iter_mut().zip(src_pixels) {
             dp[0] = sp[2];
             dp[1] = sp[1];
             dp[2] = sp[0];

@@ -1438,7 +1438,9 @@ mod tests {
             for row in 0..h as usize {
                 let bright = (row as u32).is_multiple_of(2) == i.is_multiple_of(2);
                 let v = if bright { 220u8 } else { 40u8 };
-                for px in bgra[row * (w as usize) * 4..][..(w as usize) * 4].chunks_exact_mut(4) {
+                let line = &mut bgra[row * (w as usize) * 4..][..(w as usize) * 4];
+                let (pixels, _) = line.as_chunks_mut::<4>();
+                for px in pixels {
                     px[0] = v;
                     px[1] = v;
                     px[2] = v;
@@ -1577,7 +1579,8 @@ pub(crate) mod tests_support {
     /// fine grain) without shipping a font. Each dot's right column
     /// half-blends toward the page, faking the AA edge real glyphs carry.
     pub(crate) fn paint_document(buf: &mut [u8], w: usize, rows: usize) {
-        for px in buf.chunks_exact_mut(4) {
+        let (pixels, _) = buf.as_chunks_mut::<4>();
+        for px in pixels {
             px.copy_from_slice(&[0xEE, 0xEC, 0xE8, 0xFF]);
         }
         let mut s = 0x5EED_1234_u64;
@@ -1757,7 +1760,8 @@ mod tests_hardware {
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
         let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
         for i in 0..90u32 {
-            for (j, px) in bgra.chunks_exact_mut(4).enumerate() {
+            let (pixels, _) = bgra.as_chunks_mut::<4>();
+            for (j, px) in pixels.iter_mut().enumerate() {
                 let v = ((j as u32).wrapping_add(i.wrapping_mul(977)) % 255) as u8;
                 px[0] = v;
                 px[1] = v.wrapping_add(40);

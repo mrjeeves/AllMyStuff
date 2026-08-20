@@ -789,7 +789,9 @@ fn pipewire_consume(
             let rgba = match format {
                 VideoFormat::RGB => {
                     let mut buf = vec![0u8; (w * h * 4) as usize];
-                    for (src, dst) in packed.chunks_exact(3).zip(buf.chunks_exact_mut(4)) {
+                    let (src_pixels, _) = packed.as_chunks::<3>();
+                    let (dst_pixels, _) = buf.as_chunks_mut::<4>();
+                    for (src, dst) in src_pixels.iter().zip(dst_pixels) {
                         dst[..3].copy_from_slice(src);
                         dst[3] = 255;
                     }
@@ -797,7 +799,8 @@ fn pipewire_consume(
                 }
                 VideoFormat::BGRx | VideoFormat::BGRA => {
                     let mut buf = packed;
-                    for px in buf.chunks_exact_mut(4) {
+                    let (pixels, _) = buf.as_chunks_mut::<4>();
+                    for px in pixels {
                         px.swap(0, 2);
                     }
                     buf

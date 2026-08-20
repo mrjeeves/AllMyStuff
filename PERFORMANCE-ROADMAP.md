@@ -1,5 +1,10 @@
 # Performance Roadmap — Parsec-tier 4K60
 
+> **Engineering roadmap:** this document records video-pipeline direction and
+> implementation history. It is not a release promise or a user guide. Current
+> user-visible behavior belongs in the [README](README.md), and stable process
+> boundaries belong in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 A unified, prioritized plan for the video trifecta (throughput · latency · quality/bandwidth)
 across **AllMyStuff** (capture / encode / decode / UI / product) and **MyOwnMesh** (transport).
 The organizing spine is one **Performance↔Quality slider** that is a *pure quality/performance

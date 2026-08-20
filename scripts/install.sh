@@ -122,6 +122,31 @@ install_serve_binary() {
   log "Installed: $PREFIX_DIR/allmystuff-serve"
 }
 
+ensure_drive_mount_helper() {
+  [ "$OS" = "linux" ] || return 0
+  if command -v mount.davfs >/dev/null 2>&1 || [ -x /sbin/mount.davfs ] || [ -x /usr/sbin/mount.davfs ]; then
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    log "(dry-run) would install davfs2 for native Linux drive mapping"
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "Native Linux drive mapping needs the davfs2 package. Install it with your package manager."
+    return 0
+  fi
+  log "Installing davfs2 for native Linux drive mapping…"
+  if [ "$(id -u)" -eq 0 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends davfs2 ||
+      warn "Couldn't install davfs2; native drive mapping will remain unavailable until it is installed."
+  elif sudo -n true 2>/dev/null; then
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends davfs2 ||
+      warn "Couldn't install davfs2; native drive mapping will remain unavailable until it is installed."
+  else
+    warn "Native Linux drive mapping needs davfs2. Run: sudo apt-get install davfs2"
+  fi
+}
+
 install_amst_binary() {
   src="$1"
   mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
@@ -668,6 +693,10 @@ elif [ "$DRY_RUN" = "true" ]; then
 else
   warn "Built the CLI from source; skipping the node binary (needs the media toolchain)."
   warn "Build it with:  cargo build --release --manifest-path node/Cargo.toml"
+fi
+
+if [ "$SERVE_INSTALLED" = "true" ] || [ "$DRY_RUN" = "true" ]; then
+  ensure_drive_mount_helper
 fi
 
 # AMSTerm (amst) — the standalone mesh terminal: a shell on any machine you

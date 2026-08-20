@@ -1,5 +1,10 @@
 # Tester kit — verifying the encoder line for upstream review
 
+> **Historical record from July 2026:** this kit belongs to the encoder handoff
+> captured against AllMyStuff 0.2.46. Commands and expected results may no
+> longer match the current release. See the [documentation map](README.md) for
+> current testing and contributor guidance.
+
 _For Chris's review and security push. Everything here runs against the
 curated `codex/video-pipeline-upstream-pr` branch. The companion document is
 [`INTEGRATION-REPORT-2026-07.md`](INTEGRATION-REPORT-2026-07.md) (what

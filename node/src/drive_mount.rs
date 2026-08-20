@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,17 +22,69 @@ use dav_server::fs::{
     OpenOptions, ReadDirMeta,
 };
 use futures_util::{future, FutureExt, StreamExt};
-use hyper::{server::conn::http1, service::service_fn};
+use http_body_util::{BodyExt, Full};
+use hyper::{server::conn::http1, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use dav_server::{fakels::FakeLs, DavHandler};
 
 use crate::mesh::Mesh;
 
-#[derive(Debug, Clone, Serialize)]
+// `dav-server` deliberately leaves the quota properties out of its special
+// empty-body PROPFIND response for Microsoft clients. Windows WebClient uses
+// exactly that request for Explorer's capacity query, so `get_quota` is never
+// reached even though the mesh source reports the correct used/total values.
+// Turn that one shorthand request into an explicit property request before
+// handing it to the library. Explicit client bodies remain untouched.
+const EMPTY_PROPFIND_WITH_QUOTA: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">
+  <D:prop>
+    <D:creationdate/><D:displayname/><D:getcontentlanguage/>
+    <D:getcontentlength/><D:getcontenttype/><D:getetag/>
+    <D:getlastmodified/><D:lockdiscovery/><D:resourcetype/>
+    <D:supportedlock/><D:quota-available-bytes/><D:quota-used-bytes/>
+    <Z:Win32CreationTime/><Z:Win32FileAttributes/>
+    <Z:Win32LastAccessTime/><Z:Win32LastModifiedTime/>
+  </D:prop>
+</D:propfind>"#;
+
+fn add_quota_to_empty_propfind<B>(
+    request: Request<B>,
+) -> Request<http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let should_expand = request.method().as_str() == "PROPFIND" && request.body().is_end_stream();
+    let (mut parts, body) = request.into_parts();
+    if should_expand {
+        use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+
+        parts.headers.remove(TRANSFER_ENCODING);
+        parts.headers.insert(
+            CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/xml; charset=utf-8"),
+        );
+        parts.headers.insert(
+            CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_str(&EMPTY_PROPFIND_WITH_QUOTA.len().to_string())
+                .expect("static PROPFIND length is a valid header"),
+        );
+        Request::from_parts(
+            parts,
+            Full::new(Bytes::from_static(EMPTY_PROPFIND_WITH_QUOTA))
+                .map_err(|error: Infallible| match error {})
+                .boxed_unsync(),
+        )
+    } else {
+        Request::from_parts(parts, body.map_err(std::io::Error::other).boxed_unsync())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
     pub route: String,
     pub label: String,
@@ -87,8 +141,7 @@ impl DriveMounts {
         }
         #[cfg(not(windows))]
         {
-            let _ = mount;
-            Ok(())
+            remove_known_native_mount(mount).await
         }
     }
 
@@ -116,7 +169,7 @@ impl DriveMounts {
                 reclaim_stale_owned_mount(&requested).await?;
             }
         }
-        let mount = choose_mount(&requested_mount, &active).await?;
+        let mount = choose_mount(&requested_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -142,7 +195,10 @@ impl DriveMounts {
                             io,
                             service_fn(move |request| {
                                 let handler = handler.clone();
-                                async move { Ok::<_, Infallible>(handler.handle(request).await) }
+                                async move {
+                                    let request = add_quota_to_empty_propfind(request);
+                                    Ok::<_, Infallible>(handler.handle(request).await)
+                                }
                             }),
                         )
                         .await
@@ -152,7 +208,24 @@ impl DriveMounts {
                 });
             }
         });
+        #[cfg(windows)]
         let url = format!("http://localhost:{port}/");
+        #[cfg(not(windows))]
+        let url = format!("http://127.0.0.1:{port}/");
+        let info = NativeDriveInfo {
+            route: route.clone(),
+            label: label.clone(),
+            mount: mount.clone(),
+            port,
+        };
+        // Unix mounts can survive their node process. Record ownership before
+        // invoking the OS helper so even a partial mount followed by an error
+        // remains safe to clean on the next start. Windows records ownership
+        // in `label_native` below instead.
+        if let Err(error) = remember_native_mount(&info) {
+            server_task.abort();
+            return Err(format!("couldn't record the native drive mount: {error}"));
+        }
         // Seed Explorer's network-drive label BEFORE `net use` publishes the
         // mount. On a reconnect Explorer enumerates the new loopback UNC as
         // soon as the mapping appears and caches its generated
@@ -163,13 +236,15 @@ impl DriveMounts {
         if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
         }
-        if let Err(error) = mount_native(&mount, &url).await {
+        if let Err(error) = mount_native(&mount, &url, &label).await {
             server_task.abort();
             // `net use` can create a reconnecting/remembered entry before it
             // reports failure. Remove that partial mapping now; otherwise the
             // next retry sees its own letter as occupied and Explorer keeps a
             // ghost drive around.
-            let _ = unmount_native(&mount).await;
+            if unmount_native(&mount).await.is_ok() {
+                let _ = forget_native_mount(&mount);
+            }
             // `label_native` may have written only part of its registry state
             // before failing; cleanup is deliberately unconditional.
             let _ = clear_native_label(&mount, Some(port)).await;
@@ -182,12 +257,6 @@ impl DriveMounts {
         if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
         }
-        let info = NativeDriveInfo {
-            route: route.clone(),
-            label,
-            mount,
-            port,
-        };
         self.active.lock().insert(
             route,
             ActiveMount {
@@ -204,13 +273,17 @@ impl DriveMounts {
         };
         active.server.abort();
         crate::spawn(async move {
-            if let Err(error) = unmount_native(&active.info.mount).await {
-                tracing::warn!(
-                    "couldn't remove native drive {} for {}: {error}",
-                    active.info.mount,
-                    active.info.route
-                );
-            }
+            let unmounted = match unmount_native(&active.info.mount).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        "couldn't remove native drive {} for {}: {error}",
+                        active.info.mount,
+                        active.info.route
+                    );
+                    false
+                }
+            };
             if let Err(error) = clear_native_label(&active.info.mount, Some(active.info.port)).await
             {
                 tracing::warn!(
@@ -218,11 +291,23 @@ impl DriveMounts {
                     active.info.mount
                 );
             }
+            if unmounted {
+                if let Err(error) = forget_native_mount(&active.info.mount) {
+                    tracing::warn!(
+                        "couldn't forget native drive lease for {}: {error}",
+                        active.info.mount
+                    );
+                }
+            }
         });
     }
 }
 
-async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<String, String> {
+async fn choose_mount(
+    requested: &str,
+    _label: &str,
+    active: &[NativeDriveInfo],
+) -> Result<String, String> {
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
@@ -240,10 +325,120 @@ async fn choose_mount(requested: &str, active: &[NativeDriveInfo]) -> Result<Str
         }
         Err("there are no free drive letters".into())
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let _ = (requested, active);
-        Err("native drive mounting is currently available on Windows".into())
+        choose_unix_mount(requested, _label, active).await
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (requested, _label, active);
+        Err("native drive mounting is not available on this operating system".into())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn choose_unix_mount(
+    requested: &str,
+    label: &str,
+    active: &[NativeDriveInfo],
+) -> Result<String, String> {
+    if !requested.trim().is_empty() {
+        let mount = PathBuf::from(requested.trim());
+        validate_unix_mount(&mount, active).await?;
+        return Ok(mount.to_string_lossy().into_owned());
+    }
+
+    let root = default_unix_mount_root()?;
+    std::fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "couldn't create the AllMyStuff drive folder {}: {error}",
+            root.display()
+        )
+    })?;
+    let stem = safe_mount_name(label);
+    for suffix in 1..=1_000 {
+        let name = if suffix == 1 {
+            stem.clone()
+        } else {
+            format!("{stem} {suffix}")
+        };
+        let mount = root.join(name);
+        if validate_unix_mount(&mount, active).await.is_ok() {
+            return Ok(mount.to_string_lossy().into_owned());
+        }
+    }
+    Err("couldn't choose an available mount point".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result<(), String> {
+    if !mount.is_absolute() || mount.parent().is_none() {
+        return Err("mount point must be an absolute folder path, not the filesystem root".into());
+    }
+    if active.iter().any(|entry| Path::new(&entry.mount) == mount)
+        || native_mount_is_active(&mount.to_string_lossy()).await?
+    {
+        return Err(format!("{} is already mounted", mount.display()));
+    }
+    match std::fs::symlink_metadata(mount) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("mount point cannot be a symbolic link".into());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("mount point must be a folder".into());
+        }
+        Ok(_) => {
+            let mut entries = std::fs::read_dir(mount).map_err(|error| error.to_string())?;
+            if entries.next().is_some() {
+                return Err(format!("{} is not empty", mount.display()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(mount).map_err(|error| {
+                format!("couldn't create mount point {}: {error}", mount.display())
+            })?;
+        }
+        Err(error) => return Err(format!("couldn't inspect {}: {error}", mount.display())),
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn safe_mount_name(label: &str) -> String {
+    let cleaned = label
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim_matches([' ', '.']).trim();
+    if cleaned.is_empty() {
+        "Remote Drive".into()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_unix_mount_root() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| home.join("AllMyStuff Drives"))
+        .ok_or_else(|| "couldn't find this user's home folder".into())
+}
+
+#[cfg(target_os = "linux")]
+fn default_unix_mount_root() -> Result<PathBuf, String> {
+    if unsafe { libc::geteuid() } == 0 {
+        Ok(PathBuf::from("/mnt/allmystuff"))
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join("AllMyStuff Drives"))
+            .ok_or_else(|| "couldn't find this user's home folder".into())
     }
 }
 
@@ -394,8 +589,128 @@ async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
     Err("the source accepted the drive but its file connection never became ready".into())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn command_result(output: std::process::Output, context: String) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        Err(context)
+    } else {
+        Err(format!("{context}: {detail}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn native_mount_is_active(mount: &str) -> Result<bool, String> {
+    let mount = mount
+        .replace('\\', r"\134")
+        .replace(' ', r"\040")
+        .replace('\t', r"\011")
+        .replace('\n', r"\012");
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("couldn't inspect Linux mounts: {error}"))?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mounted| mounted == mount)
+    }))
+}
+
+#[cfg(target_os = "macos")]
+async fn native_mount_is_active(mount: &str) -> Result<bool, String> {
+    let output = crate::child_process::command("/sbin/mount")
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect macOS mounts: {error}"))?;
+    if !output.status.success() {
+        return Err("macOS couldn't list its mounted filesystems".into());
+    }
+    let marker = format!(" on {mount} (");
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&marker)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn native_mount_lease_path() -> Option<PathBuf> {
+    allmystuff_protocol::myownmesh_state_dir().map(|dir| dir.join("allmystuff-native-mounts.json"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static NATIVE_MOUNT_LEASE_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn load_native_mount_leases() -> Vec<NativeDriveInfo> {
+    native_mount_lease_path()
+        .map(|path| crate::persist::load_json(&path))
+        .unwrap_or_default()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn save_native_mount_leases(leases: &[NativeDriveInfo]) -> Result<(), String> {
+    let path = native_mount_lease_path()
+        .ok_or_else(|| "couldn't find the AllMyStuff state folder".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("couldn't create the state folder: {error}"))?;
+    }
+    let json = serde_json::to_vec_pretty(leases)
+        .map_err(|error| format!("couldn't encode native mount leases: {error}"))?;
+    crate::persist::write_atomic(&path, &json)
+        .map_err(|error| format!("couldn't save native mount leases: {error}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remember_native_mount(info: &NativeDriveInfo) -> Result<(), String> {
+    let _guard = NATIVE_MOUNT_LEASE_LOCK.lock();
+    let mut leases = load_native_mount_leases();
+    leases.retain(|lease| lease.mount != info.mount && lease.route != info.route);
+    leases.push(info.clone());
+    save_native_mount_leases(&leases)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forget_native_mount(mount: &str) -> Result<(), String> {
+    let _guard = NATIVE_MOUNT_LEASE_LOCK.lock();
+    let mut leases = load_native_mount_leases();
+    leases.retain(|lease| lease.mount != mount);
+    save_native_mount_leases(&leases)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn remember_native_mount(_info: &NativeDriveInfo) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn forget_native_mount(_mount: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
+    if !load_native_mount_leases()
+        .iter()
+        .any(|lease| lease.mount == mount)
+    {
+        return Ok(());
+    }
+    unmount_native(mount).await?;
+    forget_native_mount(mount)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+async fn remove_known_native_mount(_mount: &str) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(windows)]
-async fn mount_native(mount: &str, url: &str) -> Result<(), String> {
+async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
     let output = crate::child_process::command("net.exe")
         .args(["use", mount, url, "/persistent:no"])
         .output()
@@ -414,9 +729,45 @@ async fn mount_native(mount: &str, url: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
-async fn mount_native(_mount: &str, _url: &str) -> Result<(), String> {
-    Err("native drive mounting is currently available on Windows".into())
+#[cfg(target_os = "macos")]
+async fn mount_native(mount: &str, url: &str, label: &str) -> Result<(), String> {
+    let output = crate::child_process::command("/sbin/mount_webdav")
+        .args(["-S", "-v", label, url, mount])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't launch macOS drive mounting: {error}"))?;
+    command_result(
+        output,
+        format!("macOS couldn't mount the remote drive at {mount}"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
+    let helper = ["/sbin/mount.davfs", "/usr/sbin/mount.davfs"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .unwrap_or("mount.davfs");
+    let output = crate::child_process::command(helper)
+        .args(["-o", "rw,noexec,nosuid,nodev", url, mount])
+        .output()
+        .await
+        .map_err(|error| {
+            format!(
+                "couldn't launch Linux drive mounting: {error}. Install the davfs2 package first"
+            )
+        })?;
+    command_result(
+        output,
+        format!(
+            "Linux couldn't mount the remote drive at {mount}. Install davfs2; a non-root user also needs permission to mount that path"
+        ),
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+async fn mount_native(_mount: &str, _url: &str, _label: &str) -> Result<(), String> {
+    Err("native drive mounting is not available on this operating system".into())
 }
 
 #[cfg(windows)]
@@ -433,7 +784,20 @@ async fn unmount_native(mount: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn unmount_native(mount: &str) -> Result<(), String> {
+    if native_mount_is_active(mount).await? {
+        let output = crate::child_process::command("/sbin/umount")
+            .arg(mount)
+            .output()
+            .await
+            .map_err(|error| format!("couldn't launch drive unmounting: {error}"))?;
+        command_result(output, format!("couldn't unmount {mount}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 async fn unmount_native(_mount: &str) -> Result<(), String> {
     Ok(())
 }
@@ -658,7 +1022,29 @@ fn drive_registry_root() -> Result<String, String> {
     registry_root_for_client(sid.as_deref())
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn cleanup_stale_native_mounts() {
+    let leases = load_native_mount_leases();
+    if leases.is_empty() {
+        return;
+    }
+    let mut retained = Vec::new();
+    for lease in leases {
+        tracing::info!("cleaning stale AllMyStuff drive mount {}", lease.mount);
+        if let Err(error) = unmount_native(&lease.mount).await {
+            tracing::warn!(
+                "couldn't clean stale native drive mount {}: {error}",
+                lease.mount
+            );
+            retained.push(lease);
+        }
+    }
+    if let Err(error) = save_native_mount_leases(&retained) {
+        tracing::warn!("couldn't update native drive lease cleanup: {error}");
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 async fn cleanup_stale_native_mounts() {}
 
 #[derive(Clone)]
@@ -980,7 +1366,10 @@ fn map_remote_error(reason: &str) -> FsError {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::registry_root_for_client;
+    use super::{add_quota_to_empty_propfind, registry_root_for_client};
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty, Full};
+    use hyper::Request;
 
     #[test]
     fn service_drive_state_targets_the_interactive_user_hive() {
@@ -995,6 +1384,32 @@ mod registry_tests {
     fn service_client_sid_cannot_inject_a_registry_path() {
         assert!(registry_root_for_client(Some(r"S-1-5-21\Software")).is_err());
         assert!(registry_root_for_client(Some("not-a-sid")).is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_propfind_explicitly_requests_drive_capacity() {
+        let request = Request::builder()
+            .method("PROPFIND")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let request = add_quota_to_empty_propfind(request);
+
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8_lossy(&body);
+        assert!(xml.contains("quota-available-bytes"));
+        assert!(xml.contains("quota-used-bytes"));
+    }
+
+    #[tokio::test]
+    async fn explicit_propfind_body_is_preserved() {
+        let request = Request::builder()
+            .method("PROPFIND")
+            .body(Full::new(Bytes::from_static(b"<explicit/>")))
+            .unwrap();
+        let request = add_quota_to_empty_propfind(request);
+
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<explicit/>");
     }
 }
 

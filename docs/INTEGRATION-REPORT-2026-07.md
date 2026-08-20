@@ -1,5 +1,10 @@
 # Integration report — the encoder fork line, for Chris's review
 
+> **Historical record from July 2026:** this report describes a prototype
+> handoff against AllMyStuff 0.2.46. It is preserved for engineering
+> provenance, not as documentation of the current release. See the
+> [documentation map](README.md) for current material.
+
 _Prepared from `nathanfraske/AllMyStuffEncoderFraske`, branch
 `codex/video-pipeline-upstream-pr`, for review against the current
 `mrjeeves/AllMyStuff` `main`. **Everything here is a prototype until

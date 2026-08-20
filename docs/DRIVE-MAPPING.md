@@ -1,16 +1,21 @@
 # Native drive mapping over the mesh
 
+This is the implementation and security specification. For ordinary mapping
+steps, start with [Files and drives](USING-ALLMYSTUFF.md#files-and-drives).
+
 ## Decision
 
 AllMyStuff maps an explicitly selected folder as a real operating-system
-drive. On Windows the receiver sees an ordinary drive letter in Explorer and
-every native application; it is not an AllMyStuff-only file browser.
+drive. Windows receives an ordinary drive letter, macOS receives a mounted
+volume, and Linux receives a filesystem mount point. Native applications use
+the result directly; it is not an AllMyStuff-only file browser.
 
-The first native adapter is Windows WebDAV. A loopback-only WebDAV server runs
-on the receiving node, translates filesystem operations into the existing
-mesh file protocol, and is mounted with Windows `net use`. The WebDAV server
-is never exposed to the LAN and the file bytes still travel only on the live
-AllMyStuff route (direct, STUN, or TURN).
+The receiving node runs a loopback-only WebDAV server that translates
+filesystem operations into the existing mesh file protocol. Windows mounts it
+with `net use`, macOS with its built-in `mount_webdav`, and Linux with
+`mount.davfs` from `davfs2`. The WebDAV server is never exposed to the LAN and
+the file bytes still travel only on the live AllMyStuff route (direct, STUN, or
+TURN).
 
 ## User contract
 
@@ -27,7 +32,7 @@ AllMyStuff route (direct, STUN, or TURN).
 - The attached computer is the destination and is therefore excluded from the
   source list. This prevents a circular source that disappears when that
   computer reboots into an installer or firmware utility.
-- The drive-letter field defaults to **Auto — next available**. A user may
+- The drive-letter field defaults to **Auto, next available**. A user may
   enter a particular `X:` instead. Enter, click-away, or Map Drive completes
   the form.
 - A mapping is still one-way, but both affected machines show the same source,
@@ -41,13 +46,13 @@ AllMyStuff route (direct, STUN, or TURN).
 
 ```text
 source machine                                      receiving machine
-┌─────────────────────────────┐                    ┌─────────────────────────┐
-│ selected local folder       │                    │ Windows Explorer / apps │
-│ route-id → canonical root   │                    │           │ X:\         │
-│             │               │                    │   net use + WebClient   │
-│ scoped FileEvent host       │◄══ mesh route ═══►│ 127.0.0.1 WebDAV       │
-└─────────────────────────────┘  direct/STUN/TURN  │ RemoteDavFs adapter     │
-                                                   └─────────────────────────┘
+┌─────────────────────────────┐                    ┌──────────────────────────┐
+│ selected local folder       │                    │ Explorer / Finder / apps │
+│ route-id → canonical root   │                    │ X:\ or native mount      │
+│             │               │                    │ OS WebDAV filesystem     │
+│ scoped FileEvent host       │◄══ mesh route ═══►│ 127.0.0.1 WebDAV        │
+└─────────────────────────────┘  direct/STUN/TURN  │ RemoteDavFs adapter      │
+                                                   └──────────────────────────┘
 ```
 
 One mapping has a stable mapping ID and a `Storage` route:
@@ -75,18 +80,24 @@ room shared-file downloads, and their permissions remain separate.
    and offers the Storage route with `DriveRouteOffer` metadata.
 2. The receiver accepts under the normal Files authorization gate.
 3. On activation, the receiver binds an ephemeral listener to
-   `127.0.0.1:0`, builds `RemoteDavFs`, chooses the next free letter (Z down to
-   D when Auto), and runs `net use <letter> http://localhost:<port>/
-   /persistent:no`.
+   `127.0.0.1:0`, builds `RemoteDavFs`, and chooses a native destination.
+   Windows selects the next free letter from Z down to D when Auto. macOS uses
+   `~/AllMyStuff Drives/<name>`. A Linux system service uses
+   `/mnt/allmystuff/<name>`; a user process uses
+   `~/AllMyStuff Drives/<name>`. An explicit absolute mount point overrides
+   those defaults.
 4. Explorer WebDAV requests become scoped FileEvents over the active route.
-5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and runs
-   `net use <letter> /delete /y`, but retains the relationship and reconnect
+5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and
+   unmounts the native destination, but retains the relationship and reconnect
    intent. Both interfaces show it as unavailable until the peer returns.
 6. Explicit removal deletes the relationship and reconnect intent on both
    endpoints. A crash-safe pending removal is retried until the peer confirms
    it, preventing a sleeping Windows machine from recreating an orphan drive.
 7. If native mounting fails, the receiver tears the route down instead of
-   showing a live connection line for a drive Windows cannot use.
+   showing a live connection line for a drive the operating system cannot use.
+8. AllMyStuff records only the native mounts it created. After a crash or hard
+   stop, startup cleanup unmounts those exact owned entries before restoring
+   the durable mapping relationships. It never sweeps unrelated mounts.
 
 ## KVM install and firmware media
 
@@ -126,10 +137,17 @@ computer. That invariant is enforced in both the picker and the node backend.
 
 ## Compatibility and tradeoffs
 
-- Windows is first-class now because it supplies a native WebDAV redirector;
-  no WinFsp/Dokan driver installation is required. macOS and Linux builds
-  compile but return a clear unsupported result until their mount adapters
-  (`mount_webdav`, GVfs, or an equivalent) are implemented.
+- Windows uses its built-in WebClient redirector, so no WinFsp or Dokan driver
+  is required. Explorer's abbreviated Microsoft PROPFIND request is expanded
+  locally to include quota properties, which lets mapped drives show the
+  source filesystem's used and available space.
+- macOS uses the operating system's built-in `mount_webdav` command and gives
+  the volume the label selected in AllMyStuff.
+- Linux uses `mount.davfs`. Ubuntu and Debian packages install `davfs2` as a
+  dependency, and the portable installer attempts to install it through
+  `apt-get`. A headless AllMyStuff service normally has the privileges needed
+  for arbitrary mount points. A non-root process must have permission to mount
+  its selected path under the host's ordinary `davfs2` policy.
 - WebDAV favors zero-install interoperability over perfect POSIX semantics.
   Windows applications get ordinary read/write/seek/rename/delete behavior;
   filesystem features WebDAV cannot represent (hard links, alternate streams,
@@ -147,8 +165,15 @@ computer. That invariant is enforced in both the picker and the node backend.
   reads, and ranged writes.
 - Test offer metadata round-tripping and multiple unique folder routes.
 - On Windows, map a folder both directions, verify the letter appears in
-  Explorer, read/write/seek/rename/delete with native programs, and confirm
-  each one-way relationship appears on both machines.
+  Explorer, verify used and free space match the source filesystem, exercise
+  read/write/seek/rename/delete with native programs, and confirm each one-way
+  relationship appears on both machines.
+- On macOS, verify the selected label under `~/AllMyStuff Drives`, reconnect
+  after source sleep, and exercise the same native file operations.
+- On an Ubuntu file server, install and run the system service, verify the
+  mount under `/mnt/allmystuff`, reboot both sides independently, and confirm
+  the owned-mount cleanup restores the relationship without leaving a ghost
+  mount.
 - Take either endpoint offline, remove the relationship from the other, bring
   it back, and confirm the pending removal clears the native drive and cannot
   be resurrected by reconnect.

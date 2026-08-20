@@ -5292,7 +5292,9 @@ impl Mesh {
     ) -> Result<(), String> {
         match tokio::time::timeout(Duration::from_secs(35), receiver).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("the native drive request ended before Windows mounted it".into()),
+            Ok(Err(_)) => {
+                Err("the native drive request ended before this machine mounted it".into())
+            }
             Err(_) => {
                 self.drive_pull_tokens.lock().remove(request);
                 self.drive_pull_waiters.lock().remove(request);
@@ -9227,6 +9229,15 @@ impl Mesh {
         // one flag; every place that asks "am I in a fleet" (the drawer, the
         // settings pane, the leave button) reads it, so they can't disagree.
         let in_fleet = self.ownership.in_fleet();
+        // The claim code is a local UI credential, not fleet state. Expose it
+        // only while this device is actively offering remote adoption. The
+        // owned payload is local IPC, so this makes the existing rendezvous ID
+        // visible without advertising it to peers or adding it to a profile.
+        let claim_code = if self.ownership.claimable() && self.ownership.public_claims_allowed() {
+            Some(format_claim_code(&self.ownership.ensure_claim_code()))
+        } else {
+            None
+        };
         // Not in a fleet at all → the empty, well-formed shape. Everything below
         // assumes membership, and the GUI keys solely on `in_fleet`.
         if !in_fleet {
@@ -9239,6 +9250,10 @@ impl Mesh {
                 o.insert(
                     "public_claims".into(),
                     Value::Bool(self.ownership.public_claims()),
+                );
+                o.insert(
+                    "claim_code".into(),
+                    claim_code.map(Value::String).unwrap_or(Value::Null),
                 );
             }
             return v;
@@ -9441,6 +9456,13 @@ impl Mesh {
             obj.insert(
                 "public_claims".into(),
                 Value::Bool(self.ownership.public_claims()),
+            );
+            // A fleet member cannot be claimable, so this is normally null in
+            // the fleet shape. Keeping the field in both shapes gives the GUI
+            // one stable contract as membership changes.
+            obj.insert(
+                "claim_code".into(),
+                claim_code.map(Value::String).unwrap_or(Value::Null),
             );
             // Governed topology (daemon ≥ 0.2.36): the owner-signed
             // network-wide shape the fleet runs, or null when ungoverned
@@ -9986,6 +10008,10 @@ impl Mesh {
         self.ensure_claim_networks().await;
         self.refresh_profile_ownership().await;
         let claimable = self.ownership.claimable();
+        // `ensure_claim_networks` may have minted the remote claim code. Push
+        // the refreshed local payload now so Settings can show (or clear) it
+        // without waiting for an unrelated roster event.
+        self.emit_owned().await;
         // Do not wait for the next background peer sweep: a peer already
         // sighted on the LAN should receive both edges immediately. The false
         // edge matters for removing a fallback claim advert after claim mode

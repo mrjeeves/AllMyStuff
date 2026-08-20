@@ -108,6 +108,20 @@
   let claimCode = $state("");
   let claiming = $state(false);
   let claimErr = $state<string | null>(null);
+  let claimIdCopied = $state(false);
+  const localClaimId = $derived(fleet?.claim_code?.trim() ?? "");
+
+  async function copyLocalClaimId() {
+    if (!localClaimId) return;
+    try {
+      await navigator.clipboard.writeText(localClaimId);
+      claimIdCopied = true;
+      setTimeout(() => (claimIdCopied = false), 1500);
+    } catch {
+      app.toast("warn", "Couldn't copy the remote claim ID");
+    }
+  }
+
   async function claimByCode() {
     const code = claimCode.trim();
     if (!code || claiming) return;
@@ -283,34 +297,62 @@
         <span>Allow claiming over the public mesh</span>
       </label>
       <p class="hint">
-        This device only. Leave this off for LAN claiming. Turn it on to claim
-        a remote device with its claim code.
+        This device only. Leave this off for seamless LAN claiming. Turn it on
+        when either device is remote.
       </p>
       {#if app.publicClaims}
-        <div class="claim-code-row">
-          <input
-            class="mfa-input code-input"
-            placeholder="Claim code from the device (xxxx-xxxx-…)"
-            bind:value={claimCode}
-            disabled={claiming}
-            onkeydown={(e) => {
-              if (e.key === "Enter") void claimByCode();
-            }}
-          />
-          <button
-            class="btn small primary"
-            disabled={claiming || !claimCode.trim()}
-            onclick={() => void claimByCode()}
-          >
-            {claiming ? "Claiming…" : "Claim a remote device"}
-          </button>
+        <div class="claim-direction">
+          <div class="claim-direction-title">This device's remote claim ID</div>
+          {#if localClaimId}
+            <div class="local-claim-id-row">
+              <code>{localClaimId}</code>
+              <button
+                class="btn small"
+                aria-label="Copy this device's remote claim ID"
+                onclick={() => void copyLocalClaimId()}
+              >
+                {claimIdCopied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <p class="hint">
+              Enter this ID on the computer that will claim this device.
+            </p>
+          {:else}
+            <p class="hint claim-unavailable">
+              Choose <b>Make claimable</b> on this device's graph card to create
+              its remote claim ID. A device already in a fleet cannot be claimed.
+            </p>
+          {/if}
         </div>
-        {#if claimErr}
-          <div class="mfa-status err" role="alert">⚠ {claimErr}</div>
-        {/if}
-        <p class="hint">
-          Enter the code shown by the remote device.
-        </p>
+
+        <div class="claim-direction">
+          <div class="claim-direction-title">Claim a remote device</div>
+          <div class="claim-code-row">
+            <input
+              class="mfa-input code-input"
+              aria-label="Remote claim ID"
+              placeholder="Remote claim ID (xxxx-xxxx-…)"
+              bind:value={claimCode}
+              disabled={claiming}
+              onkeydown={(e) => {
+                if (e.key === "Enter") void claimByCode();
+              }}
+            />
+            <button
+              class="btn small primary"
+              disabled={claiming || !claimCode.trim()}
+              onclick={() => void claimByCode()}
+            >
+              {claiming ? "Claiming…" : "Claim device"}
+            </button>
+          </div>
+          {#if claimErr}
+            <div class="mfa-status err" role="alert">⚠ {claimErr}</div>
+          {/if}
+          <p class="hint">
+            Enter the remote claim ID shown on the other device.
+          </p>
+        </div>
       {/if}
     </section>
   {/snippet}
@@ -1034,6 +1076,41 @@
     align-items: center;
     gap: 0.4rem;
     margin-top: 0.5rem;
+  }
+  .claim-direction {
+    margin-top: 0.65rem;
+    padding: 0.65rem 0.7rem;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+  }
+  .claim-direction-title {
+    color: var(--ink);
+    font-size: 0.82rem;
+    font-weight: 700;
+  }
+  .local-claim-id-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-top: 0.5rem;
+  }
+  .local-claim-id-row code {
+    flex: 1;
+    min-width: 0;
+    padding: 0.42rem 0.6rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 0.88rem;
+    font-weight: 650;
+    letter-spacing: 0.035em;
+    user-select: all;
+  }
+  .claim-unavailable {
+    margin-bottom: 0;
   }
   .mfa-disable-row {
     display: flex;

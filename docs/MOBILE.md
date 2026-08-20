@@ -1,5 +1,10 @@
 # AllMyStuff on iPhone & Android
 
+This is a developer architecture and launch-status document. It is not an
+installation guide for a released mobile app. Start with the
+[documentation map](README.md) if you are looking for desktop usage or
+contributor setup.
+
 This document is the architecture and status of the official AllMyStuff
 mobile app. It is meant to be exhaustive: the crux that makes it possible, the
 one architectural inversion the desktop never needed, what actually shipped

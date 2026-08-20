@@ -45,6 +45,11 @@
     "macOS": {
       "signingIdentity": "-"
     },
+    "linux": {
+      "deb": {
+        "depends": ["davfs2"]
+      }
+    },
     "windows": {
       "nsis": {
         "installerHooks": "./windows/installer-hooks.nsh"

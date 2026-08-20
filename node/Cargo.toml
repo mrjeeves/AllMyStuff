@@ -125,6 +125,7 @@ tokio-tungstenite = "0.30"
 dav-server = { version = "0.11", default-features = false }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # SIMD-accelerated byte scanning for the pacer's Annex-B start-code walk
 # (already in the tree transitively — this only makes it a direct dep).

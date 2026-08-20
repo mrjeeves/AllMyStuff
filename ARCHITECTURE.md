@@ -4,6 +4,10 @@ AllMyStuff is a desktop app for connecting the computers you own over a
 private mesh. It's deliberately split so the **model is pure and testable**
 and the **mesh is a sidecar**, never an embedded dependency.
 
+This is an engineering reference, not a user guide. Start with
+[Using AllMyStuff](docs/USING-ALLMYSTUFF.md) for product behavior or the
+[documentation map](docs/README.md) to find a narrower document.
+
 ## One picture
 
 ```
@@ -743,7 +747,10 @@ home or absolute paths; `..`, symlink escapes, and deleting/renaming the mapped
 root are refused. The active route is the explicit lease, so the receiver may
 browse and edit that one volume without gaining the whole-machine `:files`
 permission. AllMyStuff exposes this in Settings → Drives, while CECSupport uses
-the same route and frame contract in its Drive mapping card. No KVM participates.
+the same route and frame contract in its Drive mapping card. The receiver turns
+the route into a loopback WebDAV filesystem, then mounts it with Windows
+WebClient, macOS `mount_webdav`, or Linux `mount.davfs`. The mount is native to
+the operating system. No KVM participates.
 
 **A shared folder** is that same lease made *durable*, and is what a share
 hands over instead of the whole-machine `:files` console (which stays
@@ -811,23 +818,20 @@ carries traffic when something happens, never on a timer. The fleet roster
 (it holds the grouping key) is only ever *handed* to fleet members; presence
 goes to everyone.
 
-## Next milestones
+## Deeper references
 
-- **Per-device audio routing** — map a specific scanned device to a `cpal`
-  device (audio still uses the default input/output; monitors are routed
-  per-screen and cameras per-device now), and an audio codec (Opus) so
-  the media channel isn't raw PCM.
-- **Folder-share reconnect** — a mapped drive rebuilds itself when its source
-  returns with a fresh incarnation, by re-sending the root it remembers. A
-  shared folder has no root to remember (that's the point), so it is re-opened
-  by id instead; making that automatic is the remaining half.
+This document describes the current process and crate boundaries. Narrower
+designs live beside it:
 
-Done since this list was last true: **share-grant-gated control** (input
-injection honours a shared person's explicit control grant — `may_drive`), and
-**persisted relationships + grants** (`shares.rs`, durable beside ownership,
-which is what lets a restart reclassify a peer as *shared* with its grants
-rather than forgetting them).
+- [Native drive mapping](docs/DRIVE-MAPPING.md) covers desktop mounts, mapping
+  lifecycle, authorization, and KVM install media.
+- [Mobile architecture](docs/MOBILE.md) covers the in-process mobile runtime
+  and current launch gaps.
+- [Performance roadmap](PERFORMANCE-ROADMAP.md) tracks video-pipeline work that
+  is not part of the stable architecture contract.
+- [Release signing](RELEASE-SIGNING.md) is the maintainer runbook for update
+  provenance.
 
-Deliberately out of scope: embedding `myownmesh-core` at the source level —
-AllMyStuff is a control-socket client by design, matching the rest of the
-family.
+AllMyStuff intentionally keeps MyOwnMesh as a separate desktop process reached
+through its control socket. Mobile embeds the same mesh engine only because the
+mobile platforms do not allow the desktop sidecar process model.

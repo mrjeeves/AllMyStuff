@@ -4,78 +4,36 @@
 
 # AllMyStuff
 
-Remote desktop, shell, and files for every computer you own — over a private mesh.
+**Everything you own, wired together.**
+
+Your computers, KVMs, files, terminals, and local sites in one place.
 
 [![Release](https://img.shields.io/github/v/release/mrjeeves/AllMyStuff?label=release&color=success)](https://github.com/mrjeeves/AllMyStuff/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-informational.svg)](#installation)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-informational.svg)](#install)
 [![Built on MyOwnMesh](https://img.shields.io/badge/mesh-MyOwnMesh-6c5ce7.svg)](https://github.com/mrjeeves/MyOwnMesh)
 
-<img src="docs/design/allmystuff-app.svg" width="720" alt="The AllMyStuff window: each machine is a node on a graph, with live routes between them — a screen stream from den-tower and a file transfer from nas-01" />
+<img src="docs/design/allmystuff-app.svg" width="720" alt="AllMyStuff showing a fleet of computers and KVMs, with controls for remote access, files, drives, and power" />
 
 </div>
 
-AllMyStuff is a desktop app that links the computers you own into a single
-private network. From one window you can watch and control any machine's screen,
-open a terminal on it, and move files between them — without setting up a VPN,
-forwarding ports, or signing into a cloud service. It scans each machine's
-hardware automatically and lays everything out as a graph you click through.
+AllMyStuff is a desktop app for reaching the machines that are yours and the
+things other people have shared with you. Remote control a screen, open a real
+terminal, move files, map a folder into the native filesystem, reach a local
+web service, or work through a KVM when the operating system is not available.
 
-It's free, open source, and runs on macOS, Linux, and Windows.
+The graph is the home screen. Your fleet stays together, while devices visible
+through a mesh or share remain separate and expose only the actions that
+relationship allows.
 
-## Features
+There is no cloud copy of your stuff and no VPN to configure. Connections use
+an end-to-end encrypted [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh)
+route. Peers connect directly when they can and use an authenticated relay when
+NAT or a firewall leaves no direct path.
 
-- **Remote desktop.** View and control any machine's screen at up to 4K, with
-  one tab per monitor. Keyboard and mouse pass through, so a remote machine
-  works as if you were sitting at it. Relative Mouse captures raw movement for
-  games and other fullscreen apps that recenter their own cursor; Esc releases
-  it. The console controls can slide away without leaving a dead strip over the
-  remote screen.
-- **Remote shell.** Open a real terminal on any of your machines. No SSH daemon,
-  keys, or port forwarding to set up — it runs over the mesh. There's also a
-  command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
-  you into a shell on any machine you own, right from your own terminal, and a
-  bare `amst` opens one on this machine. It comes with AllMyStuff (see below).
-- **Shared terminals.** A shell session more than one machine can attach to at
-  once, tmux-style — `amst <machine> -s` lists a machine's open shells, and
-  `-a <id>` joins one.
-- **Clipboard sync.** While controlling a machine, the clipboard follows you:
-  paste sends yours to the remote, copy brings the remote's back — text,
-  images, and files. On desktop, you can also drag files straight onto the
-  remote screen; they transfer over the same authenticated clipboard route and
-  paste at the drop point.
-- **File access.** Browse, preview, and transfer files between machines.
-  Downloads land straight on your disk; nothing routes through a third party.
-- **Automatic discovery.** Each machine reports its hardware and attached
-  devices — displays, cameras, microphones, disks — and they appear on the
-  graph, ready to connect. Claiming a new device is LAN-first: it offers
-  itself for adoption only over a local, mDNS-only rendezvous — never the
-  public mesh unless you switch that on at the device itself.
-- **Fleets.** Every device you claim joins your fleet: one identity across all
-  of them, linked by a shared fleet key, with cryptographically signed
-  membership in three tiers — owner, manager, member.
-- **Sharing with people.** Grant one capability — a screen, a camera, files —
-  to a person, not a machine: it works from whichever of their devices is
-  handy, and you can revoke it at any time.
-- **Virtual rooms.** Bring several machines into one call, with invites or
-  knock-to-join and a chat alongside; the media itself still flows directly
-  between members.
-- **Sites.** Open a machine's local web service in your browser — even one
-  bound to loopback — through a port mapped on the machine you're sitting at.
-  Only ports the host advertises are ever proxied.
-- **KVM appliances.** Point a NanoKVM-class device at a machine and you can
-  reach its screen and keyboard even when its OS is down — BIOS included —
-  with power and reset a click away; the KVM's own web UI opens through the
-  mesh. NanoKVM and NanoKVM-Pro can also present an ISO, IMG, or removable USB
-  disk from another authorized machine as
-  [boot/install media](docs/DRIVE-MAPPING.md#kvm-install-and-firmware-media).
-- **Peer-to-peer and encrypted.** Traffic flows directly between your machines
-  over an end-to-end encrypted mesh. There is no central server holding your
-  data.
-- **Headless mode.** Put a machine with no screen on the graph with
-  `allmystuff serve`, and keep it there across reboots as a system service.
+AllMyStuff is free, open source, and runs on macOS, Linux, and Windows.
 
-## Installation
+## Install
 
 **macOS and Linux**
 
@@ -89,80 +47,152 @@ curl -fsSL https://allmystuff.works/install.sh | sh
 irm https://allmystuff.works/install.ps1 | iex
 ```
 
-The installer downloads the verified binaries, adds `allmystuff`, `amst`, and the
-desktop app to your `PATH`, and sets up the [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh)
-daemon the app runs on. Pre-built bundles (`.dmg`, `.msi`, `.deb`, `.AppImage`)
-and portable archives are on the
+The installer verifies the release, installs the desktop app and command-line
+tools, and brings the pinned MyOwnMesh runtime with it. Prebuilt `.dmg`, `.msi`,
+`.deb`, and `.AppImage` bundles, plus portable archives, are available on the
 [releases page](https://github.com/mrjeeves/AllMyStuff/releases).
 
-### AMSTerm (`amst`) — the terminal
+## Your first fleet
 
-**AMSTerm** is the command-line terminal — a real shell on any machine you own,
-over the mesh. It **comes with AllMyStuff**: the installer above drops the `amst`
-command on your `PATH`, adds an **AMSTerm** app launcher (and, on Windows, a
-desktop + Start Menu shortcut and an **"AMSTerm here"** right-click menu on
-folders) — no separate install. `amst` is a client of this machine's AllMyStuff
-node; if none is running it opens the desktop app to bring one up (or, on a
-headless box, starts a headless node directly and says so).
+Install AllMyStuff on each computer you want to own as a group. On the local
+network, choose **Make claimable** under that computer's **This Device** card,
+then select it from another AllMyStuff machine and choose **Claim this device**.
+Claiming adds it to your fleet and gives it the fleet relationship used for
+remote control, terminals, files, drives, sites, updates, and device management.
 
-## Getting started
+Once the machines are in your fleet, they do not need to remain on the same
+LAN. Open AllMyStuff and choose **Remote**, **Files**, **Drives**, or
+**Settings** on a device card. Normal mode keeps the graph and its common
+actions up front. Advanced mode exposes the fuller routing and device surfaces.
 
-The app opens to a populated demo graph, so you can explore the interface
-without connecting anything first.
+For task-by-task walkthroughs, see [Using AllMyStuff](docs/USING-ALLMYSTUFF.md).
+The [documentation map](docs/README.md) separates user help from contributor,
+architecture, and maintainer material.
 
-To use it for real, install AllMyStuff on each computer you want to reach. They
-discover one another and appear on the graph. Click a machine to see its
-hardware, then open a session:
+## What it does
 
-- **Screen** to watch or control it,
-- **Terminal** for a shell,
-- **Files** to browse and transfer.
+- **Remote control.** View and control every shared display, switch between
+  screens, carry text, images, and files through the synchronized clipboard,
+  and drop local files onto the remote desktop. Relative mouse capture supports
+  games and other applications that consume raw movement. Pop any monitor into
+  its own native window, then arrange several remote monitors across your local
+  displays so the whole remote desk stays visible at once.
+- **Terminals.** Open a real shell without configuring SSH, keys, or forwarded
+  ports. Terminal sessions can be attached from more than one machine when you
+  want to follow the same shell together.
+- **Files and native drives.** Browse and transfer files in the app. Map an
+  authorized folder or whole drive into the operating system: a drive letter
+  in Windows, a mounted volume on macOS, or a mount point on Linux. It appears
+  in native applications, not only inside AllMyStuff. A mapping is one-way, but
+  both affected machines show the same source, destination, name, mount, and
+  availability. Reverse mapping is a second explicit action.
+- **Sites.** Publish only the local web services you mean to expose, then open
+  them from another authorized machine even when the service itself listens on
+  loopback.
+- **KVMs.** Use NanoKVM and NanoKVM-Pro devices for video, keyboard, mouse,
+  power control, Wi-Fi, updates, and BIOS access. Authorized ISO, IMG, and
+  removable USB media can be presented to the attached computer for operating
+  system installation or firmware work.
+- **Sharing.** Share a capability with a person without adding their computer
+  to your fleet. Screen, control, files, cameras, microphones, and sites keep
+  their own permissions. A share from you does not silently create a share back
+  to you.
+- **Rooms.** Bring several people and machines into a temporary collaboration
+  surface with chat, screens, control, cameras, microphones, and shared files.
+- **Always On.** Run the node as a system service so a machine stays reachable
+  before login and after reboot. The app also checks and repairs its pinned
+  runtime components during updates.
 
-For a machine without a display — a home server, a build box — run
-`allmystuff serve` to put it on the graph headless, or `allmystuff service
-install` to keep it running across logins and reboots.
+The detailed native-drive and KVM media behavior is documented in
+[Native drive mapping over the mesh](docs/DRIVE-MAPPING.md).
+
+## Fleets, meshes, shares, and rooms
+
+These ideas are intentionally separate:
+
+| Concept | What it means |
+|---|---|
+| **Fleet** | The devices you own together. Membership is signed and carries an owner, manager, or member role. |
+| **Mesh** | A private reachability space. Being visible on a mesh does not grant access to a device. |
+| **Share** | A one-way permission from one person to another for specific capabilities. |
+| **Room** | A shared session where invited members can use only the capabilities offered to that room. |
+
+That separation matters. Seeing a computer is not permission to control it,
+sharing your files does not expose theirs, and joining a room does not make its
+members part of your fleet.
+
+## AMSTerm
+
+`amst` comes with AllMyStuff and opens a mesh terminal from the command line:
+
+```sh
+amst                         # a shell on this machine
+amst Tracy-Laptop            # a new shell on another fleet machine
+amst Tracy-Laptop --sessions # list its open terminal sessions
+amst Tracy-Laptop --attach term-3
+```
+
+On Windows, the installer also adds an AMSTerm launcher, shortcuts, and an
+**AMSTerm here** folder menu. If this machine's node is not running, `amst`
+starts the desktop app or the installed headless node as appropriate.
+
+## Headless machines
+
+Run a server, build machine, or other computer without the desktop interface:
+
+```sh
+allmystuff serve
+```
+
+Keep it available across logins and reboots:
+
+```sh
+allmystuff service install
+```
+
+The desktop app and `allmystuff serve` run the same node engine and speak the
+same protocol.
 
 ## How it works
 
-AllMyStuff is written in Rust, with a [Tauri](https://tauri.app) and
-[Svelte](https://svelte.dev) desktop interface. It runs as a client of the
-[MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) daemon, which handles peer
-identity, discovery, and encrypted transport — so connections are direct and
-work through NATs without manual port forwarding.
+AllMyStuff is written in Rust with a [Tauri](https://tauri.app) and
+[Svelte](https://svelte.dev) desktop interface. Its node engine owns device
+inventory, authorization, sessions, media, input, terminals, files, drive
+mapping, sites, KVM integration, and the local control API. MyOwnMesh provides
+identity, discovery, encrypted transport, and relay fallback.
 
-The networking engine — presence, session setup, and the screen, audio, input,
-terminal, and file channels — lives in one Rust crate that both front ends
-share: the desktop app and the headless `allmystuff serve` binary run the same
-code. The device graph and its routing rules are pure Rust, mirrored to
-TypeScript so the UI stays interactive on its own.
+The graph model and protocol live in shared Rust crates. The desktop app and
+headless node use those same crates, while the UI mirrors the state it needs to
+stay responsive.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and crate layout.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the crate map, data flow, and
+persistent-state layout.
 
 ## Project status
 
-AllMyStuff is under active development. What works today:
+AllMyStuff is under active development and ships frequent releases. The
+desktop app and headless node are built and tested on macOS, Linux, and Windows.
+The mobile client has a runnable Tauri shell and shared core, but device
+validation and store releases are still in progress. See
+[docs/MOBILE.md](docs/MOBILE.md) for its current state.
 
-| Area | Status | Notes |
-|---|---|---|
-| Device scanner | ✅ | Linux, macOS, and Windows; built and tested on all three in CI |
-| Desktop graph UI | ✅ | Interactive on both demo and live data |
-| Remote desktop | ✅ | Hardware-encoded H.264 up to 4K (VideoToolbox on macOS, Media Foundation on Windows), with software and MJPEG fallbacks; keyboard and mouse passthrough |
-| Remote terminal | ✅ | A real PTY per tab over the mesh; no SSH daemon required |
-| File access | ✅ | Browse, preview, upload, download, rename, delete; bulk transfers stream in chunks with backpressure, straight to disk |
-| Audio and camera | ✅ | Opus audio and H.264 camera over the same transport |
-| Discovery and routing | ✅ | Peers appear via presence; sessions negotiate and tear down cleanly |
-| Mobile (iOS/Android) | 🚧 | Runnable Tauri shell in `gui/mobile`: embeds the mesh daemon + the node engine in-process (iOS can't spawn them) with the full graph/console/terminal/files surface, touch-adapted. Device validation and store release remain. See [docs/MOBILE.md](docs/MOBILE.md) |
+Please use [GitHub Issues](https://github.com/mrjeeves/AllMyStuff/issues) for
+reproducible bugs and feature requests.
 
-## Building from source
+## Build from source
+
+Install [`just`](https://just.systems), then:
 
 ```sh
-just setup    # one-time: Rust, Node, pnpm, and GUI dependencies
-just dev      # run the app with hot reload
+just setup       # install development prerequisites
+just dev         # run the complete desktop app with hot reload
+just check       # run the library, node, and front-end checks
+just gui-build   # build the native desktop bundle
 ```
 
-The CLI reference, platform requirements, and notes on helping test macOS,
-Windows, and Raspberry Pi builds are in [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for platform requirements, CLI details,
+and the repository workflow.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

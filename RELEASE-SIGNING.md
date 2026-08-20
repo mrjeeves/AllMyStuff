@@ -1,5 +1,9 @@
 # Release signing (minisign)
 
+> **Maintainer runbook:** ordinary users and contributors do not need to
+> configure release signing. See the [documentation map](docs/README.md) for
+> install, usage, and development guides.
+
 The self-updater (`allmystuff-updater`) verifies every downloaded artifact
 before it stages it for the next launch:
 

@@ -560,6 +560,10 @@ export interface OwnedRoster {
    *  set only on this machine, never synced from the fleet, never settable
    *  by a remote peer. Off (absent) = LAN-local claiming only — the default. */
   public_claims?: boolean;
+  /** This device's formatted remote claim ID while it is both claimable and
+   *  participating in public-mesh claiming. Local IPC only: it is never part
+   *  of fleet governance or peer presence. */
+  claim_code?: string | null;
   /** Governed topology (daemon ≥ 0.2.36): the owner-signed, network-wide
    *  shape the fleet mesh runs — `hubs` once infra hubs are designated,
    *  `full_mesh` after an explicit reset. Null/absent when ungoverned (the

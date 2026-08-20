@@ -1264,7 +1264,8 @@ mod tests {
         let mut saw_split = false;
 
         for frame in 0..12u64 {
-            for (p, px) in rgb.chunks_exact_mut(3).enumerate() {
+            let (pixels, _) = rgb.as_chunks_mut::<3>();
+            for (p, px) in pixels.iter_mut().enumerate() {
                 let x = p % w;
                 let y = p / w;
                 let tile = (((x / 8) + (y / 8) + frame as usize) & 1) as u8;

@@ -1555,7 +1555,8 @@ mod tests {
         let mut aus = Vec::new();
         for frame in 0..12u32 {
             let mut rgb = vec![0u8; w * h * 3];
-            for (i, px) in rgb.chunks_exact_mut(3).enumerate() {
+            let (pixels, _) = rgb.as_chunks_mut::<3>();
+            for (i, px) in pixels.iter_mut().enumerate() {
                 let stripe = ((i / w) as u32 + frame * 5) % 48 < 24;
                 let texture = ((i as u32).wrapping_mul(29) >> 4) as u8;
                 px.copy_from_slice(&[

@@ -5100,11 +5100,7 @@ impl Mesh {
                     expires_in: CEC_KVM_SUPPORT_LEASE_SECS,
                 });
                 if let Err(error) = self
-                    .send_control_reliable(
-                        &technician,
-                        &available,
-                        CEC_KVM_DISCOVERY_TTL,
-                    )
+                    .send_control_reliable(&technician, &available, CEC_KVM_DISCOVERY_TTL)
                     .await
                 {
                     tracing::debug!(
@@ -7185,12 +7181,7 @@ impl Mesh {
         self.cec.bind_session(&session_id, &tech);
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
-            self.cec_send_approval(
-                network_id,
-                canonical.clone(),
-                session_id.clone(),
-                scope,
-            );
+            self.cec_send_approval(network_id, canonical.clone(), session_id.clone(), scope);
         }
         // Carry `tech`/`agent_name` on the event (like the auto-approve path
         // does), so the customer GUI can bind the session — and its chat — to

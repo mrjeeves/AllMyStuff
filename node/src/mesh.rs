@@ -1334,6 +1334,15 @@ const CEC_CONNECT_ATTEMPT_TTL: std::time::Duration = std::time::Duration::from_s
 /// closes the gap between daemon delivery acknowledgement and application
 /// acknowledgement without making the KVM persist handshake transport state.
 const CEC_CONNECT_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Attached-KVM access stays ephemeral, but must outlive both the two-second
+/// renewal cadence and NanoKVM's ten-second targeted-greet cooldown. Fifteen
+/// seconds is also the hard maximum both receivers accept from the wire.
+const CEC_KVM_SUPPORT_LEASE_SECS: u64 = 15;
+/// Discovery is the ordering barrier for KVM passthrough: the technician must
+/// actually consume `KvmSupportAvailable` before the appliance is granted and
+/// immediately greets it. Keep a failed attempt short; the two-second sweep
+/// retries while the fifteen-second lease tolerates ordinary route rebuilds.
+const CEC_KVM_DISCOVERY_TTL: Duration = Duration::from_secs(3);
 
 const LOCAL_CLAIM_REPAIR_DELAYS: [Duration; 3] = [
     Duration::ZERO,
@@ -5075,7 +5084,6 @@ impl Mesh {
     /// tells that KVM which technician may drive it. The appliance independently
     /// verifies that this sender is its recorded attached computer.
     async fn refresh_kvm_support(&self) {
-        const LEASE_SECS: u64 = 8;
         let kvms = self.locally_attached_kvms();
         if kvms.is_empty() {
             return;
@@ -5084,11 +5092,21 @@ impl Mesh {
             for kvm in &kvms {
                 // Discovery goes first so the KVM's immediate targeted greet
                 // cannot race the technician's strict CEC presence filter.
+                // This must be acknowledged delivery, not `send_control`'s
+                // one-shot dispatch: the two destinations have independent
+                // links, so call order alone never established wire order.
                 let available = ControlMessage::App(AppControl::KvmSupportAvailable {
                     kvm: NodeId::from(kvm.clone()),
-                    expires_in: LEASE_SECS,
+                    expires_in: CEC_KVM_SUPPORT_LEASE_SECS,
                 });
-                if let Err(error) = self.send_control(&technician, &available).await {
+                if let Err(error) = self
+                    .send_control_reliable(
+                        &technician,
+                        &available,
+                        CEC_KVM_DISCOVERY_TTL,
+                    )
+                    .await
+                {
                     tracing::debug!(
                         "couldn't announce support KVM {} to technician {}: {error}",
                         short_id(kvm),
@@ -5098,7 +5116,7 @@ impl Mesh {
                 }
                 let grant = ControlMessage::App(AppControl::KvmSupportGrant {
                     technician: technician.clone(),
-                    expires_in: LEASE_SECS,
+                    expires_in: CEC_KVM_SUPPORT_LEASE_SECS,
                 });
                 if let Err(error) = self.send_control(kvm, &grant).await {
                     tracing::debug!(
@@ -7165,21 +7183,13 @@ impl Mesh {
         // Bind the session to this technician so the consent sweep can end
         // exactly their sessions when the grant later lapses.
         self.cec.bind_session(&session_id, &tech);
-        // Prime attached-KVM discovery and authority now, rather than making
-        // the newly approved console wait for the next two-second renewal
-        // sweep before its KVM screen can be selected.
-        self.refresh_kvm_support().await;
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
-            self.cec_send_decision(
+            self.cec_send_approval(
                 network_id,
                 canonical.clone(),
-                allmystuff_cec_protocol::ControlMessage::Connect(
-                    allmystuff_cec_protocol::ConnectControl::Approve {
-                        session_id: session_id.clone(),
-                        scope,
-                    },
-                ),
+                session_id.clone(),
+                scope,
             );
         }
         // Carry `tech`/`agent_name` on the event (like the auto-approve path
@@ -7499,7 +7509,63 @@ impl Mesh {
         set
     }
 
-    /// Fire a customer *decision* (Approve / Deny / End) at a technician
+    /// Deliver Approve, then and only then open the attached-KVM renewal gate.
+    ///
+    /// The technician authenticates a `KvmSupportAvailable` announcement by
+    /// checking that its session is already Active. Sending KVM discovery from
+    /// local approval raced the far side's Approve handler; NanoKVM could greet
+    /// during that gap, get rejected, and stay absent for its ten-second greet
+    /// cooldown. Acknowledged delivery is the bilateral boundary. Once it
+    /// lands, mark this session ready and prime the same ordered discovery ->
+    /// delegation sequence the renewal sweep keeps alive.
+    fn cec_send_approval(
+        self: &Arc<Self>,
+        network: String,
+        peer: String,
+        session_id: String,
+        scope: allmystuff_cec_protocol::ApprovalScope,
+    ) {
+        let mesh = self.clone();
+        crate::spawn(async move {
+            let message = allmystuff_cec_protocol::ControlMessage::Connect(
+                allmystuff_cec_protocol::ConnectControl::Approve {
+                    session_id: session_id.clone(),
+                    scope,
+                },
+            );
+            match mesh
+                .cec_send_control_acked(
+                    &network,
+                    &peer,
+                    &message,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            {
+                Ok(()) if mesh.cec.mark_kvm_support_ready(&session_id) => {
+                    tracing::info!(
+                        "CEC approval confirmed by {}; enabling attached-KVM passthrough",
+                        short_id(&peer)
+                    );
+                    mesh.refresh_kvm_support().await;
+                }
+                Ok(()) => {
+                    tracing::debug!(
+                        "CEC approval reached {}, but session {session_id} was no longer active",
+                        short_id(&peer)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "cec approval undelivered to {} (they can re-dial; standing grants auto-approve): {e}",
+                        short_id(&peer)
+                    );
+                }
+            }
+        });
+    }
+
+    /// Fire a customer *decision* (Deny / End) at a technician
     /// under the acked contract, without blocking the GUI op that made
     /// the decision: the send is spawned, queued daemon-side until the
     /// technician's link is up, retransmitted across rebuilds, and a
@@ -7768,10 +7834,6 @@ impl Mesh {
                                 // technician so the consent sweep can end it
                                 // when the standing grant later lapses.
                                 self.cec.bind_session(&session_id, &from);
-                                // A standing approval is already active, so
-                                // make the attached KVM available before the
-                                // approval response reaches the technician.
-                                self.refresh_kvm_support().await;
                                 if let Some(rec) =
                                     self.cec.touch_dialed(crate::cec::pubkey_part(&from))
                                 {
@@ -7796,15 +7858,11 @@ impl Mesh {
                                 // across rebuilds, and only gives up at the TTL.
                                 // (An old technician re-beats; its duplicate
                                 // Requests just re-spawn cheap dedup'd replies.)
-                                self.cec_send_decision(
+                                self.cec_send_approval(
                                     network.clone(),
                                     from.clone(),
-                                    allmystuff_cec_protocol::ControlMessage::Connect(
-                                        allmystuff_cec_protocol::ConnectControl::Approve {
-                                            session_id,
-                                            scope,
-                                        },
-                                    ),
+                                    session_id,
+                                    scope,
                                 );
                                 // Help arrived (a standing grant answered the
                                 // raised hand) — withdraw the ask, same as an

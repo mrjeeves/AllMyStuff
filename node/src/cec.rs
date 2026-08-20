@@ -27,7 +27,7 @@
 //!
 //! [`Mesh`]: crate::mesh::Mesh
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -245,6 +245,12 @@ struct CecInner {
     /// grant lapses. Keyed by session id, like [`Self::sessions`]; customer
     /// side only.
     session_tech: HashMap<String, String>,
+    /// Sessions whose Approve frame the technician has acknowledged receiving.
+    /// KVM passthrough must not start from local approval alone: until the far
+    /// side has consumed Approve it rejects the customer's KVM announcement as
+    /// coming from a non-active session, and the appliance's immediate greet is
+    /// then lost behind its cooldown. Memory-only, like the sessions themselves.
+    kvm_support_ready: HashSet<String>,
     /// KVMs temporarily exposed by a customer this technician is actively
     /// controlling. These are deliberately memory-only leases: the customer's
     /// 2-second heartbeat renews them, and a dead app/session loses them within
@@ -360,6 +366,7 @@ impl Cec {
                 dialed,
                 sessions: HashMap::new(),
                 session_tech: HashMap::new(),
+                kvm_support_ready: HashSet::new(),
                 support_kvms: HashMap::new(),
                 dial_cancel: None,
                 asking_help: false,
@@ -546,6 +553,8 @@ impl Cec {
             .collect();
         for id in &ended {
             inner.sessions.insert(id.clone(), "ended".to_string());
+            inner.session_tech.remove(id);
+            inner.kvm_support_ready.remove(id);
         }
         ended
     }
@@ -984,10 +993,11 @@ impl Cec {
         })
     }
 
-    /// Customer-side technicians whose approved support sessions are active.
-    /// This is the authority window for attached-KVM delegation: the KVM is
-    /// part of the support console from session start, before the technician
-    /// happens to turn on (or send the first event over) its input route.
+    /// Customer-side technicians whose approved support sessions are active
+    /// and whose Approve frame has reached the technician. This is the authority
+    /// window for attached-KVM delegation: the KVM is part of the support
+    /// console from bilateral session start, before the technician happens to
+    /// turn on (or send the first event over) its input route.
     pub fn active_session_technicians(&self) -> Vec<String> {
         let inner = self.inner.lock();
         let mut peers: Vec<String> = inner
@@ -998,6 +1008,7 @@ impl Cec {
                     .sessions
                     .get(*session)
                     .is_some_and(|state| state == "active")
+                    && inner.kvm_support_ready.contains(*session)
             })
             .map(|(_, peer)| peer.clone())
             .collect();
@@ -1132,6 +1143,7 @@ impl Cec {
         // accumulate stale rows across a technician's reconnects.
         if matches!(state, "ended" | "denied") {
             inner.session_tech.remove(session_id);
+            inner.kvm_support_ready.remove(session_id);
         }
     }
 
@@ -1151,6 +1163,7 @@ impl Cec {
             .insert(session_id.to_string(), state.to_string());
         if matches!(state, "ended" | "denied") {
             inner.session_tech.remove(session_id);
+            inner.kvm_support_ready.remove(session_id);
         }
         true
     }
@@ -1164,6 +1177,21 @@ impl Cec {
             .lock()
             .session_tech
             .insert(session_id.to_string(), pubkey_part(tech).to_string());
+    }
+
+    /// Record the bilateral half of approval: the technician has consumed our
+    /// acknowledged Approve frame. Only then may the customer introduce its
+    /// attached KVM to that technician. Returns false if the session stopped
+    /// being active while the delivery was in flight.
+    pub fn mark_kvm_support_ready(&self, session_id: &str) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.sessions.get(session_id).map(String::as_str) != Some("active")
+            || !inner.session_tech.contains_key(session_id)
+        {
+            return false;
+        }
+        inner.kvm_support_ready.insert(session_id.to_string());
+        true
     }
 
     /// End (and forget) every session bound to `tech`, returning their ids so
@@ -1181,6 +1209,7 @@ impl Cec {
             .collect();
         for sid in &ids {
             inner.session_tech.remove(sid);
+            inner.kvm_support_ready.remove(sid);
             inner.sessions.remove(sid);
         }
         ids
@@ -1618,10 +1647,21 @@ mod tests {
         cec.set_session("waiting", "requested");
         cec.bind_session("waiting", TECH_B);
 
+        // Local approval is not enough: the technician still rejects an
+        // attached-KVM announcement until it has consumed Approve.
+        assert!(cec.active_session_technicians().is_empty());
+        assert!(cec.mark_kvm_support_ready("active-a"));
+        assert!(cec.mark_kvm_support_ready("active-b"));
+        assert!(!cec.mark_kvm_support_ready("waiting"));
         assert_eq!(cec.active_session_technicians(), vec![TECH.to_string()]);
 
         cec.set_session("active-a", "ended");
         cec.set_session("active-b", "ended");
+        assert!(cec.active_session_technicians().is_empty());
+
+        // A reused id cannot inherit an old delivery acknowledgement.
+        cec.set_session("active-a", "active");
+        cec.bind_session("active-a", TECH);
         assert!(cec.active_session_technicians().is_empty());
     }
 

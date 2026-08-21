@@ -110,11 +110,11 @@ fn opt_out_process_throttling() {
 /// Sleep `d` with ~50–100 µs accuracy instead of the timer-wheel/quantum
 /// milliseconds: a high-resolution waitable timer carries the wait to
 /// within a short tail, and a bounded spin walks the rest on the
-/// monotonic clock. The pacer's inter-chunk gaps are 100–1500 µs — on the
-/// plain sleep paths those all round up to a millisecond or more, which
-/// silently triples a keyframe's designed spread (measured by the
-/// `pace gaps` line). The spin tail costs one core for ≤200 µs per call;
-/// callers only use this for sub-2 ms pacing gaps, never bulk waits.
+/// monotonic clock. The pacer's final tail waits can sit below the ordinary
+/// timer wheel's resolution; rounding each one up by a millisecond materially
+/// distorts its configured drain rate (measured by the `pace gaps` line). The
+/// spin tail costs one core for ≤200 µs per call; callers only use this for the
+/// final few milliseconds of a pacing reservation, never bulk waits.
 /// Never returns early — the spin's exit is the monotonic elapsed test.
 pub(crate) fn precise_sleep(d: std::time::Duration) {
     let start = std::time::Instant::now();

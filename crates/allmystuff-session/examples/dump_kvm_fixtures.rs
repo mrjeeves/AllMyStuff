@@ -188,6 +188,7 @@ fn main() {
         to_value(&ControlMessage::Route(RouteControl::Accept {
             route_id: site_route.id.to_string(),
             session: None,
+            paced_video: false,
         })),
     );
 

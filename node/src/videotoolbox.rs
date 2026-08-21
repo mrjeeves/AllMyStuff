@@ -129,6 +129,7 @@ extern "C" {
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    static kVTCompressionPropertyKey_MaxH264SliceBytes: CFStringRef;
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
@@ -327,6 +328,17 @@ impl VideoToolboxH264 {
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 CFNumber::from(i64::from(i32::MAX)).as_CFTypeRef(),
             );
+            if crate::video::paced_slices_enabled() {
+                // Give the app-side pacer real cut points on macOS. This is a
+                // slice-shape dial, not a bitrate/VBV clamp: VideoToolbox keeps
+                // its quality headroom while no individual NAL can become an
+                // unshapable keyframe-sized wall.
+                let _ = VTSessionSetProperty(
+                    enc.session,
+                    kVTCompressionPropertyKey_MaxH264SliceBytes,
+                    CFNumber::from(crate::video::PACE_SLICE_BYTES as i64).as_CFTypeRef(),
+                );
+            }
             let status = VTCompressionSessionPrepareToEncodeFrames(enc.session);
             if status != 0 {
                 return Err(format!("VTCompressionSessionPrepare: OSStatus {status}"));

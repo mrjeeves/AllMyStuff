@@ -167,22 +167,10 @@ fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
 /// 60 fps) so a decoder that stalls dumps to the next keyframe fast instead of
 /// playing seconds of stale, latency-inducing backlog — a healthy decoder (a
 /// few ms per frame) never queues anywhere near this.
-// Sized in *samples*, and the pacer sends each sliced AU as several
-// samples (a lossless frame is 8+, more at its IDRs) — 48 keeps the
-// documented ~200 ms of headroom for chunked streams where 12 was 1.5
-// frames. Whole-AU reassembly upstream of the queue is the follow-up
-// that makes this exact again.
-const MAX_PENDING: usize = 48;
-
-/// Idle boundary for paced NVDEC chunks. NVDEC treats END_OF_PICTURE
-/// literally for both H.264 and HEVC, so same-timestamp samples must be
-/// reassembled before either parser is fed. The sender may spread a whole AU
-/// across roughly one 60 Hz frame and TURN can add jitter above its nominal
-/// 8 ms inter-chunk cap, so 50 ms is the conservative last-picture fallback.
-/// An active stream does not pay that timeout: the following RTP timestamp
-/// closes the prior AU immediately. Each same-timestamp arrival resets it.
-#[cfg(all(windows, feature = "host"))]
-const NVDEC_CHUNK_IDLE: Duration = Duration::from_millis(50);
+// Pacing reassembly now happens at mesh ingress, before either WebCodecs or
+// this native bridge. This queue is therefore measured in complete access
+// units again: ~200 ms at 60 fps.
+const MAX_PENDING: usize = 12;
 
 /// How often each decoder logs its dial-in line (matches the encode side).
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -688,9 +676,6 @@ fn run_decode<F, G>(
     // Compressed bytes fed this window — the wire layer's bandwidth at
     // the decoder's door (the nv12/rgba layers derive from frames×dims).
     let mut in_bytes = 0u64;
-    let mut deferred_au: Option<Au> = None;
-    #[cfg(all(windows, feature = "host"))]
-    let mut logged_nvdec_coalesce = false;
     let mut h264_runtime = H264RuntimePolicy::default();
     #[cfg(all(windows, feature = "host"))]
     let mut hevc_runtime = HevcRuntimePolicy::default();
@@ -704,29 +689,23 @@ fn run_decode<F, G>(
 
     while !stop.load(Ordering::SeqCst) {
         // A bounded wait keeps the stop flag responsive on a quiet stream.
-        let au = if let Some(au) = deferred_au.take() {
-            au
-        } else {
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(au) => au,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if zero_output_aus > 0
-                        && zero_output_since.is_some_and(|t| t.elapsed() >= STATS_EVERY)
-                    {
-                        tracing::warn!(
-                            "video decoder for {route_id} accepted {zero_output_aus} AU(s) / {zero_output_bytes} bytes but has produced no picture"
-                        );
-                        zero_output_since = Some(Instant::now());
-                        zero_output_aus = 0;
-                        zero_output_bytes = 0;
-                    }
-                    continue;
+        let au = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(au) => au,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if zero_output_aus > 0
+                    && zero_output_since.is_some_and(|t| t.elapsed() >= STATS_EVERY)
+                {
+                    tracing::warn!(
+                        "video decoder for {route_id} accepted {zero_output_aus} AU(s) / {zero_output_bytes} bytes but has produced no picture"
+                    );
+                    zero_output_since = Some(Instant::now());
+                    zero_output_aus = 0;
+                    zero_output_bytes = 0;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                continue;
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        #[cfg(all(windows, feature = "host"))]
-        let mut au = au;
         in_bytes += au.data.len() as u64;
         if need_key.swap(false, Ordering::SeqCst) {
             // The feeder overflowed: drain the stale backlog and wait for
@@ -834,70 +813,6 @@ fn run_decode<F, G>(
                     }
                     continue;
                 }
-            }
-        }
-
-        // NVDEC interprets END_OF_PICTURE literally in both codecs and would
-        // display every paced slice as a partial picture. Collect
-        // same-timestamp samples until the next timestamp or the sender's
-        // bounded pacing window expires, then submit exactly one complete AU
-        // to the driver. D3D11VA owns its own HEVC slice assembly and must keep
-        // receiving the chunks independently.
-        #[cfg(all(windows, feature = "host"))]
-        if crate::video::paced_slices_enabled()
-            && matches!(
-                decoder.as_ref(),
-                Some(Active::H264(H264Rung::Nvdec(_)))
-                    | Some(Active::Hevc(HevcRung::Nvdec(_)))
-                    | Some(Active::Av1(Av1Rung::Nvdec(_)))
-            )
-        {
-            let mut deadline = Instant::now() + NVDEC_CHUNK_IDLE;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match rx.recv_timeout(remaining) {
-                    Ok(next) if next.ts_us == au.ts_us => {
-                        in_bytes += next.data.len() as u64;
-                        au.key |= next.key;
-                        au.data.extend_from_slice(&next.data);
-                        deadline = Instant::now() + NVDEC_CHUNK_IDLE;
-                    }
-                    Ok(next) => {
-                        deferred_au = Some(next);
-                        break;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            if !logged_nvdec_coalesce {
-                logged_nvdec_coalesce = true;
-                tracing::info!(
-                    "NVDEC for {route_id} ({stream_codec:?}): coalescing paced same-timestamp samples ({} ms idle boundary)",
-                    NVDEC_CHUNK_IDLE.as_millis()
-                );
-            }
-            // Overflow may have been signaled while we were collecting the
-            // train. Apply the same wholesale freshness reset before decode.
-            if need_key.swap(false, Ordering::SeqCst) {
-                while rx.try_recv().is_ok() {}
-                if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-                    tracing::warn!(
-                        "video decoder queue overflow for {route_id} while coalescing; dropped stale access units and requesting a key"
-                    );
-                    last_queue_reset = Some(Instant::now());
-                }
-                deferred_au = None;
-                decoder = None;
-                waiting_key = true;
-                zero_output_since = None;
-                zero_output_aus = 0;
-                zero_output_bytes = 0;
-                on_glitch(None);
-                continue;
             }
         }
 
@@ -1519,118 +1434,6 @@ mod tests {
         bridge.stop("resize-route");
     }
 
-    /// Experimental pacing's receiver contract on the real NVIDIA rung. Feed
-    /// multi-slice H.264 as separate same-timestamp samples with sub-idle gaps;
-    /// the following timestamp must close/defer cleanly, and the final static
-    /// picture must close on the bounded idle fallback. Run in a fresh test
-    /// process with `ALLMYSTUFF_PACED_SLICES=1`.
-    #[cfg(all(windows, feature = "host"))]
-    #[test]
-    fn h264_nvdec_bridge_coalesces_paced_samples_and_final_idle() {
-        if !crate::video::paced_slices_enabled() {
-            eprintln!("SKIP: set ALLMYSTUFF_PACED_SLICES=1 for the paced NVDEC bridge gate");
-            return;
-        }
-        let _warm = match crate::nvdec::NvdecH264::open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("SKIP: NVDEC H.264 unavailable: {e}");
-                return;
-            }
-        };
-
-        use openh264::encoder::{
-            BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
-        };
-        use openh264::formats::{RgbSliceU8, YUVBuffer};
-        let (w, h) = (640usize, 480usize);
-        let config = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .bitrate(BitRate::from_bps(8_000_000))
-            .max_frame_rate(FrameRate::from_hz(60.0))
-            .max_slice_len(4 * 1024);
-        let mut enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
-            .expect("H.264 encoder");
-        let mut aus = Vec::new();
-        for frame in 0..12u32 {
-            let mut rgb = vec![0u8; w * h * 3];
-            let (pixels, _) = rgb.as_chunks_mut::<3>();
-            for (i, px) in pixels.iter_mut().enumerate() {
-                let stripe = ((i / w) as u32 + frame * 5) % 48 < 24;
-                let texture = ((i as u32).wrapping_mul(29) >> 4) as u8;
-                px.copy_from_slice(&[
-                    if stripe { 190 } else { 35 },
-                    texture,
-                    255u8.wrapping_sub(texture),
-                ]);
-            }
-            let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (w, h)));
-            let data = enc.encode(&yuv).expect("encode paced H.264").to_vec();
-            if !data.is_empty() {
-                aus.push(data);
-            }
-            if aus.len() == 3 {
-                break;
-            }
-        }
-        assert_eq!(aus.len(), 3, "three encoded access units");
-
-        let bridge = DecodeBridge::new();
-        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
-        let mut saw_multi = false;
-        let final_ts = 30_000u64;
-        for (index, data) in aus.into_iter().enumerate() {
-            let ts_us = (index as u64 + 1) * 10_000;
-            let chunks = crate::video::split_annexb_paced(&data, 4 * 1024);
-            saw_multi |= chunks.len() > 1;
-            for range in chunks {
-                let sink = frame_tx.clone();
-                bridge.feed(
-                    "paced-h264-route",
-                    DecoderPreference::Automatic,
-                    Au {
-                        ts_us,
-                        key: is_decode_entry(&data),
-                        data: data[range].to_vec(),
-                    },
-                    move |packet| {
-                        let _ = sink.send(packet);
-                    },
-                    |_| {},
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-        assert!(saw_multi, "the encoder produced multi-sample access units");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut timestamps = Vec::new();
-        while Instant::now() < deadline && !timestamps.contains(&final_ts) {
-            match frame_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(packet) => timestamps.push(u64::from_le_bytes(
-                    packet[20..28].try_into().expect("timestamp field"),
-                )),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        bridge.stop("paced-h264-route");
-        assert!(
-            timestamps.contains(&10_000),
-            "next timestamp closed the first AU"
-        );
-        assert!(
-            timestamps.contains(&20_000),
-            "deferred timestamp decoded in order"
-        );
-        assert!(
-            timestamps.contains(&final_ts),
-            "the static final AU closed on the {} ms idle boundary; got {timestamps:?}",
-            NVDEC_CHUNK_IDLE.as_millis()
-        );
-    }
-
     /// HEVC through the whole bridge on the real hardware rungs: NVENC
     /// lossless AUs fed with `key: false` on purpose — the daemon's key
     /// flag is H.264-shaped and must never be load-bearing for HEVC; the
@@ -1689,20 +1492,20 @@ mod tests {
             for (d, _) in out.units {
                 let chunks = crate::video::split_annexb_paced(&d, crate::video::PACE_SLICE_BYTES);
                 saw_multi |= chunks.len() > 1;
-                for range in chunks {
-                    let sink = got.clone();
-                    bridge.feed(
-                        "route-hevc",
-                        DecoderPreference::Automatic,
-                        Au {
-                            ts_us: i * 16_667,
-                            key: false,
-                            data: d[range].to_vec(),
-                        },
-                        move |p| sink.lock().push(p),
-                        |_| {},
-                    );
-                }
+                // Mesh ingress owns paced-fragment validation/reassembly; the
+                // native bridge's contract is one complete AU again.
+                let sink = got.clone();
+                bridge.feed(
+                    "route-hevc",
+                    DecoderPreference::Automatic,
+                    Au {
+                        ts_us: i * 16_667,
+                        key: false,
+                        data: d,
+                    },
+                    move |p| sink.lock().push(p),
+                    |_| {},
+                );
             }
             // Stay under the bounded queue — the decoder runs ~1 ms/frame.
             std::thread::sleep(Duration::from_millis(4));

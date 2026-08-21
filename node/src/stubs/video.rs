@@ -121,6 +121,29 @@ pub(crate) fn paced_slices_enabled() -> bool {
     *ON
 }
 
+const PACED_AU_MARKER_UUID: &[u8; 16] = b"AMS-PACED-AU-V1!";
+
+pub(crate) fn paced_au_marker(chunks: usize) -> Vec<u8> {
+    let chunks = u16::try_from(chunks).unwrap_or(u16::MAX);
+    let mut out = Vec::with_capacity(26);
+    out.extend_from_slice(&[0, 0, 0, 1, 0x06, 0x05, 18]);
+    out.extend_from_slice(PACED_AU_MARKER_UUID);
+    out.extend_from_slice(&chunks.to_le_bytes());
+    out.push(0x80);
+    out
+}
+
+pub(crate) fn paced_au_marker_count(data: &[u8]) -> Option<usize> {
+    if data.len() != 26
+        || data[..7] != [0, 0, 0, 1, 0x06, 0x05, 18]
+        || &data[7..23] != PACED_AU_MARKER_UUID
+        || data[25] != 0x80
+    {
+        return None;
+    }
+    Some(u16::from_le_bytes([data[23], data[24]]) as usize)
+}
+
 /// Mirror of the real module's paced splitter — pure byte logic, kept
 /// identical (both codecs, glue rules, byte-exact concatenation).
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {

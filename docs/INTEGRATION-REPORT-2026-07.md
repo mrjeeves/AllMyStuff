@@ -67,19 +67,20 @@ DXGI duplication (damage-driven, cursor save-under)          win_capture.rs
           user-pinned bitrates
   └─ App-side slice pacer                                     mesh.rs send_video_paced
      splits AUs at slice-NAL boundaries (encoders emit
-     count-mode slices: 8/16/32), spreads chunks with
-     rate-matched gaps:
-       · LAN: 800 Mbps drain, 6/10 ms budgets (shallow-
-         buffer burst shaping — the original tuning)
-       · WAN: drain = route send-rate ×1.5, budget ≤ one
-         frame interval (never hands a 40 Mbps path an
-         890 Mbps instantaneous wall)
-     gaps executed against deadlines via a high-resolution
-     waitable timer + bounded spin (os_perf.rs precise_sleep;
+     count-mode/byte-capped slices), then shapes them through
+     one persistent per-route token bucket:
+       · 96 KiB immediate quality/recovery allowance
+       · bounded rate-relative drain (8 Mbps WAN / 16 Mbps LAN
+         floor, 32 Mbps recovery-headroom ceiling unless the
+         route's own target is higher)
+       · bucket state survives frame boundaries, so a backed-up
+         producer cannot spend a new burst allowance per frame
+     reserved gaps executed via a high-resolution waitable
+     timer + bounded spin (os_perf.rs precise_sleep;
      measured 435 µs worst overshoot on the dev box)
   └─ Daemon track-lane send (existing API, one send per        control_client.rs
-     chunk; non-final chunks duration_us=0 → assembler
-     emits per marker, exactly as before)
+     chunk; data chunks duration_us=0, followed by a valid-SEI
+     end marker carrying the expected fragment count)
 ═══ MyOwnMesh (FROZEN) — RTP packetization, ICE/STUN/TURN ═══
 ```
 
@@ -91,6 +92,10 @@ handle_video_inbound                                          mesh.rs
   ├─ arrival timing: the pacer's chunk trains are timed
   │  packet trains → bandwidth estimate (dispersion EWMA)
   │  + one-way-delay trend (standing-queue early warning)
+  ├─ paced-video v1 ingress (presence capability + activating
+  │  RouteControl::Accept selection): validates timestamp,
+  │  end marker, and fragment count, then reassembles
+  │  one complete AU; torn trains are dropped before decode
   └─ DecodeBridge (native lane; webview WebCodecs path         video_decode.rs
      unchanged where it works)
        H.264 → openh264 (universal)

@@ -198,7 +198,10 @@ mod tests {
         match classify(CHANNEL_CONTROL, "desk", accept) {
             Some(Inbound::Control {
                 from,
-                msg: ControlMessage::Route(RouteControl::Accept { route_id, session }),
+                msg:
+                    ControlMessage::Route(RouteControl::Accept {
+                        route_id, session, ..
+                    }),
             }) => {
                 assert_eq!(from, "desk");
                 assert_eq!(route_id, "route:x→y");

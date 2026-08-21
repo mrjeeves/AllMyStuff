@@ -535,6 +535,7 @@ impl Session {
                         message: ControlMessage::Route(RouteControl::Accept {
                             route_id: route.id,
                             session: None,
+                            paced_video: false,
                         }),
                     }];
                 }
@@ -572,6 +573,7 @@ impl Session {
                             message: ControlMessage::Route(RouteControl::Accept {
                                 route_id: route.id.clone(),
                                 session: None,
+                                paced_video: false,
                             }),
                         },
                         Effect::StartMedia(route),
@@ -580,7 +582,9 @@ impl Session {
                     Vec::new()
                 }
             }
-            RouteControl::Accept { route_id, session } => {
+            RouteControl::Accept {
+                route_id, session, ..
+            } => {
                 if let Some(r) = self.routes.get_mut(&route_id) {
                     // The host's accept may echo the resolved terminal session
                     // id (which shell this route actually attached to) — record
@@ -812,6 +816,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r1".into(),
                 session: None,
+                paced_video: false,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
@@ -867,6 +872,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t1".into(),
                 session: Some("term-2".into()),
+                paced_video: false,
             }),
         );
         assert!(matches!(effects.as_slice(), [Effect::StartMedia(r)] if r.id == "t1"));
@@ -886,6 +892,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t2".into(),
                 session: None,
+                paced_video: false,
             }),
         );
         // Host's follow-up accept once the PTY is open, carrying the minted id.
@@ -894,6 +901,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t2".into(),
                 session: Some("term-5".into()),
+                paced_video: false,
             }),
         );
         assert!(
@@ -1146,6 +1154,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r1".into(),
                 session: None,
+                paced_video: false,
             }),
         );
         assert!(matches!(fx.as_slice(), [Effect::StartMedia(_)]));
@@ -1242,6 +1251,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r2".into(),
                 session: None,
+                paced_video: false,
             }),
         );
         assert!(!s.expire_offer("r2", "too late"));
@@ -1262,6 +1272,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "live".into(),
                 session: None,
+                paced_video: false,
             }),
         );
 

@@ -183,6 +183,17 @@ pub const FEATURE_CLIPBOARD_RECEIPTS: &str = "clipboard-receipts";
 /// falls back to MJPEG, exactly as before the pool.
 pub const FEATURE_MEDIA_LANES: &str = "media-lanes";
 
+/// Feature tag a node advertises when it speaks the paced-video v1 framing
+/// contract. A capable sender may split one encoded access unit across
+/// several same-timestamp track samples and closes the train with an explicit
+/// marker carrying the expected fragment count. A capable receiver validates
+/// that count and reassembles the complete access unit before any decoder sees
+/// it. The streaming side selects the mode in [`RouteControl::Accept`]; the
+/// feature alone never changes framing. Rolling upgrades therefore keep
+/// whole-access-unit delivery until both ends support and acknowledge the
+/// contract.
+pub const FEATURE_PACED_VIDEO: &str = "paced-video-v1";
+
 /// Feature tag a node advertises in [`NodeProfile::features`] when it is a
 /// **KVM appliance** (a NanoKVM-class device): it captures a target machine's
 /// HDMI and injects USB-HID into it, and it carries its own web UI as a
@@ -348,6 +359,10 @@ pub struct NodeProfile {
 /// `skip_serializing_if` helper for additive numeric presence fields.
 fn u64_is_zero(v: &u64) -> bool {
     *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One site a node exposes — a TCP service it's listening on that it's
@@ -1063,6 +1078,14 @@ pub enum RouteControl {
         route_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        /// The streaming side selected paced-video v1 for this route. This is
+        /// the acknowledgement half of capability negotiation: a viewer does
+        /// not interpret same-timestamp samples as fragments merely because it
+        /// advertised support; it does so only when the host's activating
+        /// Accept says it will send that framing. Absent/false is the legacy
+        /// whole-access-unit contract.
+        #[serde(default, skip_serializing_if = "is_false")]
+        paced_video: bool,
     },
     /// "No" — with a human reason ("not authorized", "device busy").
     Reject { route_id: String, reason: String },
@@ -1992,19 +2015,37 @@ mod tests {
         // (the viewer just doesn't learn a shared id), never an error.
         let legacy = r#"{"kind":"accept","route_id":"r1"}"#;
         let rc: RouteControl = serde_json::from_str(legacy).unwrap();
-        assert!(matches!(rc, RouteControl::Accept { session: None, .. }));
+        assert!(matches!(
+            rc,
+            RouteControl::Accept {
+                session: None,
+                paced_video: false,
+                ..
+            }
+        ));
         let s = serde_json::to_string(&rc).unwrap();
         assert!(!s.contains("session"));
+        assert!(!s.contains("paced_video"));
 
         // The terminal host echoes the resolved session id on accept.
         let accept = RouteControl::Accept {
             route_id: "r1".into(),
             session: Some("term-7".into()),
+            paced_video: false,
         };
         let s = serde_json::to_string(&accept).unwrap();
         assert!(s.contains("\"session\":\"term-7\""));
         let back: RouteControl = serde_json::from_str(&s).unwrap();
         assert_eq!(accept, back);
+
+        let paced = RouteControl::Accept {
+            route_id: "screen".into(),
+            session: None,
+            paced_video: true,
+        };
+        let s = serde_json::to_string(&paced).unwrap();
+        assert!(s.contains("\"paced_video\":true"));
+        assert_eq!(serde_json::from_str::<RouteControl>(&s).unwrap(), paced);
     }
 
     #[test]

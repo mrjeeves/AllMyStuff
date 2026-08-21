@@ -401,10 +401,11 @@ pub enum LinkClass {
 /// posture for driving a game over the stream. Two automatic dials move —
 /// the off-LAN fps floor rises to 60 ([`auto_fps`]) and the encoder's burst
 /// headroom tightens ([`burst_bounds`]) so a scene change queues for half
-/// the time. The caveat is documented honestly: the transport is still
-/// open-loop (no pacer/BWE), so 60 fps over a weak WAN link is the
-/// operator's deliberate trade until the transport work lands — which is
-/// exactly why this is an explicit opt-in and not the default.
+/// the time. 60 fps over a weak WAN link remains the operator's deliberate
+/// trade, which is why this is an explicit opt-in and not the default.
+/// Production transport shaping bounds its burst walls; receiver-driven rate
+/// adaptation stays game-only by default so quality-first postures are never
+/// silently softened.
 pub(crate) fn game_mode() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_GAME_MODE") {
@@ -440,8 +441,7 @@ pub(crate) fn target_fps_for(link: LinkClass, posture: Posture) -> u32 {
 /// 30 made fast motion look choppy. It's a ceiling, not a promise
 /// (damage-driven backends produce less on quiet screens). Off-LAN (or
 /// before the path class is known) the default steps back to 30: the
-/// transport is still open-loop (no pacer/BWE yet), and doubling the
-/// cadence there buys queueing latency, not smoothness — unless
+/// doubling the cadence there buys queueing latency, not smoothness — unless
 /// [`game_mode`] pins the cadence-first trade deliberately. The env dial
 /// overrides everything; an explicit viewer Tune never reaches this.
 fn auto_fps(link: LinkClass, game: bool) -> u32 {
@@ -4668,33 +4668,55 @@ fn rate_adapt_step(
 }
 
 pub(crate) fn paced_slices_enabled() -> bool {
-    // Production is deliberately locked safe-off for the upstream cut. The
-    // env-controlled form remains in test builds so the fork can exercise its
-    // sender/receiver prototype without making one-sided field configuration
-    // or version skew capable of fragmenting pictures for WebCodecs/NVDEC.
-    #[cfg(not(test))]
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = !std::env::var("ALLMYSTUFF_PACED_SLICES")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
+            .unwrap_or(false);
+        if !on {
+            tracing::warn!("ALLMYSTUFF_PACED_SLICES=0 — video burst shaping disabled");
+        }
+        on
+    });
+    *ON
+}
+
+/// UUID carried in the v1 paced-access-unit closing SEI. The marker is a
+/// valid H.264 user-data-unregistered NAL so the frozen media daemon can carry
+/// it through its ordinary H.264 track without a transport change. The app
+/// consumes it before decode.
+const PACED_AU_MARKER_UUID: &[u8; 16] = b"AMS-PACED-AU-V1!";
+
+/// Build the explicit end marker for one paced access unit. The two-byte
+/// fragment count lets ingress distinguish a complete train from a train that
+/// lost a whole media sample (RTP reassembly can detect packet holes inside a
+/// sample, but not the absence of a sample it never knew existed).
+pub(crate) fn paced_au_marker(chunks: usize) -> Vec<u8> {
+    let chunks = u16::try_from(chunks).unwrap_or(u16::MAX);
+    let mut out = Vec::with_capacity(26);
+    out.extend_from_slice(&[0, 0, 0, 1, 0x06]); // SEI NAL
+    out.extend_from_slice(&[0x05, 18]); // user_data_unregistered, 16-byte UUID + u16 count
+    out.extend_from_slice(PACED_AU_MARKER_UUID);
+    out.extend_from_slice(&chunks.to_le_bytes());
+    out.push(0x80); // rbsp_trailing_bits
+    out
+}
+
+/// Parse a v1 paced-access-unit closing marker. Exact shape matching avoids
+/// mistaking an encoder's ordinary user-data SEI for transport framing.
+pub(crate) fn paced_au_marker_count(data: &[u8]) -> Option<usize> {
+    if data.len() != 26
+        || data[..7] != [0, 0, 0, 1, 0x06, 0x05, 18]
+        || &data[7..23] != PACED_AU_MARKER_UUID
+        || data[25] != 0x80
     {
-        false
+        return None;
     }
-    #[cfg(test)]
-    {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            // Experimental opt-in only. A paced picture becomes several media
-            // samples with one RTP timestamp; WebCodecs and NVDEC require a whole
-            // access-unit/finality contract that shipped ingress does not carry.
-            // Defaulting this on caused partial-frame decode regressions.
-            let on = std::env::var("ALLMYSTUFF_PACED_SLICES")
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
-                .unwrap_or(false);
-            if on {
-                tracing::warn!(
-                    "ALLMYSTUFF_PACED_SLICES=1 — experimental multi-sample AU pacing enabled"
-                );
-            }
-            on
-        });
-        *ON
-    }
+    Some(u16::from_le_bytes([data[23], data[24]]) as usize)
 }
 
 /// Split one Annex-B access unit into paced chunks of at most `max_chunk`
@@ -5436,12 +5458,22 @@ mod tests {
         assert_eq!(split_annexb_paced(&[0, 0], 1000)[0], 0..2);
     }
 
+    #[test]
+    fn paced_au_marker_is_exact_and_counted() {
+        let marker = paced_au_marker(17);
+        assert_eq!(paced_au_marker_count(&marker), Some(17));
+        assert_eq!(marker[4] & 0x1f, 6, "valid H.264 SEI NAL");
+        let mut ordinary_sei = marker.clone();
+        ordinary_sei[7] ^= 1;
+        assert_eq!(paced_au_marker_count(&ordinary_sei), None);
+        assert_eq!(paced_au_marker_count(&[0, 0, 0, 1, 0x06]), None);
+    }
+
     /// The OpenH264-specific incremental-feed property on a REAL bitstream: an encoder
-    /// with a slice cap emits multi-slice units, the splitter cuts them,
-    /// and an OpenH264 decoder fed **chunk by chunk** still decode every
-    /// picture cleanly. This does not generalize to WebCodecs or NVDEC, which
-    /// require complete access units; pacing remains experimental until the
-    /// receiver has an explicit completion contract.
+    /// with a slice cap emits multi-slice units, the splitter cuts them, and
+    /// OpenH264 can consume them incrementally. Production ingress does not
+    /// depend on that decoder quirk: the v1 marker/count contract reassembles
+    /// every decoder's input to a complete access unit in `mesh.rs`.
     #[test]
     fn openh264_accepts_paced_slice_chunks_incrementally() {
         use openh264::encoder::{

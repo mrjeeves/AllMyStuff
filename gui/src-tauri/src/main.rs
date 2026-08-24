@@ -29,7 +29,11 @@ compile_error!(
     "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
 );
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
 // client of the per-machine node's control socket (see
@@ -977,6 +981,419 @@ async fn open_terminal_window(
 }
 
 // ---- files (the mesh-native file manager) -------------------------------
+
+#[tauri::command]
+async fn files_canvas_snapshot(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_snapshot", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_apply(
+    state: State<'_, AppState>,
+    mutations: Vec<Value>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_apply", json!({ "mutations": mutations }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct LocalFileLocation {
+    id: String,
+    label: String,
+    path: String,
+    kind: String,
+}
+
+#[derive(serde::Serialize)]
+struct LocalFileEntry {
+    id: String,
+    name: String,
+    path: String,
+    dir: bool,
+    size: u64,
+    modified: Option<u64>,
+    hidden: bool,
+    symlink: bool,
+}
+
+#[derive(serde::Serialize)]
+struct LocalFileListing {
+    id: String,
+    path: String,
+    platform: String,
+    entries: Vec<LocalFileEntry>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LocalPreview {
+    Text { text: String },
+    Image { mime: String, data: String },
+    Unsupported,
+}
+
+fn path_fallback_id(kind: &str, path: &Path, meta: &std::fs::Metadata, fold_case: bool) -> String {
+    let shown = path.to_string_lossy();
+    let normalized = if fold_case {
+        shown.to_lowercase()
+    } else {
+        shown.into_owned()
+    };
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+        .map(|at| at.as_nanos())
+        .unwrap_or_default();
+    format!("path:{kind}:{hash:016x}:{created:x}")
+}
+
+fn local_file_id(path: &Path, meta: &std::fs::Metadata, symlink: bool) -> String {
+    #[cfg(not(windows))]
+    let _ = symlink;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        return format!("unix:{}:{}", meta.dev(), meta.ino());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | if symlink {
+                        FILE_FLAG_OPEN_REPARSE_POINT
+                    } else {
+                        0
+                    },
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+            unsafe { CloseHandle(handle) };
+            if ok {
+                let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+                return format!("windows:{:x}:{index:x}", info.dwVolumeSerialNumber);
+            }
+        }
+        if symlink {
+            return path_fallback_id("link", path, meta, true);
+        }
+        if let Ok(real) = path.canonicalize() {
+            return path_fallback_id("canonical", &real, meta, true);
+        }
+        // Last resort for a provider that refuses both a stable handle and
+        // canonicalization. Keep the path out of fleet metadata and include
+        // creation time when the provider exposes it.
+        return path_fallback_id("entry", path, meta, true);
+    }
+    #[allow(unreachable_code)]
+    path_fallback_id("entry", path, meta, false)
+}
+
+fn location(id: &str, label: &str, path: Option<PathBuf>, kind: &str) -> Option<LocalFileLocation> {
+    let path = path?;
+    if !path.exists() {
+        return None;
+    }
+    Some(LocalFileLocation {
+        id: id.into(),
+        label: label.into(),
+        path: path.to_string_lossy().into_owned(),
+        kind: kind.into(),
+    })
+}
+
+/// Native places for the Files sidebar. Reading these paths is local-only and
+/// side-effect free; no mesh traffic is generated by browsing.
+#[tauri::command]
+fn local_file_locations() -> Vec<LocalFileLocation> {
+    let mut out = Vec::new();
+    out.extend(
+        [
+            location("home", "Home", dirs::home_dir(), "favorite"),
+            location("desktop", "Desktop", dirs::desktop_dir(), "favorite"),
+            location("documents", "Documents", dirs::document_dir(), "favorite"),
+            location("downloads", "Downloads", dirs::download_dir(), "favorite"),
+            location("pictures", "Pictures", dirs::picture_dir(), "favorite"),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    for (index, volume) in allmystuff_inventory::scan().storage.into_iter().enumerate() {
+        let Some(path) = volume.mount_point.map(PathBuf::from) else {
+            continue;
+        };
+        let shown = if volume.name.trim().is_empty() {
+            path.to_string_lossy().into_owned()
+        } else {
+            volume.name
+        };
+        if out.iter().any(|item| item.path == path.to_string_lossy()) {
+            continue;
+        }
+        if let Some(item) = location(&format!("volume-{index}"), &shown, Some(path), "volume") {
+            out.push(item);
+        }
+    }
+    out
+}
+
+#[tauri::command]
+async fn local_file_list(path: String) -> Result<LocalFileListing, String> {
+    tokio::task::spawn_blocking(move || {
+        let requested = PathBuf::from(path);
+        let canonical = requested.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical.is_dir() {
+            return Err("that location is not a folder".into());
+        }
+        let directory_meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
+        let directory_id = local_file_id(&canonical, &directory_meta, false);
+        let mut entries = Vec::new();
+        for item in std::fs::read_dir(&canonical).map_err(|e| e.to_string())? {
+            let Ok(item) = item else { continue };
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().into_owned();
+            let symlink = item
+                .file_type()
+                .map(|kind| kind.is_symlink())
+                .unwrap_or(false);
+            let Ok(identity_meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let target_meta = if symlink {
+                std::fs::metadata(&path).ok()
+            } else {
+                Some(identity_meta.clone())
+            };
+            let display_meta = target_meta.as_ref().unwrap_or(&identity_meta);
+            #[cfg(windows)]
+            let hidden = {
+                use std::os::windows::fs::MetadataExt as _;
+                identity_meta.file_attributes() & 0x2 != 0
+            };
+            #[cfg(not(windows))]
+            let hidden = name.starts_with('.');
+            entries.push(LocalFileEntry {
+                id: local_file_id(&path, &identity_meta, symlink),
+                name,
+                path: path.to_string_lossy().into_owned(),
+                dir: display_meta.is_dir(),
+                size: if display_meta.is_file() {
+                    display_meta.len()
+                } else {
+                    0
+                },
+                modified: display_meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+                hidden,
+                symlink,
+            });
+        }
+        // Hard links intentionally share an underlying file id, but still
+        // appear as separate directory entries. Disambiguate only that rare
+        // collision; ordinary rename/move continues to retain the native id.
+        let mut id_counts = std::collections::HashMap::new();
+        for entry in &entries {
+            *id_counts.entry(entry.id.clone()).or_insert(0_usize) += 1;
+        }
+        for entry in &mut entries {
+            if id_counts.get(&entry.id).copied().unwrap_or_default() > 1 {
+                entry.id = format!("{}:entry:{}", entry.id, entry.name);
+            }
+        }
+        entries.sort_by(|a, b| {
+            b.dir
+                .cmp(&a.dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(LocalFileListing {
+            id: directory_id,
+            path: canonical.to_string_lossy().into_owned(),
+            platform: std::env::consts::OS.into(),
+            entries,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_preview(path: String) -> Result<LocalPreview, String> {
+    tokio::task::spawn_blocking(move || {
+        use base64::Engine as _;
+        const LIMIT: u64 = 4 * 1024 * 1024;
+        let path = PathBuf::from(path);
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > LIMIT {
+            return Ok(LocalPreview::Unsupported);
+        }
+        let ext = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mime = match ext.as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "svg" => Some("image/svg+xml"),
+            "bmp" => Some("image/bmp"),
+            _ => None,
+        };
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        if let Some(mime) = mime {
+            return Ok(LocalPreview::Image {
+                mime: mime.into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+        }
+        const TEXT: &[&str] = &[
+            "txt", "md", "rs", "ts", "js", "svelte", "json", "toml", "yaml", "yml", "css", "html",
+            "xml", "sh", "ps1", "py", "go", "c", "h", "cpp", "hpp", "java", "log", "ini", "csv",
+            "sql",
+        ];
+        if TEXT.contains(&ext.as_str()) {
+            return Ok(LocalPreview::Text {
+                text: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(LocalPreview::Unsupported)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn launch_native(path: &Path, reveal: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    let status = {
+        let mut command = std::process::Command::new("explorer.exe");
+        if reveal && path.is_file() {
+            command.arg(format!("/select,{}", path.to_string_lossy()));
+        } else {
+            command.arg(path);
+        }
+        command.status()
+    };
+    #[cfg(target_os = "macos")]
+    let status = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg(path).status()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = {
+        let target = if reveal && path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        std::process::Command::new("xdg-open").arg(target).status()
+    };
+    status.map_err(|e| e.to_string()).and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("native file browser exited with {status}"))
+        }
+    })
+}
+
+#[tauri::command]
+async fn local_file_open(path: String, reveal: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || launch_native(&PathBuf::from(path), reveal))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn safe_child(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err("use a single file or folder name".into());
+    }
+    Ok(parent.join(name.trim()))
+}
+
+#[tauri::command]
+async fn local_file_mkdir(parent: String, name: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let path = safe_child(&PathBuf::from(parent), &name)?;
+        std::fs::create_dir(&path).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_rename(path: String, name: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let from = PathBuf::from(path);
+        let parent = from.parent().ok_or("that item has no parent folder")?;
+        let to = safe_child(parent, &name)?;
+        if to.exists() {
+            #[cfg(windows)]
+            let case_only =
+                from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
+            #[cfg(not(windows))]
+            let case_only = false;
+            if !case_only {
+                return Err("an item with that name already exists".into());
+            }
+        }
+        std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+        Ok(to.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete uses the OS Trash/Recycle Bin. The canvas never offers an
+/// irreversible unlink operation.
+#[tauri::command]
+async fn local_file_trash(paths: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            trash::delete(PathBuf::from(path)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 /// Forward one file request from a files window down its active files
 /// route (the viewer side of a mesh-native file session).
@@ -2780,7 +3197,9 @@ fn schedule_macos_autostart_refresh(app: &tauri::AppHandle) -> Result<bool, Stri
         .status()
         .map_err(|e| format!("submitting the macOS login-item refresh helper: {e}"))?;
     if !submitted.success() {
-        return Err(format!("launchctl could not submit the refresh helper ({submitted})"));
+        return Err(format!(
+            "launchctl could not submit the refresh helper ({submitted})"
+        ));
     }
     Ok(true)
 }
@@ -2829,8 +3248,7 @@ fn run_macos_autostart_refresh(parent_pid: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    std::fs::write(&marker, [])
-        .map_err(|e| format!("writing {}: {e}", marker.display()))?;
+    std::fs::write(&marker, []).map_err(|e| format!("writing {}: {e}", marker.display()))?;
     let load = std::process::Command::new("launchctl")
         .args(["load", "-w"])
         .arg(&plist)
@@ -3347,6 +3765,15 @@ fn main() {
             file_unwatch,
             file_download,
             open_files_window,
+            files_canvas_snapshot,
+            files_canvas_apply,
+            local_file_locations,
+            local_file_list,
+            local_file_preview,
+            local_file_open,
+            local_file_mkdir,
+            local_file_rename,
+            local_file_trash,
             site_scan,
             site_exposed,
             site_set_exposed,

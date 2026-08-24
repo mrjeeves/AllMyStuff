@@ -1,0 +1,127 @@
+export type FilesView = "canvas" | "details";
+export type FilesMap = "files" | "sharing";
+
+export interface Point { x: number; y: number }
+export interface Rect extends Point { width: number; height: number }
+
+export interface CanvasStamp {
+  counter: number;
+  actor: string;
+}
+
+export interface CanvasRecord<T = unknown> {
+  id: string;
+  kind: "frame" | "item" | "preference";
+  value: T | null;
+  stamp: CanvasStamp;
+  deleted?: boolean;
+}
+
+export interface CanvasFrame extends Rect {
+  id: string;
+  title: string;
+  color: string;
+  parentId: string | null;
+}
+
+export interface CanvasPlacement extends Point {
+  id: string;
+  parentId: string | null;
+}
+
+export function compareStamp(a: CanvasStamp, b: CanvasStamp): number {
+  return a.counter - b.counter || a.actor.localeCompare(b.actor);
+}
+
+/** Merge fleet records as a per-entity LWW map. Concurrent edits to unrelated
+ * entities never collide; the actor tie-break makes equal counters converge. */
+export function mergeCanvasRecords(
+  current: readonly CanvasRecord[],
+  incoming: readonly CanvasRecord[],
+): { records: CanvasRecord[]; changed: boolean } {
+  const byId = new Map(current.map((record) => [record.id, record]));
+  let changed = false;
+  for (const next of incoming) {
+    const previous = byId.get(next.id);
+    if (!previous || compareStamp(next.stamp, previous.stamp) > 0) {
+      byId.set(next.id, next);
+      changed = true;
+    }
+  }
+  return { records: [...byId.values()], changed };
+}
+
+export function contains(outer: Rect, inner: Rect, padding = 0): boolean {
+  return (
+    inner.x >= outer.x + padding &&
+    inner.y >= outer.y + padding &&
+    inner.x + inner.width <= outer.x + outer.width - padding &&
+    inner.y + inner.height <= outer.y + outer.height - padding
+  );
+}
+
+/** Pick the tightest containing frame. Descendants are excluded so reparenting
+ * cannot create a cycle when a frame is moved across another frame. */
+export function containingFrame(
+  subject: Rect & { id?: string },
+  frames: readonly CanvasFrame[],
+  descendants: ReadonlySet<string> = new Set(),
+): string | null {
+  return (
+    frames
+      .filter((frame) => frame.id !== subject.id && !descendants.has(frame.id) && contains(frame, subject, 18))
+      .sort((a, b) => a.width * a.height - b.width * b.height)[0]?.id ?? null
+  );
+}
+
+/** Path fallback identity is origin-scoped and platform-aware. Backslashes and
+ * Windows drive casing normalize, while POSIX paths remain case-sensitive. */
+export function fileReferenceId(origin: string, path: string, platform: string): string {
+  const windows = platform.toLowerCase().startsWith("win");
+  const normalized = path.replaceAll("\\", "/").replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  return `${origin}:${windows ? normalized.toLocaleLowerCase("en-US") : normalized}`;
+}
+
+export function descendantsOf(id: string, frames: readonly CanvasFrame[]): Set<string> {
+  const found = new Set<string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const frame of frames) {
+      if (frame.id !== id && !found.has(frame.id) && (frame.parentId === id || (frame.parentId && found.has(frame.parentId)))) {
+        found.add(frame.id);
+        grew = true;
+      }
+    }
+  }
+  return found;
+}
+
+/** Concurrent reparenting can create a cycle even though each peer rejected
+ * cycles locally. Break every merged cycle at the lexicographically smallest
+ * frame id, yielding the same visible hierarchy on every fleet member. */
+export function normalizeFrameNesting(input: readonly CanvasFrame[]): CanvasFrame[] {
+  const frames = input.map((frame) => ({ ...frame }));
+  const byId = new Map(frames.map((frame) => [frame.id, frame]));
+  for (const frame of frames) {
+    if (frame.parentId && !byId.has(frame.parentId)) frame.parentId = null;
+  }
+  for (const start of [...frames].sort((a, b) => a.id.localeCompare(b.id))) {
+    const order: string[] = [];
+    const seen = new Map<string, number>();
+    let current: CanvasFrame | undefined = start;
+    while (current?.parentId) {
+      const cycleAt = seen.get(current.id);
+      if (cycleAt !== undefined) {
+        const cycle = order.slice(cycleAt).sort();
+        const root = cycle[0] ? byId.get(cycle[0]) : undefined;
+        if (root) root.parentId = null;
+        break;
+      }
+      seen.set(current.id, order.length);
+      order.push(current.id);
+      current = byId.get(current.parentId);
+    }
+  }
+  return frames;
+}

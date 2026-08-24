@@ -31,8 +31,8 @@ use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
     DriveRouteOffer, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
     RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
-    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_MEDIA, CHANNEL_PRESENCE,
+    CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -42,6 +42,9 @@ use allmystuff_session::{
 };
 
 use crate::audio::{AudioBridge, CaptureSource};
+use crate::canvas::{
+    CanvasMessage, CanvasMutation, CanvasRecord, CanvasStore, SNAPSHOT_CHUNK_RECORDS,
+};
 use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
 use crate::drive_mount::DriveMounts;
@@ -136,6 +139,8 @@ pub struct Mesh {
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
     files: FilesPlane,
+    /// Layout-only Files canvas document. Bytes/listings never enter it.
+    canvas: CanvasStore,
     /// OS-native drive letters/mounts backed by active Storage routes.
     drive_mounts: DriveMounts,
     /// Explicit inbound pull requests. A drive pushed at us needs owner/fleet
@@ -1728,6 +1733,7 @@ impl Mesh {
             term_rx_seq: Mutex::new(HashMap::new()),
             term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
+            canvas: CanvasStore::load(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
             drive_pull_waiters: Mutex::new(HashMap::new()),
@@ -3845,11 +3851,18 @@ impl Mesh {
                             }
                         );
                         self.ownership_check(Some(&from), Some(&network)).await;
+                        self.sync_files_canvas_to(&from, &network).await;
                         // (The old "re-beacon the help room at whoever just
                         // came up" nudge lived here. A raised hand is
                         // asking-room *membership* now — the engine's own
                         // signaling announces cover every watcher, new or
                         // late, with nothing to re-send.)
+                    } else if !is_self {
+                        // A transport can reconnect while both app processes
+                        // keep the same boot id. Probe with one tiny digest so
+                        // patches lost during that partition still heal without
+                        // repeatedly shipping the whole canvas.
+                        self.probe_files_canvas_to(&from, &network).await;
                     }
                     if changed {
                         self.emit_snapshot();
@@ -4498,6 +4511,37 @@ impl Mesh {
                     MediaPayload::File(frame) => self.handle_file_frame(&from, frame),
                     MediaPayload::Clipboard(frame) => self.handle_clipboard_frame(&from, frame),
                     MediaPayload::Site(frame) => self.handle_site_frame(&from, frame),
+                }
+            }
+            CHANNEL_FILES_CANVAS => {
+                // This is fleet state, never ordinary-mesh or person-share
+                // state. The closed network plus signed-roster gate is the
+                // authority; malformed/oversized records are dropped by the
+                // store without disturbing the current document.
+                if !self.is_fleet_network(&network) || !self.sender_may_control(&from) {
+                    tracing::warn!(
+                        "ignoring Files canvas patch from {} outside the authenticated fleet",
+                        short_id(&from)
+                    );
+                    return;
+                }
+                let Ok(message) = serde_json::from_value::<CanvasMessage>(payload) else {
+                    return;
+                };
+                match message {
+                    CanvasMessage::Patch { records } => {
+                        if self.canvas.merge(records) {
+                            self.sink.emit(
+                                "allmystuff://files-canvas",
+                                json!({ "records": self.canvas.snapshot() }),
+                            );
+                        }
+                    }
+                    CanvasMessage::Digest { digest } => {
+                        if digest != self.canvas.digest() {
+                            self.sync_files_canvas_to(&from, &network).await;
+                        }
+                    }
                 }
             }
             CHANNEL_ROOMS => {
@@ -11871,6 +11915,7 @@ impl Mesh {
             CHANNEL_CONTROL,
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
+            CHANNEL_FILES_CANVAS,
             // CEC Support rides the same engine on its own channels; subscribing
             // everywhere is harmless (they're empty on non-CEC meshes) and means
             // a CEC Silent mesh is live for connect-requests the moment it's
@@ -16464,6 +16509,104 @@ impl Mesh {
     /// and presence plus re-stated invites heal the gaps. Returns how many
     /// members the daemon actually dispatched to, so the UI can be honest
     /// about a line that reached nobody.
+    /// Current fleet-wide Files canvas document for a newly opened GUI.
+    pub fn files_canvas_snapshot(&self) -> Vec<CanvasRecord> {
+        self.canvas.snapshot()
+    }
+
+    /// Apply one UI batch, persist it, and gossip exactly that batch. Dragging
+    /// never calls this until pointer-up, so motion cannot become network yap.
+    pub async fn files_canvas_apply(
+        &self,
+        mutations: Vec<CanvasMutation>,
+    ) -> Result<Vec<CanvasRecord>, String> {
+        let actor = self
+            .local_node_id()
+            .map(|id| pubkey_part(id.as_str()).to_string())
+            .unwrap_or_else(|| "local".into());
+        let records = self.canvas.apply_local(&actor, mutations)?;
+        self.sink.emit(
+            "allmystuff://files-canvas",
+            json!({ "records": self.canvas.snapshot() }),
+        );
+        self.broadcast_files_canvas(records.clone()).await;
+        Ok(records)
+    }
+
+    async fn broadcast_files_canvas(&self, records: Vec<CanvasRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return;
+        };
+        for records in records.chunks(SNAPSHOT_CHUNK_RECORDS) {
+            let Ok(payload) = serde_json::to_value(CanvasMessage::Patch {
+                records: records.to_vec(),
+            }) else {
+                continue;
+            };
+            let response = self
+                .client
+                .request(&Request::ChannelSendAll {
+                    network: network.clone(),
+                    channel: CHANNEL_FILES_CANVAS.into(),
+                    payload,
+                })
+                .await;
+            if let Err(error) = response {
+                tracing::debug!("Files canvas patch will converge on reconnect: {error}");
+                break;
+            }
+        }
+    }
+
+    /// Chunked snapshot on first sighting/new boot or a digest mismatch. Chunks
+    /// stay below the daemon's message ceiling even if a record reaches its cap.
+    async fn sync_files_canvas_to(&self, peer: &str, network: &str) {
+        if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
+            return;
+        }
+        for records in self.canvas.snapshot().chunks(SNAPSHOT_CHUNK_RECORDS) {
+            let Ok(payload) = serde_json::to_value(CanvasMessage::Patch {
+                records: records.to_vec(),
+            }) else {
+                continue;
+            };
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network: network.into(),
+                    channel: CHANNEL_FILES_CANVAS.into(),
+                    peer: pubkey_part(peer).into(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    /// Lightweight reconnect probe. Presence is event-driven, not a timer, and
+    /// equal digests produce no response or canvas traffic.
+    async fn probe_files_canvas_to(&self, peer: &str, network: &str) {
+        if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
+            return;
+        }
+        let Ok(payload) = serde_json::to_value(CanvasMessage::Digest {
+            digest: self.canvas.digest(),
+        }) else {
+            return;
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.into(),
+                channel: CHANNEL_FILES_CANVAS.into(),
+                peer: pubkey_part(peer).into(),
+                payload,
+            })
+            .await;
+    }
+
     pub async fn room_send(
         &self,
         members: Vec<String>,

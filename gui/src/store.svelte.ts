@@ -643,14 +643,15 @@ function loadRememberedDevices(): string[] {
   }
 }
 
-type UiMode = "normal" | "advanced";
+type UiMode = "normal" | "files" | "advanced";
 const UI_MODE_STORE_KEY = "allmystuff.uiMode.v1";
 
 /** The native app opens in the deliberately quiet, graph-first experience.
  *  Once someone opts into Advanced we remember that choice on this machine. */
 function loadUiMode(): UiMode {
   try {
-    return localStorage.getItem(UI_MODE_STORE_KEY) === "advanced" ? "advanced" : "normal";
+    const mode = localStorage.getItem(UI_MODE_STORE_KEY);
+    return mode === "advanced" || mode === "files" ? mode : "normal";
   } catch {
     return "normal";
   }
@@ -2752,8 +2753,8 @@ class AppStore {
   // ---- selection ---------------------------------------------------
   setUiMode(mode: UiMode) {
     this.uiMode = mode;
-    if (mode === "normal") {
-      // Normal mode has no details drawer or card drop-outs. Clear their
+    if (mode !== "advanced") {
+      // Normal and Files have no device drawer or card drop-outs. Clear their
       // latent state so switching back never acts on a stale selection.
       this.selectedNodeId = null;
       this.kvmRevealed = null;

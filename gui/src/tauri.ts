@@ -33,6 +33,7 @@ import type {
   UpdateStatus,
   VideoFrameMsg,
 } from "./types";
+import type { CanvasRecord } from "./files-canvas";
 
 interface ScanResult {
   node_id: string;
@@ -150,6 +151,124 @@ export function isMobile(): boolean {
     /Android|iPhone|iPad|iPod/i.test(ua) ||
     (/Macintosh/.test(ua) && navigator.maxTouchPoints > 2)
   );
+}
+
+export interface LocalFileLocation {
+  id: string;
+  label: string;
+  path: string;
+  kind: "favorite" | "volume";
+}
+
+export interface LocalFileEntry {
+  id: string;
+  name: string;
+  path: string;
+  dir: boolean;
+  size: number;
+  modified?: number | null;
+  hidden: boolean;
+  symlink: boolean;
+}
+
+export interface LocalFileListing {
+  id: string;
+  path: string;
+  platform: string;
+  entries: LocalFileEntry[];
+}
+
+export type LocalFilePreview =
+  | { kind: "text"; text: string }
+  | { kind: "image"; mime: string; data: string }
+  | { kind: "unsupported" };
+
+async function requiredInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (!isTauri()) throw new Error("this action needs the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+export function localFileLocations(): Promise<LocalFileLocation[]> {
+  return isTauri()
+    ? requiredInvoke<LocalFileLocation[]>("local_file_locations")
+    : Promise.resolve([
+        { id: "home", label: "Home", path: "/Users/you", kind: "favorite" },
+        { id: "desktop", label: "Desktop", path: "/Users/you/Desktop", kind: "favorite" },
+        { id: "documents", label: "Documents", path: "/Users/you/Documents", kind: "favorite" },
+        { id: "downloads", label: "Downloads", path: "/Users/you/Downloads", kind: "favorite" },
+      ]);
+}
+
+export function localFileList(path: string): Promise<LocalFileListing> {
+  if (!isTauri()) {
+    const now = Math.floor(Date.now() / 1000);
+    return Promise.resolve({
+      id: `demo-directory:${path}`,
+      path,
+      platform: navigator.platform.includes("Win") ? "windows" : "macos",
+      entries: [
+        { id: "demo-projects", name: "Projects", path: `${path}/Projects`, dir: true, size: 0, modified: now - 7200, hidden: false, symlink: false },
+        { id: "demo-photos", name: "Photos", path: `${path}/Photos`, dir: true, size: 0, modified: now - 86400, hidden: false, symlink: false },
+        { id: "demo-plan", name: "Fleet storage plan.md", path: `${path}/Fleet storage plan.md`, dir: false, size: 18432, modified: now - 900, hidden: false, symlink: false },
+        { id: "demo-design", name: "Canvas design.png", path: `${path}/Canvas design.png`, dir: false, size: 2400000, modified: now - 3600, hidden: false, symlink: false },
+        { id: "demo-budget", name: "Storage budget.xlsx", path: `${path}/Storage budget.xlsx`, dir: false, size: 89216, modified: now - 172800, hidden: false, symlink: false },
+      ],
+    });
+  }
+  return requiredInvoke<LocalFileListing>("local_file_list", { path });
+}
+
+export function localFilePreview(path: string): Promise<LocalFilePreview> {
+  return isTauri()
+    ? requiredInvoke<LocalFilePreview>("local_file_preview", { path })
+    : Promise.resolve(path.endsWith(".md")
+        ? { kind: "text", text: "# Fleet storage plan\n\nKeep file placement separate from the shared canvas metadata." }
+        : { kind: "unsupported" });
+}
+
+export function localFileOpen(path: string, reveal = false): Promise<void> {
+  return requiredInvoke("local_file_open", { path, reveal });
+}
+
+export function localFileMkdir(parent: string, name: string): Promise<string> {
+  return requiredInvoke("local_file_mkdir", { parent, name });
+}
+
+export function localFileRename(path: string, name: string): Promise<string> {
+  return requiredInvoke("local_file_rename", { path, name });
+}
+
+export function localFileTrash(paths: string[]): Promise<void> {
+  return requiredInvoke("local_file_trash", { paths });
+}
+
+export interface CanvasMutation {
+  id: string;
+  kind: CanvasRecord["kind"];
+  value: unknown | null;
+  deleted?: boolean;
+}
+
+export function filesCanvasSnapshot(): Promise<CanvasRecord[]> {
+  return isTauri() ? requiredInvoke<CanvasRecord[]>("files_canvas_snapshot") : Promise.resolve([]);
+}
+
+export function filesCanvasApply(mutations: CanvasMutation[]): Promise<CanvasRecord[]> {
+  return isTauri()
+    ? requiredInvoke<CanvasRecord[]>("files_canvas_apply", { mutations })
+    : Promise.resolve(mutations.map((mutation, index) => ({
+        ...mutation,
+        stamp: { counter: Date.now() + index, actor: "web-preview" },
+      })));
+}
+
+export async function onFilesCanvas(
+  cb: (records: CanvasRecord[]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ records: CanvasRecord[] }>("allmystuff://files-canvas", (event) => cb(event.payload.records));
 }
 
 // ---- app metadata -----------------------------------------------------

@@ -49,6 +49,11 @@ pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 /// sees the channel, so the whole plane is additive.
 pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
 
+/// Fleet-private Files canvas metadata. It is subscribed everywhere so a
+/// network transition cannot strand it, but receivers accept it only on their
+/// authenticated closed fleet network.
+pub const CHANNEL_FILES_CANVAS: &str = "allmystuff/files-canvas/v1";
+
 /// Well-known LAN-local claim-rendezvous network. Every AllMyStuff node
 /// joins it with daemon signaling `{strategy: "none", mdns: true}` — the
 /// network never touches remote infrastructure, so a claimable device

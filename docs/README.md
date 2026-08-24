@@ -19,6 +19,7 @@ with the job in front of you.
 | Build, test, or contribute | [Contributing](../CONTRIBUTING.md) |
 | Understand the process and crate boundaries | [Architecture](../ARCHITECTURE.md) |
 | Work on the desktop or mobile front end | [GUI guide](../gui/README.md) |
+| Understand Files mode, identity, and fleet canvas convergence | [Files canvas](FILES-CANVAS.md) |
 | Understand the mobile client | [Mobile architecture and status](MOBILE.md) |
 | Work on video performance | [Performance roadmap](../PERFORMANCE-ROADMAP.md) |
 | Configure release signing | [Release signing](../RELEASE-SIGNING.md) |

@@ -54,6 +54,7 @@ pub mod audio;
 pub mod byte_queues;
 #[cfg(feature = "host")]
 pub mod camera_capture;
+pub mod canvas;
 pub mod cec;
 pub mod child_process;
 #[cfg(feature = "host")]

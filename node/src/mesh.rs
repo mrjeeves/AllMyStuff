@@ -4547,9 +4547,7 @@ impl Mesh {
                     }
                     CanvasMessage::Digest { epoch, digest } => {
                         let (local_epoch, local_digest) = self.canvas.digest_state();
-                        if epoch < local_epoch {
-                            self.sync_files_canvas_to(&from, &network).await;
-                        } else if epoch == local_epoch && digest != local_digest {
+                        if epoch < local_epoch || (epoch == local_epoch && digest != local_digest) {
                             self.sync_files_canvas_to(&from, &network).await;
                         } else if epoch > local_epoch {
                             // Ask the newer peer to replay its barrier. This is a

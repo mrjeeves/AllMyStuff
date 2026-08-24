@@ -25,11 +25,13 @@
     descendantsOf,
     mergeCanvasRecords,
     normalizeFrameNesting,
+    sharedFilesystemObject,
     type CanvasFrame,
     type CanvasPlacement,
     type CanvasRecord,
     type FilesMap,
     type FilesView,
+    type SharedFilesystemKind,
   } from "../files-canvas";
 
   let locations = $state<LocalFileLocation[]>([]);
@@ -98,6 +100,17 @@
     }
     return out;
   });
+  const filesystemPartners = $derived.by(() => app.sharePartners.flatMap((partner) => {
+    const sharedByYou = partner.sharedByYou.flatMap(({ node, grant }) => {
+      const object = sharedFilesystemObject(grant);
+      return object ? [{ node, grant, object }] : [];
+    });
+    const sharedWithYou = partner.sharedWithYou.flatMap(({ node, grant }) => {
+      const object = sharedFilesystemObject(grant);
+      return object ? [{ node, grant, object }] : [];
+    });
+    return sharedByYou.length || sharedWithYou.length ? [{ partner, sharedByYou, sharedWithYou }] : [];
+  }));
 
   function absorb(incoming: CanvasRecord[]) {
     records = mergeCanvasRecords(records, incoming).records;
@@ -111,7 +124,10 @@
       placesWidth = Math.max(160, Math.min(420, Number(localStorage.getItem("allmystuff.files.placesWidth")) || 224));
       previewWidth = Math.max(220, Math.min(520, Number(localStorage.getItem("allmystuff.files.previewWidth")) || 288));
       wallpaperPath = localStorage.getItem("allmystuff.files.wallpaperPath") ?? "";
-      if (wallpaperPath) void import("@tauri-apps/api/core").then(({ convertFileSrc }) => (wallpaper = convertFileSrc(wallpaperPath)));
+      if (wallpaperPath) void loadWallpaper(wallpaperPath, false).catch(() => {
+        wallpaperPath = "";
+        wallpaper = "";
+      });
     } catch { /* private mode keeps these device-local for this session */ }
     void Promise.all([localFileLocations(), filesCanvasSnapshot()]).then(async ([places, saved]) => {
       locations = places;
@@ -186,7 +202,12 @@
   }
 
   function togglePreview() {
-    previewOpen = !previewOpen;
+    if (!previewOpen || !app.filesSettings.showPreview) {
+      previewOpen = true;
+      if (!app.filesSettings.showPreview) app.updateFilesSettings({ showPreview: true });
+    } else {
+      previewOpen = false;
+    }
     try { localStorage.setItem("allmystuff.files.previewOpen", String(previewOpen)); } catch {}
   }
 
@@ -213,22 +234,25 @@
 
   async function chooseWallpaper() {
     try {
-      const [{ open: openDialog }, { convertFileSrc }] = await Promise.all([
-        import("@tauri-apps/plugin-dialog"),
-        import("@tauri-apps/api/core"),
-      ]);
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
       const selected = await openDialog({
         multiple: false,
         directory: false,
         filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp"] }],
       });
       if (typeof selected !== "string") return;
-      wallpaperPath = selected;
-      wallpaper = convertFileSrc(selected);
-      localStorage.setItem("allmystuff.files.wallpaperPath", selected);
+      await loadWallpaper(selected, true);
     } catch (error) {
       app.toast("warn", `Couldn't set the background: ${String(error)}`);
     }
+  }
+
+  async function loadWallpaper(nextPath: string, persist: boolean) {
+    const result = await localFilePreview(nextPath);
+    if (result.kind !== "image") throw new Error("choose a supported image under 4 MB");
+    wallpaperPath = nextPath;
+    wallpaper = `data:${result.mime};base64,${result.data}`;
+    if (persist) localStorage.setItem("allmystuff.files.wallpaperPath", nextPath);
   }
 
   function clearWallpaper() {
@@ -393,18 +417,8 @@
   }
 
   function newFrame() {
-    if (map === "files") {
-      changeView("canvas");
-      frameTool = !frameTool;
-      return;
-    }
-    const id = `${framePrefix}${crypto.randomUUID()}`;
-    const frame: CanvasFrame = {
-      id, title: "New frame", color: "violet", parentId: null,
-      x: (-pan.x + 140) / zoom, y: (-pan.y + 110) / zoom, width: 430, height: 280,
-    };
-    frame.parentId = containingFrame(frame, frames);
-    void save([frameRecord(frame)]);
+    if (map === "files") changeView("canvas");
+    frameTool = !frameTool;
   }
 
   function dragItem(event: PointerEvent, item: LocalFileEntry, index: number) {
@@ -442,9 +456,10 @@
       placement.parentId === frame.id || (placement.parentId ? children.has(placement.parentId) : false),
     );
     const itemStarts = new Map(movedItems.map(([id, placement]) => [id, { x: placement.x, y: placement.y }]));
+    const canvasZoom = map === "files" ? zoom : 1;
     const move = (next: PointerEvent) => {
-      const dx = (next.clientX - origin.x) / zoom;
-      const dy = (next.clientY - origin.y) / zoom;
+      const dx = (next.clientX - origin.x) / canvasZoom;
+      const dy = (next.clientY - origin.y) / canvasZoom;
       for (const candidate of movedFrames) {
         const start = frameStarts.get(candidate.id)!;
         candidate.x = start.x + dx;
@@ -475,9 +490,10 @@
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY };
     const start = { width: frame.width, height: frame.height };
+    const canvasZoom = map === "files" ? zoom : 1;
     const move = (next: PointerEvent) => {
-      frame.width = Math.max(180, start.width + (next.clientX - origin.x) / zoom);
-      frame.height = Math.max(120, start.height + (next.clientY - origin.y) / zoom);
+      frame.width = Math.max(180, start.width + (next.clientX - origin.x) / canvasZoom);
+      frame.height = Math.max(120, start.height + (next.clientY - origin.y) / canvasZoom);
       records = [...records];
     };
     const up = () => {
@@ -491,11 +507,16 @@
   }
 
   function panCanvas(event: PointerEvent) {
-    if (event.button !== 0 || event.target !== event.currentTarget) return;
+    if (event.button !== 0) return;
+    const target = event.target as Element;
+    if (target.closest(".file-tile, .canvas-frame, .load-more, .zoom, .share-frame")) return;
     if (frameTool) {
       const viewport = event.currentTarget as HTMLElement;
       const rect = viewport.getBoundingClientRect();
-      const start = { x: (event.clientX - rect.left - pan.x) / zoom, y: (event.clientY - rect.top - pan.y) / zoom };
+      const canvasPan = map === "files" ? pan : { x: 0, y: 0 };
+      const canvasScroll = map === "sharing" ? { x: viewport.scrollLeft, y: viewport.scrollTop } : { x: 0, y: 0 };
+      const canvasZoom = map === "files" ? zoom : 1;
+      const start = { x: (event.clientX - rect.left - canvasPan.x + canvasScroll.x) / canvasZoom, y: (event.clientY - rect.top - canvasPan.y + canvasScroll.y) / canvasZoom };
       const frame: CanvasFrame = {
         id: `${framePrefix}${crypto.randomUUID()}`,
         title: "New frame",
@@ -508,8 +529,8 @@
       };
       draftFrame = frame;
       const move = (next: PointerEvent) => {
-        const x = (next.clientX - rect.left - pan.x) / zoom;
-        const y = (next.clientY - rect.top - pan.y) / zoom;
+        const x = (next.clientX - rect.left - canvasPan.x + canvasScroll.x) / canvasZoom;
+        const y = (next.clientY - rect.top - canvasPan.y + canvasScroll.y) / canvasZoom;
         frame.x = Math.min(start.x, x);
         frame.y = Math.min(start.y, y);
         frame.width = Math.abs(x - start.x);
@@ -529,7 +550,7 @@
           (candidate) => !candidate.parentId || !enclosedIds.has(candidate.parentId),
         );
         for (const candidate of capturedFrames) candidate.parentId = frame.id;
-        const capturedItems = visible.flatMap((item, index) => {
+        const capturedItems = (map === "files" ? visible : []).flatMap((item, index) => {
           const placement = itemPosition(item, index);
           if (
             !contains(frame, { ...placement, width: tileSize, height: tileSize + 32 }) ||
@@ -544,6 +565,7 @@
       window.addEventListener("pointerup", up, { once: true });
       return;
     }
+    if (map !== "files") return;
     const start = { ...pan };
     const origin = { x: event.clientX, y: event.clientY };
     const move = (next: PointerEvent) => { pan = { x: start.x + next.clientX - origin.x, y: start.y + next.clientY - origin.y }; };
@@ -616,12 +638,15 @@
 
   function dragLocalFile(event: DragEvent, item: LocalFileEntry) {
     event.dataTransfer?.setData(LOCAL_DRAG, JSON.stringify({
-      id: item.id,
       path: item.path,
       name: item.name,
       dir: item.dir,
     }));
     if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
+  }
+
+  function sharedIcon(kind: SharedFilesystemKind): string {
+    return kind === "folder" ? "📁" : kind === "drive" ? "💽" : "📄";
   }
 
   function dragShareGrant(event: DragEvent, nodeId: string, grantId: string) {
@@ -631,6 +656,7 @@
 
   async function shareDrop(event: DragEvent, partner: SharePartner) {
     event.preventDefault();
+    event.stopPropagation();
     const raw = event.dataTransfer?.getData(LOCAL_DRAG);
     if (!raw) return;
     try {
@@ -658,6 +684,7 @@
 
   function retractDrop(event: DragEvent) {
     event.preventDefault();
+    event.stopPropagation();
     const raw = event.dataTransfer?.getData(GRANT_DRAG);
     if (!raw) return;
     try {
@@ -671,7 +698,6 @@
 
 <section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => { if (!(event.target as Element).closest(".context-menu")) context = null; }}>
   <nav class="filebar" aria-label="File commands">
-    <button class:active={placesOpen} title="Show or hide Quick access" onclick={togglePlaces}>☰</button>
     <button title="Back" disabled={historyIndex <= 0} onclick={() => browseHistory(-1)}>‹</button>
     <button title="Forward" disabled={historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
     <button title="Up one folder" disabled={!path || parentPath(path) === path} onclick={() => navigate(parentPath(path))}>↑</button>
@@ -692,67 +718,80 @@
       {#if view === "canvas"}<input type="range" min="64" max="150" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Thumbnail size" />{/if}
       <button class:active={showHidden} onclick={toggleHidden} title="Show hidden files">···</button>
     {/if}
-    <button class:active={previewOpen && app.filesSettings.showPreview} title="Show or hide Preview" onclick={togglePreview}>◧</button>
   </nav>
 
-  <aside class="places">
+  <aside class="places" class:collapsed={!placesOpen}>
     <button class="resize-edge places-edge" aria-label="Resize Quick access" onpointerdown={(event) => resizeSidebar(event, "places")}></button>
-    <h3>Quick access</h3>
-    {#each locations.filter((place) => place.kind === "favorite") as place}
-      <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>{place.id === "home" ? "⌂" : "📁"}</span>{place.label}</button>
-    {/each}
-    <h3>Recent</h3>
-    {#if recent.length === 0}<p>Opened files appear here.</p>{/if}
-    {#each recent as item}<button onclick={() => open(item)}><span>{icon(item)}</span>{item.name}</button>{/each}
-    <h3>{platform === "macos" ? "Locations" : "This PC"}</h3>
-    {#each locations.filter((place) => place.kind === "volume") as place}
-      <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>💽</span>{place.label}</button>
-    {/each}
-    <h3>Fleet</h3>
-    <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}><span>⇄</span>Shared with me / out</button>
-    <div class="fleet-note"><i></i>Canvas metadata syncs fleet-wide</div>
-    <div class="background-control">
-      <button onclick={chooseWallpaper}><span>▧</span>Background</button>
-      {#if wallpaperPath}<button class="clear-background" title="Clear background" onclick={clearWallpaper}>×</button>{/if}
+    <div class="sidebar-head">
+      <b>Quick access</b>
+      <button class="sidebar-toggle" title="Show or hide Quick access" aria-label="Show or hide Quick access" onclick={togglePlaces}>{placesOpen ? "‹" : "›"}</button>
     </div>
+    {#if placesOpen}
+      <div class="sidebar-body">
+        {#each locations.filter((place) => place.kind === "favorite") as place}
+          <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>{place.id === "home" ? "⌂" : "📁"}</span>{place.label}</button>
+        {/each}
+        <h3>Recent</h3>
+        {#if recent.length === 0}<p>Opened files appear here.</p>{/if}
+        {#each recent as item}<button onclick={() => open(item)}><span>{icon(item)}</span>{item.name}</button>{/each}
+        <h3>{platform === "macos" ? "Locations" : "This PC"}</h3>
+        {#each locations.filter((place) => place.kind === "volume") as place}
+          <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>💽</span>{place.label}</button>
+        {/each}
+        <h3>Fleet</h3>
+        <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}><span>⇄</span>Shared with me / out</button>
+        {#if map === "sharing"}
+          <h3>Drag from current folder</h3>
+          {#each visible.slice(0, 64) as item (item.id)}
+            <button draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><span>{icon(item)}</span>{item.name}</button>
+          {/each}
+        {/if}
+        <div class="fleet-note"><i></i>Canvas metadata syncs fleet-wide</div>
+        <div class="background-control">
+          <button onclick={chooseWallpaper}><span>▧</span>Background</button>
+          {#if wallpaperPath}<button class="clear-background" title="Clear background" onclick={clearWallpaper}>×</button>{/if}
+        </div>
+      </div>
+    {/if}
   </aside>
 
   <main class="browser" style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
     {#if map === "sharing"}
-      <div class="sharing-canvas">
-        <section class="share-frame personal" role="group" aria-label="Personally stored files" ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
-          <h2>Personally stored</h2>
-          <p>Drag a folder into another fleet's frame to share its whole live subtree. Drag a shared item back here to retract it.</p>
-          <div class="share-items">
-            {#each visible as item (item.id)}
-              <button class="share-file" draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><i>{icon(item)}</i><span>{item.name}</span></button>
-            {/each}
-          </div>
-          {#if !complete}<button class="share-more" onclick={loadMore} disabled={loadingPage}>{loadingPage ? "Reading…" : "Load more Desktop items"}</button>{/if}
-        </section>
-        {#each app.sharePartners as partner (partner.person.id)}
-          <section class="share-frame partner" role="group" aria-label={`Files shared with ${partner.person.name}`} ondragover={(event) => event.preventDefault()} ondrop={(event) => shareDrop(event, partner)}>
-            <h2>{partner.person.name}</h2>
-            <p>One frame for this fleet. Dropping a folder here grants the root; children are covered dynamically and are never indexed into the canvas.</p>
-            <h3>Shared out</h3>
-            <div class="share-items">
-              {#each partner.sharedByYou as { node, grant } (grant.id)}
-                <button class="share-file outbound" draggable={true} ondragstart={(event) => dragShareGrant(event, node.id, grant.id)} title="Drag back to Personally stored to retract"><i>📁</i><span>{grant.label}</span></button>
-              {:else}<small>Drop a folder here to share it.</small>{/each}
-            </div>
-            <h3>Shared with me</h3>
-            <div class="share-items">
-              {#each partner.sharedWithYou as { grant } (grant.id)}
-                <div class="share-file inbound"><i>📁</i><span>{grant.label}</span></div>
-              {:else}<small>Nothing shared in.</small>{/each}
-            </div>
+      <div class="sharing-canvas" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
+        <p class="share-map-help">Only actual shared files, folders, and drives appear here. Drag a shared-out item onto empty canvas to retract it.</p>
+        {#each filesystemPartners as relation (relation.partner.person.id)}
+          <section class="share-frame partner" role="group" aria-label={`Files shared with ${relation.partner.person.name}`} ondragover={(event) => event.preventDefault()} ondrop={(event) => shareDrop(event, relation.partner)}>
+            <h2>{relation.partner.person.name}</h2>
+            <p>This fleet's concrete filesystem sharing surface. Folder grants include their live descendants without listing every child here.</p>
+            {#if relation.sharedByYou.length}
+              <h3>Shared out</h3>
+              <div class="share-items">
+                {#each relation.sharedByYou as { node, grant, object } (grant.id)}
+                  <button class="share-file outbound" draggable={true} ondragstart={(event) => dragShareGrant(event, node.id, grant.id)} title={`Drag onto empty canvas to retract ${object.label}`}><i>{sharedIcon(object.kind)}</i><span>{object.label}</span></button>
+                {/each}
+              </div>
+            {/if}
+            {#if relation.sharedWithYou.length}
+              <h3>Shared with me</h3>
+              <div class="share-items">
+                {#each relation.sharedWithYou as { grant, object } (grant.id)}
+                  <div class="share-file inbound" title={object.label}><i>{sharedIcon(object.kind)}</i><span>{object.label}</span></div>
+                {/each}
+              </div>
+            {/if}
           </section>
         {:else}
-          <section class="share-frame empty-share"><h2>No other fleets yet</h2><p>Connect with another person or fleet, then their sharing frame will appear here.</p></section>
+          <section class="share-frame empty-share"><h2>No shared filesystem objects</h2><p>Other share types remain available elsewhere; this Files view appears only when a concrete file, folder, or drive is shared.</p></section>
         {/each}
         {#each frames as frame}
-          <article class="canvas-frame user" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}><b>{frame.title}</b></article>
+          <article class="canvas-frame user" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
+            <input value={frame.title} onchange={(event) => { frame.title = event.currentTarget.value; void save([frameRecord(frame)]); }} onpointerdown={(event) => event.stopPropagation()} />
+            <button title="Delete frame, keep its contents" onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
+            <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
+          </article>
         {/each}
+        {#if draftFrame}<article class="canvas-frame draft user" style={`left:${draftFrame.x}px;top:${draftFrame.y}px;width:${draftFrame.width}px;height:${draftFrame.height}px`}>New frame</article>{/if}
+        {#if frameTool}<div class="frame-hint">Drag on empty canvas to draw a frame</div>{/if}
       </div>
     {:else if view === "details"}
       <div class="details">
@@ -768,7 +807,7 @@
         {#if !complete}<button class="details-load" onclick={loadMore} disabled={loadingPage}><span>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</span></button>{/if}
       </div>
     {:else}
-      <div class="viewport" role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
+      <div class="viewport" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
           {#each frames as frame}
             <article class="canvas-frame" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
@@ -804,22 +843,30 @@
     {/if}
   </main>
 
-  {#if previewOpen && app.filesSettings.showPreview}<aside class="preview">
+  <aside class="preview" class:collapsed={!previewOpen || !app.filesSettings.showPreview}>
     <button class="resize-edge preview-edge" aria-label="Resize Preview" onpointerdown={(event) => resizeSidebar(event, "preview")}></button>
-    {#if selected}
-      <div class="preview-art">
-        {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
-        {:else}<span>{icon(selected)}</span>{/if}
+    <div class="sidebar-head preview-head">
+      <b>Preview</b>
+      <button class="sidebar-toggle" title="Show or hide Preview" aria-label="Show or hide Preview" onclick={togglePreview}>{previewOpen && app.filesSettings.showPreview ? "›" : "‹"}</button>
+    </div>
+    {#if previewOpen && app.filesSettings.showPreview}
+      <div class="sidebar-body">
+        {#if selected}
+          <div class="preview-art">
+            {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
+            {:else}<span>{icon(selected)}</span>{/if}
+          </div>
+          <h2>{selected.name}</h2>
+          <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
+          {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
+          <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
+          <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
+        {:else}
+          <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
+        {/if}
       </div>
-      <h2>{selected.name}</h2>
-      <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
-      {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
-      <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
-      <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
-    {:else}
-      <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
     {/if}
-  </aside>{/if}
+  </aside>
 
   {#if context}
     <div class="context-menu" style={`left:${context.x}px;top:${context.y}px`} role="menu">
@@ -836,10 +883,9 @@
 
 <style>
   .files-workspace { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template: auto 1fr / var(--places-width, 14rem) minmax(20rem, 1fr) var(--preview-width, 18rem); background: var(--bg); overflow: hidden; }
-  .files-workspace.preview-hidden { grid-template-columns: var(--places-width, 14rem) minmax(20rem, 1fr); }
-  .files-workspace.places-hidden { grid-template-columns: minmax(20rem, 1fr) var(--preview-width, 18rem); }
-  .files-workspace.places-hidden.preview-hidden { grid-template-columns: minmax(20rem, 1fr); }
-  .files-workspace.places-hidden .places { display: none; }
+  .files-workspace.preview-hidden { grid-template-columns: var(--places-width, 14rem) minmax(20rem, 1fr) 2.5rem; }
+  .files-workspace.places-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) var(--preview-width, 18rem); }
+  .files-workspace.places-hidden.preview-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) 2.5rem; }
   button, input { font: inherit; }
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
   .filebar > button, .switch button, .native-open { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
@@ -849,37 +895,48 @@
   .switch { display: inline-flex; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }
   .switch button { border: 0; background: transparent; min-height: 1.65rem; }
   .switch button.active { background: var(--accent-soft); color: var(--accent-ink); }
-  .places, .preview { position: relative; min-height: 0; overflow: auto; background: var(--surface); padding: .8rem; }
+  .places, .preview { position: relative; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: var(--surface); padding: 0; }
   .places { display: flex; flex-direction: column; border-right: 1px solid var(--line); }
   .preview { border-left: 1px solid var(--line); }
+  .sidebar-head { flex: 0 0 auto; min-height: 2.65rem; display: flex; align-items: center; justify-content: space-between; gap: .4rem; padding: .45rem .55rem; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: .76rem; white-space: nowrap; }
+  .sidebar-head b { overflow: hidden; text-overflow: ellipsis; }
+  .sidebar-toggle { flex: 0 0 1.65rem; width: 1.65rem; height: 1.65rem; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--ink-soft); }
+  .sidebar-toggle:hover { color: var(--ink); border-color: var(--line-strong); }
+  .sidebar-body { flex: 1; min-height: 0; overflow: auto; padding: .8rem; }
+  .places .sidebar-body { display: flex; flex-direction: column; }
+  .places.collapsed, .preview.collapsed { padding: 0; }
+  .places.collapsed .sidebar-head, .preview.collapsed .sidebar-head { justify-content: center; padding-inline: .25rem; border-bottom: 0; }
+  .places.collapsed .sidebar-head b, .preview.collapsed .sidebar-head b, .places.collapsed .resize-edge, .preview.collapsed .resize-edge { display: none; }
+  .places.collapsed .sidebar-toggle, .preview.collapsed .sidebar-toggle { flex-basis: 1.8rem; width: 1.8rem; }
   .resize-edge { position: absolute; top: 0; bottom: 0; z-index: 5; width: 7px; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: ew-resize; }
   .resize-edge:hover { background: var(--accent-soft); }
   .places .places-edge { right: 0; width: 7px; }
   .preview .preview-edge { left: 0; width: 7px; }
   .places h3 { margin: 1rem .5rem .35rem; color: var(--ink-faint); font-size: .66rem; text-transform: uppercase; letter-spacing: .09em; }
   .places h3:first-child { margin-top: .2rem; }
-  .places > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .places > button:hover, .places > button.active { background: var(--surface-2); color: var(--ink); }
+  .places .sidebar-body > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .places .sidebar-body > button:hover, .places .sidebar-body > button.active { background: var(--surface-2); color: var(--ink); }
   .places p, .fleet-note { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }
   .fleet-note { display: flex; gap: .4rem; align-items: center; margin-top: .7rem; }.fleet-note i { width: 7px; height: 7px; background: var(--ok); border-radius: 50%; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
-  .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, linear-gradient(transparent, transparent)), radial-gradient(circle at 1px 1px, oklch(0.36 0.025 285 / .38) 1px, transparent 1.2px); background-position: center, 0 0; background-repeat: no-repeat, repeat; background-size: cover, 22px 22px; }
+  .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
+  .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
   .viewport:active { cursor: grabbing; }.world { position: absolute; inset: 0; transform-origin: 0 0; }
   .canvas-frame { position: absolute; z-index: 0; border: 1px solid oklch(0.62 .2 292 / .55); border-radius: 15px; background: oklch(0.62 .2 292 / .08); box-shadow: inset 0 0 0 1px oklch(1 0 0 / .025); padding: .55rem; }
   .canvas-frame input { width: calc(100% - 2rem); border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; }.canvas-frame > button { float: right; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { width: 100%; height: 1.15em; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: hidden; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { width: 100%; height: 1.15em; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: hidden; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }.zoom { position: absolute; right: .7rem; bottom: .7rem; padding: .25rem .5rem; border-radius: 6px; background: var(--surface); color: var(--ink-faint); font-size: .68rem; }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
   .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { font-style: normal; font-size: 1.2rem; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
-  .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
+  .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview .sidebar-body > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
   .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }
-  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(3, minmax(15rem, 1fr)); gap: 1.2rem; align-items: start; }.share-frame { min-height: 24rem; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); font-size: .75rem; line-height: 1.45; }.share-frame.personal { border-color: var(--c-fleet); }.canvas-frame.user { pointer-events: auto; z-index: 3; }
-  @media (max-width: 1050px) { .files-workspace, .files-workspace.preview-hidden { grid-template-columns: min(11rem, var(--places-width, 11rem)) minmax(18rem, 1fr); }.files-workspace.places-hidden, .files-workspace.places-hidden.preview-hidden { grid-template-columns: minmax(18rem, 1fr); }.preview { display: none; }.search { display: none; } }
-  @media (max-width: 760px) { .files-workspace, .files-workspace.places-hidden, .files-workspace.preview-hidden, .files-workspace.places-hidden.preview-hidden { grid-template-columns: 1fr; }.places { display: none; }.filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
-  .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-items > small { grid-column: 1 / -1; color: var(--ink-faint); font-size: .72rem; }.share-file { min-width: 0; min-height: 5.5rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }.share-more { margin-top: .7rem; padding: .4rem .65rem; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink-soft); }
+  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1.2rem; align-items: start; touch-action: none; }.share-map-help { grid-column: 1 / -1; margin: 0; color: var(--ink-faint); font-size: .74rem; }.share-frame { position: relative; z-index: 2; min-width: 0; min-height: 12rem; overflow: hidden; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; overflow-wrap: anywhere; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); overflow-wrap: anywhere; font-size: .75rem; line-height: 1.45; }.canvas-frame.user { pointer-events: auto; z-index: 1; }.frame-hint { position: fixed; left: 50%; bottom: 1rem; z-index: 8; translate: -50% 0; padding: .45rem .7rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: .72rem; pointer-events: none; }
+  @media (max-width: 1050px) { .search { display: none; } }
+  @media (max-width: 760px) { .filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
+  .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-file { min-width: 0; min-height: 5.75rem; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }
 </style>

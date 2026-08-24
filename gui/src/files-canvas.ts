@@ -29,6 +29,36 @@ export interface CanvasPlacement extends Point {
   parentId: string | null;
 }
 
+export type SharedFilesystemKind = "file" | "folder" | "drive";
+
+export interface SharedFilesystemObject {
+  sourceNode: string;
+  objectId: string;
+  kind: SharedFilesystemKind;
+  label: string;
+}
+
+/** Files mode must not reinterpret the general-purpose share graph as a file
+ * tree. Only explicit, bounded storage-object capabilities belong here. */
+export function sharedFilesystemObject(grant: {
+  media: string;
+  capability?: string | null;
+  label?: string | null;
+}): SharedFilesystemObject | null {
+  if (grant.media !== "storage") return null;
+  const match = /^([^:]+):(file|folder|drive|disk):([^:]+)$/.exec(grant.capability?.trim() ?? "");
+  if (!match) return null;
+  const rawLabel = grant.label?.trim() ?? "";
+  const shareMarker = rawLabel.toLocaleLowerCase("en-US").lastIndexOf(": share ");
+  const label = (shareMarker >= 0 ? rawLabel.slice(shareMarker + 8) : rawLabel.replace(/^share\s+/i, "")).trim();
+  return {
+    sourceNode: match[1]!,
+    kind: match[2] === "disk" ? "drive" : match[2] as SharedFilesystemKind,
+    objectId: match[3]!,
+    label: label || match[3]!,
+  };
+}
+
 export function compareStamp(a: CanvasStamp, b: CanvasStamp): number {
   return a.counter - b.counter || a.actor.localeCompare(b.actor);
 }

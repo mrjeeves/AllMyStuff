@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, fileReferenceId, mergeCanvasRecords, normalizeFrameNesting } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, fileReferenceId, mergeCanvasRecords, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -48,4 +48,30 @@ test("a missing or tombstoned parent cannot strand a frame", () => {
     { id: "child", title: "", color: "", parentId: "gone", x: 0, y: 0, width: 50, height: 50 },
   ]);
   assert.equal(frame.parentId, null);
+});
+
+test("the sharing map accepts only explicit filesystem object grants", () => {
+  assert.deepEqual(
+    sharedFilesystemObject({ media: "storage", capability: "node-a:folder:folder-42", label: "Workstation: share Projects" }),
+    { sourceNode: "node-a", kind: "folder", objectId: "folder-42", label: "Projects" },
+  );
+  assert.deepEqual(
+    sharedFilesystemObject({ media: "storage", capability: "node-a:file:file-7", label: "share Notes.txt" }),
+    { sourceNode: "node-a", kind: "file", objectId: "file-7", label: "Notes.txt" },
+  );
+  assert.equal(sharedFilesystemObject({ media: "storage", capability: "node-a:disk:backup", label: "Backup" }).kind, "drive");
+  assert.equal(sharedFilesystemObject({ media: "storage", capability: "node-a:drive:media", label: "Media" }).kind, "drive");
+});
+
+test("the sharing map cannot collide with broad or non-filesystem shares", () => {
+  const rejected = [
+    { media: "display", capability: "node-a:folder:looks-like-one", label: "Screen" },
+    { media: "storage", capability: "node-a:files", label: "All files" },
+    { media: "storage", capability: "node-a:storage-in", label: "Storage" },
+    { media: "storage", capability: "node-a:folder:", label: "Missing id" },
+    { media: "storage", capability: "node-a:folder:id:extra", label: "Too many segments" },
+    { media: "storage", capability: ":folder:id", label: "Missing source" },
+    { media: "storage", capability: null, label: "Generic storage" },
+  ];
+  for (const grant of rejected) assert.equal(sharedFilesystemObject(grant), null);
 });

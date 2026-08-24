@@ -43,7 +43,7 @@ use allmystuff_session::{
 
 use crate::audio::{AudioBridge, CaptureSource};
 use crate::canvas::{
-    CanvasMessage, CanvasMutation, CanvasRecord, CanvasStore, SNAPSHOT_CHUNK_RECORDS,
+    CanvasMessage, CanvasMutation, CanvasRecord, CanvasStamp, CanvasStore, SNAPSHOT_CHUNK_RECORDS,
 };
 use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
@@ -4529,17 +4529,53 @@ impl Mesh {
                     return;
                 };
                 match message {
-                    CanvasMessage::Patch { records } => {
-                        if self.canvas.merge(records) {
+                    CanvasMessage::Patch { epoch, records } => {
+                        let advancing = epoch > self.canvas.epoch();
+                        if advancing && !self.fleet_peer_may_manage(&network, &from).await {
+                            tracing::warn!(
+                                "ignoring Files canvas epoch advance from non-manager {}",
+                                short_id(&from)
+                            );
+                            return;
+                        }
+                        if self.canvas.merge_at_epoch(epoch, records, advancing) {
                             self.sink.emit(
                                 "allmystuff://files-canvas",
                                 json!({ "records": self.canvas.snapshot() }),
                             );
                         }
                     }
-                    CanvasMessage::Digest { digest } => {
-                        if digest != self.canvas.digest() {
+                    CanvasMessage::Digest { epoch, digest } => {
+                        let (local_epoch, local_digest) = self.canvas.digest_state();
+                        if epoch < local_epoch {
                             self.sync_files_canvas_to(&from, &network).await;
+                        } else if epoch == local_epoch && digest != local_digest {
+                            self.sync_files_canvas_to(&from, &network).await;
+                        } else if epoch > local_epoch {
+                            // Ask the newer peer to replay its barrier. This is a
+                            // single mismatch response, not a timer or ack loop.
+                            self.probe_files_canvas_to(&from, &network).await;
+                        }
+                    }
+                    CanvasMessage::Barrier { epoch } => {
+                        // Snapshot syncs restate the current barrier. They are
+                        // harmless no-ops and must not cause a governance lookup
+                        // on every reconnect; only an actual advance needs auth.
+                        if epoch <= self.canvas.epoch() {
+                            return;
+                        }
+                        if !self.fleet_peer_may_manage(&network, &from).await {
+                            tracing::warn!(
+                                "ignoring Files canvas purge from non-manager {}",
+                                short_id(&from)
+                            );
+                            return;
+                        }
+                        if self.canvas.apply_barrier(epoch) {
+                            self.sink.emit(
+                                "allmystuff://files-canvas",
+                                json!({ "records": self.canvas.snapshot() }),
+                            );
                         }
                     }
                 }
@@ -11072,15 +11108,12 @@ impl Mesh {
         }
     }
 
-    /// This device's **signed** governance role in `network` — `"owner"`,
+    /// A device's **signed** governance role in `network` — `"owner"`,
     /// `"controller"`, or `"member"` — or `None` if it holds none / the state
-    /// can't be read. This is the authoritative answer for "what am I on the
-    /// fleet": a device the founder *granted* the owner role is an owner here,
-    /// even though it isn't the structural key-holder ([`Ownership::is_fleet_owner`]).
-    /// Owners are owners; there is no second-class owner. `me` is matched in
-    /// bare-pubkey form, as the roles map keys it.
-    async fn fleet_signed_role(&self, network: &str) -> Option<String> {
-        let me = pubkey_part(&self.local_node_id()?).to_string();
+    /// can't be read. This is the authoritative answer for who may advance a
+    /// Files epoch: transport identity alone is deliberately insufficient.
+    async fn fleet_role_for(&self, network: &str, device: &str) -> Option<String> {
+        let device = pubkey_part(device).to_string();
         let data = match self
             .client
             .request(&Request::GovernanceState {
@@ -11097,10 +11130,24 @@ impl Mesh {
             .and_then(|roles| {
                 roles
                     .iter()
-                    .find(|(k, _)| pubkey_part(k) == me)
+                    .find(|(k, _)| pubkey_part(k) == device)
                     .and_then(|(_, v)| v.as_str())
                     .map(str::to_string)
             })
+    }
+
+    /// This device's signed fleet role. Owners are owners; there is no
+    /// second-class distinction between the founder and a granted owner.
+    async fn fleet_signed_role(&self, network: &str) -> Option<String> {
+        let me = self.local_node_id()?;
+        self.fleet_role_for(network, &me).await
+    }
+
+    async fn fleet_peer_may_manage(&self, network: &str, peer: &str) -> bool {
+        matches!(
+            self.fleet_role_for(network, peer).await.as_deref(),
+            Some("owner" | "controller")
+        )
     }
 
     /// The fleet network's governed topology — the owner-signed,
@@ -16514,6 +16561,20 @@ impl Mesh {
         self.canvas.snapshot()
     }
 
+    pub async fn files_canvas_status(&self) -> Value {
+        let (epoch, live_records, tombstones) = self.canvas.status();
+        let role = match self.ownership.fleet_network_id() {
+            Some(network) => self.fleet_signed_role(&network).await,
+            None => None,
+        };
+        json!({
+            "liveRecords": live_records,
+            "tombstones": tombstones,
+            "epoch": epoch.counter,
+            "canPurge": matches!(role.as_deref(), Some("owner" | "controller")),
+        })
+    }
+
     /// Apply one UI batch, persist it, and gossip exactly that batch. Dragging
     /// never calls this until pointer-up, so motion cannot become network yap.
     pub async fn files_canvas_apply(
@@ -16524,16 +16585,63 @@ impl Mesh {
             .local_node_id()
             .map(|id| pubkey_part(id.as_str()).to_string())
             .unwrap_or_else(|| "local".into());
-        let records = self.canvas.apply_local(&actor, mutations)?;
+        let batch = self.canvas.apply_local_batch(&actor, mutations)?;
         self.sink.emit(
             "allmystuff://files-canvas",
             json!({ "records": self.canvas.snapshot() }),
         );
-        self.broadcast_files_canvas(records.clone()).await;
-        Ok(records)
+        self.broadcast_files_canvas(batch.epoch, batch.records.clone())
+            .await;
+        Ok(batch.records)
     }
 
-    async fn broadcast_files_canvas(&self, records: Vec<CanvasRecord>) {
+    /// Purge deleted-record markers behind a fleet-wide epoch barrier. The
+    /// caller and every advancing inbound barrier must be a signed owner or
+    /// manager; ordinary members may edit within an epoch but cannot erase its
+    /// anti-resurrection history.
+    pub async fn files_canvas_purge_tombstones(&self) -> Result<Value, String> {
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("this device isn't in a fleet")?;
+        let role = self.fleet_signed_role(&network).await;
+        if !matches!(role.as_deref(), Some("owner" | "controller")) {
+            return Err("only a fleet owner or manager can purge Files tombstones".into());
+        }
+        let actor = self
+            .local_node_id()
+            .map(|id| pubkey_part(id.as_str()).to_string())
+            .ok_or("this device identity isn't ready")?;
+        let purge = self.canvas.purge_tombstones(&actor)?;
+        if purge.purged > 0 {
+            self.sink.emit(
+                "allmystuff://files-canvas",
+                json!({ "records": purge.live_records.clone() }),
+            );
+            if let Err(error) = self
+                .broadcast_files_canvas_barrier(
+                    &network,
+                    purge.epoch.clone(),
+                    purge.live_records.clone(),
+                )
+                .await
+            {
+                // The durable local epoch is authoritative. A peer digest on
+                // the next usable connection will replay the barrier and live
+                // snapshot, so an offline fleet does not make purge ambiguous.
+                tracing::debug!("Files purge will converge on reconnect: {error}");
+            }
+        }
+        Ok(json!({
+            "purged": purge.purged,
+            "liveRecords": purge.live_records.len(),
+            "tombstones": 0,
+            "epoch": purge.epoch.counter,
+            "canPurge": true,
+        }))
+    }
+
+    async fn broadcast_files_canvas(&self, epoch: CanvasStamp, records: Vec<CanvasRecord>) {
         if records.is_empty() {
             return;
         }
@@ -16542,6 +16650,7 @@ impl Mesh {
         };
         for records in records.chunks(SNAPSHOT_CHUNK_RECORDS) {
             let Ok(payload) = serde_json::to_value(CanvasMessage::Patch {
+                epoch: epoch.clone(),
                 records: records.to_vec(),
             }) else {
                 continue;
@@ -16554,11 +16663,49 @@ impl Mesh {
                     payload,
                 })
                 .await;
-            if let Err(error) = response {
-                tracing::debug!("Files canvas patch will converge on reconnect: {error}");
-                break;
+            match response {
+                Ok(response) if response.ok => {}
+                Ok(response) => {
+                    tracing::debug!(
+                        "Files canvas patch will converge on reconnect: {}",
+                        response.error.unwrap_or_else(|| "send refused".into())
+                    );
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!("Files canvas patch will converge on reconnect: {error}");
+                    break;
+                }
             }
         }
+    }
+
+    async fn broadcast_files_canvas_barrier(
+        &self,
+        network: &str,
+        epoch: CanvasStamp,
+        records: Vec<CanvasRecord>,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_value(CanvasMessage::Barrier {
+            epoch: epoch.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        let response = self
+            .client
+            .request(&Request::ChannelSendAll {
+                network: network.into(),
+                channel: CHANNEL_FILES_CANVAS.into(),
+                payload,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "couldn't broadcast the Files purge barrier".into()));
+        }
+        self.broadcast_files_canvas(epoch, records).await;
+        Ok(())
     }
 
     /// Chunked snapshot on first sighting/new boot or a digest mismatch. Chunks
@@ -16567,8 +16714,24 @@ impl Mesh {
         if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
             return;
         }
-        for records in self.canvas.snapshot().chunks(SNAPSHOT_CHUNK_RECORDS) {
+        let snapshot = self.canvas.snapshot_state();
+        let Ok(barrier) = serde_json::to_value(CanvasMessage::Barrier {
+            epoch: snapshot.epoch.clone(),
+        }) else {
+            return;
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.into(),
+                channel: CHANNEL_FILES_CANVAS.into(),
+                peer: pubkey_part(peer).into(),
+                payload: barrier,
+            })
+            .await;
+        for records in snapshot.records.chunks(SNAPSHOT_CHUNK_RECORDS) {
             let Ok(payload) = serde_json::to_value(CanvasMessage::Patch {
+                epoch: snapshot.epoch.clone(),
                 records: records.to_vec(),
             }) else {
                 continue;
@@ -16591,9 +16754,8 @@ impl Mesh {
         if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
             return;
         }
-        let Ok(payload) = serde_json::to_value(CanvasMessage::Digest {
-            digest: self.canvas.digest(),
-        }) else {
+        let (epoch, digest) = self.canvas.digest_state();
+        let Ok(payload) = serde_json::to_value(CanvasMessage::Digest { epoch, digest }) else {
             return;
         };
         let _ = self

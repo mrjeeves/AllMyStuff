@@ -992,6 +992,15 @@ async fn files_canvas_snapshot(state: State<'_, AppState>) -> Result<Value, Stri
 }
 
 #[tauri::command]
+async fn files_canvas_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn files_canvas_apply(
     state: State<'_, AppState>,
     mutations: Vec<Value>,
@@ -999,6 +1008,17 @@ async fn files_canvas_apply(
     state
         .node
         .request("files_canvas_apply", json!({ "mutations": mutations }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_purge_tombstones(
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_purge_tombstones", json!({}))
         .await
         .map_err(|e| e.to_string())
 }
@@ -3766,7 +3786,9 @@ fn main() {
             file_download,
             open_files_window,
             files_canvas_snapshot,
+            files_canvas_status,
             files_canvas_apply,
+            files_canvas_purge_tombstones,
             local_file_locations,
             local_file_list,
             local_file_preview,

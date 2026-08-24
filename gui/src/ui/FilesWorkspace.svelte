@@ -36,13 +36,13 @@
   let platform = $state("windows");
   let entries = $state<LocalFileEntry[]>([]);
   let loading = $state(true);
-  let showHidden = $state(false);
+  let showHidden = $state(app.filesSettings.showHidden);
   let query = $state("");
   let selectedId = $state<string | null>(null);
   let preview = $state<LocalFilePreview | null>(null);
   let map = $state<FilesMap>("files");
-  let view = $state<FilesView>("canvas");
-  let tileSize = $state(92);
+  let view = $state<FilesView>(app.filesSettings.defaultView);
+  let tileSize = $state(app.filesSettings.thumbnailSize);
   let pan = $state({ x: 24, y: 24 });
   let zoom = $state(1);
   let records = $state<CanvasRecord[]>([]);
@@ -57,6 +57,12 @@
   const visible = $derived(
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
   );
+
+  $effect(() => {
+    showHidden = app.filesSettings.showHidden;
+    view = app.filesSettings.defaultView;
+    tileSize = app.filesSettings.thumbnailSize;
+  });
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
   const scope = $derived(`local:${app.localId}:${directoryId || path}`);
   const framePrefix = $derived(map === "files" ? `frame:${map}:${scope}:` : `frame:${map}:`);
@@ -212,7 +218,7 @@
 
   function newFrame() {
     if (map === "files") {
-      view = "canvas";
+      changeView("canvas");
       frameTool = !frameTool;
       return;
     }
@@ -378,10 +384,16 @@
 
   function changeView(next: FilesView) {
     view = next;
+    app.updateFilesSettings({ defaultView: next });
     if (next !== "canvas") {
       frameTool = false;
       draftFrame = null;
     }
+  }
+
+  function toggleHidden() {
+    showHidden = !showHidden;
+    app.updateFilesSettings({ showHidden });
   }
 
   function zoomCanvas(event: WheelEvent) {
@@ -429,7 +441,7 @@
   ]));
 </script>
 
-<section class="files-workspace" role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()}>
+<section class="files-workspace" class:preview-hidden={!app.filesSettings.showPreview} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()}>
   <nav class="filebar" aria-label="File commands">
     <button title="Back" disabled={historyIndex <= 0} onclick={() => browseHistory(-1)}>‹</button>
     <button title="Forward" disabled={historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
@@ -447,8 +459,8 @@
         <button class:active={view === "canvas"} onclick={() => changeView("canvas")} title="Thumbnails">▦</button>
         <button class:active={view === "details"} onclick={() => changeView("details")} title="Details">☷</button>
       </div>
-      {#if view === "canvas"}<input type="range" min="64" max="150" bind:value={tileSize} aria-label="Thumbnail size" />{/if}
-      <button class:active={showHidden} onclick={() => (showHidden = !showHidden)} title="Show hidden files">···</button>
+      {#if view === "canvas"}<input type="range" min="64" max="150" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Thumbnail size" />{/if}
+      <button class:active={showHidden} onclick={toggleHidden} title="Show hidden files">···</button>
       <button onclick={() => navigate(path)} title="Refresh">↻</button>
     {/if}
   </nav>
@@ -528,7 +540,7 @@
     {/if}
   </main>
 
-  <aside class="preview">
+  {#if app.filesSettings.showPreview}<aside class="preview">
     {#if selected}
       <div class="preview-art">
         {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
@@ -542,7 +554,7 @@
     {:else}
       <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
     {/if}
-  </aside>
+  </aside>{/if}
 
   {#if context}
     <div class="context-menu" style={`left:${context.x}px;top:${context.y}px`} role="menu">
@@ -560,6 +572,7 @@
 
 <style>
   .files-workspace { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template: auto 1fr / 14rem minmax(20rem, 1fr) 18rem; background: var(--bg); overflow: hidden; }
+  .files-workspace.preview-hidden { grid-template-columns: 14rem minmax(20rem, 1fr); }
   button, input { font: inherit; }
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
   .filebar > button, .switch button, .native-open { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }

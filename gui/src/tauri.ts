@@ -254,6 +254,26 @@ export function filesCanvasSnapshot(): Promise<CanvasRecord[]> {
   return isTauri() ? requiredInvoke<CanvasRecord[]>("files_canvas_snapshot") : Promise.resolve([]);
 }
 
+export interface FilesCanvasStatus {
+  liveRecords: number;
+  tombstones: number;
+  epoch: number;
+  canPurge: boolean;
+  purged?: number;
+}
+
+export function filesCanvasStatus(): Promise<FilesCanvasStatus> {
+  return isTauri()
+    ? requiredInvoke<FilesCanvasStatus>("files_canvas_status")
+    : Promise.resolve({ liveRecords: 0, tombstones: 0, epoch: 0, canPurge: true });
+}
+
+export function filesCanvasPurgeTombstones(): Promise<FilesCanvasStatus> {
+  return isTauri()
+    ? requiredInvoke<FilesCanvasStatus>("files_canvas_purge_tombstones")
+    : Promise.resolve({ liveRecords: 0, tombstones: 0, epoch: 0, canPurge: true, purged: 0 });
+}
+
 export function filesCanvasApply(mutations: CanvasMutation[]): Promise<CanvasRecord[]> {
   return isTauri()
     ? requiredInvoke<CanvasRecord[]>("files_canvas_apply", { mutations })

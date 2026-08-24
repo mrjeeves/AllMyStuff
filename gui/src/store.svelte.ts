@@ -307,6 +307,7 @@ export type SettingsTab =
   | "networks"
   | "devices"
   | "fleet"
+  | "files"
   | "sharing"
   | "always_on"
   | "updates"
@@ -645,6 +646,35 @@ function loadRememberedDevices(): string[] {
 
 type UiMode = "normal" | "files" | "advanced";
 const UI_MODE_STORE_KEY = "allmystuff.uiMode.v1";
+const FILES_SETTINGS_STORE_KEY = "allmystuff.filesSettings.v1";
+
+export interface FilesSettings {
+  defaultView: "canvas" | "details";
+  thumbnailSize: number;
+  showHidden: boolean;
+  showPreview: boolean;
+}
+
+const DEFAULT_FILES_SETTINGS: FilesSettings = {
+  defaultView: "canvas",
+  thumbnailSize: 92,
+  showHidden: false,
+  showPreview: true,
+};
+
+function loadFilesSettings(): FilesSettings {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FILES_SETTINGS_STORE_KEY) ?? "{}");
+    return {
+      defaultView: saved.defaultView === "details" ? "details" : "canvas",
+      thumbnailSize: Math.max(64, Math.min(150, Number(saved.thumbnailSize) || 92)),
+      showHidden: saved.showHidden === true,
+      showPreview: saved.showPreview !== false,
+    };
+  } catch {
+    return { ...DEFAULT_FILES_SETTINGS };
+  }
+}
 
 /** The native app opens in the deliberately quiet, graph-first experience.
  *  Once someone opts into Advanced we remember that choice on this machine. */
@@ -669,6 +699,9 @@ class AppStore {
 
   // ---- interaction state ------------------------------------------
   uiMode = $state<UiMode>(loadUiMode());
+  /** Device-local Files presentation preferences. Canvas geometry itself is
+   *  node-owned fleet state and intentionally does not live here. */
+  filesSettings = $state<FilesSettings>(loadFilesSettings());
   selectedNodeId = $state<string | null>(null);
   /** Passive discoveries the user explicitly chose to retain. */
   rememberedDevices = $state<string[]>(loadRememberedDevices());
@@ -2761,6 +2794,22 @@ class AppStore {
     }
     try {
       localStorage.setItem(UI_MODE_STORE_KEY, mode);
+    } catch {
+      /* private mode — keep the choice for this session */
+    }
+  }
+
+  updateFilesSettings(patch: Partial<FilesSettings>) {
+    this.filesSettings = {
+      ...this.filesSettings,
+      ...patch,
+      thumbnailSize: Math.max(
+        64,
+        Math.min(150, Number(patch.thumbnailSize ?? this.filesSettings.thumbnailSize)),
+      ),
+    };
+    try {
+      localStorage.setItem(FILES_SETTINGS_STORE_KEY, JSON.stringify(this.filesSettings));
     } catch {
       /* private mode — keep the choice for this session */
     }

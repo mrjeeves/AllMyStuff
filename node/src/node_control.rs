@@ -1407,10 +1407,12 @@ pub async fn dispatch(
         "files_canvas_snapshot" => DispatchOut::Json(
             serde_json::to_value(mesh.files_canvas_snapshot()).unwrap_or_default(),
         ),
+        "files_canvas_status" => DispatchOut::Json(mesh.files_canvas_status().await),
         "files_canvas_apply" => {
             let mutations: Vec<crate::canvas::CanvasMutation> = try_arg!(arg(a, "mutations"));
             json_result(mesh.files_canvas_apply(mutations).await)
         }
+        "files_canvas_purge_tombstones" => json_result(mesh.files_canvas_purge_tombstones().await),
         "room_send" => {
             let members: Vec<String> = try_arg!(arg(a, "members"));
             let message: allmystuff_protocol::RoomMessage = try_arg!(arg(a, "message"));

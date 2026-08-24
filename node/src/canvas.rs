@@ -18,7 +18,7 @@ const MAX_MUTATIONS_PER_APPLY: usize = 512;
 const MAX_VALUE_BYTES: usize = 8 * 1024;
 pub const SNAPSHOT_CHUNK_RECORDS: usize = 16;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CanvasStamp {
     pub counter: u64,
     pub actor: String,
@@ -46,16 +46,46 @@ pub struct CanvasMutation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CanvasMessage {
-    Patch { records: Vec<CanvasRecord> },
-    Digest { digest: String },
+    Patch {
+        #[serde(default)]
+        epoch: CanvasStamp,
+        records: Vec<CanvasRecord>,
+    },
+    Digest {
+        #[serde(default)]
+        epoch: CanvasStamp,
+        digest: String,
+    },
+    /// Advances the document-wide anti-resurrection boundary. Receivers drop
+    /// every older-epoch record before accepting the live snapshot chunks that
+    /// follow. Repeating the same barrier is deliberately a no-op, so a delayed
+    /// duplicate cannot erase edits authored after the purge.
+    Barrier { epoch: CanvasStamp },
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Persisted {
+    /// The latest fleet-wide compaction barrier. Legacy stores/messages default
+    /// to epoch zero and continue to merge until the first explicit purge.
+    #[serde(default)]
+    epoch: CanvasStamp,
     #[serde(default)]
     records: BTreeMap<String, CanvasRecord>,
     #[serde(default)]
     counters: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanvasBatch {
+    pub epoch: CanvasStamp,
+    pub records: Vec<CanvasRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CanvasPurge {
+    pub epoch: CanvasStamp,
+    pub purged: usize,
+    pub live_records: Vec<CanvasRecord>,
 }
 
 pub struct CanvasStore {
@@ -79,6 +109,9 @@ impl CanvasStore {
         inner
             .records
             .retain(|id, record| id == &record.id && valid_record(record));
+        if !valid_epoch(&inner.epoch) {
+            inner.epoch = CanvasStamp::default();
+        }
         Self {
             path,
             inner: Mutex::new(inner),
@@ -89,29 +122,78 @@ impl CanvasStore {
         self.inner.lock().records.values().cloned().collect()
     }
 
+    /// Epoch + records captured under one lock. Pairing them is important: a
+    /// purge racing a snapshot must never label pre-purge records as current.
+    pub fn snapshot_state(&self) -> CanvasBatch {
+        let inner = self.inner.lock();
+        CanvasBatch {
+            epoch: inner.epoch.clone(),
+            records: inner.records.values().cloned().collect(),
+        }
+    }
+
+    pub fn status(&self) -> (CanvasStamp, usize, usize) {
+        let inner = self.inner.lock();
+        let tombstones = inner
+            .records
+            .values()
+            .filter(|record| record.deleted)
+            .count();
+        (
+            inner.epoch.clone(),
+            inner.records.len().saturating_sub(tombstones),
+            tombstones,
+        )
+    }
+
     /// A small convergence probe for reconnects where neither process rebooted.
     /// FNV-1a is not an authentication primitive (the fleet channel provides
     /// authenticity); it is only a deterministic change detector.
     pub fn digest(&self) -> String {
         let inner = self.inner.lock();
-        let mut hash = 0xcbf29ce484222325_u64;
-        for record in inner.records.values() {
-            let Ok(bytes) = serde_json::to_vec(record) else {
-                continue;
-            };
-            for byte in bytes {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-        }
-        format!("{hash:016x}")
+        digest_inner(&inner)
     }
 
+    pub fn digest_state(&self) -> (CanvasStamp, String) {
+        let inner = self.inner.lock();
+        (inner.epoch.clone(), digest_inner(&inner))
+    }
+
+    pub fn epoch(&self) -> CanvasStamp {
+        self.inner.lock().epoch.clone()
+    }
+}
+
+fn digest_inner(inner: &Persisted) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for record in inner.records.values() {
+        let Ok(bytes) = serde_json::to_vec(record) else {
+            continue;
+        };
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+impl CanvasStore {
     pub fn apply_local(
         &self,
         actor: &str,
         mutations: Vec<CanvasMutation>,
     ) -> Result<Vec<CanvasRecord>, String> {
+        self.apply_local_batch(actor, mutations)
+            .map(|batch| batch.records)
+    }
+
+    /// Apply a local edit and return the epoch atomically paired with it.
+    pub fn apply_local_batch(
+        &self,
+        actor: &str,
+        mutations: Vec<CanvasMutation>,
+    ) -> Result<CanvasBatch, String> {
         if mutations.len() > MAX_MUTATIONS_PER_APPLY {
             return Err("too many canvas changes in one patch".into());
         }
@@ -136,7 +218,17 @@ impl CanvasStore {
             return Err("canvas has too many records".into());
         }
         let old_counter = inner.counters.get(actor).copied();
-        let mut counter = old_counter.unwrap_or_default();
+        // A local edit must outrank the record it is replacing even when that
+        // record came from a different actor with a much higher clock. This is
+        // a Lamport clock, not an independent per-device sequence.
+        let observed = inner
+            .counters
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_default()
+            .max(inner.epoch.counter);
+        let mut counter = old_counter.unwrap_or_default().max(observed);
         if counter > u64::MAX.saturating_sub(mutations.len() as u64) {
             return Err("canvas clock exhausted".into());
         }
@@ -184,15 +276,43 @@ impl CanvasStore {
             }
             return Err(error);
         }
-        Ok(records)
+        Ok(CanvasBatch {
+            epoch: inner.epoch.clone(),
+            records,
+        })
     }
 
     pub fn merge(&self, incoming: Vec<CanvasRecord>) -> bool {
+        let epoch = self.inner.lock().epoch.clone();
+        self.merge_at_epoch(epoch, incoming, false)
+    }
+
+    /// Merge records scoped to `epoch`. A higher epoch is accepted only when
+    /// the caller has authenticated the sender as an owner/manager; advancing
+    /// clears every old record before merging so an offline live record cannot
+    /// reappear after its tombstone was compacted.
+    pub fn merge_at_epoch(
+        &self,
+        epoch: CanvasStamp,
+        incoming: Vec<CanvasRecord>,
+        allow_advance: bool,
+    ) -> bool {
         if incoming.len() > MAX_RECORDS {
             return false;
         }
+        if !valid_epoch(&epoch) {
+            return false;
+        }
         let mut inner = self.inner.lock();
-        let mut changed = false;
+        if epoch < inner.epoch || (epoch > inner.epoch && !allow_advance) {
+            return false;
+        }
+        let previous = inner.clone();
+        let mut changed = epoch > inner.epoch;
+        if changed {
+            inner.epoch = epoch;
+            inner.records.clear();
+        }
         for record in incoming {
             if !valid_record(&record) {
                 continue;
@@ -221,10 +341,82 @@ impl CanvasStore {
         if changed {
             if let Err(error) = persist(&self.path, &inner) {
                 tracing::error!("persisting merged Files canvas failed: {error}");
+                *inner = previous;
+                return false;
             }
         }
         changed
     }
+
+    /// Install a strictly newer purge barrier without any records. Snapshot
+    /// chunks may follow; a dropped connection heals via the epoch-aware digest
+    /// exchange. Equal barriers do nothing so delayed duplicates are harmless.
+    pub fn apply_barrier(&self, epoch: CanvasStamp) -> bool {
+        if !valid_epoch(&epoch) {
+            return false;
+        }
+        let mut inner = self.inner.lock();
+        if epoch <= inner.epoch {
+            return false;
+        }
+        let previous = inner.clone();
+        inner.epoch = epoch;
+        inner.records.clear();
+        if let Err(error) = persist(&self.path, &inner) {
+            tracing::error!("persisting Files canvas purge barrier failed: {error}");
+            *inner = previous;
+            return false;
+        }
+        true
+    }
+
+    /// Compact all tombstones behind a new fleet-wide epoch. Live records stay,
+    /// while every older-epoch snapshot becomes permanently ineligible to merge.
+    pub fn purge_tombstones(&self, actor: &str) -> Result<CanvasPurge, String> {
+        if actor.is_empty() || actor.len() > 512 {
+            return Err("invalid canvas actor".into());
+        }
+        let mut inner = self.inner.lock();
+        let purged = inner
+            .records
+            .values()
+            .filter(|record| record.deleted)
+            .count();
+        if purged == 0 {
+            return Ok(CanvasPurge {
+                epoch: inner.epoch.clone(),
+                purged,
+                live_records: inner.records.values().cloned().collect(),
+            });
+        }
+        let previous = inner.clone();
+        let next = inner
+            .epoch
+            .counter
+            .max(inner.counters.get(actor).copied().unwrap_or_default())
+            .checked_add(1)
+            .ok_or("canvas clock exhausted")?;
+        inner.epoch = CanvasStamp {
+            counter: next,
+            actor: actor.into(),
+        };
+        inner.counters.insert(actor.into(), next);
+        inner.records.retain(|_, record| !record.deleted);
+        if let Err(error) = persist(&self.path, &inner) {
+            *inner = previous;
+            return Err(error);
+        }
+        Ok(CanvasPurge {
+            epoch: inner.epoch.clone(),
+            purged,
+            live_records: inner.records.values().cloned().collect(),
+        })
+    }
+}
+
+fn valid_epoch(epoch: &CanvasStamp) -> bool {
+    (epoch.counter == 0 && epoch.actor.is_empty())
+        || (epoch.counter > 0 && !epoch.actor.is_empty() && epoch.actor.len() <= 512)
 }
 
 fn valid_record(record: &CanvasRecord) -> bool {
@@ -371,6 +563,31 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_outranks_a_remote_high_counter() {
+        let store = CanvasStore::load_at(None);
+        let remote = CanvasRecord {
+            id: "same".into(),
+            kind: "item".into(),
+            value: mutation("same", 1).value,
+            stamp: CanvasStamp {
+                counter: 500,
+                actor: "remote".into(),
+            },
+            deleted: false,
+        };
+        assert!(store.merge(vec![remote]));
+
+        let local = store
+            .apply_local("local", vec![mutation("same", 2)])
+            .unwrap();
+        assert_eq!(local[0].stamp.counter, 501);
+
+        let peer = CanvasStore::load_at(None);
+        assert!(peer.merge(store.snapshot()));
+        assert_eq!(peer.snapshot()[0].value.as_ref().unwrap()["x"], 2);
+    }
+
+    #[test]
     fn rejected_local_batch_is_transactional() {
         let store = CanvasStore::load_at(None);
         let invalid = CanvasMutation {
@@ -448,5 +665,124 @@ mod tests {
             .unwrap();
         assert!(!store.merge(live));
         assert!(store.snapshot()[0].deleted);
+    }
+
+    #[test]
+    fn purge_rejects_every_pre_epoch_snapshot() {
+        let store = CanvasStore::load_at(None);
+        let stale = store
+            .apply_local("owner", vec![mutation("deleted", 1), mutation("kept", 2)])
+            .unwrap();
+        store
+            .apply_local(
+                "owner",
+                vec![CanvasMutation {
+                    id: "deleted".into(),
+                    kind: "item".into(),
+                    value: None,
+                    deleted: true,
+                }],
+            )
+            .unwrap();
+
+        let purge = store.purge_tombstones("owner").unwrap();
+        assert_eq!(purge.purged, 1);
+        assert_eq!(purge.live_records.len(), 1);
+        assert!(!store.merge_at_epoch(CanvasStamp::default(), stale, true));
+        assert_eq!(store.snapshot()[0].id, "kept");
+    }
+
+    #[test]
+    fn repeated_barrier_cannot_erase_post_purge_edits() {
+        let store = CanvasStore::load_at(None);
+        store
+            .apply_local("owner", vec![mutation("gone", 1)])
+            .unwrap();
+        store
+            .apply_local(
+                "owner",
+                vec![CanvasMutation {
+                    id: "gone".into(),
+                    kind: "item".into(),
+                    value: None,
+                    deleted: true,
+                }],
+            )
+            .unwrap();
+        let epoch = store.purge_tombstones("owner").unwrap().epoch;
+        store
+            .apply_local("member", vec![mutation("after", 2)])
+            .unwrap();
+
+        assert!(!store.apply_barrier(epoch));
+        assert_eq!(store.snapshot()[0].id, "after");
+    }
+
+    #[test]
+    fn higher_epoch_patch_requires_manager_authorization() {
+        let store = CanvasStore::load_at(None);
+        let epoch = CanvasStamp {
+            counter: 7,
+            actor: "owner".into(),
+        };
+        let records = CanvasStore::load_at(None)
+            .apply_local("owner", vec![mutation("one", 1)])
+            .unwrap();
+
+        assert!(!store.merge_at_epoch(epoch.clone(), records.clone(), false));
+        assert_eq!(store.epoch(), CanvasStamp::default());
+        assert!(store.merge_at_epoch(epoch.clone(), records, true));
+        assert_eq!(store.epoch(), epoch);
+    }
+
+    #[test]
+    fn concurrent_purges_converge_by_epoch_actor() {
+        let left = CanvasStore::load_at(None);
+        let right = CanvasStore::load_at(None);
+        let initial = left
+            .apply_local("seed", vec![mutation("kept", 1), mutation("gone", 2)])
+            .unwrap();
+        assert!(right.merge(initial));
+        for store in [&left, &right] {
+            store
+                .apply_local(
+                    "seed",
+                    vec![CanvasMutation {
+                        id: "gone".into(),
+                        kind: "item".into(),
+                        value: None,
+                        deleted: true,
+                    }],
+                )
+                .unwrap();
+        }
+        let a = left.purge_tombstones("alpha").unwrap();
+        let b = right.purge_tombstones("beta").unwrap();
+        let winner = if a.epoch > b.epoch { a } else { b };
+
+        for store in [&left, &right] {
+            if store.epoch() < winner.epoch {
+                assert!(store.apply_barrier(winner.epoch.clone()));
+                assert!(store.merge_at_epoch(
+                    winner.epoch.clone(),
+                    winner.live_records.clone(),
+                    false,
+                ));
+            }
+        }
+        assert_eq!(left.epoch(), right.epoch());
+        assert_eq!(left.snapshot(), right.snapshot());
+    }
+
+    #[test]
+    fn empty_purge_does_not_create_network_churn() {
+        let store = CanvasStore::load_at(None);
+        store
+            .apply_local("owner", vec![mutation("live", 1)])
+            .unwrap();
+        let before = store.epoch();
+        let purge = store.purge_tombstones("owner").unwrap();
+        assert_eq!(purge.purged, 0);
+        assert_eq!(purge.epoch, before);
     }
 }

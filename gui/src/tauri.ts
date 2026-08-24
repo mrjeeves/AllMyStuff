@@ -176,6 +176,8 @@ export interface LocalFileListing {
   path: string;
   platform: string;
   entries: LocalFileEntry[];
+  nextCursor?: string | null;
+  complete: boolean;
 }
 
 export type LocalFilePreview =
@@ -200,7 +202,7 @@ export function localFileLocations(): Promise<LocalFileLocation[]> {
       ]);
 }
 
-export function localFileList(path: string): Promise<LocalFileListing> {
+export function localFileList(path: string, cursor?: string): Promise<LocalFileListing> {
   if (!isTauri()) {
     const now = Math.floor(Date.now() / 1000);
     return Promise.resolve({
@@ -214,9 +216,11 @@ export function localFileList(path: string): Promise<LocalFileListing> {
         { id: "demo-design", name: "Canvas design.png", path: `${path}/Canvas design.png`, dir: false, size: 2400000, modified: now - 3600, hidden: false, symlink: false },
         { id: "demo-budget", name: "Storage budget.xlsx", path: `${path}/Storage budget.xlsx`, dir: false, size: 89216, modified: now - 172800, hidden: false, symlink: false },
       ],
+      nextCursor: null,
+      complete: true,
     });
   }
-  return requiredInvoke<LocalFileListing>("local_file_list", { path });
+  return requiredInvoke<LocalFileListing>("local_file_list", { path, cursor });
 }
 
 export function localFilePreview(path: string): Promise<LocalFilePreview> {
@@ -229,6 +233,10 @@ export function localFilePreview(path: string): Promise<LocalFilePreview> {
 
 export function localFileOpen(path: string, reveal = false): Promise<void> {
   return requiredInvoke("local_file_open", { path, reveal });
+}
+
+export function localFileContextMenu(path: string): Promise<void> {
+  return requiredInvoke<void>("local_file_context_menu", { path });
 }
 
 export function localFileMkdir(parent: string, name: string): Promise<string> {

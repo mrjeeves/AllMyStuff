@@ -30,9 +30,10 @@ compile_error!(
 );
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
@@ -96,6 +97,7 @@ struct AppState {
     /// it's killed when the app exits (Always-On off => node lives only with
     /// the app); a reused service node has no child here and keeps running.
     node_child: Mutex<OwnedNode>,
+    local_files: Arc<Mutex<LocalFileBrowser>>,
 }
 
 // ---- this machine -----------------------------------------------------
@@ -1044,11 +1046,29 @@ struct LocalFileEntry {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct LocalFileListing {
     id: String,
     path: String,
     platform: String,
     entries: Vec<LocalFileEntry>,
+    next_cursor: Option<String>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct LocalFileBrowser {
+    next_cursor: u64,
+    cursors: HashMap<String, LocalFileCursor>,
+}
+
+struct LocalFileCursor {
+    id: String,
+    path: PathBuf,
+    reader: std::fs::ReadDir,
+    pending: Option<LocalFileEntry>,
+    seen_ids: HashMap<String, usize>,
+    touched: Instant,
 }
 
 #[derive(serde::Serialize)]
@@ -1188,29 +1208,57 @@ fn local_file_locations() -> Vec<LocalFileLocation> {
 }
 
 #[tauri::command]
-async fn local_file_list(path: String) -> Result<LocalFileListing, String> {
+async fn local_file_list(
+    state: State<'_, AppState>,
+    path: String,
+    cursor: Option<String>,
+) -> Result<LocalFileListing, String> {
+    const PAGE_SIZE: usize = 256;
+    const CURSOR_TTL: Duration = Duration::from_secs(120);
+    const MAX_CURSORS: usize = 8;
+    let browser = state.local_files.clone();
     tokio::task::spawn_blocking(move || {
-        let requested = PathBuf::from(path);
-        let canonical = requested.canonicalize().map_err(|e| e.to_string())?;
-        if !canonical.is_dir() {
-            return Err("that location is not a folder".into());
-        }
-        let directory_meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
-        let directory_id = local_file_id(&canonical, &directory_meta, false);
-        let mut entries = Vec::new();
-        for item in std::fs::read_dir(&canonical).map_err(|e| e.to_string())? {
-            let Ok(item) = item else { continue };
-            let path = item.path();
+        let now = Instant::now();
+        let mut current = if let Some(token) = cursor {
+            let mut browser = browser.lock();
+            browser
+                .cursors
+                .retain(|_, value| now.duration_since(value.touched) <= CURSOR_TTL);
+            let current = browser
+                .cursors
+                .remove(&token)
+                .ok_or_else(|| "that folder page expired; refresh it".to_string())?;
+            if PathBuf::from(&path) != current.path {
+                return Err("that folder page belongs to another location".into());
+            }
+            current
+        } else {
+            let canonical = PathBuf::from(&path)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            if !canonical.is_dir() {
+                return Err("that location is not a folder".into());
+            }
+            let directory_meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
+            LocalFileCursor {
+                id: local_file_id(&canonical, &directory_meta, false),
+                reader: std::fs::read_dir(&canonical).map_err(|e| e.to_string())?,
+                path: canonical,
+                pending: None,
+                seen_ids: HashMap::new(),
+                touched: now,
+            }
+        };
+
+        let convert = |item: std::fs::DirEntry,
+                       seen_ids: &mut HashMap<String, usize>|
+         -> Option<LocalFileEntry> {
+            let entry_path = item.path();
             let name = item.file_name().to_string_lossy().into_owned();
-            let symlink = item
-                .file_type()
-                .map(|kind| kind.is_symlink())
-                .unwrap_or(false);
-            let Ok(identity_meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
+            let symlink = item.file_type().map(|kind| kind.is_symlink()).unwrap_or(false);
+            let identity_meta = std::fs::symlink_metadata(&entry_path).ok()?;
             let target_meta = if symlink {
-                std::fs::metadata(&path).ok()
+                std::fs::metadata(&entry_path).ok()
             } else {
                 Some(identity_meta.clone())
             };
@@ -1222,16 +1270,20 @@ async fn local_file_list(path: String) -> Result<LocalFileListing, String> {
             };
             #[cfg(not(windows))]
             let hidden = name.starts_with('.');
-            entries.push(LocalFileEntry {
-                id: local_file_id(&path, &identity_meta, symlink),
+            let base_id = local_file_id(&entry_path, &identity_meta, symlink);
+            let count = seen_ids.entry(base_id.clone()).or_insert(0);
+            *count += 1;
+            let id = if *count == 1 {
+                base_id
+            } else {
+                format!("{base_id}:entry:{name}")
+            };
+            Some(LocalFileEntry {
+                id,
                 name,
-                path: path.to_string_lossy().into_owned(),
+                path: entry_path.to_string_lossy().into_owned(),
                 dir: display_meta.is_dir(),
-                size: if display_meta.is_file() {
-                    display_meta.len()
-                } else {
-                    0
-                },
+                size: if display_meta.is_file() { display_meta.len() } else { 0 },
                 modified: display_meta
                     .modified()
                     .ok()
@@ -1239,30 +1291,64 @@ async fn local_file_list(path: String) -> Result<LocalFileListing, String> {
                     .map(|d| d.as_secs()),
                 hidden,
                 symlink,
-            });
+            })
+        };
+
+        let mut entries = Vec::with_capacity(PAGE_SIZE);
+        if let Some(entry) = current.pending.take() {
+            entries.push(entry);
         }
-        // Hard links intentionally share an underlying file id, but still
-        // appear as separate directory entries. Disambiguate only that rare
-        // collision; ordinary rename/move continues to retain the native id.
-        let mut id_counts = std::collections::HashMap::new();
-        for entry in &entries {
-            *id_counts.entry(entry.id.clone()).or_insert(0_usize) += 1;
-        }
-        for entry in &mut entries {
-            if id_counts.get(&entry.id).copied().unwrap_or_default() > 1 {
-                entry.id = format!("{}:entry:{}", entry.id, entry.name);
+        while entries.len() < PAGE_SIZE {
+            let Some(item) = current.reader.next() else { break };
+            let Ok(item) = item else { continue };
+            if let Some(entry) = convert(item, &mut current.seen_ids) {
+                entries.push(entry);
             }
         }
+        while entries.len() == PAGE_SIZE && current.pending.is_none() {
+            let Some(item) = current.reader.next() else { break };
+            let Ok(item) = item else { continue };
+            current.pending = convert(item, &mut current.seen_ids);
+        }
+
         entries.sort_by(|a, b| {
             b.dir
                 .cmp(&a.dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+        let listing_id = current.id.clone();
+        let listing_path = current.path.to_string_lossy().into_owned();
+        let complete = current.pending.is_none();
+        let next_cursor = if complete {
+            None
+        } else {
+            let mut browser = browser.lock();
+            browser
+                .cursors
+                .retain(|_, value| now.duration_since(value.touched) <= CURSOR_TTL);
+            if browser.cursors.len() >= MAX_CURSORS {
+                let oldest = browser
+                    .cursors
+                    .iter()
+                    .min_by_key(|(_, value)| value.touched)
+                    .map(|(token, _)| token.clone());
+                if let Some(token) = oldest {
+                    browser.cursors.remove(&token);
+                }
+            }
+            browser.next_cursor = browser.next_cursor.wrapping_add(1);
+            let token = format!("files-{:x}", browser.next_cursor);
+            current.touched = Instant::now();
+            browser.cursors.insert(token.clone(), current);
+            Some(token)
+        };
         Ok(LocalFileListing {
-            id: directory_id,
-            path: canonical.to_string_lossy().into_owned(),
+            id: listing_id,
+            path: listing_path,
             platform: std::env::consts::OS.into(),
             entries,
+            next_cursor,
+            complete,
         })
     })
     .await
@@ -1358,6 +1444,105 @@ async fn local_file_open(path: String, reveal: bool) -> Result<(), String> {
     tokio::task::spawn_blocking(move || launch_native(&PathBuf::from(path), reveal))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(windows)]
+unsafe fn windows_shell_context_menu(
+    hwnd: windows::Win32::Foundation::HWND,
+    path: &Path,
+) -> windows::core::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::{
+        core::{PCSTR, PCWSTR},
+        Win32::{
+            Foundation::POINT,
+            System::Com::{
+                CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+            },
+            UI::{
+                Shell::{
+                    Common::ITEMIDLIST, IContextMenu, IShellFolder, SHBindToParent,
+                    SHParseDisplayName, CMINVOKECOMMANDINFO, CMF_NORMAL,
+                },
+                WindowsAndMessaging::{
+                    CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
+                    TrackPopupMenu, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                },
+            },
+        },
+    };
+
+    // Tauri/WebView initializes COM on the UI thread. Balance only our own
+    // successful initialization; RPC_E_CHANGED_MODE means it was initialized
+    // in another apartment and is still usable here.
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let mut absolute: *mut ITEMIDLIST = std::ptr::null_mut();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut absolute, 0, None)? };
+
+    let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+    let parent: IShellFolder = unsafe { SHBindToParent(absolute, Some(&mut child))? };
+    let shell_menu: IContextMenu =
+        unsafe { parent.GetUIObjectOf(hwnd, &[child.cast_const()], None)? };
+    let menu = unsafe { CreatePopupMenu()? };
+    unsafe { shell_menu.QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL).ok()? };
+
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point)?;
+        let _ = SetForegroundWindow(hwnd);
+    }
+    let command = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            None,
+            hwnd,
+            None,
+        )
+        .0 as u32
+    };
+    if command != 0 {
+        let invoke = CMINVOKECOMMANDINFO {
+            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+            hwnd,
+            // Shell command ids are passed as MAKEINTRESOURCEA offsets.
+            lpVerb: PCSTR((command - 1) as usize as *const u8),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        unsafe { shell_menu.InvokeCommand(&invoke)? };
+    }
+    unsafe {
+        DestroyMenu(menu)?;
+        CoTaskMemFree(Some(absolute.cast()));
+        if initialized {
+            CoUninitialize();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        #[allow(clippy::unnecessary_cast)]
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
+        window
+            .run_on_main_thread(move || {
+                let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
+                if let Err(error) = unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) } {
+                    tracing::warn!(%error, "couldn't show Windows Shell context menu");
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    Err("native file context menus are not implemented on this desktop yet".into())
 }
 
 fn safe_child(parent: &Path, name: &str) -> Result<PathBuf, String> {
@@ -3793,6 +3978,7 @@ fn main() {
             local_file_list,
             local_file_preview,
             local_file_open,
+            local_file_context_menu,
             local_file_mkdir,
             local_file_rename,
             local_file_trash,
@@ -3905,6 +4091,7 @@ fn main() {
             app.manage(AppState {
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
+                local_files: Arc::new(Mutex::new(LocalFileBrowser::default())),
             });
             // Installer hooks cover new NSIS installs. Existing installations
             // can arrive here through the self-updater, so migrate the old

@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app } from "../store.svelte";
+  import { app, type SharePartner } from "../store.svelte";
   import { humanBytes } from "../types";
   import {
     filesCanvasApply,
     filesCanvasSnapshot,
+    shareFolderFrom,
+    localFileContextMenu,
     localFileList,
     localFileLocations,
     localFileMkdir,
@@ -53,6 +55,20 @@
   let thumbnails = $state<Record<string, string>>({});
   let history = $state<string[]>([]);
   let historyIndex = $state(-1);
+  let nextCursor = $state<string | null>(null);
+  let complete = $state(true);
+  let loadingPage = $state(false);
+  let navigationGeneration = 0;
+  let address = $state("");
+  let placesOpen = $state(true);
+  let previewOpen = $state(app.filesSettings.showPreview);
+  const previewRequests = new Map<string, Promise<LocalFilePreview>>();
+  const thumbnailRequests = new Map<string, Promise<string>>();
+  let thumbnailOrder: string[] = [];
+  let placesWidth = $state(224);
+  let previewWidth = $state(288);
+  let wallpaperPath = $state("");
+  let wallpaper = $state("");
 
   const visible = $derived(
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
@@ -89,22 +105,33 @@
 
   onMount(() => {
     let stop = () => {};
+    try {
+      placesOpen = localStorage.getItem("allmystuff.files.placesOpen") !== "false";
+      previewOpen = localStorage.getItem("allmystuff.files.previewOpen") !== "false";
+      placesWidth = Math.max(160, Math.min(420, Number(localStorage.getItem("allmystuff.files.placesWidth")) || 224));
+      previewWidth = Math.max(220, Math.min(520, Number(localStorage.getItem("allmystuff.files.previewWidth")) || 288));
+      wallpaperPath = localStorage.getItem("allmystuff.files.wallpaperPath") ?? "";
+      if (wallpaperPath) void import("@tauri-apps/api/core").then(({ convertFileSrc }) => (wallpaper = convertFileSrc(wallpaperPath)));
+    } catch { /* private mode keeps these device-local for this session */ }
     void Promise.all([localFileLocations(), filesCanvasSnapshot()]).then(async ([places, saved]) => {
       locations = places;
       records = saved;
-      if (places[0]) await navigate(places[0].path);
+      const desktop = places.find((place) => place.id === "desktop") ?? places[0];
+      if (desktop) await navigate(desktop.path);
     });
     void onFilesCanvas((next) => { records = next; }).then((unlisten) => { stop = unlisten; });
     return () => stop();
   });
 
   async function navigate(next: string, remember = true) {
+    const generation = ++navigationGeneration;
     loading = true;
     context = null;
     selectedId = null;
     preview = null;
     try {
       const listing = await localFileList(next);
+      if (generation !== navigationGeneration) return;
       directoryId = listing.id;
       if (remember && listing.path !== path) {
         const kept = history.slice(0, historyIndex + 1);
@@ -113,14 +140,101 @@
         historyIndex = kept.length - 1;
       }
       path = listing.path;
+      address = listing.path;
       platform = listing.platform;
       entries = listing.entries;
+      nextCursor = listing.nextCursor ?? null;
+      thumbnailOrder = [];
+      complete = listing.complete;
       thumbnails = {};
     } catch (error) {
+      if (generation !== navigationGeneration) return;
       app.toast("warn", `Couldn't open that folder: ${String(error)}`);
     } finally {
-      loading = false;
+      if (generation === navigationGeneration) loading = false;
     }
+  }
+
+  async function loadMore() {
+    const cursor = nextCursor;
+    if (!cursor || loadingPage) return;
+    const generation = navigationGeneration;
+    loadingPage = true;
+    try {
+      const listing = await localFileList(path, cursor);
+      if (generation !== navigationGeneration || listing.path !== path) return;
+      const known = new Set(entries.map((entry) => entry.id));
+      entries = [...entries, ...listing.entries.filter((entry) => !known.has(entry.id))];
+      nextCursor = listing.nextCursor ?? null;
+      complete = listing.complete;
+    } catch (error) {
+      if (generation === navigationGeneration) app.toast("warn", `Couldn't read the next folder page: ${String(error)}`);
+    } finally {
+      if (generation === navigationGeneration) loadingPage = false;
+    }
+  }
+
+  function navigateAddress(event: KeyboardEvent) {
+    if (event.key !== "Enter") return;
+    const next = address.trim();
+    if (next) void navigate(next);
+  }
+
+  function togglePlaces() {
+    placesOpen = !placesOpen;
+    try { localStorage.setItem("allmystuff.files.placesOpen", String(placesOpen)); } catch {}
+  }
+
+  function togglePreview() {
+    previewOpen = !previewOpen;
+    try { localStorage.setItem("allmystuff.files.previewOpen", String(previewOpen)); } catch {}
+  }
+
+  function resizeSidebar(event: PointerEvent, side: "places" | "preview") {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = side === "places" ? placesWidth : previewWidth;
+    const move = (next: PointerEvent) => {
+      const delta = next.clientX - startX;
+      if (side === "places") placesWidth = Math.max(160, Math.min(420, startWidth + delta));
+      else previewWidth = Math.max(220, Math.min(520, startWidth - delta));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      try {
+        localStorage.setItem(`allmystuff.files.${side}Width`, String(side === "places" ? placesWidth : previewWidth));
+      } catch {}
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+  }
+
+  async function chooseWallpaper() {
+    try {
+      const [{ open: openDialog }, { convertFileSrc }] = await Promise.all([
+        import("@tauri-apps/plugin-dialog"),
+        import("@tauri-apps/api/core"),
+      ]);
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp"] }],
+      });
+      if (typeof selected !== "string") return;
+      wallpaperPath = selected;
+      wallpaper = convertFileSrc(selected);
+      localStorage.setItem("allmystuff.files.wallpaperPath", selected);
+    } catch (error) {
+      app.toast("warn", `Couldn't set the background: ${String(error)}`);
+    }
+  }
+
+  function clearWallpaper() {
+    wallpaperPath = "";
+    wallpaper = "";
+    try { localStorage.removeItem("allmystuff.files.wallpaperPath"); } catch {}
   }
 
   function browseHistory(delta: number) {
@@ -152,11 +266,62 @@
     return placements.get(item.id) ?? { id: item.id, ...fallbackPosition(index) };
   }
 
+  function requestPreview(item: LocalFileEntry): Promise<LocalFilePreview> {
+    const existing = previewRequests.get(item.path);
+    if (existing) return existing;
+    const request = localFilePreview(item.path).finally(() => {
+      if (previewRequests.get(item.path) === request) previewRequests.delete(item.path);
+    });
+    previewRequests.set(item.path, request);
+    return request;
+  }
+
+  function thumbnailFor(item: LocalFileEntry, result: LocalFilePreview): Promise<string> {
+    const existing = thumbnailRequests.get(item.id);
+    if (existing) return existing;
+    if (result.kind !== "image") return Promise.resolve("");
+    const request = new Promise<string>((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        const scale = Math.min(1, 256 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) return resolve("");
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/webp", 0.78));
+      };
+      image.onerror = () => resolve("");
+      image.src = `data:${result.mime};base64,${result.data}`;
+    }).finally(() => thumbnailRequests.delete(item.id));
+    thumbnailRequests.set(item.id, request);
+    return request;
+  }
+
+  function retainThumbnail(id: string, data: string) {
+    if (!data) return;
+    thumbnailOrder = [...thumbnailOrder.filter((entry) => entry !== id), id];
+    const next = { ...thumbnails, [id]: data };
+    while (thumbnailOrder.length > 128) {
+      const expired = thumbnailOrder.shift();
+      if (expired) delete next[expired];
+    }
+    thumbnails = next;
+  }
+
   async function select(item: LocalFileEntry) {
     selectedId = item.id;
     preview = null;
     if (!item.dir) {
-      try { preview = await localFilePreview(item.path); } catch { preview = { kind: "unsupported" }; }
+      try {
+        const result = await requestPreview(item);
+        if (selectedId !== item.id) return;
+        preview = result;
+        if (result.kind === "image") retainThumbnail(item.id, await thumbnailFor(item, result));
+      } catch {
+        if (selectedId === item.id) preview = { kind: "unsupported" };
+      }
     }
   }
 
@@ -181,20 +346,31 @@
     return platform === "macos" ? "Finder" : platform === "windows" ? "File Explorer" : "Files";
   }
 
+  function showContextMenu(event: MouseEvent, item: LocalFileEntry) {
+    event.preventDefault();
+    event.stopPropagation();
+    void select(item);
+    context = null;
+    if (platform === "windows") {
+      void localFileContextMenu(item.path).catch((error) => app.toast("warn", String(error)));
+      return;
+    }
+    context = { x: event.clientX, y: event.clientY, item };
+  }
+
   function loadThumbnail(node: HTMLElement, item: LocalFileEntry) {
     const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
-    if (item.dir || item.size > 1024 * 1024 || !["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].includes(ext)) {
+    if (item.dir || item.size > 4 * 1024 * 1024 || !["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].includes(ext)) {
       return {};
     }
     let cancelled = false;
     const observer = new IntersectionObserver((events) => {
       if (!events.some((event) => event.isIntersecting)) return;
       observer.disconnect();
-      void localFilePreview(item.path).then((result) => {
-        if (!cancelled && result.kind === "image") {
-          thumbnails = { ...thumbnails, [item.id]: `data:${result.mime};base64,${result.data}` };
-        }
-      }).catch(() => {});
+      void requestPreview(item)
+        .then((result) => thumbnailFor(item, result))
+        .then((data) => { if (!cancelled) retainThumbnail(item.id, data); })
+        .catch(() => {});
     }, { rootMargin: "120px" });
     observer.observe(node);
     return { destroy() { cancelled = true; observer.disconnect(); } };
@@ -435,18 +611,72 @@
     ]);
   }
 
-  const shareRows = $derived(app.sharePartners.flatMap((partner) => [
-    ...partner.sharedWithYou.map(({ grant }) => ({ side: "in", person: partner.person.name, label: grant.label })),
-    ...partner.sharedByYou.map(({ grant }) => ({ side: "out", person: partner.person.name, label: grant.label })),
-  ]));
+  const LOCAL_DRAG = "application/x-allmystuff-local-file";
+  const GRANT_DRAG = "application/x-allmystuff-share-grant";
+
+  function dragLocalFile(event: DragEvent, item: LocalFileEntry) {
+    event.dataTransfer?.setData(LOCAL_DRAG, JSON.stringify({
+      id: item.id,
+      path: item.path,
+      name: item.name,
+      dir: item.dir,
+    }));
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
+  }
+
+  function dragShareGrant(event: DragEvent, nodeId: string, grantId: string) {
+    event.dataTransfer?.setData(GRANT_DRAG, JSON.stringify({ nodeId, grantId }));
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  }
+
+  async function shareDrop(event: DragEvent, partner: SharePartner) {
+    event.preventDefault();
+    const raw = event.dataTransfer?.getData(LOCAL_DRAG);
+    if (!raw) return;
+    try {
+      const item = JSON.parse(raw) as { path?: string; name?: string; dir?: boolean };
+      if (!item.path || !item.name) return;
+      if (!item.dir) {
+        app.toast("warn", "Single-file grants need their own registry; this build will not widen a file into a parent-folder share.");
+        return;
+      }
+      const target = partner.nodes[0];
+      if (!target) throw new Error("that fleet has no available device");
+      const minted = await shareFolderFrom(app.localId, item.path, item.name);
+      if (!minted?.id) throw new Error("the source device did not mint a folder id");
+      app.grant(target.id, {
+        id: crypto.randomUUID(),
+        media: "storage",
+        role: "provide",
+        capability: `${app.localId}:folder:${minted.id}`,
+        label: `${app.node(app.localId)?.label ?? "This device"}: share ${minted.label || item.name}`,
+      });
+    } catch (error) {
+      app.toast("warn", `Couldn't share that folder: ${String(error)}`);
+    }
+  }
+
+  function retractDrop(event: DragEvent) {
+    event.preventDefault();
+    const raw = event.dataTransfer?.getData(GRANT_DRAG);
+    if (!raw) return;
+    try {
+      const grant = JSON.parse(raw) as { nodeId?: string; grantId?: string };
+      if (grant.nodeId && grant.grantId) app.revokeGrant(grant.nodeId, grant.grantId);
+    } catch {
+      app.toast("warn", "That share could not be identified, so nothing was retracted.");
+    }
+  }
 </script>
 
-<section class="files-workspace" class:preview-hidden={!app.filesSettings.showPreview} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()}>
+<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => { if (!(event.target as Element).closest(".context-menu")) context = null; }}>
   <nav class="filebar" aria-label="File commands">
+    <button class:active={placesOpen} title="Show or hide Quick access" onclick={togglePlaces}>☰</button>
     <button title="Back" disabled={historyIndex <= 0} onclick={() => browseHistory(-1)}>‹</button>
     <button title="Forward" disabled={historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
     <button title="Up one folder" disabled={!path || parentPath(path) === path} onclick={() => navigate(parentPath(path))}>↑</button>
-    <div class="crumb" title={path}>{path || "Loading…"}</div>
+    <button onclick={() => navigate(path)} title="Refresh">↻</button>
+    <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Location" spellcheck="false" />
     <input class="search" bind:value={query} disabled={map !== "files"} placeholder="Search this folder" aria-label="Search this folder" />
     <button onclick={createFolder} disabled={map !== "files"} title="New folder">＋ Folder</button>
     <button class:active={frameTool} onclick={newFrame} title={map === "files" ? "Draw a nestable canvas frame" : "Add a nestable canvas frame"}>▱ Frame</button>
@@ -461,11 +691,12 @@
       </div>
       {#if view === "canvas"}<input type="range" min="64" max="150" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Thumbnail size" />{/if}
       <button class:active={showHidden} onclick={toggleHidden} title="Show hidden files">···</button>
-      <button onclick={() => navigate(path)} title="Refresh">↻</button>
     {/if}
+    <button class:active={previewOpen && app.filesSettings.showPreview} title="Show or hide Preview" onclick={togglePreview}>◧</button>
   </nav>
 
   <aside class="places">
+    <button class="resize-edge places-edge" aria-label="Resize Quick access" onpointerdown={(event) => resizeSidebar(event, "places")}></button>
     <h3>Quick access</h3>
     {#each locations.filter((place) => place.kind === "favorite") as place}
       <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>{place.id === "home" ? "⌂" : "📁"}</span>{place.label}</button>
@@ -480,14 +711,45 @@
     <h3>Fleet</h3>
     <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}><span>⇄</span>Shared with me / out</button>
     <div class="fleet-note"><i></i>Canvas metadata syncs fleet-wide</div>
+    <div class="background-control">
+      <button onclick={chooseWallpaper}><span>▧</span>Background</button>
+      {#if wallpaperPath}<button class="clear-background" title="Clear background" onclick={clearWallpaper}>×</button>{/if}
+    </div>
   </aside>
 
-  <main class="browser">
+  <main class="browser" style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
     {#if map === "sharing"}
       <div class="sharing-canvas">
-        <section class="share-frame personal"><h2>Personally stored</h2><p>Files remain on their current devices. This frame describes ownership, not a copy.</p><div class="share-card">💻 {app.node(app.localId)?.label ?? "This device"}<small>{entries.length} items in this view</small></div></section>
-        <section class="share-frame inbound"><h2>Shared with me</h2>{#each shareRows.filter((row) => row.side === "in") as row}<div class="share-card">↙ {row.label}<small>from {row.person}</small></div>{:else}<p>Nothing is shared with you yet.</p>{/each}</section>
-        <section class="share-frame outbound"><h2>Shared out</h2>{#each shareRows.filter((row) => row.side === "out") as row}<div class="share-card">↗ {row.label}<small>with {row.person}</small></div>{:else}<p>You haven't shared anything out.</p>{/each}</section>
+        <section class="share-frame personal" role="group" aria-label="Personally stored files" ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
+          <h2>Personally stored</h2>
+          <p>Drag a folder into another fleet's frame to share its whole live subtree. Drag a shared item back here to retract it.</p>
+          <div class="share-items">
+            {#each visible as item (item.id)}
+              <button class="share-file" draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><i>{icon(item)}</i><span>{item.name}</span></button>
+            {/each}
+          </div>
+          {#if !complete}<button class="share-more" onclick={loadMore} disabled={loadingPage}>{loadingPage ? "Reading…" : "Load more Desktop items"}</button>{/if}
+        </section>
+        {#each app.sharePartners as partner (partner.person.id)}
+          <section class="share-frame partner" role="group" aria-label={`Files shared with ${partner.person.name}`} ondragover={(event) => event.preventDefault()} ondrop={(event) => shareDrop(event, partner)}>
+            <h2>{partner.person.name}</h2>
+            <p>One frame for this fleet. Dropping a folder here grants the root; children are covered dynamically and are never indexed into the canvas.</p>
+            <h3>Shared out</h3>
+            <div class="share-items">
+              {#each partner.sharedByYou as { node, grant } (grant.id)}
+                <button class="share-file outbound" draggable={true} ondragstart={(event) => dragShareGrant(event, node.id, grant.id)} title="Drag back to Personally stored to retract"><i>📁</i><span>{grant.label}</span></button>
+              {:else}<small>Drop a folder here to share it.</small>{/each}
+            </div>
+            <h3>Shared with me</h3>
+            <div class="share-items">
+              {#each partner.sharedWithYou as { grant } (grant.id)}
+                <div class="share-file inbound"><i>📁</i><span>{grant.label}</span></div>
+              {:else}<small>Nothing shared in.</small>{/each}
+            </div>
+          </section>
+        {:else}
+          <section class="share-frame empty-share"><h2>No other fleets yet</h2><p>Connect with another person or fleet, then their sharing frame will appear here.</p></section>
+        {/each}
         {#each frames as frame}
           <article class="canvas-frame user" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}><b>{frame.title}</b></article>
         {/each}
@@ -496,13 +758,14 @@
       <div class="details">
         <div class="detail-head"><span>Name</span><span>Date modified</span><span>Type</span><span>Size</span></div>
         {#each visible as item}
-          <button class:selected={selectedId === item.id} onclick={() => select(item)} ondblclick={() => open(item)} oncontextmenu={(event) => { event.preventDefault(); context = { x: event.clientX, y: event.clientY, item }; }}>
+          <button class:selected={selectedId === item.id} onclick={() => select(item)} ondblclick={() => open(item)} oncontextmenu={(event) => showContextMenu(event, item)}>
             <span class="detail-name"><i>{icon(item)}</i>{item.name}</span>
             <span>{item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</span>
             <span>{item.dir ? "Folder" : item.name.includes(".") ? item.name.split(".").pop()?.toUpperCase() : "File"}</span>
             <span>{item.dir ? "—" : humanBytes(item.size)}</span>
           </button>
         {/each}
+        {#if !complete}<button class="details-load" onclick={loadMore} disabled={loadingPage}><span>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</span></button>{/if}
       </div>
     {:else}
       <div class="viewport" role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
@@ -525,7 +788,7 @@
               style={`left:${position.x}px;top:${position.y}px;width:${tileSize}px`}
               onpointerdown={(event) => dragItem(event, item, index)}
               ondblclick={() => open(item)}
-              oncontextmenu={(event) => { event.preventDefault(); event.stopPropagation(); void select(item); context = { x: event.clientX, y: event.clientY, item }; }}
+              oncontextmenu={(event) => showContextMenu(event, item)}
             >
               <span class="file-icon" use:loadThumbnail={item} style={`font-size:${Math.max(38, tileSize * 0.58)}px`}>
                 {#if thumbnails[item.id]}<img src={thumbnails[item.id]} alt="" />{:else}{icon(item)}{/if}
@@ -535,12 +798,14 @@
           {/each}
         </div>
         {#if loading}<div class="empty">Reading folder…</div>{:else if visible.length === 0}<div class="empty">No matching items</div>{/if}
+        {#if !complete}<button class="load-more" onclick={loadMore} disabled={loadingPage}>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</button>{/if}
         <div class="zoom">{Math.round(zoom * 100)}%</div>
       </div>
     {/if}
   </main>
 
-  {#if app.filesSettings.showPreview}<aside class="preview">
+  {#if previewOpen && app.filesSettings.showPreview}<aside class="preview">
+    <button class="resize-edge preview-edge" aria-label="Resize Preview" onpointerdown={(event) => resizeSidebar(event, "preview")}></button>
     {#if selected}
       <div class="preview-art">
         {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
@@ -566,13 +831,15 @@
       <hr />
       <button class="danger" onclick={() => { void moveToTrash(context!.item); context = null; }}>Move to {platform === "windows" ? "Recycle Bin" : "Trash"}</button>
     </div>
-    <button class="menu-scrim" aria-label="Close menu" onclick={() => (context = null)}></button>
   {/if}
 </section>
 
 <style>
-  .files-workspace { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template: auto 1fr / 14rem minmax(20rem, 1fr) 18rem; background: var(--bg); overflow: hidden; }
-  .files-workspace.preview-hidden { grid-template-columns: 14rem minmax(20rem, 1fr); }
+  .files-workspace { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template: auto 1fr / var(--places-width, 14rem) minmax(20rem, 1fr) var(--preview-width, 18rem); background: var(--bg); overflow: hidden; }
+  .files-workspace.preview-hidden { grid-template-columns: var(--places-width, 14rem) minmax(20rem, 1fr); }
+  .files-workspace.places-hidden { grid-template-columns: minmax(20rem, 1fr) var(--preview-width, 18rem); }
+  .files-workspace.places-hidden.preview-hidden { grid-template-columns: minmax(20rem, 1fr); }
+  .files-workspace.places-hidden .places { display: none; }
   button, input { font: inherit; }
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
   .filebar > button, .switch button, .native-open { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
@@ -582,16 +849,21 @@
   .switch { display: inline-flex; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }
   .switch button { border: 0; background: transparent; min-height: 1.65rem; }
   .switch button.active { background: var(--accent-soft); color: var(--accent-ink); }
-  .places, .preview { min-height: 0; overflow: auto; background: var(--surface); padding: .8rem; }
-  .places { border-right: 1px solid var(--line); }
+  .places, .preview { position: relative; min-height: 0; overflow: auto; background: var(--surface); padding: .8rem; }
+  .places { display: flex; flex-direction: column; border-right: 1px solid var(--line); }
   .preview { border-left: 1px solid var(--line); }
+  .resize-edge { position: absolute; top: 0; bottom: 0; z-index: 5; width: 7px; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: ew-resize; }
+  .resize-edge:hover { background: var(--accent-soft); }
+  .places .places-edge { right: 0; width: 7px; }
+  .preview .preview-edge { left: 0; width: 7px; }
   .places h3 { margin: 1rem .5rem .35rem; color: var(--ink-faint); font-size: .66rem; text-transform: uppercase; letter-spacing: .09em; }
   .places h3:first-child { margin-top: .2rem; }
   .places > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .places > button:hover, .places > button.active { background: var(--surface-2); color: var(--ink); }
   .places p, .fleet-note { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }
   .fleet-note { display: flex; gap: .4rem; align-items: center; margin-top: .7rem; }.fleet-note i { width: 7px; height: 7px; background: var(--ok); border-radius: 50%; }
-  .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background: radial-gradient(circle at 1px 1px, oklch(0.36 0.025 285 / .38) 1px, transparent 1.2px); background-size: 22px 22px; }
+  .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
+  .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, linear-gradient(transparent, transparent)), radial-gradient(circle at 1px 1px, oklch(0.36 0.025 285 / .38) 1px, transparent 1.2px); background-position: center, 0 0; background-repeat: no-repeat, repeat; background-size: cover, 22px 22px; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
   .viewport:active { cursor: grabbing; }.world { position: absolute; inset: 0; transform-origin: 0 0; }
   .canvas-frame { position: absolute; z-index: 0; border: 1px solid oklch(0.62 .2 292 / .55); border-radius: 15px; background: oklch(0.62 .2 292 / .08); box-shadow: inset 0 0 0 1px oklch(1 0 0 / .025); padding: .55rem; }
@@ -601,10 +873,13 @@
   .file-tile { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .35rem; touch-action: none; }
   .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { width: 100%; height: 1.15em; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: hidden; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }.zoom { position: absolute; right: .7rem; bottom: .7rem; padding: .25rem .5rem; border-radius: 6px; background: var(--surface); color: var(--ink-faint); font-size: .68rem; }
+  .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
   .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { font-style: normal; font-size: 1.2rem; }
+  .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
   .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
-  .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }.menu-scrim { position: fixed; inset: 0; z-index: 101; border: 0; background: transparent; }
-  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(3, minmax(15rem, 1fr)); gap: 1.2rem; align-items: start; }.share-frame { min-height: 24rem; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); font-size: .75rem; line-height: 1.45; }.share-frame.personal { border-color: var(--c-fleet); }.share-frame.inbound { border-color: var(--c-share); }.share-frame.outbound { border-color: var(--m-storage); }.share-card { margin-top: .7rem; padding: .75rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); font-size: .8rem; }.share-card small { display: block; margin: .25rem 0 0 1.4rem; color: var(--ink-faint); }.canvas-frame.user { pointer-events: auto; z-index: 3; }
-  @media (max-width: 1050px) { .files-workspace { grid-template-columns: 11rem minmax(18rem, 1fr); }.preview { display: none; }.search { display: none; } }
-  @media (max-width: 760px) { .files-workspace { grid-template-columns: 1fr; }.places { display: none; }.filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
+  .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }
+  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(3, minmax(15rem, 1fr)); gap: 1.2rem; align-items: start; }.share-frame { min-height: 24rem; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); font-size: .75rem; line-height: 1.45; }.share-frame.personal { border-color: var(--c-fleet); }.canvas-frame.user { pointer-events: auto; z-index: 3; }
+  @media (max-width: 1050px) { .files-workspace, .files-workspace.preview-hidden { grid-template-columns: min(11rem, var(--places-width, 11rem)) minmax(18rem, 1fr); }.files-workspace.places-hidden, .files-workspace.places-hidden.preview-hidden { grid-template-columns: minmax(18rem, 1fr); }.preview { display: none; }.search { display: none; } }
+  @media (max-width: 760px) { .files-workspace, .files-workspace.places-hidden, .files-workspace.preview-hidden, .files-workspace.places-hidden.preview-hidden { grid-template-columns: 1fr; }.places { display: none; }.filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
+  .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-items > small { grid-column: 1 / -1; color: var(--ink-faint); font-size: .72rem; }.share-file { min-width: 0; min-height: 5.5rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }.share-more { margin-top: .7rem; padding: .4rem .65rem; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink-soft); }
 </style>

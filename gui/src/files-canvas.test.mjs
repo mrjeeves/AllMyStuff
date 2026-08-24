@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, fileReferenceId, mergeCanvasRecords, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, fileReferenceId, mergeCanvasRecords, nativeFileDisplayName, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -30,6 +30,13 @@ test("fallback file identity folds Windows paths but not POSIX case", () => {
   assert.equal(fileReferenceId("node:a", "C:\\Users\\Chris\\Doc.txt", "windows"), fileReferenceId("node:a", "c:/users/chris/doc.txt", "windows"));
   assert.notEqual(fileReferenceId("node:a", "/Users/Chris/Doc.txt", "macos"), fileReferenceId("node:a", "/Users/Chris/doc.txt", "macos"));
   assert.notEqual(fileReferenceId("node:a", "/tmp/a", "linux"), fileReferenceId("node:b", "/tmp/a", "linux"));
+});
+
+test("Windows shortcut presentation hides only the final lnk suffix", () => {
+  assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "windows"), "AllMyAgents");
+  assert.equal(nativeFileDisplayName("CEC Support.LNK", "Windows_NT"), "CEC Support");
+  assert.equal(nativeFileDisplayName("notes.lnk.txt", "windows"), "notes.lnk.txt");
+  assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "linux"), "AllMyAgents.lnk");
 });
 
 test("concurrent frame reparenting cannot leave a cyclic hierarchy", () => {

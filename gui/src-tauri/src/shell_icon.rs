@@ -1,0 +1,154 @@
+//! Windows Shell icon extraction for filesystem shortcuts.
+//!
+//! Asking the shell for the `.lnk` icon preserves target icons, custom shortcut
+//! icons, and Windows' own fallback behavior instead of guessing from a suffix.
+
+use std::{ffi::c_void, path::Path};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+            BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+        },
+        Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+        UI::{
+            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
+            WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON},
+        },
+    },
+};
+
+const ICON_SIZE: i32 = 96;
+
+pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut info = SHFILEINFOW::default();
+    let found = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+    if found == 0 || info.hIcon.0.is_null() {
+        return None;
+    }
+
+    let rendered = render_icon(info.hIcon);
+    unsafe {
+        let _ = DestroyIcon(info.hIcon);
+    }
+    rendered
+}
+
+fn render_icon(icon: HICON) -> Option<String> {
+    let dc = unsafe { CreateCompatibleDC(None) };
+    if dc.0.is_null() {
+        return None;
+    }
+
+    let mut bitmap_info = BITMAPINFO::default();
+    bitmap_info.bmiHeader.biSize = std::mem::size_of_val(&bitmap_info.bmiHeader) as u32;
+    bitmap_info.bmiHeader.biWidth = ICON_SIZE;
+    bitmap_info.bmiHeader.biHeight = -ICON_SIZE;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let bitmap =
+        match unsafe { CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) } {
+            Ok(bitmap) if !bits.is_null() => bitmap,
+            _ => {
+                unsafe {
+                    let _ = DeleteDC(dc);
+                };
+                return None;
+            }
+        };
+    let old = unsafe { SelectObject(dc, bitmap.into()) };
+    let byte_len = (ICON_SIZE * ICON_SIZE * 4) as usize;
+
+    let rgba = (|| {
+        unsafe { std::ptr::write_bytes(bits.cast::<u8>(), 0, byte_len) };
+        unsafe { DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL) }.ok()?;
+        let black = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), byte_len) }.to_vec();
+        let has_alpha = black.chunks_exact(4).any(|pixel| pixel[3] != 0);
+        let mut rgba = Vec::with_capacity(byte_len);
+
+        if has_alpha {
+            for pixel in black.chunks_exact(4) {
+                let alpha = pixel[3];
+                let unpremultiply = |channel: u8| -> u8 {
+                    if alpha == 0 || alpha == 255 {
+                        channel
+                    } else {
+                        ((u16::from(channel) * 255 / u16::from(alpha)).min(255)) as u8
+                    }
+                };
+                rgba.extend_from_slice(&[
+                    unpremultiply(pixel[2]),
+                    unpremultiply(pixel[1]),
+                    unpremultiply(pixel[0]),
+                    alpha,
+                ]);
+            }
+        } else {
+            // Older icons carry transparency in a 1-bit mask instead of the
+            // 32-bit alpha channel. Draw once more over white and recover the
+            // mask from the difference, avoiding a black square around them.
+            let surface = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), byte_len) };
+            for pixel in surface.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[255, 255, 255, 255]);
+            }
+            unsafe { DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL) }.ok()?;
+            let white = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), byte_len) };
+            for (black_pixel, white_pixel) in black.chunks_exact(4).zip(white.chunks_exact(4)) {
+                let background = (0..3)
+                    .map(|channel| white_pixel[channel].saturating_sub(black_pixel[channel]))
+                    .max()
+                    .unwrap_or(255);
+                let alpha = 255_u8.saturating_sub(background);
+                let restore = |channel: u8| -> u8 {
+                    if alpha == 0 {
+                        0
+                    } else {
+                        ((u16::from(channel) * 255 / u16::from(alpha)).min(255)) as u8
+                    }
+                };
+                rgba.extend_from_slice(&[
+                    restore(black_pixel[2]),
+                    restore(black_pixel[1]),
+                    restore(black_pixel[0]),
+                    alpha,
+                ]);
+            }
+        }
+        Some(rgba)
+    })();
+
+    if !old.is_invalid() {
+        unsafe { SelectObject(dc, old) };
+    }
+    unsafe {
+        let _ = DeleteDC(dc);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+    }
+
+    let rgba = rgba?;
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, ICON_SIZE as u32, ICON_SIZE as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().ok()?.write_image_data(&rgba).ok()?;
+    }
+    Some(STANDARD.encode(png_bytes))
+}

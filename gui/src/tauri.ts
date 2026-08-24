@@ -169,6 +169,7 @@ export interface LocalFileEntry {
   modified?: number | null;
   hidden: boolean;
   symlink: boolean;
+  shellIcon?: string | null;
 }
 
 export interface LocalFileListing {

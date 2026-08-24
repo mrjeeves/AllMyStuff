@@ -22,6 +22,7 @@
   import {
     contains,
     containingFrame,
+    nativeFileDisplayName,
     descendantsOf,
     mergeCanvasRecords,
     normalizeFrameNesting,
@@ -71,6 +72,7 @@
   let previewWidth = $state(288);
   let wallpaperPath = $state("");
   let wallpaper = $state("");
+  let canvasHeight = $state(720);
 
   const visible = $derived(
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
@@ -282,8 +284,22 @@
   }
 
   function fallbackPosition(index: number) {
-    const width = tileSize + 36;
-    return { x: 64 + (index % 7) * width, y: 72 + Math.floor(index / 7) * (tileSize + 58), parentId: null };
+    const columnWidth = tileSize + 36;
+    const rowHeight = tileSize + 58;
+    const itemsPerColumn = Math.max(1, Math.floor(Math.max(rowHeight, canvasHeight - 144) / rowHeight));
+    return {
+      x: 64 + Math.floor(index / itemsPerColumn) * columnWidth,
+      y: 72 + (index % itemsPerColumn) * rowHeight,
+      parentId: null,
+    };
+  }
+
+  function measureCanvas(node: HTMLElement) {
+    const update = () => { canvasHeight = node.clientHeight; };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return { destroy() { observer.disconnect(); } };
   }
 
   function itemPosition(item: LocalFileEntry, index: number) {
@@ -368,6 +384,21 @@
 
   function nativeBrowserName(): string {
     return platform === "macos" ? "Finder" : platform === "windows" ? "File Explorer" : "Files";
+  }
+
+  function displayName(item: LocalFileEntry): string {
+    return nativeFileDisplayName(item.name, platform);
+  }
+
+  function isWindowsShortcut(item: LocalFileEntry): boolean {
+    return platform.toLowerCase().startsWith("win") && /\.lnk$/i.test(item.name);
+  }
+
+  function fileType(item: LocalFileEntry): string {
+    if (item.dir) return "Folder";
+    if (isWindowsShortcut(item)) return "Shortcut";
+    const extension = item.name.includes(".") ? item.name.split(".").pop()?.toUpperCase() : "";
+    return extension || "File";
   }
 
   function showContextMenu(event: MouseEvent, item: LocalFileEntry) {
@@ -607,13 +638,15 @@
   }
 
   async function rename(item: LocalFileEntry) {
-    const name = window.prompt("Rename", item.name);
-    if (!name || name === item.name) return;
+    const requested = window.prompt("Rename", displayName(item));
+    if (!requested) return;
+    const name = isWindowsShortcut(item) && !/\.lnk$/i.test(requested) ? `${requested}.lnk` : requested;
+    if (name === item.name) return;
     try { await localFileRename(item.path, name); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
   }
 
   async function moveToTrash(item: LocalFileEntry) {
-    if (!window.confirm(`Move “${item.name}” to the ${platform === "windows" ? "Recycle Bin" : "Trash"}?`)) return;
+    if (!window.confirm(`Move “${displayName(item)}” to the ${platform === "windows" ? "Recycle Bin" : "Trash"}?`)) return;
     try { await localFileTrash([item.path]); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
   }
 
@@ -733,7 +766,7 @@
         {/each}
         <h3>Recent</h3>
         {#if recent.length === 0}<p>Opened files appear here.</p>{/if}
-        {#each recent as item}<button onclick={() => open(item)}><span>{icon(item)}</span>{item.name}</button>{/each}
+        {#each recent as item}<button onclick={() => open(item)}><span>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>{/each}
         <h3>{platform === "macos" ? "Locations" : "This PC"}</h3>
         {#each locations.filter((place) => place.kind === "volume") as place}
           <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>💽</span>{place.label}</button>
@@ -743,7 +776,7 @@
         {#if map === "sharing"}
           <h3>Drag from current folder</h3>
           {#each visible.slice(0, 64) as item (item.id)}
-            <button draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><span>{icon(item)}</span>{item.name}</button>
+            <button draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><span>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>
           {/each}
         {/if}
         <div class="fleet-note"><i></i>Canvas metadata syncs fleet-wide</div>
@@ -755,7 +788,7 @@
     {/if}
   </aside>
 
-  <main class="browser" style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
+  <main class="browser" use:measureCanvas style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
     {#if map === "sharing"}
       <div class="sharing-canvas" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
         <p class="share-map-help">Only actual shared files, folders, and drives appear here. Drag a shared-out item onto empty canvas to retract it.</p>
@@ -798,9 +831,9 @@
         <div class="detail-head"><span>Name</span><span>Date modified</span><span>Type</span><span>Size</span></div>
         {#each visible as item}
           <button class:selected={selectedId === item.id} onclick={() => select(item)} ondblclick={() => open(item)} oncontextmenu={(event) => showContextMenu(event, item)}>
-            <span class="detail-name"><i>{icon(item)}</i>{item.name}</span>
+            <span class="detail-name"><i>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</i>{displayName(item)}</span>
             <span>{item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</span>
-            <span>{item.dir ? "Folder" : item.name.includes(".") ? item.name.split(".").pop()?.toUpperCase() : "File"}</span>
+            <span>{fileType(item)}</span>
             <span>{item.dir ? "—" : humanBytes(item.size)}</span>
           </button>
         {/each}
@@ -830,9 +863,9 @@
               oncontextmenu={(event) => showContextMenu(event, item)}
             >
               <span class="file-icon" use:loadThumbnail={item} style={`font-size:${Math.max(38, tileSize * 0.58)}px`}>
-                {#if thumbnails[item.id]}<img src={thumbnails[item.id]} alt="" />{:else}{icon(item)}{/if}
+                {#if thumbnails[item.id]}<img src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
               </span>
-              <span>{item.name}</span>
+              <span>{displayName(item)}</span>
             </button>
           {/each}
         </div>
@@ -854,12 +887,13 @@
         {#if selected}
           <div class="preview-art">
             {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
+            {:else if selected.shellIcon}<img src={`data:image/png;base64,${selected.shellIcon}`} alt="" />
             {:else}<span>{icon(selected)}</span>{/if}
           </div>
-          <h2>{selected.name}</h2>
+          <h2>{displayName(selected)}</h2>
           <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
           {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
-          <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
+          <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if isWindowsShortcut(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
           <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
         {:else}
           <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
@@ -931,7 +965,7 @@
   .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { width: 100%; height: 1.15em; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: hidden; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }.zoom { position: absolute; right: .7rem; bottom: .7rem; padding: .25rem .5rem; border-radius: 6px; background: var(--surface); color: var(--ink-faint); font-size: .68rem; }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
-  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { font-style: normal; font-size: 1.2rem; }
+  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
   .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview .sidebar-body > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
   .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }

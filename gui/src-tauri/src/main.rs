@@ -51,6 +51,8 @@ use tauri_plugin_autostart::ManagerExt;
 mod backend_recovery;
 #[allow(dead_code)] // parsers for the other desktop OSes are exercised by this module's tests
 mod host_wifi;
+#[cfg(windows)]
+mod shell_icon;
 mod window_behavior;
 
 use backend_recovery::{
@@ -1015,9 +1017,7 @@ async fn files_canvas_apply(
 }
 
 #[tauri::command]
-async fn files_canvas_purge_tombstones(
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
+async fn files_canvas_purge_tombstones(state: State<'_, AppState>) -> Result<Value, String> {
     state
         .node
         .request("files_canvas_purge_tombstones", json!({}))
@@ -1043,6 +1043,8 @@ struct LocalFileEntry {
     modified: Option<u64>,
     hidden: bool,
     symlink: bool,
+    #[serde(rename = "shellIcon")]
+    shell_icon: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1255,7 +1257,10 @@ async fn local_file_list(
          -> Option<LocalFileEntry> {
             let entry_path = item.path();
             let name = item.file_name().to_string_lossy().into_owned();
-            let symlink = item.file_type().map(|kind| kind.is_symlink()).unwrap_or(false);
+            let symlink = item
+                .file_type()
+                .map(|kind| kind.is_symlink())
+                .unwrap_or(false);
             let identity_meta = std::fs::symlink_metadata(&entry_path).ok()?;
             let target_meta = if symlink {
                 std::fs::metadata(&entry_path).ok()
@@ -1266,10 +1271,22 @@ async fn local_file_list(
             #[cfg(windows)]
             let hidden = {
                 use std::os::windows::fs::MetadataExt as _;
-                identity_meta.file_attributes() & 0x2 != 0
+                use windows_sys::Win32::Storage::FileSystem::{
+                    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+                };
+                identity_meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
+                    != 0
             };
             #[cfg(not(windows))]
             let hidden = name.starts_with('.');
+            #[cfg(windows)]
+            let shell_icon = name
+                .to_ascii_lowercase()
+                .ends_with(".lnk")
+                .then(|| shell_icon::shortcut_icon(&entry_path))
+                .flatten();
+            #[cfg(not(windows))]
+            let shell_icon = None;
             let base_id = local_file_id(&entry_path, &identity_meta, symlink);
             let count = seen_ids.entry(base_id.clone()).or_insert(0);
             *count += 1;
@@ -1283,13 +1300,18 @@ async fn local_file_list(
                 name,
                 path: entry_path.to_string_lossy().into_owned(),
                 dir: display_meta.is_dir(),
-                size: if display_meta.is_file() { display_meta.len() } else { 0 },
+                size: if display_meta.is_file() {
+                    display_meta.len()
+                } else {
+                    0
+                },
                 modified: display_meta
                     .modified()
                     .ok()
                     .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs()),
                 hidden,
+                shell_icon,
                 symlink,
             })
         };
@@ -1299,14 +1321,18 @@ async fn local_file_list(
             entries.push(entry);
         }
         while entries.len() < PAGE_SIZE {
-            let Some(item) = current.reader.next() else { break };
+            let Some(item) = current.reader.next() else {
+                break;
+            };
             let Ok(item) = item else { continue };
             if let Some(entry) = convert(item, &mut current.seen_ids) {
                 entries.push(entry);
             }
         }
         while entries.len() == PAGE_SIZE && current.pending.is_none() {
-            let Some(item) = current.reader.next() else { break };
+            let Some(item) = current.reader.next() else {
+                break;
+            };
             let Ok(item) = item else { continue };
             current.pending = convert(item, &mut current.seen_ids);
         }
@@ -1462,7 +1488,7 @@ unsafe fn windows_shell_context_menu(
             UI::{
                 Shell::{
                     Common::ITEMIDLIST, IContextMenu, IShellFolder, SHBindToParent,
-                    SHParseDisplayName, CMINVOKECOMMANDINFO, CMF_NORMAL,
+                    SHParseDisplayName, CMF_NORMAL, CMINVOKECOMMANDINFO,
                 },
                 WindowsAndMessaging::{
                     CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
@@ -1477,7 +1503,11 @@ unsafe fn windows_shell_context_menu(
     // in another apartment and is still usable here.
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     let mut absolute: *mut ITEMIDLIST = std::ptr::null_mut();
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut absolute, 0, None)? };
 
     let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
@@ -1485,7 +1515,11 @@ unsafe fn windows_shell_context_menu(
     let shell_menu: IContextMenu =
         unsafe { parent.GetUIObjectOf(hwnd, &[child.cast_const()], None)? };
     let menu = unsafe { CreatePopupMenu()? };
-    unsafe { shell_menu.QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL).ok()? };
+    unsafe {
+        shell_menu
+            .QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL)
+            .ok()?
+    };
 
     let mut point = POINT::default();
     unsafe {
@@ -1534,7 +1568,9 @@ fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> Result
         window
             .run_on_main_thread(move || {
                 let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
-                if let Err(error) = unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) } {
+                if let Err(error) =
+                    unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) }
+                {
                     tracing::warn!(%error, "couldn't show Windows Shell context menu");
                 }
             })

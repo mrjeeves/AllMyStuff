@@ -112,6 +112,12 @@ export function fileReferenceId(origin: string, path: string, platform: string):
   return `${origin}:${windows ? normalized.toLocaleLowerCase("en-US") : normalized}`;
 }
 
+/** Match Explorer's presentation without changing the actual filesystem name.
+ * Only a final, case-insensitive .lnk suffix is hidden, and only on Windows. */
+export function nativeFileDisplayName(name: string, platform: string): string {
+  return platform.toLowerCase().startsWith("win") && /\.lnk$/i.test(name) ? name.slice(0, -4) : name;
+}
+
 export function descendantsOf(id: string, frames: readonly CanvasFrame[]): Set<string> {
   const found = new Set<string>();
   let grew = true;

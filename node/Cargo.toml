@@ -117,6 +117,8 @@ serde_json = "1"
 anyhow = "1"
 dirs = "5"
 parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 futures-util = "0.3"
@@ -251,6 +253,7 @@ windows-sys = { version = "0.60", features = [
     # guard (os_perf.rs); without it the pacing sleeps quantize at ~15.6 ms.
     "Win32_Media",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Power",
     # GetSystemCpuSetInformation + SYSTEM_CPU_SET_INFORMATION — the hybrid

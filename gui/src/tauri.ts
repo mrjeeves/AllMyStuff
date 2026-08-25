@@ -259,6 +259,44 @@ export function localFileTrash(paths: string[]): Promise<void> {
   return requiredInvoke("local_file_trash", { paths });
 }
 
+export interface NamespaceObservation {
+  provisionalId: string;
+  priorEntryId?: string;
+  sourceDevice: string;
+  nativeId: string;
+  name: string;
+  nativePath: string;
+  dir: boolean;
+  hidden: boolean;
+  size: number;
+  modified: number;
+}
+
+export interface NamespaceAdoption {
+  provisionalId: string;
+  entryId: string;
+  objectId: string;
+}
+
+export function filesNamespaceAdopt(
+  parent: string,
+  observations: NamespaceObservation[],
+): Promise<NamespaceAdoption[]> {
+  if (!isTauri()) {
+    return Promise.resolve(
+      observations.map((observation) => ({
+        provisionalId: observation.provisionalId,
+        entryId: observation.provisionalId,
+        objectId: observation.nativeId,
+      })),
+    );
+  }
+  return requiredInvoke<NamespaceAdoption[]>("files_namespace_adopt", {
+    parent,
+    observations,
+  });
+}
+
 export interface CanvasMutation {
   id: string;
   kind: CanvasRecord["kind"];

@@ -226,6 +226,14 @@ pub struct FileFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
+    /// Filesystem-native identity, opaque outside the source device. Combined
+    /// with the source device id it survives rename/move where the host OS can
+    /// provide a durable file id. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_id: Option<String>,
+    /// Native hidden/system state. Display policy remains viewer-local.
+    #[serde(default)]
+    pub hidden: bool,
     /// `true` for a directory (what the listing navigates into).
     pub dir: bool,
     /// Byte size (0 for directories).
@@ -271,6 +279,13 @@ pub enum FileEvent {
     List {
         req: u64,
         path: String,
+        /// Opaque continuation minted by the host. Missing keeps the legacy
+        /// one-shot behavior for older viewers; upgraded viewers always send
+        /// a bounded limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
     },
     /// Read a whole file. Answered with a stream of `Chunk`s (the last
     /// has `eof: true`) or `Err`.
@@ -349,6 +364,8 @@ pub enum FileEvent {
         path: String,
         home: String,
         entries: Vec<FileEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
     },
     VolumeList {
         req: u64,
@@ -1172,6 +1189,8 @@ mod tests {
             FileEvent::List {
                 req: 1,
                 path: "~".into(),
+                cursor: None,
+                limit: None,
             },
             FileEvent::Read {
                 req: 2,
@@ -1203,11 +1222,14 @@ mod tests {
                 home: "/home/u".into(),
                 entries: vec![FileEntry {
                     name: "docs".into(),
+                    native_id: Some("unix:1:2".into()),
+                    hidden: false,
                     dir: true,
                     size: 0,
                     modified: Some(1_700_000_000),
                     symlink: false,
                 }],
+                next_cursor: None,
             },
             FileEvent::Chunk {
                 req: 8,
@@ -1258,6 +1280,8 @@ mod tests {
             FileEvent::List {
                 req: 1,
                 path: "~".into(),
+                cursor: None,
+                limit: None,
             },
         ))
         .unwrap();

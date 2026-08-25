@@ -50,6 +50,7 @@ use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
 use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
+use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
 use crate::ownership::Ownership;
 use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
@@ -139,6 +140,9 @@ pub struct Mesh {
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
     files: FilesPlane,
+    /// Durable identities and local native bindings for Files pages that have
+    /// actually been visited. This is bounded page adoption, not disk indexing.
+    namespace: NamespaceCatalog,
     /// Layout-only Files canvas document. Bytes/listings never enter it.
     canvas: CanvasStore,
     /// OS-native drive letters/mounts backed by active Storage routes.
@@ -1733,6 +1737,7 @@ impl Mesh {
             term_rx_seq: Mutex::new(HashMap::new()),
             term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
+            namespace: NamespaceCatalog::load(),
             canvas: CanvasStore::load(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
@@ -16554,6 +16559,16 @@ impl Mesh {
     /// and presence plus re-stated invites heal the gaps. Returns how many
     /// members the daemon actually dispatched to, so the UI can be honest
     /// about a line that reached nobody.
+    /// Adopt one bounded listing page into the fleet namespace catalog. The
+    /// returned identities, not native paths, are what the Files canvas uses.
+    pub fn files_namespace_adopt(
+        &self,
+        parent_id: String,
+        observations: Vec<NamespaceObservation>,
+    ) -> Result<Vec<NamespaceAdoption>, String> {
+        self.namespace.adopt_page(&parent_id, observations)
+    }
+
     /// Current fleet-wide Files canvas document for a newly opened GUI.
     pub fn files_canvas_snapshot(&self) -> Vec<CanvasRecord> {
         self.canvas.snapshot()

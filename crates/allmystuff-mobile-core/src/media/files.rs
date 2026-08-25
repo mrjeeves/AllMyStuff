@@ -87,6 +87,8 @@ impl FileClient {
             self.frame(FileEvent::List {
                 req,
                 path: path.into(),
+                cursor: None,
+                limit: None,
             }),
         )
     }
@@ -179,6 +181,7 @@ impl FileClient {
                 path,
                 home,
                 entries,
+                ..
             } => Some(FileReply::Listing {
                 req: *req,
                 path: path.clone(),
@@ -265,11 +268,14 @@ mod tests {
                 home: "/home/me".into(),
                 entries: vec![FileEntry {
                     name: "notes.txt".into(),
+                    native_id: Some("unix:1:2".into()),
+                    hidden: false,
                     dir: false,
                     size: 12,
                     modified: None,
                     symlink: false,
                 }],
+                next_cursor: None,
             },
         );
         match fc.accept(&reply) {

@@ -684,6 +684,8 @@ export interface FileEntry {
   size: number;
   modified?: number | null;
   symlink?: boolean;
+  native_id?: string | null;
+  hidden?: boolean;
 }
 
 export interface FileVolume {
@@ -700,7 +702,7 @@ export interface FileVolume {
  *  request id (`req`) it belongs to. */
 export type FileEvent =
   | { kind: "volumes"; req: number }
-  | { kind: "list"; req: number; path: string }
+  | { kind: "list"; req: number; path: string; cursor?: string | null; limit?: number | null }
   | { kind: "read"; req: number; path: string }
   | { kind: "stat"; req: number; path: string }
   | { kind: "read_range"; req: number; path: string; offset: number; len: number }
@@ -710,7 +712,7 @@ export type FileEvent =
   | { kind: "mkdir"; req: number; path: string }
   | { kind: "rename"; req: number; from: string; to: string }
   | { kind: "delete"; req: number; path: string }
-  | { kind: "entries"; req: number; path: string; home: string; entries: FileEntry[] }
+  | { kind: "entries"; req: number; path: string; home: string; entries: FileEntry[]; next_cursor?: string | null }
   | { kind: "volume_list"; req: number; volumes: FileVolume[] }
   | { kind: "metadata"; req: number; entry: FileEntry }
   | { kind: "chunk"; req: number; data: string; total: number; eof?: boolean }

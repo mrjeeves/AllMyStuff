@@ -1162,7 +1162,14 @@ impl DavFileSystem for RemoteDavFs {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         let path = Self::path(path);
         async move {
-            let events = self.request(|req| FileEvent::List { req, path }).await?;
+            let events = self
+                .request(|req| FileEvent::List {
+                    req,
+                    path,
+                    cursor: None,
+                    limit: None,
+                })
+                .await?;
             match events.into_iter().next() {
                 Some(FileEvent::Entries { entries, .. }) => {
                     let entries: Vec<Box<dyn DavDirEntry>> = entries

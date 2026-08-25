@@ -23,7 +23,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use allmystuff_session::{FileEntry, FileEvent};
 use parking_lot::Mutex;
@@ -40,6 +40,19 @@ const OP_QUEUE: usize = 8;
 /// finite, so a wedged window can't balloon; beyond it the oldest chunks
 /// go (the files window caps previews well below this anyway).
 const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
+const LIST_PAGE_DEFAULT: usize = 256;
+const LIST_PAGE_MAX: usize = 512;
+const LIST_CURSOR_MAX: usize = 64;
+const LIST_CURSOR_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct RemoteListCursor {
+    requested_path: String,
+    shown_path: String,
+    home: String,
+    reader: std::fs::ReadDir,
+    pending: Option<std::fs::DirEntry>,
+    touched: Instant,
+}
 
 pub struct FilesPlane {
     /// Viewer half: response frames per route, drained by the files
@@ -49,6 +62,9 @@ pub struct FilesPlane {
     /// in-flight ops — `stop` flips it so a teardown ends a download
     /// mid-stream instead of pumping bytes at a gone peer.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Live native iterators for upgraded peers: opaque, route-scoped,
+    /// TTL'd, and globally capped.
+    list_cursors: Arc<Mutex<HashMap<(String, String), RemoteListCursor>>>,
     /// Active Storage routes are explicit volume mappings. Their route id is
     /// bound to the host's real mount root when the route activates; requests
     /// never trust a peer-supplied filesystem path as that root.
@@ -69,6 +85,7 @@ impl FilesPlane {
         FilesPlane {
             queues: ByteQueues::new(MAX_QUEUED_BYTES),
             cancels: Mutex::new(HashMap::new()),
+            list_cursors: Arc::new(Mutex::new(HashMap::new())),
             roots: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
         }
@@ -102,10 +119,13 @@ impl FilesPlane {
         let (tx, rx) = tokio::sync::mpsc::channel::<FileEvent>(OP_QUEUE);
         let cancel = self.cancel_flag(route_id);
         let rid = route_id.to_string();
+        let list_cursors = self.list_cursors.clone();
         let _ = std::thread::Builder::new()
             .name(format!("amst-files-op {rid}"))
             .spawn(move || {
-                if let Some(reply) = run_op(event, &tx, &cancel, root.as_deref()) {
+                if let Some(reply) =
+                    run_op(event, &tx, &cancel, root.as_deref(), &rid, &list_cursors)
+                {
                     let _ = tx.blocking_send(reply);
                 }
             });
@@ -129,6 +149,9 @@ impl FilesPlane {
         }
         self.queues.remove(route_id);
         self.roots.lock().remove(route_id);
+        self.list_cursors
+            .lock()
+            .retain(|(route, _), _| route != route_id);
         self.waiters
             .lock()
             .retain(|(route, _), _| route != route_id);
@@ -223,6 +246,8 @@ fn run_op(
     tx: &tokio::sync::mpsc::Sender<FileEvent>,
     cancel: &AtomicBool,
     root: Option<&Path>,
+    route_id: &str,
+    list_cursors: &Mutex<HashMap<(String, String), RemoteListCursor>>,
 ) -> Option<FileEvent> {
     match event {
         FileEvent::Quota { req } => Some(match root {
@@ -255,18 +280,48 @@ fn run_op(
                     .collect(),
             })
         }
-        FileEvent::List { req, path } => Some(match list_dir(&path, root) {
-            Ok((path, entries)) => FileEvent::Entries {
-                req,
-                path,
-                home: if root.is_some() {
-                    "/".into()
+        FileEvent::List {
+            req,
+            path,
+            cursor,
+            limit,
+        } => Some(match limit {
+            Some(limit) => match list_dir_page(
+                &path,
+                root,
+                route_id,
+                cursor.as_deref(),
+                if limit == 0 {
+                    LIST_PAGE_DEFAULT
                 } else {
-                    home_dir_string()
+                    usize::from(limit).min(LIST_PAGE_MAX)
                 },
-                entries,
+                list_cursors,
+                cancel,
+            ) {
+                Ok((path, home, entries, next_cursor)) => FileEvent::Entries {
+                    req,
+                    path,
+                    home,
+                    entries,
+                    next_cursor,
+                },
+                Err(reason) => FileEvent::Err { req, reason },
             },
-            Err(reason) => FileEvent::Err { req, reason },
+            None => match list_dir(&path, root) {
+                Ok((path, entries)) => FileEvent::Entries {
+                    req,
+                    path,
+                    home: if root.is_some() {
+                        "/".into()
+                    } else {
+                        home_dir_string()
+                    },
+                    entries,
+                    next_cursor: None,
+                },
+                Err(reason) => FileEvent::Err { req, reason },
+            },
         }),
         FileEvent::Read { req, path } => match stream_read(req, &path, tx, cancel, root) {
             Ok(()) => None, // the chunk stream (ending in eof) is the reply
@@ -533,6 +588,216 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+fn native_file_id(path: &Path, meta: &std::fs::Metadata, symlink: bool) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let _ = (path, symlink);
+        return Some(format!("unix:{:x}:{:x}", meta.dev(), meta.ino()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let _ = meta;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | if symlink {
+                        FILE_FLAG_OPEN_REPARSE_POINT
+                    } else {
+                        0
+                    },
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+        unsafe { CloseHandle(handle) };
+        if !ok {
+            return None;
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        return Some(format!("windows:{:x}:{index:x}", info.dwVolumeSerialNumber));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn native_hidden(name: &str, meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = name;
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+        return meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        name.starts_with('.')
+    }
+}
+
+fn listed_file_entry(entry: std::fs::DirEntry) -> FileEntry {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let path = entry.path();
+    let identity_meta = std::fs::symlink_metadata(&path).ok();
+    let symlink = identity_meta.as_ref().is_some_and(|meta| meta.is_symlink());
+    let meta = std::fs::metadata(&path).ok();
+    let dir = meta.as_ref().is_some_and(|meta| meta.is_dir());
+    FileEntry {
+        native_id: identity_meta
+            .as_ref()
+            .and_then(|meta| native_file_id(&path, meta, symlink)),
+        hidden: identity_meta
+            .as_ref()
+            .is_some_and(|meta| native_hidden(&name, meta)),
+        name,
+        dir,
+        size: if dir {
+            0
+        } else {
+            meta.as_ref().map(|meta| meta.len()).unwrap_or(0)
+        },
+        modified: meta
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        symlink,
+    }
+}
+
+fn next_dir_entry(
+    reader: &mut std::fs::ReadDir,
+    cancel: &AtomicBool,
+) -> Result<Option<std::fs::DirEntry>, String> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("file route closed".into());
+        }
+        match reader.next() {
+            Some(Ok(entry)) => return Ok(Some(entry)),
+            Some(Err(_)) => continue,
+            None => return Ok(None),
+        }
+    }
+}
+
+fn new_list_cursor_token() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| format!("mint list cursor: {error}"))?;
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(token, "{byte:02x}");
+    }
+    Ok(token)
+}
+
+fn list_dir_page(
+    path: &str,
+    root: Option<&Path>,
+    route_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    cursors: &Mutex<HashMap<(String, String), RemoteListCursor>>,
+    cancel: &AtomicBool,
+) -> Result<(String, String, Vec<FileEntry>, Option<String>), String> {
+    let now = Instant::now();
+    let existing_token = cursor.map(str::to_owned);
+    let mut state = if let Some(token) = cursor {
+        if token.len() > 128 || token.is_empty() {
+            return Err("invalid directory cursor".into());
+        }
+        let mut cursors = cursors.lock();
+        cursors.retain(|_, state| now.duration_since(state.touched) <= LIST_CURSOR_TTL);
+        let key = (route_id.to_string(), token.to_string());
+        let state = cursors
+            .remove(&key)
+            .ok_or("that directory page expired; refresh the folder")?;
+        if state.requested_path != path {
+            return Err("directory cursor does not match this path".into());
+        }
+        state
+    } else {
+        {
+            let mut cursors = cursors.lock();
+            cursors.retain(|_, state| now.duration_since(state.touched) <= LIST_CURSOR_TTL);
+            if cursors.len() >= LIST_CURSOR_MAX {
+                return Err("too many directory pages are open; finish or refresh one".into());
+            }
+        }
+        let dir = resolve_for(path, root)?;
+        let reader = std::fs::read_dir(&dir).map_err(|error| error.to_string())?;
+        let shown_path = match root {
+            Some(_) => scoped_display_path(path)?,
+            None => dir.to_string_lossy().into_owned(),
+        };
+        RemoteListCursor {
+            requested_path: path.to_string(),
+            shown_path,
+            home: if root.is_some() {
+                "/".into()
+            } else {
+                home_dir_string()
+            },
+            reader,
+            pending: None,
+            touched: now,
+        }
+    };
+
+    let mut entries = Vec::with_capacity(limit);
+    if let Some(entry) = state.pending.take() {
+        entries.push(listed_file_entry(entry));
+    }
+    while entries.len() < limit {
+        let Some(entry) = next_dir_entry(&mut state.reader, cancel)? else {
+            break;
+        };
+        entries.push(listed_file_entry(entry));
+    }
+    state.pending = next_dir_entry(&mut state.reader, cancel)?;
+    let shown_path = state.shown_path.clone();
+    let home = state.home.clone();
+    let next_cursor = if state.pending.is_some() {
+        let token = match existing_token {
+            Some(token) => token,
+            None => new_list_cursor_token()?,
+        };
+        state.touched = now;
+        let mut cursors = cursors.lock();
+        cursors.retain(|_, state| now.duration_since(state.touched) <= LIST_CURSOR_TTL);
+        if cursors.len() >= LIST_CURSOR_MAX {
+            return Err("too many directory pages are open; refresh this folder".into());
+        }
+        cursors.insert((route_id.to_string(), token.clone()), state);
+        Some(token)
+    } else {
+        None
+    };
+
+    Ok((shown_path, home, entries, next_cursor))
+}
+
 fn list_dir(path: &str, root: Option<&Path>) -> Result<(String, Vec<FileEntry>), String> {
     let dir = resolve_for(path, root)?;
     let mut entries = Vec::new();
@@ -540,16 +805,19 @@ fn list_dir(path: &str, root: Option<&Path>) -> Result<(String, Vec<FileEntry>),
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         let p = entry.path();
-        let symlink = entry
-            .path()
-            .symlink_metadata()
-            .map(|m| m.is_symlink())
-            .unwrap_or(false);
+        let identity_meta = std::fs::symlink_metadata(&p).ok();
+        let symlink = identity_meta.as_ref().is_some_and(|m| m.is_symlink());
         // Follow links for dir-ness/size so a symlinked folder is
         // navigable; a broken link reads as a 0-byte file.
         let meta = std::fs::metadata(&p).ok();
         let dir_flag = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         entries.push(FileEntry {
+            native_id: identity_meta
+                .as_ref()
+                .and_then(|meta| native_file_id(&p, meta, symlink)),
+            hidden: identity_meta
+                .as_ref()
+                .is_some_and(|meta| native_hidden(&name, meta)),
             name,
             dir: dir_flag,
             size: if dir_flag {
@@ -586,6 +854,8 @@ fn stat_path(path: &str, root: Option<&Path>) -> Result<FileEntry, String> {
             .unwrap_or_default()
     };
     Ok(FileEntry {
+        native_id: native_file_id(&p, &symlink_meta, symlink),
+        hidden: native_hidden(&name, &symlink_meta),
         name,
         dir,
         size: if dir { 0 } else { meta.len() },
@@ -700,6 +970,8 @@ mod tests {
             FileEvent::List {
                 req: 1,
                 path: dir.to_string_lossy().into_owned(),
+                cursor: None,
+                limit: None,
             },
         ));
         let [FileEvent::Entries {
@@ -733,6 +1005,46 @@ mod tests {
             events.last(),
             Some(FileEvent::Chunk { eof: true, .. })
         ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn upgraded_directory_lists_are_bounded_and_continuable() {
+        let dir = tempdir("paged-list");
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("file-{index}.txt")), [index]).unwrap();
+        }
+        let shown = dir.to_string_lossy().into_owned();
+        let plane = FilesPlane::new();
+        let mut cursor = None;
+        let mut names = std::collections::HashSet::new();
+        for req in 1..=3 {
+            let events = drain(plane.handle(
+                "paged-route",
+                FileEvent::List {
+                    req,
+                    path: shown.clone(),
+                    cursor,
+                    limit: Some(2),
+                },
+            ));
+            let [FileEvent::Entries {
+                entries,
+                next_cursor,
+                ..
+            }] = events.as_slice()
+            else {
+                panic!("expected one paged Entries reply, got {events:?}");
+            };
+            assert!(entries.len() <= 2);
+            names.extend(entries.iter().map(|entry| entry.name.clone()));
+            cursor = next_cursor.clone();
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(names.len(), 5);
+        assert!(cursor.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -863,6 +1175,8 @@ mod tests {
                 FileEvent::List {
                     req: 1,
                     path: missing.clone(),
+                    cursor: None,
+                    limit: None,
                 },
             ),
             (
@@ -956,6 +1270,8 @@ mod tests {
             FileEvent::List {
                 req: 1,
                 path: "~".into(),
+                cursor: None,
+                limit: None,
             },
             Some(root.clone()),
         ));
@@ -1018,6 +1334,8 @@ mod tests {
             FileEvent::List {
                 req: 9,
                 path: "/../".into(),
+                cursor: None,
+                limit: None,
             },
             Some(root.clone()),
         ));

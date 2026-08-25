@@ -987,6 +987,22 @@ async fn open_terminal_window(
 // ---- files (the mesh-native file manager) -------------------------------
 
 #[tauri::command]
+async fn files_namespace_adopt(
+    state: State<'_, AppState>,
+    parent: String,
+    observations: Vec<Value>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "files_namespace_adopt",
+            json!({ "parent": parent, "observations": observations }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn files_canvas_snapshot(state: State<'_, AppState>) -> Result<Value, String> {
     state
         .node
@@ -4238,6 +4254,7 @@ fn main() {
             file_unwatch,
             file_download,
             open_files_window,
+            files_namespace_adopt,
             files_canvas_snapshot,
             files_canvas_status,
             files_canvas_apply,

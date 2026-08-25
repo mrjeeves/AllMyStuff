@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, type SharePartner } from "../store.svelte";
-  import { humanBytes, type FileEntry, type FileEvent } from "../types";
+  import { humanBytes, type FileEntry, type FileEvent, type FileVolume } from "../types";
   import {
     filesCanvasApply,
     filesNamespaceAdopt,
@@ -34,6 +34,7 @@
     isLegacyAutoRowPlacement,
     nativeFileGridMetrics,
     nativeFileDisplayName,
+    nativeLocationTrail,
     nativeWindowsLinkExtension,
     rectsIntersect,
     resolveDesktopTileCollisions,
@@ -54,7 +55,12 @@
   type WorkspaceBinding =
     | { kind: "local"; deviceId: string; deviceLabel: string; nativeId: string }
     | { kind: "remote"; deviceId: string; deviceLabel: string; nativeId: string; routeId: string };
-  type WorkspaceEntry = LocalFileEntry & { binding: WorkspaceBinding; objectId?: string };
+  type WorkspaceEntry = LocalFileEntry & {
+    binding: WorkspaceBinding;
+    objectId?: string;
+    computerNode?: boolean;
+    computerOnline?: boolean;
+  };
   type RemoteSession = {
     deviceId: string;
     deviceLabel: string;
@@ -102,13 +108,21 @@
   let nextCursor = $state<string | null>(null);
   let complete = $state(true);
   let fleetHome = $state(true);
+  let computerHome = $state(false);
+  let currentComputer = $state<{ deviceId: string; deviceLabel: string; routeId?: string } | null>(null);
   let localRootPath = "";
   let sourceSummary = $state("Loading this device…");
   const remoteSessions = new Map<string, RemoteSession>();
-  const fleetHomeFailures = new Map<string, string>();
-  const fleetPageCursors = new Map<string, { deviceId: string; path: string; cursor: string }>();
   const pendingRemoteOpens = new Map<string, { name: string; deviceLabel: string }>();
-  let currentRemoteDirectory = $state<{ deviceId: string; routeId: string; path: string; home: string } | null>(null);
+  const remoteDirectoryIds = new Map<string, string>();
+  let currentRemoteDirectory = $state<{
+    deviceId: string;
+    deviceLabel: string;
+    routeId: string;
+    path: string;
+    home: string;
+    nativeId: string;
+  } | null>(null);
   let loadingPage = $state(false);
   let navigationGeneration = 0;
   let address = $state("");
@@ -155,6 +169,10 @@
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
   );
 
+  const fleetFileNodes = $derived(
+    app.catalog.nodes.filter((node) => app.filesAllowed(node)),
+  );
+
   const collidingNames = $derived.by(() => {
     const counts = new Map<string, number>();
     for (const item of entries) {
@@ -179,7 +197,18 @@
     tileSize = app.filesSettings.thumbnailSize;
   });
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
-  const scope = $derived(fleetHome ? "fleet:home" : `fleet-directory:${directoryId || path}`);
+  const navigatorTrail = $derived(
+    fleetHome || computerHome
+      ? []
+      : nativeLocationTrail(currentRemoteDirectory?.path ?? path, currentRemoteDirectory ? "" : platform),
+  );
+  const scope = $derived(
+    fleetHome
+      ? "fleet:home"
+      : computerHome
+        ? "computer:" + canonicalDeviceId(currentComputer?.deviceId ?? app.localId)
+        : `fleet-directory:${directoryId || path}`,
+  );
   const framePrefix = $derived(map === "files" ? `frame:${map}:${scope}:` : `frame:${map}:`);
   const frames = $derived(
     normalizeFrameNesting(
@@ -268,6 +297,79 @@
         deviceId: app.localId,
         deviceLabel: app.localNode?.label || "This device",
         nativeId,
+      },
+    };
+  }
+
+  function computerNodeEntry(
+    deviceId: string,
+    deviceLabel: string,
+    remote: boolean,
+    online = true,
+  ): WorkspaceEntry {
+    const canonical = canonicalDeviceId(deviceId);
+    const nativeId = "computer-root";
+    const binding: WorkspaceBinding = remote
+      ? { kind: "remote", deviceId, deviceLabel, nativeId, routeId: "" }
+      : { kind: "local", deviceId, deviceLabel, nativeId };
+    return {
+      id: "entry:" + canonical + ":" + nativeId,
+      name: deviceLabel,
+      path: "computer://" + encodeURIComponent(canonical),
+      dir: true,
+      size: 0,
+      modified: null,
+      hidden: false,
+      symlink: false,
+      virtualItem: true,
+      computerNode: true,
+      computerOnline: online,
+      shellIcon: null,
+      binding,
+    };
+  }
+
+  function computerLocationEntry(location: LocalFileLocation): WorkspaceEntry {
+    const nativeId = "volume:" + stableTextId(location.path.toLocaleLowerCase());
+    return {
+      id: "entry:" + canonicalDeviceId(app.localId) + ":" + nativeId,
+      name: location.label,
+      path: location.path,
+      dir: true,
+      size: 0,
+      modified: null,
+      hidden: false,
+      symlink: false,
+      virtualItem: true,
+      shellIcon: null,
+      binding: {
+        kind: "local",
+        deviceId: app.localId,
+        deviceLabel: app.localNode?.label || "This device",
+        nativeId,
+      },
+    };
+  }
+
+  function remoteVolumeEntry(session: RemoteSession, volume: FileVolume): WorkspaceEntry {
+    const nativeId = remoteFallbackNativeId(volume.path);
+    return {
+      id: "entry:" + canonicalDeviceId(session.deviceId) + ":" + nativeId,
+      name: volume.name.trim() || volume.path,
+      path: volume.path,
+      dir: true,
+      size: volume.size,
+      modified: null,
+      hidden: false,
+      symlink: false,
+      virtualItem: true,
+      shellIcon: null,
+      binding: {
+        kind: "remote",
+        deviceId: session.deviceId,
+        deviceLabel: session.deviceLabel,
+        nativeId,
+        routeId: session.routeId,
       },
     };
   }
@@ -427,46 +529,10 @@
     return event;
   }
 
-  async function loadRemoteFleetHome(generation: number) {
-    const nodes = app.catalog.nodes.filter((node) => node.online && app.filesAllowed(node));
-    if (nodes.length === 0) {
-      sourceSummary = "Fleet Home · this device";
-      return;
-    }
-    sourceSummary = `Fleet Home · this device + ${nodes.length} connecting`;
-    let ready = 1;
-    await Promise.allSettled(nodes.map(async (node) => {
-      try {
-        const session = await ensureRemoteSession(node.id, node.label);
-        let listing;
-        try {
-          listing = await remoteList(session, "~/Desktop");
-        } catch {
-          listing = await remoteList(session, "~");
-        }
-        if (generation !== navigationGeneration || !fleetHome) return;
-        const additions = await adoptWorkspaceEntries(
-          "fleet:home",
-          listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
-        );
-        const known = new Set(entries.map((item) => item.id));
-        entries = [...entries, ...additions.filter((item) => !known.has(item.id))];
-        if (listing.next_cursor) {
-          fleetPageCursors.set(node.id, {
-            deviceId: node.id,
-            path: listing.path,
-            cursor: listing.next_cursor,
-          });
-          if (!nextCursor) nextCursor = "fleet-remote";
-          complete = false;
-        }
-        ready += 1;
-        sourceSummary = `Fleet Home · ${ready} devices live`;
-      } catch (error) {
-        fleetHomeFailures.set(node.id, String(error));
-        sourceSummary = `Fleet Home · ${ready} live · ${fleetHomeFailures.size} unavailable`;
-      }
-    }));
+  async function remoteVolumes(session: RemoteSession): Promise<FileVolume[]> {
+    const event = await remoteRequest(session, { kind: "volumes" } as Omit<FileEvent, "req">);
+    if (event.kind !== "volume_list") throw new Error("The remote device returned an invalid volume list");
+    return event.volumes;
   }
 
   async function navigateFleetHome() {
@@ -474,9 +540,9 @@
     if (!desktop) return;
     const generation = ++navigationGeneration;
     loading = true;
+    computerHome = false;
+    currentComputer = null;
     currentRemoteDirectory = null;
-    fleetPageCursors.clear();
-    fleetHomeFailures.clear();
     clearWorkspaceSelection();
     try {
       const listing = await localFileList(desktop.path);
@@ -488,21 +554,86 @@
       path = "fleet://home";
       address = "Fleet Home";
       platform = listing.platform;
-      entries = await adoptWorkspaceEntries(
+      const desktopEntries = await adoptWorkspaceEntries(
         "fleet:home",
         listing.entries.map(localWorkspaceEntry),
       );
+      const fleetComputers = [
+        computerNodeEntry(app.localId, app.localNode?.label || nativeComputerName(), false),
+        ...app.catalog.nodes
+          .filter((node) => app.filesAllowed(node))
+          .map((node) => computerNodeEntry(node.id, node.label, true, node.online)),
+      ];
+      entries = [...fleetComputers, ...desktopEntries];
       nextCursor = listing.nextCursor ?? null;
       complete = listing.complete;
       history = ["fleet://home"];
       historyIndex = 0;
       thumbnails = {};
       thumbnailOrder = [];
-      sourceSummary = "Fleet Home · this device";
+      sourceSummary = "Fleet Home · " + fleetComputers.length + " computers";
       loading = false;
-      void loadRemoteFleetHome(generation);
     } catch (error) {
       if (generation === navigationGeneration) app.toast("warn", `Couldn't open Fleet Home: ${String(error)}`);
+    } finally {
+      if (generation === navigationGeneration) loading = false;
+    }
+  }
+
+  async function navigateComputer(
+    deviceId = app.localId,
+    deviceLabel = app.localNode?.label || nativeComputerName(),
+    remember = true,
+  ) {
+    const canonical = canonicalDeviceId(deviceId);
+    const local = canonical === canonicalDeviceId(app.localId);
+    if (!local) {
+      const node = app.catalog.nodes.find(
+        (candidate) => canonicalDeviceId(candidate.id) === canonical,
+      );
+      if (!node?.online) {
+        app.toast("warn", deviceLabel + " is offline right now");
+        return;
+      }
+    }
+    const generation = ++navigationGeneration;
+    loading = true;
+    try {
+      let nextEntries: WorkspaceEntry[];
+      let routeId: string | undefined;
+      if (local) {
+        nextEntries = locations.filter((location) => location.kind === "volume").map(computerLocationEntry);
+      } else {
+        const session = await ensureRemoteSession(deviceId, deviceLabel);
+        routeId = session.routeId;
+        nextEntries = (await remoteVolumes(session)).map((volume) => remoteVolumeEntry(session, volume));
+      }
+      if (generation !== navigationGeneration) return;
+      currentRemoteDirectory = null;
+      clearWorkspaceSelection();
+      directoryId = "computer:" + canonical;
+      fleetHome = false;
+      computerHome = true;
+      currentComputer = { deviceId, deviceLabel, routeId };
+      map = "files";
+      path = "computer://" + encodeURIComponent(canonical);
+      address = "Fleet Home / " + deviceLabel + " / " + (local ? nativeComputerName() : "Computer");
+      entries = nextEntries;
+      nextCursor = null;
+      complete = true;
+      thumbnails = {};
+      thumbnailOrder = [];
+      sourceSummary = deviceLabel + " · " + nextEntries.length + " drives";
+      if (remember) {
+        const kept = history.slice(0, historyIndex + 1);
+        if (kept.at(-1) !== path) kept.push(path);
+        history = kept;
+        historyIndex = kept.length - 1;
+      }
+    } catch (error) {
+      if (generation === navigationGeneration) {
+        app.toast("warn", "Couldn't open that computer: " + String(error));
+      }
     } finally {
       if (generation === navigationGeneration) loading = false;
     }
@@ -586,13 +717,14 @@
   async function navigate(next: string, remember = true) {
     const generation = ++navigationGeneration;
     loading = true;
-    fleetPageCursors.clear();
     clearWorkspaceSelection();
     try {
       const listing = await localFileList(next);
       if (generation !== navigationGeneration) return;
       directoryId = listing.id;
       map = "files";
+      computerHome = false;
+      currentComputer = null;
       currentRemoteDirectory = null;
       fleetHome = false;
       localRootPath = listing.path;
@@ -625,7 +757,7 @@
   async function navigateRemoteDirectory(
     session: RemoteSession,
     requestedPath: string,
-    label: string,
+    _label: string,
     nativeId: string,
   ) {
     const generation = ++navigationGeneration;
@@ -636,16 +768,21 @@
       if (generation !== navigationGeneration) return;
       fleetHome = false;
       localRootPath = "";
+      remoteDirectoryIds.set(remotePathKey(session.deviceId, listing.path), nativeId);
+      computerHome = false;
+      currentComputer = null;
       currentRemoteDirectory = {
         deviceId: session.deviceId,
+        deviceLabel: session.deviceLabel,
         routeId: session.routeId,
         path: listing.path,
         home: listing.home,
+        nativeId,
       };
       directoryId = `remote:${session.deviceId}:${nativeId}`;
       map = "files";
       path = `fleet://directory/${encodeURIComponent(session.deviceId)}/${encodeURIComponent(nativeId)}`;
-      address = `Fleet Home / ${label}`;
+      address = `${session.deviceLabel} / ${listing.path}`;
       entries = await adoptWorkspaceEntries(
         directoryId,
         listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
@@ -674,6 +811,31 @@
     await navigateRemoteDirectory(session, item.path, displayName(item), item.binding.nativeId);
   }
 
+  function remotePathKey(deviceId: string, nativePath: string): string {
+    const windows = !nativePath.startsWith("/") && (
+      /^[A-Za-z]:[\\/]/.test(nativePath) || nativePath.startsWith("\\\\")
+    );
+    const normalized = nativePath.replace(/[\\/]+$/, "").replaceAll("\\", "/");
+    return deviceId + ":" + (windows ? normalized.toLocaleLowerCase("en-US") : normalized);
+  }
+
+  function remoteFallbackNativeId(nativePath: string): string {
+    return "path-fallback:" + stableTextId(remotePathKey("", nativePath).slice(1));
+  }
+
+  async function navigateRemotePath(session: RemoteSession, requestedPath: string, label: string) {
+    let nativeId = remoteDirectoryIds.get(remotePathKey(session.deviceId, requestedPath));
+    if (!nativeId) {
+      const event = await remoteRequest(session, {
+        kind: "stat",
+        path: requestedPath,
+      } as Omit<FileEvent, "req">);
+      if (event.kind !== "metadata" || !event.entry.dir) throw new Error("That location is not a folder");
+      nativeId = event.entry.native_id?.trim() || remoteFallbackNativeId(requestedPath);
+    }
+    await navigateRemoteDirectory(session, requestedPath, label, nativeId);
+  }
+
   async function navigateRemoteParent() {
     const current = currentRemoteDirectory;
     if (!current) return;
@@ -681,11 +843,11 @@
     if (!session) return;
     const parent = parentPath(current.path);
     if (parent === current.path) {
-      await navigateFleetHome();
+      await navigateComputer(current.deviceId, current.deviceLabel);
       return;
     }
     const label = parent.split(/[\\/]/).filter(Boolean).at(-1) || "Home";
-    await navigateRemoteDirectory(session, parent, label, `path-fallback:${stableTextId(parent)}`);
+    await navigateRemotePath(session, parent, label);
   }
 
   async function loadMore() {
@@ -706,41 +868,6 @@
         );
         nextCursor = listing.next_cursor ?? null;
         complete = !nextCursor;
-      } else if (fleetHome && cursor === "fleet-remote") {
-        const source = fleetPageCursors.values().next().value;
-        if (!source) {
-          nextCursor = null;
-          complete = true;
-          return;
-        }
-        const session = remoteSessions.get(source.deviceId);
-        if (!session) {
-          fleetPageCursors.delete(source.deviceId);
-          throw new Error("A Fleet Home source disconnected");
-        }
-        try {
-          const listing = await remoteList(session, source.path, source.cursor);
-          if (generation !== navigationGeneration || !fleetHome) return;
-          additions = await adoptWorkspaceEntries(
-            "fleet:home",
-            listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
-          );
-          if (listing.next_cursor) {
-            fleetPageCursors.set(source.deviceId, {
-              ...source,
-              path: listing.path,
-              cursor: listing.next_cursor,
-            });
-          } else {
-            fleetPageCursors.delete(source.deviceId);
-          }
-        } catch (error) {
-          fleetPageCursors.delete(source.deviceId);
-          throw error;
-        } finally {
-          nextCursor = fleetPageCursors.size > 0 ? "fleet-remote" : null;
-          complete = fleetPageCursors.size === 0;
-        }
       } else {
         const sourcePath = fleetHome ? localRootPath : path;
         const listing = await localFileList(sourcePath, cursor);
@@ -749,9 +876,8 @@
           fleetHome ? "fleet:home" : directoryId,
           listing.entries.map(localWorkspaceEntry),
         );
-        nextCursor = listing.nextCursor
-          ?? (fleetHome && fleetPageCursors.size > 0 ? "fleet-remote" : null);
-        complete = listing.complete && !nextCursor;
+        nextCursor = listing.nextCursor ?? null;
+        complete = listing.complete;
       }
       const known = new Set(entries.map((entry) => entry.id));
       entries = [...entries, ...additions.filter((entry) => !known.has(entry.id))];
@@ -768,7 +894,32 @@
     if (event.key !== "Enter") return;
     const next = address.trim();
     if (!next) return;
-    if (next.toLocaleLowerCase() === "fleet home" || next === "fleet://home") void navigateFleetHome(); else void navigate(next);
+    if (next.toLocaleLowerCase() === "fleet home" || next === "fleet://home") {
+      void navigateFleetHome();
+      return;
+    }
+    if (computerHome && currentComputer && next === address) {
+      void navigateComputer(currentComputer.deviceId, currentComputer.deviceLabel, false);
+      return;
+    }
+    if (next.startsWith("computer://")) {
+      navigateComputerTarget(next, true);
+      return;
+    }
+    if (["this pc", "computer"].includes(next.toLocaleLowerCase())) {
+      void navigateComputer();
+      return;
+    }
+    if (currentRemoteDirectory) {
+      const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+      if (!session) return;
+      const prefix = currentRemoteDirectory.deviceLabel + " / ";
+      const requested = next.startsWith(prefix) ? next.slice(prefix.length) : next;
+      void navigateRemotePath(session, requested, requested.split(/[\\/]/).filter(Boolean).at(-1) || "Home")
+        .catch((error) => app.toast("warn", "Couldn't open that fleet folder: " + String(error)));
+      return;
+    }
+    void navigate(next);
   }
 
   function togglePlaces() {
@@ -836,17 +987,36 @@
     try { localStorage.removeItem("allmystuff.files.wallpaperPath"); } catch {}
   }
 
+  function navigateComputerTarget(target: string, remember: boolean) {
+    let deviceId: string;
+    try {
+      deviceId = decodeURIComponent(target.slice("computer://".length));
+    } catch {
+      app.toast("warn", "That computer address is malformed");
+      return;
+    }
+    if (deviceId === canonicalDeviceId(app.localId)) {
+      void navigateComputer(app.localId, app.localNode?.label || nativeComputerName(), remember);
+      return;
+    }
+    const node = app.catalog.nodes.find((candidate) => canonicalDeviceId(candidate.id) === deviceId);
+    if (node) void navigateComputer(node.id, node.label, remember);
+    else app.toast("warn", "That fleet computer is no longer available");
+  }
+
   function browseHistory(delta: number) {
     const next = historyIndex + delta;
     if (next < 0 || next >= history.length) return;
     historyIndex = next;
     const target = history[next]!;
-    if (target === "fleet://home") void navigateFleetHome(); else void navigate(target, false);
+    if (target === "fleet://home") void navigateFleetHome();
+    else if (target.startsWith("computer://")) navigateComputerTarget(target, false);
+    else void navigate(target, false);
   }
 
   function goBack() {
     if (currentRemoteDirectory) {
-      void navigateFleetHome();
+      void navigateComputer(currentRemoteDirectory.deviceId, currentRemoteDirectory.deviceLabel);
       return;
     }
     browseHistory(-1);
@@ -854,7 +1024,15 @@
 
   function goUp() {
     if (fleetHome) return;
-    if (currentRemoteDirectory) void navigateRemoteParent(); else void navigate(parentPath(path));
+    if (computerHome) {
+      void navigateFleetHome();
+    } else if (currentRemoteDirectory) {
+      void navigateRemoteParent();
+    } else {
+      const parent = parentPath(path);
+      if (parent === path) void navigateComputer();
+      else void navigate(parent);
+    }
   }
 
   function refreshWorkspace() {
@@ -862,11 +1040,14 @@
       void navigateFleetHome();
       return;
     }
+    if (computerHome && currentComputer) {
+      void navigateComputer(currentComputer.deviceId, currentComputer.deviceLabel, false);
+      return;
+    }
     if (currentRemoteDirectory) {
       const session = remoteSessions.get(currentRemoteDirectory.deviceId);
       if (session) {
-        const label = currentRemoteDirectory.path.split(/[\\/]/).filter(Boolean).at(-1) || "Home";
-        void navigateRemoteDirectory(session, currentRemoteDirectory.path, label, `path-fallback:${stableTextId(currentRemoteDirectory.path)}`);
+        void navigateRemoteDirectory(session, currentRemoteDirectory.path, "Current folder", currentRemoteDirectory.nativeId);
       }
       return;
     }
@@ -997,7 +1178,7 @@
   }
 
   function loadNativeIcon(node: HTMLElement, item: WorkspaceEntry) {
-    if (item.binding.kind !== "local" || platform !== "windows" || nativeIconFor(item)) return {};
+    if (item.computerNode || item.binding.kind !== "local" || platform !== "windows" || nativeIconFor(item)) return {};
     let cancelled = false;
     const observer = new IntersectionObserver((events) => {
       if (!events.some((event) => event.isIntersecting)) return;
@@ -1051,15 +1232,23 @@
   }
 
   async function open(item: WorkspaceEntry) {
+    if (item.computerNode) {
+      await navigateComputer(item.binding.deviceId, item.binding.deviceLabel);
+      return;
+    }
     recent = [item, ...recent.filter((entry) => entry.id !== item.id)].slice(0, 8);
     if (item.binding.kind === "remote") {
-      if (item.dir && !item.virtualItem) {
-        await navigateRemoteItem(item);
-        return;
-      }
       const session = remoteSessions.get(item.binding.deviceId);
       if (!session) {
         app.toast("warn", "That device's Files connection is no longer active");
+        return;
+      }
+      if (item.dir) {
+        if (item.virtualItem) {
+          await navigateRemotePath(session, item.path, displayName(item));
+        } else {
+          await navigateRemoteItem(item);
+        }
         return;
       }
       const req = session.nextReq++;
@@ -1079,11 +1268,13 @@
       }
       return;
     }
-    if (item.dir && !item.virtualItem) await navigate(item.path);
+    if (item.dir) await navigate(item.path);
     else await localFileOpen(item.path);
   }
 
   function icon(item: WorkspaceEntry): string {
+    if (item.computerNode) return "\u{1F5A5}\u{FE0F}";
+    if (item.virtualItem && item.dir) return "\u{1F4BD}";
     if (item.dir) return item.symlink ? "🗂️" : "📁";
     const ext = item.name.split(".").pop()?.toLowerCase();
     if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext ?? "")) return "🖼️";
@@ -1098,6 +1289,54 @@
     return platform === "macos" ? "Finder" : platform === "windows" ? "File Explorer" : "Files";
   }
 
+  function nativeComputerName(): string {
+    return platform === "windows" ? "This PC" : platform === "macos" ? "Computer" : "Filesystem";
+  }
+
+  function sameNativePath(left: string, right: string): boolean {
+    const windows = [left, right].some((value) =>
+      !value.startsWith("/") && (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\"))
+    );
+    const normalize = (value: string) => {
+      const stripped = value.replace(/[\\/]+$/, "").replaceAll("\\", "/");
+      return windows ? stripped.toLocaleLowerCase("en-US") : stripped;
+    };
+    return normalize(left) === normalize(right);
+  }
+
+  function navigatorCrumbLabel(label: string, nativePath: string): string {
+    if (currentRemoteDirectory && sameNativePath(nativePath, currentRemoteDirectory.home)) return "Home";
+    if (!currentRemoteDirectory) {
+      const place = locations.find((candidate) => sameNativePath(candidate.path, nativePath));
+      if (place) return place.label;
+    }
+    return label;
+  }
+
+  function openNavigatorCrumb(nativePath: string, label: string) {
+    if (!currentRemoteDirectory) {
+      void navigate(nativePath);
+      return;
+    }
+    const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+    if (!session) return;
+    void navigateRemotePath(session, nativePath, label)
+      .catch((error) => app.toast("warn", "Couldn't open that fleet folder: " + String(error)));
+  }
+
+  function computerBranchActive(deviceId: string): boolean {
+    const canonical = canonicalDeviceId(deviceId);
+    if (computerHome && currentComputer) return canonicalDeviceId(currentComputer.deviceId) === canonical;
+    if (currentRemoteDirectory) return canonicalDeviceId(currentRemoteDirectory.deviceId) === canonical;
+    return (
+      canonical === canonicalDeviceId(app.localId) &&
+      !fleetHome &&
+      !computerHome &&
+      !currentRemoteDirectory
+    );
+  }
+
+
   function displayName(item: WorkspaceEntry): string {
     return nativeFileDisplayName(item.name, platform);
   }
@@ -1111,6 +1350,8 @@
   }
 
   function fileType(item: WorkspaceEntry): string {
+    if (item.computerNode) return "Computer";
+    if (item.virtualItem && item.dir) return "Drive";
     if (item.dir) return "Folder";
     if (isWindowsShellLink(item)) return "Shortcut";
     const extension = item.name.includes(".") ? item.name.split(".").pop()?.toUpperCase() : "";
@@ -1125,7 +1366,7 @@
     // selection honest instead of implying that an action targets a group.
     if (!selectedIds.has(item.id) || selectedIds.size > 1) void select(item);
     context = null;
-    if (item.binding.kind === "local" && platform === "windows") {
+    if (!item.computerNode && item.binding.kind === "local" && platform === "windows") {
       void localFileContextMenu(item.path).catch((error) => {
         context = { ...menuPosition, item };
         app.toast("warn", `Windows couldn't build its menu; showing the safe fallback. ${String(error)}`);
@@ -1705,6 +1946,7 @@
   }
 
   async function createFolder() {
+    if (computerHome) return;
     const operationDirectory = directoryId;
     try {
       let created: WorkspaceEntry;
@@ -1859,8 +2101,8 @@
     <button title="Up one folder" disabled={fleetHome} onclick={goUp}>↑</button>
     <button onclick={refreshWorkspace} title="Refresh">↻</button>
     <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Location" spellcheck="false" />
-    <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleet Home" : "Search this folder"} aria-label="Search files" />
-    <button onclick={createFolder} disabled={map !== "files"} title="New folder">＋ Folder</button>
+    <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleet Home" : computerHome ? "Search drives" : "Search this folder"} aria-label="Search files" />
+    <button onclick={createFolder} disabled={map !== "files" || computerHome} title="New folder">＋ Folder</button>
     <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
     {#if map === "files"}
       <div class="switch" role="group" aria-label="View">
@@ -1872,7 +2114,7 @@
           {#each FILE_TILE_SIZES as size}<option value={size}>{size === 32 ? "Small" : size === 48 ? "Medium" : "Large"} icons</option>{/each}
         </select>
       {/if}
-      <button class:active={showHidden} aria-pressed={showHidden} onclick={toggleHidden} title={showHidden ? "Hide hidden files" : "Show hidden files"}>···</button>
+      <button class:active={showHidden} aria-pressed={showHidden} onclick={toggleHidden} title={showHidden ? "Hide hidden files" : "Show hidden files"}>&#183;&#183;&#183;</button>
     {/if}
   </nav>
 
@@ -1885,6 +2127,42 @@
     {#if placesOpen}
       <div class="sidebar-body">
         <button class:active={fleetHome && map === "files"} onclick={navigateFleetHome}><span>⌂</span>Fleet Home</button>
+        <div class="computer-tree" aria-label="Fleet filesystem tree">
+          <button class:active={computerBranchActive(app.localId)} onclick={() => { void navigateComputer(); }} title={app.localNode?.label || nativeComputerName()}><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
+          {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(app.localId)}
+            <div class="location-branch" aria-label="Drives on this computer">
+              {#each entries as drive (drive.id)}
+                <button title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
+              {/each}
+            </div>
+          {:else if !fleetHome && !computerHome && !currentRemoteDirectory}
+            <div class="location-branch local" aria-label="Current location">
+              {#each navigatorTrail as crumb, index (crumb.path)}
+                <button class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                  {navigatorCrumbLabel(crumb.label, crumb.path)}
+                </button>
+              {/each}
+            </div>
+          {/if}
+          {#each fleetFileNodes as node (node.id)}
+            <button class:active={computerBranchActive(node.id)} class:offline={!node.online} onclick={() => { void navigateComputer(node.id, node.label); }} title={node.online ? node.label : node.label + " (offline)"}><span aria-hidden="true">&#9635;</span>{node.label}</button>
+            {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(node.id)}
+              <div class="location-branch" aria-label={"Drives on " + node.label}>
+                {#each entries as drive (drive.id)}
+                  <button title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
+                {/each}
+              </div>
+            {:else if currentRemoteDirectory && canonicalDeviceId(currentRemoteDirectory.deviceId) === canonicalDeviceId(node.id)}
+              <div class="location-branch" aria-label={"Current location on " + node.label}>
+                {#each navigatorTrail as crumb, index (crumb.path)}
+                  <button class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                    {navigatorCrumbLabel(crumb.label, crumb.path)}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          {/each}
+        </div>
         <p class="source-summary">{sourceSummary}</p>
         <h3>Recent</h3>
         {#if recent.length === 0}<p>Files opened from anywhere in the fleet appear here.</p>{/if}
@@ -1957,6 +2235,7 @@
           <div
             class="detail-row"
             class:selected={selectedIds.has(item.id)}
+            class:offline={item.computerNode && item.computerOnline === false}
             role="button"
             tabindex="0"
             onclick={(event) => {
@@ -2031,6 +2310,7 @@
             <div
               class="file-tile"
               class:selected={selectedIds.has(item.id)}
+              class:offline={item.computerNode && item.computerOnline === false}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
               role="button"
               tabindex="0"
@@ -2107,7 +2387,7 @@
             {:else}<span>{icon(selected)}</span>{/if}
           </div>
           <h2>{displayName(selected)}</h2>
-          <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
+          <p>{selected.dir ? fileType(selected) : humanBytes(selected.size)}</p>
           {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
           <dl>
             <dt>Fleet location</dt><dd>{address}</dd>
@@ -2115,10 +2395,10 @@
             <dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>
             {#if isWindowsShellLink(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}
           </dl>
-          {#if selected.binding.kind === "local"}
+          {#if selected.binding.kind === "local" && !selected.computerNode}
             <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
           {:else if selected.dir}
-            <button class="native-open" onclick={() => navigateRemoteItem(selected)}>Open fleet folder</button>
+            <button class="native-open" onclick={() => { void open(selected); }}>Open in AllMyStuff</button>
           {/if}
         {:else}
           <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
@@ -2130,7 +2410,7 @@
   {#if context}
     <div class="context-menu" style={`left:${context.x}px;top:${context.y}px`} role="menu">
       <button onclick={() => { void open(context!.item); context = null; }}>Open</button>
-      {#if context.item.binding.kind === "local"}
+      {#if context.item.binding.kind === "local" && !context.item.computerNode}
         <button onclick={() => { void localFileOpen(context!.item.path, true); context = null; }}>Show in {nativeBrowserName()}</button>
       {:else}
         <button disabled>Available through {context.item.binding.deviceLabel}</button>
@@ -2180,8 +2460,17 @@
   .preview .preview-edge { left: 0; width: 7px; }
   .places h3 { margin: 1rem .5rem .35rem; color: var(--ink-faint); font-size: .66rem; text-transform: uppercase; letter-spacing: .09em; }
   .places h3:first-child { margin-top: .2rem; }
-  .places .sidebar-body > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .places .sidebar-body > button:hover, .places .sidebar-body > button.active { background: var(--surface-2); color: var(--ink); }
+  .places .sidebar-body > button, .computer-tree > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .places .sidebar-body > button:hover, .places .sidebar-body > button.active, .computer-tree > button:hover, .computer-tree > button.active { background: var(--surface-2); color: var(--ink); }
+  .computer-tree { display: flex; flex-direction: column; }
+  .computer-tree > button span { flex: 0 0 auto; color: var(--ink-faint); }
+  .location-branch { display: flex; flex-direction: column; margin: 0 0 .2rem 1rem; padding-left: .45rem; border-left: 1px solid var(--line); }
+  .location-branch button { min-width: 0; display: flex; gap: .35rem; align-items: center; padding: .34rem .45rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .location-branch button::before { content: ""; flex: 0 0 .45rem; height: .42rem; margin-left: -.46rem; border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .location-branch button:hover, .location-branch button.current { background: var(--surface-2); color: var(--ink); }
+  .location-branch button.current { color: var(--ink); font-weight: 600; }
+  .computer-tree > button.active { color: var(--accent-ink); }
+  .computer-tree > button.offline, .file-tile.offline, .detail-row.offline { opacity: .52; }
   .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }.source-summary { margin: .25rem 0 .4rem; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }

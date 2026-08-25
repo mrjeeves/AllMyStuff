@@ -3,6 +3,70 @@ export type FilesMap = "files" | "sharing";
 
 export interface Point { x: number; y: number }
 export interface Rect extends Point { width: number; height: number }
+export interface NativeLocationCrumb {
+  label: string;
+  path: string;
+}
+
+/** Build clickable native-path ancestry without pretending every host uses
+ * this viewer's path syntax. Absolute POSIX paths win over the presence of a
+ * legal backslash filename; Windows handles drive, UNC, and extended paths. */
+export function nativeLocationTrail(path: string, platform = ""): NativeLocationCrumb[] {
+  const windows = !path.startsWith("/") && (
+    platform.toLocaleLowerCase().startsWith("win") ||
+    /^[A-Za-z]:[\\/]/.test(path) ||
+    path.startsWith("\\\\")
+  );
+  if (!windows) {
+    if (!path.startsWith("/")) {
+      const parts = path.split("/").filter(Boolean);
+      return parts.map((label, index) => ({ label, path: parts.slice(0, index + 1).join("/") }));
+    }
+    const parts = path.split("/").filter(Boolean);
+    return [
+      { label: "/", path: "/" },
+      ...parts.map((label, index) => ({ label, path: "/" + parts.slice(0, index + 1).join("/") })),
+    ];
+  }
+  const normalized = path.replaceAll("/", "\\");
+  const extendedUnc = /^\\\\\?\\UNC\\([^\\]+)\\([^\\]+)\\?(.*)$/i.exec(normalized);
+  if (extendedUnc) {
+    const root = "\\\\?\\UNC\\" + extendedUnc[1] + "\\" + extendedUnc[2] + "\\";
+    const parts = extendedUnc[3]!.split("\\").filter(Boolean);
+    return [
+      { label: "\\\\" + extendedUnc[1] + "\\" + extendedUnc[2], path: root },
+      ...parts.map((label, index) => ({
+        label,
+        path: root + parts.slice(0, index + 1).join("\\"),
+      })),
+    ];
+  }
+  const extendedDrive = /^\\\\\?\\([A-Za-z]:)\\?(.*)$/.exec(normalized);
+  const drive = /^([A-Za-z]:)\\?(.*)$/.exec(normalized);
+  const driveMatch = extendedDrive ?? drive;
+  if (driveMatch) {
+    const prefix = extendedDrive ? "\\\\?\\" + driveMatch[1] + "\\" : driveMatch[1] + "\\";
+    const parts = driveMatch[2]!.split("\\").filter(Boolean);
+    return [
+      { label: driveMatch[1]!, path: prefix },
+      ...parts.map((label, index) => ({ label, path: prefix + parts.slice(0, index + 1).join("\\") })),
+    ];
+  }
+  const uncParts = normalized.slice(2).split("\\").filter(Boolean);
+  if (normalized.startsWith("\\\\") && uncParts.length >= 2) {
+    const root = "\\\\" + uncParts[0] + "\\" + uncParts[1] + "\\";
+    return [
+      { label: "\\\\" + uncParts[0] + "\\" + uncParts[1], path: root },
+      ...uncParts.slice(2).map((label, index) => ({
+        label,
+        path: root + uncParts.slice(2, index + 3).join("\\"),
+      })),
+    ];
+  }
+  const parts = normalized.split("\\").filter(Boolean);
+  return parts.map((label, index) => ({ label, path: parts.slice(0, index + 1).join("\\") }));
+}
+
 
 export interface CanvasStamp {
   counter: number;

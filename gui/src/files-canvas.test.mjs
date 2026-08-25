@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -30,6 +30,30 @@ test("fallback file identity folds Windows paths but not POSIX case", () => {
   assert.equal(fileReferenceId("node:a", "C:\\Users\\Chris\\Doc.txt", "windows"), fileReferenceId("node:a", "c:/users/chris/doc.txt", "windows"));
   assert.notEqual(fileReferenceId("node:a", "/Users/Chris/Doc.txt", "macos"), fileReferenceId("node:a", "/Users/Chris/doc.txt", "macos"));
   assert.notEqual(fileReferenceId("node:a", "/tmp/a", "linux"), fileReferenceId("node:b", "/tmp/a", "linux"));
+});
+
+test("native location trails preserve host path syntax and every clickable ancestor", () => {
+  assert.deepEqual(nativeLocationTrail("C:\\Users\\Chris\\Documents", "windows"), [
+    { label: "C:", path: "C:\\" },
+    { label: "Users", path: "C:\\Users" },
+    { label: "Chris", path: "C:\\Users\\Chris" },
+    { label: "Documents", path: "C:\\Users\\Chris\\Documents" },
+  ]);
+  assert.deepEqual(nativeLocationTrail("\\\\server\\share\\Projects\\AMS", "windows"), [
+    { label: "\\\\server\\share", path: "\\\\server\\share\\" },
+    { label: "Projects", path: "\\\\server\\share\\Projects" },
+    { label: "AMS", path: "\\\\server\\share\\Projects\\AMS" },
+  ]);
+  const extendedUnc = nativeLocationTrail("\\\\?\\UNC\\server\\share\\Projects\\AMS", "windows");
+  assert.deepEqual(extendedUnc[0], { label: "\\\\server\\share", path: "\\\\?\\UNC\\server\\share\\" });
+  assert.deepEqual(extendedUnc.at(-1), { label: "AMS", path: "\\\\?\\UNC\\server\\share\\Projects\\AMS" });
+  assert.deepEqual(nativeLocationTrail("/Users/Chris/Documents", "macos"), [
+    { label: "/", path: "/" },
+    { label: "Users", path: "/Users" },
+    { label: "Chris", path: "/Users/Chris" },
+    { label: "Documents", path: "/Users/Chris/Documents" },
+  ]);
+  assert.deepEqual(nativeLocationTrail("/tmp/a\\b", "windows").at(-1), { label: "a\\b", path: "/tmp/a\\b" });
 });
 
 test("Windows shell-link presentation hides only final native suffixes", () => {

@@ -16,6 +16,7 @@ import {
   type GrantRequest,
 } from "./catalog";
 import { reconcileCecOnlyCanons } from "./cec-provenance";
+import { nearestFileTileSize } from "./files-canvas";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -657,7 +658,7 @@ export interface FilesSettings {
 
 const DEFAULT_FILES_SETTINGS: FilesSettings = {
   defaultView: "canvas",
-  thumbnailSize: 92,
+  thumbnailSize: 96,
   showHidden: false,
   showPreview: true,
 };
@@ -667,7 +668,7 @@ function loadFilesSettings(): FilesSettings {
     const saved = JSON.parse(localStorage.getItem(FILES_SETTINGS_STORE_KEY) ?? "{}");
     return {
       defaultView: saved.defaultView === "details" ? "details" : "canvas",
-      thumbnailSize: Math.max(64, Math.min(150, Number(saved.thumbnailSize) || 92)),
+      thumbnailSize: nearestFileTileSize(Number(saved.thumbnailSize)),
       showHidden: saved.showHidden === true,
       showPreview: saved.showPreview !== false,
     };
@@ -2803,10 +2804,7 @@ class AppStore {
     this.filesSettings = {
       ...this.filesSettings,
       ...patch,
-      thumbnailSize: Math.max(
-        64,
-        Math.min(150, Number(patch.thumbnailSize ?? this.filesSettings.thumbnailSize)),
-      ),
+      thumbnailSize: nearestFileTileSize(Number(patch.thumbnailSize ?? this.filesSettings.thumbnailSize)),
     };
     try {
       localStorage.setItem(FILES_SETTINGS_STORE_KEY, JSON.stringify(this.filesSettings));

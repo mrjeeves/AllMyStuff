@@ -26,7 +26,7 @@
 
     <label class="range">
       <span><b>Thumbnail size</b><output>{app.filesSettings.thumbnailSize}px</output></span>
-      <input type="range" min="64" max="150" value={app.filesSettings.thumbnailSize} onchange={(event) => app.updateFilesSettings({ thumbnailSize: event.currentTarget.valueAsNumber })} />
+      <input type="range" min="64" max="144" step="16" value={app.filesSettings.thumbnailSize} onchange={(event) => app.updateFilesSettings({ thumbnailSize: event.currentTarget.valueAsNumber })} />
     </label>
 
     <label class="toggle">

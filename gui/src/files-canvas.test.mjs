@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, fileReferenceId, mergeCanvasRecords, nativeFileDisplayName, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, mergeCanvasRecords, nativeFileDisplayName, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -32,11 +32,29 @@ test("fallback file identity folds Windows paths but not POSIX case", () => {
   assert.notEqual(fileReferenceId("node:a", "/tmp/a", "linux"), fileReferenceId("node:b", "/tmp/a", "linux"));
 });
 
-test("Windows shortcut presentation hides only the final lnk suffix", () => {
+test("Windows shell-link presentation hides only final native suffixes", () => {
   assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "windows"), "AllMyAgents");
   assert.equal(nativeFileDisplayName("CEC Support.LNK", "Windows_NT"), "CEC Support");
+  assert.equal(nativeFileDisplayName("Erin's Zoom.url", "windows"), "Erin's Zoom");
+  assert.equal(nativeWindowsLinkExtension("Erin's Zoom.URL", "windows"), ".url");
   assert.equal(nativeFileDisplayName("notes.lnk.txt", "windows"), "notes.lnk.txt");
   assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "linux"), "AllMyAgents.lnk");
+});
+
+test("file tile sizes snap to bounded non-overlapping notches", () => {
+  assert.deepEqual(FILE_TILE_SIZES, [64, 80, 96, 112, 128, 144]);
+  assert.equal(nearestFileTileSize(63), 64);
+  assert.equal(nearestFileTileSize(91), 96);
+  assert.equal(nearestFileTileSize(150), 144);
+  assert.equal(nearestFileTileSize(Number.NaN), 96);
+});
+
+test("desktop fallback stays column-major across compact canvas measurement", () => {
+  const initial = Array.from({ length: 5 }, (_, index) => desktopColumnPosition(index, 96, 720));
+  const measured = Array.from({ length: 5 }, (_, index) => desktopColumnPosition(index, 96, 280));
+  assert.deepEqual(measured, initial);
+  assert.ok(measured[1].y > measured[0].y);
+  assert.ok(measured[4].x > measured[0].x);
 });
 
 test("concurrent frame reparenting cannot leave a cyclic hierarchy", () => {

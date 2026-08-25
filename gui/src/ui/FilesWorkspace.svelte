@@ -22,7 +22,9 @@
   import {
     contains,
     containingFrame,
+    desktopColumnPosition,
     nativeFileDisplayName,
+    nativeWindowsLinkExtension,
     descendantsOf,
     mergeCanvasRecords,
     normalizeFrameNesting,
@@ -284,12 +286,8 @@
   }
 
   function fallbackPosition(index: number) {
-    const columnWidth = tileSize + 36;
-    const rowHeight = tileSize + 58;
-    const itemsPerColumn = Math.max(1, Math.floor(Math.max(rowHeight, canvasHeight - 144) / rowHeight));
     return {
-      x: 64 + Math.floor(index / itemsPerColumn) * columnWidth,
-      y: 72 + (index % itemsPerColumn) * rowHeight,
+      ...desktopColumnPosition(index, tileSize, canvasHeight),
       parentId: null,
     };
   }
@@ -390,13 +388,17 @@
     return nativeFileDisplayName(item.name, platform);
   }
 
-  function isWindowsShortcut(item: LocalFileEntry): boolean {
-    return platform.toLowerCase().startsWith("win") && /\.lnk$/i.test(item.name);
+  function windowsLinkExtension(item: LocalFileEntry): ".lnk" | ".url" | null {
+    return nativeWindowsLinkExtension(item.name, platform);
+  }
+
+  function isWindowsShellLink(item: LocalFileEntry): boolean {
+    return windowsLinkExtension(item) !== null;
   }
 
   function fileType(item: LocalFileEntry): string {
     if (item.dir) return "Folder";
-    if (isWindowsShortcut(item)) return "Shortcut";
+    if (isWindowsShellLink(item)) return "Shortcut";
     const extension = item.name.includes(".") ? item.name.split(".").pop()?.toUpperCase() : "";
     return extension || "File";
   }
@@ -404,13 +406,17 @@
   function showContextMenu(event: MouseEvent, item: LocalFileEntry) {
     event.preventDefault();
     event.stopPropagation();
+    const menuPosition = { x: event.clientX, y: event.clientY };
     void select(item);
     context = null;
     if (platform === "windows") {
-      void localFileContextMenu(item.path).catch((error) => app.toast("warn", String(error)));
+      void localFileContextMenu(item.path).catch((error) => {
+        context = { ...menuPosition, item };
+        app.toast("warn", `Windows couldn't build its menu; showing the safe fallback. ${String(error)}`);
+      });
       return;
     }
-    context = { x: event.clientX, y: event.clientY, item };
+    context = { ...menuPosition, item };
   }
 
   function loadThumbnail(node: HTMLElement, item: LocalFileEntry) {
@@ -478,6 +484,7 @@
 
   function dragFrame(event: PointerEvent, frame: CanvasFrame) {
     if (event.button !== 0) return;
+    if (frameTool) return;
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY };
     const children = descendantsOf(frame.id, frames);
@@ -540,7 +547,8 @@
   function panCanvas(event: PointerEvent) {
     if (event.button !== 0) return;
     const target = event.target as Element;
-    if (target.closest(".file-tile, .canvas-frame, .load-more, .zoom, .share-frame")) return;
+    if (frameTool && target.closest(".file-tile, button, input, .share-frame")) return;
+    if (!frameTool && target.closest(".file-tile, .canvas-frame, .load-more, .zoom, .share-frame")) return;
     if (frameTool) {
       const viewport = event.currentTarget as HTMLElement;
       const rect = viewport.getBoundingClientRect();
@@ -626,9 +634,18 @@
   }
 
   function zoomCanvas(event: WheelEvent) {
-    if (!event.ctrlKey) return;
     event.preventDefault();
-    zoom = Math.max(0.45, Math.min(2, zoom * (event.deltaY > 0 ? 0.9 : 1.1)));
+    const viewport = event.currentTarget as HTMLElement;
+    const rect = viewport.getBoundingClientRect();
+    const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? 16
+      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? viewport.clientHeight : 1;
+    const nextZoom = Math.max(0.45, Math.min(2, zoom * Math.exp(-event.deltaY * unit * 0.0015)));
+    if (nextZoom === zoom) return;
+    const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const world = { x: (cursor.x - pan.x) / zoom, y: (cursor.y - pan.y) / zoom };
+    pan = { x: cursor.x - world.x * nextZoom, y: cursor.y - world.y * nextZoom };
+    zoom = nextZoom;
   }
 
   async function createFolder() {
@@ -640,7 +657,8 @@
   async function rename(item: LocalFileEntry) {
     const requested = window.prompt("Rename", displayName(item));
     if (!requested) return;
-    const name = isWindowsShortcut(item) && !/\.lnk$/i.test(requested) ? `${requested}.lnk` : requested;
+    const suffix = windowsLinkExtension(item);
+    const name = suffix && !requested.toLowerCase().endsWith(suffix) ? `${requested}${suffix}` : requested;
     if (name === item.name) return;
     try { await localFileRename(item.path, name); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
   }
@@ -738,7 +756,7 @@
     <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Location" spellcheck="false" />
     <input class="search" bind:value={query} disabled={map !== "files"} placeholder="Search this folder" aria-label="Search this folder" />
     <button onclick={createFolder} disabled={map !== "files"} title="New folder">＋ Folder</button>
-    <button class:active={frameTool} onclick={newFrame} title={map === "files" ? "Draw a nestable canvas frame" : "Add a nestable canvas frame"}>▱ Frame</button>
+    <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
     <div class="switch" role="group" aria-label="Canvas content">
       <button class:active={map === "files"} onclick={() => changeMap("files")}>Files</button>
       <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}>Sharing map</button>
@@ -748,8 +766,8 @@
         <button class:active={view === "canvas"} onclick={() => changeView("canvas")} title="Thumbnails">▦</button>
         <button class:active={view === "details"} onclick={() => changeView("details")} title="Details">☷</button>
       </div>
-      {#if view === "canvas"}<input type="range" min="64" max="150" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Thumbnail size" />{/if}
-      <button class:active={showHidden} onclick={toggleHidden} title="Show hidden files">···</button>
+      {#if view === "canvas"}<input type="range" min="64" max="144" step="16" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Icon size" />{/if}
+      <button class:active={showHidden} aria-pressed={showHidden} onclick={toggleHidden} title={showHidden ? "Hide hidden files" : "Show hidden files"}>···</button>
     {/if}
   </nav>
 
@@ -893,7 +911,7 @@
           <h2>{displayName(selected)}</h2>
           <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
           {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
-          <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if isWindowsShortcut(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
+          <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if isWindowsShellLink(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
           <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
         {:else}
           <div class="preview-empty"><span>◫</span><b>Select an item</b><p>Preview and file details appear here.</p></div>
@@ -924,6 +942,7 @@
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
   .filebar > button, .switch button, .native-open { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
   .filebar > button:disabled { opacity: .35; }
+  .filebar > button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); box-shadow: inset 0 0 0 1px var(--accent); }
   .crumb { min-width: 8rem; flex: 1; padding: .45rem .65rem; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: .78rem; }
   .search { width: min(15rem, 20vw); padding: .45rem .65rem; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink); }
   .switch { display: inline-flex; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }

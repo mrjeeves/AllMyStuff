@@ -112,10 +112,40 @@ export function fileReferenceId(origin: string, path: string, platform: string):
   return `${origin}:${windows ? normalized.toLocaleLowerCase("en-US") : normalized}`;
 }
 
+export const FILE_TILE_SIZES = [64, 80, 96, 112, 128, 144] as const;
+
+export function nearestFileTileSize(input: number): number {
+  const value = Number.isFinite(input) ? input : 96;
+  return FILE_TILE_SIZES.reduce((best, size) =>
+    Math.abs(size - value) < Math.abs(best - value) ? size : best,
+  );
+}
+
+/** Native desktops fill downward before starting the next column. Keeping a
+ * small minimum column length also prevents compact app windows from flipping
+ * the same directory into an apparent row after the first measurement. */
+export function desktopColumnPosition(index: number, tileSize: number, canvasHeight: number): Point {
+  const columnWidth = tileSize + 36;
+  const rowHeight = tileSize + 58;
+  const measuredRows = Math.floor(Math.max(rowHeight, canvasHeight - 144) / rowHeight);
+  const itemsPerColumn = Math.max(4, measuredRows);
+  return {
+    x: 64 + Math.floor(index / itemsPerColumn) * columnWidth,
+    y: 72 + (index % itemsPerColumn) * rowHeight,
+  };
+}
+
+export function nativeWindowsLinkExtension(name: string, platform: string): ".lnk" | ".url" | null {
+  if (!platform.toLowerCase().startsWith("win")) return null;
+  const match = /\.(lnk|url)$/i.exec(name);
+  return match ? `.${match[1]!.toLowerCase()}` as ".lnk" | ".url" : null;
+}
+
 /** Match Explorer's presentation without changing the actual filesystem name.
- * Only a final, case-insensitive .lnk suffix is hidden, and only on Windows. */
+ * Final .lnk and .url suffixes are hidden only on Windows. */
 export function nativeFileDisplayName(name: string, platform: string): string {
-  return platform.toLowerCase().startsWith("win") && /\.lnk$/i.test(name) ? name.slice(0, -4) : name;
+  const suffix = nativeWindowsLinkExtension(name, platform);
+  return suffix ? name.slice(0, -suffix.length) : name;
 }
 
 export function descendantsOf(id: string, frames: readonly CanvasFrame[]): Set<string> {

@@ -24,6 +24,19 @@ use windows::{
 const ICON_SIZE: i32 = 96;
 
 pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+    // SHGetFileInfo requires COM on the calling thread. Directory pages run on
+    // Tokio workers, so the UI thread's COM apartment does not cover them.
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let icon = shortcut_icon_initialized(path);
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    icon
+}
+
+fn shortcut_icon_initialized(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt as _;
 
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -151,4 +164,20 @@ fn render_icon(icon: HICON) -> Option<String> {
         encoder.write_header().ok()?.write_image_data(&rgba).ok()?;
     }
     Some(STANDARD.encode(png_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_shell_icon_is_a_png() {
+        let path = std::env::var_os("ALLMYSTUFF_ICON_PROBE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().expect("test executable path"));
+        let encoded = shortcut_icon(&path)
+            .unwrap_or_else(|| panic!("Windows Shell returned no icon for {}", path.display()));
+        let decoded = STANDARD.decode(encoded).expect("base64 PNG");
+        assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()),);
+    }
 }

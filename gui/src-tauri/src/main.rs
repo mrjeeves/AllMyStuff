@@ -1033,6 +1033,21 @@ struct LocalFileLocation {
     kind: String,
 }
 
+#[cfg(windows)]
+fn windows_file_is_hidden(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+    attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+fn windows_shell_link_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lnk") || extension.eq_ignore_ascii_case("url")
+        })
+}
+
 #[derive(serde::Serialize)]
 struct LocalFileEntry {
     id: String,
@@ -1271,18 +1286,12 @@ async fn local_file_list(
             #[cfg(windows)]
             let hidden = {
                 use std::os::windows::fs::MetadataExt as _;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
-                };
-                identity_meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
-                    != 0
+                windows_file_is_hidden(identity_meta.file_attributes())
             };
             #[cfg(not(windows))]
             let hidden = name.starts_with('.');
             #[cfg(windows)]
-            let shell_icon = name
-                .to_ascii_lowercase()
-                .ends_with(".lnk")
+            let shell_icon = windows_shell_link_name(&name)
                 .then(|| shell_icon::shortcut_icon(&entry_path))
                 .flatten();
             #[cfg(not(windows))]
@@ -1481,101 +1490,102 @@ unsafe fn windows_shell_context_menu(
     use windows::{
         core::{PCSTR, PCWSTR},
         Win32::{
-            Foundation::POINT,
-            System::Com::{
-                CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
-            },
+            Foundation::{LPARAM, POINT, WPARAM},
+            System::Com::{CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED},
             UI::{
                 Shell::{
-                    Common::ITEMIDLIST, IContextMenu, IShellFolder, SHBindToParent,
-                    SHParseDisplayName, CMF_NORMAL, CMINVOKECOMMANDINFO,
+                    BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName,
+                    CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
                 },
                 WindowsAndMessaging::{
-                    CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
-                    TrackPopupMenu, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                    CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
+                    TrackPopupMenu, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
                 },
             },
         },
     };
 
-    // Tauri/WebView initializes COM on the UI thread. Balance only our own
-    // successful initialization; RPC_E_CHANGED_MODE means it was initialized
-    // in another apartment and is still usable here.
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-    let mut absolute: *mut ITEMIDLIST = std::ptr::null_mut();
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut absolute, 0, None)? };
+    let outcome = (|| -> windows::core::Result<()> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let item: IShellItem =
+            unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)? };
+        let shell_menu: IContextMenu =
+            unsafe { item.BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)? };
+        let menu = unsafe { CreatePopupMenu()? };
+        let menu_outcome = (|| -> windows::core::Result<()> {
+            unsafe {
+                shell_menu
+                    .QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL | CMF_EXPLORE)
+                    .ok()?
+            };
 
-    let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-    let parent: IShellFolder = unsafe { SHBindToParent(absolute, Some(&mut child))? };
-    let shell_menu: IContextMenu =
-        unsafe { parent.GetUIObjectOf(hwnd, &[child.cast_const()], None)? };
-    let menu = unsafe { CreatePopupMenu()? };
-    unsafe {
-        shell_menu
-            .QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL)
-            .ok()?
-    };
-
-    let mut point = POINT::default();
-    unsafe {
-        GetCursorPos(&mut point)?;
-        let _ = SetForegroundWindow(hwnd);
+            let mut point = POINT::default();
+            unsafe {
+                GetCursorPos(&mut point)?;
+                let _ = SetForegroundWindow(hwnd);
+            }
+            let command = unsafe {
+                TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                    point.x,
+                    point.y,
+                    None,
+                    hwnd,
+                    None,
+                )
+                .0 as u32
+            };
+            // Windows documents this nudge for repeated TrackPopupMenu calls.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+            if command != 0 {
+                let invoke = CMINVOKECOMMANDINFO {
+                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                    hwnd,
+                    // Shell command ids are passed as MAKEINTRESOURCEA offsets.
+                    lpVerb: PCSTR((command - 1) as usize as *const u8),
+                    nShow: SW_SHOWNORMAL.0,
+                    ..Default::default()
+                };
+                unsafe { shell_menu.InvokeCommand(&invoke)? };
+            }
+            Ok(())
+        })();
+        let _ = unsafe { DestroyMenu(menu) };
+        menu_outcome
+    })();
+    if initialized {
+        unsafe { CoUninitialize() };
     }
-    let command = unsafe {
-        TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            point.x,
-            point.y,
-            None,
-            hwnd,
-            None,
-        )
-        .0 as u32
-    };
-    if command != 0 {
-        let invoke = CMINVOKECOMMANDINFO {
-            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-            hwnd,
-            // Shell command ids are passed as MAKEINTRESOURCEA offsets.
-            lpVerb: PCSTR((command - 1) as usize as *const u8),
-            nShow: SW_SHOWNORMAL.0,
-            ..Default::default()
-        };
-        unsafe { shell_menu.InvokeCommand(&invoke)? };
-    }
-    unsafe {
-        DestroyMenu(menu)?;
-        CoTaskMemFree(Some(absolute.cast()));
-        if initialized {
-            CoUninitialize();
-        }
-    }
-    Ok(())
+    outcome
 }
 
 #[tauri::command]
-fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
+async fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
     #[cfg(windows)]
     {
         #[allow(clippy::unnecessary_cast)]
         let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
+        let (send, receive) = tokio::sync::oneshot::channel();
         window
             .run_on_main_thread(move || {
                 let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
-                if let Err(error) =
-                    unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) }
-                {
+                let result = unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) }
+                    .map_err(|error| error.to_string());
+                if let Err(error) = &result {
                     tracing::warn!(%error, "couldn't show Windows Shell context menu");
                 }
+                let _ = send.send(result);
             })
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        return receive
+            .await
+            .map_err(|_| "Windows Shell menu task ended unexpectedly".to_string())?;
     }
     #[cfg(not(windows))]
     Err("native file context menus are not implemented on this desktop yet".into())
@@ -4349,5 +4359,24 @@ mod tests {
             Some(ServiceCmd::Uninstall)
         ));
         assert!(service_cmd("frobnicate").is_none());
+    }
+
+    #[test]
+    fn windows_shell_links_match_only_final_native_extensions() {
+        assert!(windows_shell_link_name("AllMyAgents.lnk"));
+        assert!(windows_shell_link_name("Meeting.URL"));
+        assert!(!windows_shell_link_name("notes.lnk.txt"));
+        assert!(!windows_shell_link_name("meeting.url.backup"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_hidden_attributes_include_hidden_and_system_files() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_SYSTEM,
+        };
+        assert!(windows_file_is_hidden(FILE_ATTRIBUTE_HIDDEN));
+        assert!(windows_file_is_hidden(FILE_ATTRIBUTE_SYSTEM));
+        assert!(!windows_file_is_hidden(FILE_ATTRIBUTE_NORMAL));
     }
 }

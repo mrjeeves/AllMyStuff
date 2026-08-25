@@ -118,6 +118,8 @@
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
   const fleetDesktopCursors = new Map<string, FleetDesktopCursor>();
   const fleetDesktopFailures = new Map<string, string>();
+  const fleetDesktopAttempts = new Map<string, number>();
+  const fleetDesktopReady = new Map<string, number>();
   const FLEET_DESKTOP_CURSOR = "__fleet_desktop__";
   const pendingRemoteOpens = new Map<string, { name: string; deviceLabel: string }>();
   const remoteDirectoryIds = new Map<string, string>();
@@ -175,11 +177,20 @@
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
   );
 
-  const fleetFileNodes = $derived(
-    app.catalog.nodes.filter((node) =>
-      !app.isMe(node.id) && (app.isFleetMember(node.id) || app.filesAllowed(node))
-    ),
-  );
+  const fleetFileNodes = $derived.by(() => {
+    const distinct = new Map<string, (typeof app.catalog.nodes)[number]>();
+    for (const node of app.catalog.nodes) {
+      if (app.isMe(node.id) || (!app.isFleetMember(node.id) && !app.filesAllowed(node))) continue;
+      const key = canonicalDeviceId(node.id);
+      const prior = distinct.get(key);
+      const score = Number(node.online) * 2 + Number(app.filesAllowed(node));
+      const priorScore = prior
+        ? Number(prior.online) * 2 + Number(app.filesAllowed(prior))
+        : -1;
+      if (!prior || score > priorScore) distinct.set(key, node);
+    }
+    return Array.from(distinct.values());
+  });
 
   const collidingNames = $derived.by(() => {
     const counts = new Map<string, number>();
@@ -204,6 +215,17 @@
     view = app.filesSettings.defaultView;
     tileSize = app.filesSettings.thumbnailSize;
   });
+  $effect(() => {
+    const nodes = fleetFileNodes;
+    if (!fleetHome || loading || directoryId !== "fleet:home") return;
+    reconcileFleetComputerEntries(nodes);
+    const generation = navigationGeneration;
+    if (nodes.some((node) => node.online && app.filesAllowed(node)
+      && fleetDesktopAttempts.get(canonicalDeviceId(node.id)) !== generation)) {
+      void loadRemoteFleetDesktops(generation);
+    }
+  });
+
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
   const navigatorTrail = $derived(
     fleetHome || computerHome
@@ -335,6 +357,33 @@
       shellIcon: null,
       binding,
     };
+  }
+  type FleetFileNode = (typeof fleetFileNodes)[number];
+
+  function fleetComputerEntries(nodes: readonly FleetFileNode[] = fleetFileNodes): WorkspaceEntry[] {
+    return [
+      computerNodeEntry(app.localId, app.localNode?.label || nativeComputerName(), false),
+      ...nodes.map((node) =>
+        computerNodeEntry(node.id, node.label, true, node.online && app.filesAllowed(node))
+      ),
+    ];
+  }
+
+  function reconcileFleetComputerEntries(nodes: readonly FleetFileNode[] = fleetFileNodes) {
+    const desired = fleetComputerEntries(nodes);
+    const current = entries.filter((entry) => entry.computerNode);
+    const unchanged = current.length === desired.length && current.every((entry, index) => {
+      const next = desired[index];
+      return entry.id === next.id
+        && entry.name === next.name
+        && entry.computerOnline === next.computerOnline
+        && entry.binding.deviceId === next.binding.deviceId;
+    });
+    if (unchanged) return;
+    entries = [
+      ...desired,
+      ...entries.filter((entry) => !entry.computerNode),
+    ];
   }
 
   function computerLocationEntry(location: LocalFileLocation): WorkspaceEntry {
@@ -560,10 +609,14 @@
     return event.volumes;
   }
   async function loadRemoteFleetDesktops(generation: number) {
-    const nodes = fleetFileNodes.filter((node) => node.online && app.filesAllowed(node));
+    const nodes = fleetFileNodes.filter((node) =>
+      node.online
+      && app.filesAllowed(node)
+      && fleetDesktopAttempts.get(canonicalDeviceId(node.id)) !== generation
+    );
     if (nodes.length === 0) return;
+    for (const node of nodes) fleetDesktopAttempts.set(canonicalDeviceId(node.id), generation);
     let nextNode = 0;
-    let ready = 1;
     sourceSummary = "Fleet Home · syncing " + nodes.length + " remote desktops";
 
     const worker = async () => {
@@ -591,12 +644,14 @@
             if (!nextCursor) nextCursor = FLEET_DESKTOP_CURSOR;
             complete = false;
           }
-          ready += 1;
+          fleetDesktopReady.set(canonicalDeviceId(node.id), generation);
         } catch (error) {
           if (generation !== navigationGeneration || !fleetHome) return;
-          fleetDesktopFailures.set(node.id, String(error));
+          fleetDesktopFailures.set(canonicalDeviceId(node.id), String(error));
           console.warn(`Fleet Desktop unavailable for ${node.label}:`, error);
         }
+        const ready = 1 + Array.from(fleetDesktopReady.values())
+          .filter((loadedGeneration) => loadedGeneration === generation).length;
         const unavailable = fleetDesktopFailures.size;
         sourceSummary = "Fleet Home · " + ready + " desktops live"
           + (unavailable ? " · " + unavailable + " unavailable" : "");
@@ -635,10 +690,7 @@
         "fleet:home",
         listing.entries.map(localWorkspaceEntry),
       );
-      const fleetComputers = [
-        computerNodeEntry(app.localId, app.localNode?.label || nativeComputerName(), false),
-        ...fleetFileNodes.map((node) => computerNodeEntry(node.id, node.label, true, node.online && app.filesAllowed(node))),
-      ];
+      const fleetComputers = fleetComputerEntries();
       entries = [...fleetComputers, ...desktopEntries];
       nextCursor = listing.nextCursor ?? null;
       complete = listing.complete;

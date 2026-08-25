@@ -1591,7 +1591,7 @@ unsafe fn windows_shell_context_menu(
 ) -> windows::core::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::{
-        core::{w, PCSTR, PCWSTR, PSTR},
+        core::{PCSTR, PCWSTR, PSTR},
         Win32::{
             Foundation::{LPARAM, POINT, WPARAM},
             System::Com::{CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED},
@@ -1602,14 +1602,13 @@ unsafe fn windows_shell_context_menu(
                 },
                 Shell::{
                     BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName,
-                    SHObjectProperties, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
-                    GCS_VERBA, SHOP_FILEPATH,
+                    SHObjectProperties, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, GCS_VERBA,
+                    SHOP_FILEPATH,
                 },
                 WindowsAndMessaging::{
-                    CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
-                    MenuItemFromPoint, PostMessageW, SetForegroundWindow, TrackPopupMenu,
-                    SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_NULL,
-                    WS_POPUP,
+                    CreatePopupMenu, DestroyMenu, GetCursorPos, MenuItemFromPoint, PostMessageW,
+                    SetForegroundWindow, TrackPopupMenu, SW_SHOWNORMAL, TPM_RETURNCMD,
+                    TPM_RIGHTBUTTON, WM_NULL,
                 },
             },
         },
@@ -1627,22 +1626,6 @@ unsafe fn windows_shell_context_menu(
             unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)? };
         let shell_menu: IContextMenu =
             unsafe { item.BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)? };
-        let menu_owner = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                w!("STATIC"),
-                w!(""),
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                Some(hwnd),
-                None,
-                None,
-                None,
-            )?
-        };
         let menu = unsafe { CreatePopupMenu()? };
         let mut replay_right_click = false;
         let menu_outcome = (|| -> windows::core::Result<()> {
@@ -1668,20 +1651,20 @@ unsafe fn windows_shell_context_menu(
                     point.x,
                     point.y,
                     None,
-                    menu_owner,
+                    hwnd,
                     None,
                 )
                 .0 as u32
             };
             let mut dismissal_point = POINT::default();
             let outside_menu = unsafe { GetCursorPos(&mut dismissal_point) }.is_ok()
-                && unsafe { MenuItemFromPoint(Some(menu_owner), menu, dismissal_point) } == -1;
+                && unsafe { MenuItemFromPoint(Some(hwnd), menu, dismissal_point) } == -1;
             replay_right_click = command == 0 && outside_menu && {
                 let state = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) } as u16;
                 state & 0x8001 != 0
             };
             // Windows documents this nudge for repeated TrackPopupMenu calls.
-            let _ = unsafe { PostMessageW(Some(menu_owner), WM_NULL, WPARAM(0), LPARAM(0)) };
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
             if command != 0 {
                 let offset = command - 1;
                 let mut verb_buffer = [0_u8; 64];
@@ -1730,7 +1713,6 @@ unsafe fn windows_shell_context_menu(
             Ok(())
         })();
         let _ = unsafe { DestroyMenu(menu) };
-        let _ = unsafe { DestroyWindow(menu_owner) };
         if replay_right_click {
             unsafe {
                 mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);

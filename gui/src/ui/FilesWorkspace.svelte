@@ -521,6 +521,14 @@
     context = { ...menuPosition, item };
   }
 
+  function dismissTransientMenus(event?: PointerEvent) {
+    const target = event?.target;
+    if (!(target instanceof Element) || !target.closest(".context-menu")) {
+      context = null;
+    }
+    if (!(target instanceof Element) || !target.closest(".zoom-control")) zoomMenu = false;
+  }
+
   function loadThumbnail(node: HTMLElement, item: LocalFileEntry) {
     const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
     if (item.dir || item.size > 4 * 1024 * 1024 || !["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].includes(ext)) {
@@ -1131,11 +1139,10 @@
   }
 </script>
 
-<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => {
+<svelte:window onpointerdowncapture={dismissTransientMenus} onblur={() => dismissTransientMenus()} />
+
+<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={() => {
   cancelPendingItemRename();
-  const target = event.target as Element;
-  if (!target.closest(".context-menu")) context = null;
-  if (!target.closest(".zoom-control")) zoomMenu = false;
 }}>
   <nav class="filebar" aria-label="File commands">
     <button title="Back" disabled={historyIndex <= 0} onclick={() => browseHistory(-1)}>‹</button>

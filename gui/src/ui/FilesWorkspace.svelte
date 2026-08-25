@@ -23,8 +23,12 @@
     contains,
     containingFrame,
     desktopColumnPosition,
+    FILE_TILE_SIZES,
+    isLegacyAutoRowPlacement,
+    nativeFileGridMetrics,
     nativeFileDisplayName,
     nativeWindowsLinkExtension,
+    rectsIntersect,
     descendantsOf,
     mergeCanvasRecords,
     normalizeFrameNesting,
@@ -46,12 +50,17 @@
   let showHidden = $state(app.filesSettings.showHidden);
   let query = $state("");
   let selectedId = $state<string | null>(null);
+  let selectedIds = $state<Set<string>>(new Set());
+  let selectionAnchorId = $state<string | null>(null);
+  let marquee = $state<{ x: number; y: number; width: number; height: number } | null>(null);
   let preview = $state<LocalFilePreview | null>(null);
   let map = $state<FilesMap>("files");
   let view = $state<FilesView>(app.filesSettings.defaultView);
   let tileSize = $state(app.filesSettings.thumbnailSize);
   let pan = $state({ x: 24, y: 24 });
   let zoom = $state(1);
+  let zoomMenu = $state(false);
+  let viewportElement = $state<HTMLElement | null>(null);
   let records = $state<CanvasRecord[]>([]);
   let context = $state<{ x: number; y: number; item: LocalFileEntry } | null>(null);
   let recent = $state<LocalFileEntry[]>([]);
@@ -69,6 +78,7 @@
   let previewOpen = $state(app.filesSettings.showPreview);
   const previewRequests = new Map<string, Promise<LocalFilePreview>>();
   const thumbnailRequests = new Map<string, Promise<string>>();
+  const migratingLayouts = new Set<string>();
   let thumbnailOrder: string[] = [];
   let placesWidth = $state(224);
   let previewWidth = $state(288);
@@ -79,8 +89,17 @@
   const visible = $derived(
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
   );
+  const grid = $derived(nativeFileGridMetrics(tileSize, platform));
+  const layoutIndex = $derived.by(() => new Map(
+    [...entries]
+      .sort((a, b) => Number(a.hidden) - Number(b.hidden))
+      .map((entry, index) => [entry.id, index]),
+  ));
 
   $effect(() => {
+    if ((app.filesSettings as { iconSizeModel?: number }).iconSizeModel !== 2) {
+      app.updateFilesSettings({ thumbnailSize: 48, iconSizeModel: 2 });
+    }
     showHidden = app.filesSettings.showHidden;
     view = app.filesSettings.defaultView;
     tileSize = app.filesSettings.thumbnailSize;
@@ -95,11 +114,32 @@
         .map((record) => record.value as CanvasFrame),
     ),
   );
+  const itemPrefix = $derived(`item:${map}:${scope}:`);
+  const layoutPreferenceId = $derived(`preference:layout-v2:${map}:${scope}`);
+  const layoutVersioned = $derived(records.some((record) =>
+    !record.deleted &&
+    record.kind === "preference" &&
+    record.id === layoutPreferenceId &&
+    Number((record.value as { version?: number } | null)?.version) >= 2
+  ));
+  const legacyPlacementRecordIds = $derived.by(() => {
+    if (layoutVersioned || map !== "files") return [];
+    const matches = records.filter((record) =>
+      !record.deleted &&
+      record.kind === "item" &&
+      record.id.startsWith(itemPrefix) &&
+      isLegacyAutoRowPlacement(record.value as CanvasPlacement)
+    );
+    // Two exact points distinguish the obsolete generator from a user who
+    // happened to place one icon at the old origin.
+    return matches.length >= 2 ? matches.map((record) => record.id) : [];
+  });
   const placements = $derived.by(() => {
     const out = new Map<string, CanvasPlacement>();
+    const suppressed = new Set(legacyPlacementRecordIds);
     for (const record of records) {
-      if (!record.deleted && record.kind === "item" && record.id.startsWith(`item:${map}:${scope}:`)) {
-        out.set(record.id.slice((`item:${map}:${scope}:`).length), record.value as CanvasPlacement);
+      if (!record.deleted && record.kind === "item" && record.id.startsWith(itemPrefix) && !suppressed.has(record.id)) {
+        out.set(record.id.slice(itemPrefix.length), record.value as CanvasPlacement);
       }
     }
     return out;
@@ -148,6 +188,8 @@
     loading = true;
     context = null;
     selectedId = null;
+    selectedIds = new Set();
+    selectionAnchorId = null;
     preview = null;
     try {
       const listing = await localFileList(next);
@@ -285,9 +327,9 @@
     return /^[A-Za-z]:$/.test(parent) ? parent + sep : parent;
   }
 
-  function fallbackPosition(index: number) {
+  function fallbackPosition(item: LocalFileEntry) {
     return {
-      ...desktopColumnPosition(index, tileSize, canvasHeight),
+      ...desktopColumnPosition(layoutIndex.get(item.id) ?? 0, tileSize, canvasHeight, platform),
       parentId: null,
     };
   }
@@ -300,8 +342,8 @@
     return { destroy() { observer.disconnect(); } };
   }
 
-  function itemPosition(item: LocalFileEntry, index: number) {
-    return placements.get(item.id) ?? { id: item.id, ...fallbackPosition(index) };
+  function itemPosition(item: LocalFileEntry) {
+    return placements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) };
   }
 
   function requestPreview(item: LocalFileEntry): Promise<LocalFilePreview> {
@@ -348,24 +390,45 @@
     thumbnails = next;
   }
 
-  async function select(item: LocalFileEntry) {
-    selectedId = item.id;
-    preview = null;
-    if (!item.dir) {
-      try {
-        const result = await requestPreview(item);
-        if (selectedId !== item.id) return;
-        preview = result;
-        if (result.kind === "image") retainThumbnail(item.id, await thumbnailFor(item, result));
-      } catch {
-        if (selectedId === item.id) preview = { kind: "unsupported" };
+  async function select(item: LocalFileEntry, event?: MouseEvent | PointerEvent) {
+    const additive = Boolean(event?.ctrlKey || event?.metaKey);
+    const range = Boolean(event?.shiftKey && selectionAnchorId);
+    let next = new Set(additive ? selectedIds : []);
+    if (range) {
+      const from = visible.findIndex((entry) => entry.id === selectionAnchorId);
+      const to = visible.findIndex((entry) => entry.id === item.id);
+      if (from >= 0 && to >= 0) {
+        if (!additive) next = new Set();
+        for (let index = Math.min(from, to); index <= Math.max(from, to); index += 1) {
+          next.add(visible[index]!.id);
+        }
       }
+    } else if (additive) {
+      if (next.has(item.id)) next.delete(item.id);
+      else next.add(item.id);
+      selectionAnchorId = item.id;
+    } else {
+      next = new Set([item.id]);
+      selectionAnchorId = item.id;
+    }
+    selectedIds = next;
+    selectedId = next.has(item.id) ? item.id : next.values().next().value ?? null;
+    preview = null;
+    const primary = entries.find((entry) => entry.id === selectedId);
+    if (!primary || primary.dir) return;
+    try {
+      const result = await requestPreview(primary);
+      if (selectedId !== primary.id) return;
+      preview = result;
+      if (result.kind === "image") retainThumbnail(primary.id, await thumbnailFor(primary, result));
+    } catch {
+      if (selectedId === primary.id) preview = { kind: "unsupported" };
     }
   }
 
   async function open(item: LocalFileEntry) {
     recent = [item, ...recent.filter((entry) => entry.id !== item.id)].slice(0, 8);
-    if (item.dir) await navigate(item.path);
+    if (item.dir && !item.virtualItem) await navigate(item.path);
     else await localFileOpen(item.path);
   }
 
@@ -407,7 +470,9 @@
     event.preventDefault();
     event.stopPropagation();
     const menuPosition = { x: event.clientX, y: event.clientY };
-    void select(item);
+    // The Shell menu below is bound to this one item. Keep the visible
+    // selection honest instead of implying that an action targets a group.
+    if (!selectedIds.has(item.id) || selectedIds.size > 1) void select(item);
     context = null;
     if (platform === "windows") {
       void localFileContextMenu(item.path).catch((error) => {
@@ -442,41 +507,84 @@
   }
 
   async function save(mutations: Array<{ id: string; kind: "frame" | "item" | "preference"; value: unknown; deleted?: boolean }>) {
+    const queued = [...mutations];
+    if (
+      map === "files" &&
+      !layoutVersioned &&
+      queued.some((mutation) => mutation.kind === "item") &&
+      !queued.some((mutation) => mutation.id === layoutPreferenceId)
+    ) {
+      queued.unshift({ id: layoutPreferenceId, kind: "preference", value: { version: 2, layout: "native-column" } });
+    }
+    const preferenceIndex = queued.findIndex((mutation) => mutation.id === layoutPreferenceId);
+    if (preferenceIndex > 0) {
+      queued.unshift(...queued.splice(preferenceIndex, 1));
+    }
     try {
       // One pointer-up may move a large nested frame. Keep each IPC mutation
       // bounded while still sending nothing during pointer motion.
-      for (let offset = 0; offset < mutations.length; offset += 256) {
-        absorb(await filesCanvasApply(mutations.slice(offset, offset + 256)));
+      for (let offset = 0; offset < queued.length; offset += 256) {
+        absorb(await filesCanvasApply(queued.slice(offset, offset + 256)));
       }
     } catch (error) {
       app.toast("warn", `Canvas didn't sync: ${String(error)}`);
     }
   }
 
+  $effect(() => {
+    const migrationId = layoutPreferenceId;
+    const stale = legacyPlacementRecordIds;
+    if (stale.length < 2 || migratingLayouts.has(migrationId)) return;
+    migratingLayouts.add(migrationId);
+    void save([
+      ...stale.map((id) => ({ id, kind: "item" as const, value: null, deleted: true })),
+      { id: migrationId, kind: "preference" as const, value: { version: 2, layout: "native-column" } },
+    ]).finally(() => migratingLayouts.delete(migrationId));
+  });
+
   function newFrame() {
     if (map === "files") changeView("canvas");
     frameTool = !frameTool;
   }
 
-  function dragItem(event: PointerEvent, item: LocalFileEntry, index: number) {
+  function dragItem(event: PointerEvent, item: LocalFileEntry) {
     if (event.button !== 0) return;
     event.stopPropagation();
-    void select(item);
-    const start = itemPosition(item, index);
+    void select(item, event);
+    if (!selectedIds.has(item.id)) return;
+    const dragged = entries.filter((entry) => selectedIds.has(entry.id));
+    const starts = new Map(dragged.map((entry) => [entry.id, itemPosition(entry)]));
+    const optimisticIds = new Set(dragged.map((entry) => `${itemPrefix}${entry.id}`));
     const origin = { x: event.clientX, y: event.clientY };
+    let moved = false;
     const move = (next: PointerEvent) => {
-      const value = { id: item.id, x: start.x + (next.clientX - origin.x) / zoom, y: start.y + (next.clientY - origin.y) / zoom, parentId: start.parentId };
-      const record: CanvasRecord = { id: `item:${map}:${scope}:${item.id}`, kind: "item", value, stamp: { counter: Number.MAX_SAFE_INTEGER, actor: "optimistic" } };
-      records = [...records.filter((old) => old.id !== record.id), record];
+      const clientDx = next.clientX - origin.x;
+      const clientDy = next.clientY - origin.y;
+      if (!moved && Math.hypot(clientDx, clientDy) < 4) return;
+      moved = true;
+      const dx = clientDx / zoom;
+      const dy = clientDy / zoom;
+      const optimistic = dragged.map((entry) => {
+        const start = starts.get(entry.id)!;
+        const value = { id: entry.id, x: start.x + dx, y: start.y + dy, parentId: start.parentId };
+        return { id: `${itemPrefix}${entry.id}`, kind: "item" as const, value, stamp: { counter: Number.MAX_SAFE_INTEGER, actor: "optimistic" } };
+      });
+      records = [...records.filter((record) => !optimisticIds.has(record.id)), ...optimistic];
     };
     const up = (next: PointerEvent) => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      const position = { id: item.id, x: start.x + (next.clientX - origin.x) / zoom, y: start.y + (next.clientY - origin.y) / zoom, parentId: null as string | null };
-      position.parentId = containingFrame({ ...position, width: tileSize, height: tileSize + 32 }, frames);
-      // Drop the optimistic max stamp before applying the authoritative node stamp.
-      records = records.filter((record) => record.id !== `item:${map}:${scope}:${item.id}`);
-      void save([{ id: `item:${map}:${scope}:${item.id}`, kind: "item", value: position }]);
+      if (!moved) return;
+      const dx = (next.clientX - origin.x) / zoom;
+      const dy = (next.clientY - origin.y) / zoom;
+      const mutations = dragged.map((entry) => {
+        const start = starts.get(entry.id)!;
+        const position = { id: entry.id, x: start.x + dx, y: start.y + dy, parentId: null as string | null };
+        position.parentId = containingFrame({ ...position, width: grid.tileWidth, height: grid.tileHeight }, frames);
+        return { id: `${itemPrefix}${entry.id}`, kind: "item" as const, value: position };
+      });
+      records = records.filter((record) => !optimisticIds.has(record.id));
+      void save(mutations);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up, { once: true });
@@ -545,11 +653,9 @@
   }
 
   function panCanvas(event: PointerEvent) {
-    if (event.button !== 0) return;
     const target = event.target as Element;
-    if (frameTool && target.closest(".file-tile, button, input, .share-frame")) return;
-    if (!frameTool && target.closest(".file-tile, .canvas-frame, .load-more, .zoom, .share-frame")) return;
     if (frameTool) {
+      if (event.button !== 0 || target.closest(".file-tile, button, input, .share-frame")) return;
       const viewport = event.currentTarget as HTMLElement;
       const rect = viewport.getBoundingClientRect();
       const canvasPan = map === "files" ? pan : { x: 0, y: 0 };
@@ -589,10 +695,10 @@
           (candidate) => !candidate.parentId || !enclosedIds.has(candidate.parentId),
         );
         for (const candidate of capturedFrames) candidate.parentId = frame.id;
-        const capturedItems = (map === "files" ? visible : []).flatMap((item, index) => {
-          const placement = itemPosition(item, index);
+        const capturedItems = (map === "files" ? visible : []).flatMap((item) => {
+          const placement = itemPosition(item);
           if (
-            !contains(frame, { ...placement, width: tileSize, height: tileSize + 32 }) ||
+            !contains(frame, { ...placement, width: grid.tileWidth, height: grid.tileHeight }) ||
             (placement.parentId && enclosedIds.has(placement.parentId))
           ) return [];
           const value = { ...placement, id: item.id, parentId: frame.id };
@@ -604,11 +710,64 @@
       window.addEventListener("pointerup", up, { once: true });
       return;
     }
-    if (map !== "files") return;
-    const start = { ...pan };
-    const origin = { x: event.clientX, y: event.clientY };
-    const move = (next: PointerEvent) => { pan = { x: start.x + next.clientX - origin.x, y: start.y + next.clientY - origin.y }; };
-    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    if (map !== "files" || target.closest(".file-tile, .canvas-frame, .load-more, .zoom-control, .share-frame")) return;
+    if (event.button === 2) {
+      event.preventDefault();
+      const start = { ...pan };
+      const origin = { x: event.clientX, y: event.clientY };
+      const move = (next: PointerEvent) => {
+        pan = { x: start.x + next.clientX - origin.x, y: start.y + next.clientY - origin.y };
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up, { once: true });
+      return;
+    }
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const viewport = event.currentTarget as HTMLElement;
+    const rect = viewport.getBoundingClientRect();
+    const worldPoint = (clientX: number, clientY: number) => ({
+      x: (clientX - rect.left - pan.x) / zoom,
+      y: (clientY - rect.top - pan.y) / zoom,
+    });
+    const start = worldPoint(event.clientX, event.clientY);
+    const additive = event.ctrlKey || event.metaKey;
+    const base = new Set(additive ? selectedIds : []);
+    if (!additive) {
+      selectedIds = new Set();
+      selectedId = null;
+      preview = null;
+    }
+    let moved = false;
+    const move = (next: PointerEvent) => {
+      const point = worldPoint(next.clientX, next.clientY);
+      if (!moved && Math.hypot(next.clientX - event.clientX, next.clientY - event.clientY) < 3) return;
+      moved = true;
+      const box = {
+        x: Math.min(start.x, point.x),
+        y: Math.min(start.y, point.y),
+        width: Math.abs(point.x - start.x),
+        height: Math.abs(point.y - start.y),
+      };
+      marquee = box;
+      const chosen = new Set(base);
+      for (const item of visible) {
+        const placement = itemPosition(item);
+        if (rectsIntersect(box, { ...placement, width: grid.tileWidth, height: grid.tileHeight })) chosen.add(item.id);
+      }
+      selectedIds = chosen;
+      selectedId = chosen.values().next().value ?? null;
+      preview = null;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      marquee = null;
+    };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up, { once: true });
   }
@@ -633,19 +792,41 @@
     app.updateFilesSettings({ showHidden });
   }
 
+  function applyZoom(value: number, cursor?: { x: number; y: number }) {
+    const nextZoom = Math.max(0.45, Math.min(2, value));
+    if (nextZoom === zoom) return;
+    const anchor = cursor ?? {
+      x: (viewportElement?.clientWidth ?? 0) / 2,
+      y: (viewportElement?.clientHeight ?? 0) / 2,
+    };
+    const world = { x: (anchor.x - pan.x) / zoom, y: (anchor.y - pan.y) / zoom };
+    pan = { x: anchor.x - world.x * nextZoom, y: anchor.y - world.y * nextZoom };
+    zoom = nextZoom;
+  }
+
   function zoomCanvas(event: WheelEvent) {
     event.preventDefault();
     const viewport = event.currentTarget as HTMLElement;
+    viewportElement = viewport;
     const rect = viewport.getBoundingClientRect();
     const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
       ? 16
       : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? viewport.clientHeight : 1;
-    const nextZoom = Math.max(0.45, Math.min(2, zoom * Math.exp(-event.deltaY * unit * 0.0015)));
-    if (nextZoom === zoom) return;
-    const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-    const world = { x: (cursor.x - pan.x) / zoom, y: (cursor.y - pan.y) / zoom };
-    pan = { x: cursor.x - world.x * nextZoom, y: cursor.y - world.y * nextZoom };
-    zoom = nextZoom;
+    applyZoom(zoom * Math.exp(-event.deltaY * unit * 0.0015), {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    });
+  }
+
+  function chooseZoom(value: number) {
+    applyZoom(value);
+    zoomMenu = false;
+  }
+
+  function resetCanvasView() {
+    zoom = 1;
+    pan = { x: 24, y: 24 };
+    zoomMenu = false;
   }
 
   async function createFolder() {
@@ -747,7 +928,11 @@
   }
 </script>
 
-<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => { if (!(event.target as Element).closest(".context-menu")) context = null; }}>
+<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => {
+  const target = event.target as Element;
+  if (!target.closest(".context-menu")) context = null;
+  if (!target.closest(".zoom-control")) zoomMenu = false;
+}}>
   <nav class="filebar" aria-label="File commands">
     <button title="Back" disabled={historyIndex <= 0} onclick={() => browseHistory(-1)}>‹</button>
     <button title="Forward" disabled={historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
@@ -766,7 +951,11 @@
         <button class:active={view === "canvas"} onclick={() => changeView("canvas")} title="Thumbnails">▦</button>
         <button class:active={view === "details"} onclick={() => changeView("details")} title="Details">☷</button>
       </div>
-      {#if view === "canvas"}<input type="range" min="64" max="144" step="16" bind:value={tileSize} onchange={() => app.updateFilesSettings({ thumbnailSize: tileSize })} aria-label="Icon size" />{/if}
+      {#if view === "canvas"}
+        <select class="icon-size" value={tileSize} onchange={(event) => { tileSize = Number(event.currentTarget.value); app.updateFilesSettings({ thumbnailSize: tileSize }); }} aria-label="Icon size">
+          {#each FILE_TILE_SIZES as size}<option value={size}>{size === 32 ? "Small" : size === 48 ? "Medium" : "Large"} icons</option>{/each}
+        </select>
+      {/if}
       <button class:active={showHidden} aria-pressed={showHidden} onclick={toggleHidden} title={showHidden ? "Hide hidden files" : "Show hidden files"}>···</button>
     {/if}
   </nav>
@@ -848,7 +1037,7 @@
       <div class="details">
         <div class="detail-head"><span>Name</span><span>Date modified</span><span>Type</span><span>Size</span></div>
         {#each visible as item}
-          <button class:selected={selectedId === item.id} onclick={() => select(item)} ondblclick={() => open(item)} oncontextmenu={(event) => showContextMenu(event, item)}>
+          <button class:selected={selectedIds.has(item.id)} onclick={(event) => select(item, event)} ondblclick={() => open(item)} oncontextmenu={(event) => showContextMenu(event, item)}>
             <span class="detail-name"><i>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</i>{displayName(item)}</span>
             <span>{item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</span>
             <span>{fileType(item)}</span>
@@ -858,7 +1047,7 @@
         {#if !complete}<button class="details-load" onclick={loadMore} disabled={loadingPage}><span>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</span></button>{/if}
       </div>
     {:else}
-      <div class="viewport" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
+      <div class="viewport" bind:this={viewportElement} class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
           {#each frames as frame}
             <article class="canvas-frame" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
@@ -870,17 +1059,18 @@
           {#if draftFrame}
             <article class="canvas-frame draft" style={`left:${draftFrame.x}px;top:${draftFrame.y}px;width:${draftFrame.width}px;height:${draftFrame.height}px`}>New frame</article>
           {/if}
-          {#each visible as item, index (item.id)}
-            {@const position = itemPosition(item, index)}
+          {#if marquee}<div class="selection-marquee" style={`left:${marquee.x}px;top:${marquee.y}px;width:${marquee.width}px;height:${marquee.height}px`}></div>{/if}
+          {#each visible as item (item.id)}
+            {@const position = itemPosition(item)}
             <button
               class="file-tile"
-              class:selected={selectedId === item.id}
-              style={`left:${position.x}px;top:${position.y}px;width:${tileSize}px`}
-              onpointerdown={(event) => dragItem(event, item, index)}
+              class:selected={selectedIds.has(item.id)}
+              style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
+              onpointerdown={(event) => dragItem(event, item)}
               ondblclick={() => open(item)}
               oncontextmenu={(event) => showContextMenu(event, item)}
             >
-              <span class="file-icon" use:loadThumbnail={item} style={`font-size:${Math.max(38, tileSize * 0.58)}px`}>
+              <span class="file-icon" use:loadThumbnail={item} style={`width:${grid.iconSize}px;height:${grid.iconSize}px;font-size:${grid.iconSize}px`}>
                 {#if thumbnails[item.id]}<img src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
               </span>
               <span>{displayName(item)}</span>
@@ -889,7 +1079,18 @@
         </div>
         {#if loading}<div class="empty">Reading folder…</div>{:else if visible.length === 0}<div class="empty">No matching items</div>{/if}
         {#if !complete}<button class="load-more" onclick={loadMore} disabled={loadingPage}>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</button>{/if}
-        <div class="zoom">{Math.round(zoom * 100)}%</div>
+        <div class="zoom-control">
+          {#if zoomMenu}
+            <div class="zoom-menu" role="menu">
+              {#each [0.5, 0.75, 1, 1.25, 1.5, 2] as preset}
+                <button class:active={Math.abs(zoom - preset) < 0.001} onclick={() => chooseZoom(preset)}>{Math.round(preset * 100)}%</button>
+              {/each}
+              <hr />
+              <button onclick={resetCanvasView}>Reset view · 100%</button>
+            </div>
+          {/if}
+          <button class="zoom" aria-haspopup="menu" aria-expanded={zoomMenu} onclick={(event) => { event.stopPropagation(); zoomMenu = !zoomMenu; }}>{Math.round(zoom * 100)}%⌄</button>
+        </div>
       </div>
     {/if}
   </main>
@@ -925,10 +1126,12 @@
       <button onclick={() => { void open(context!.item); context = null; }}>Open</button>
       <button onclick={() => { void localFileOpen(context!.item.path, true); context = null; }}>Show in {nativeBrowserName()}</button>
       <hr />
-      <button onclick={() => { void rename(context!.item); context = null; }}>Rename</button>
-      <button onclick={() => { void navigator.clipboard.writeText(context!.item.path); context = null; }}>Copy path</button>
-      <hr />
-      <button class="danger" onclick={() => { void moveToTrash(context!.item); context = null; }}>Move to {platform === "windows" ? "Recycle Bin" : "Trash"}</button>
+      {#if !context.item.virtualItem}
+        <button onclick={() => { void rename(context!.item); context = null; }}>Rename</button>
+        <button onclick={() => { void navigator.clipboard.writeText(context!.item.path); context = null; }}>Copy path</button>
+        <hr />
+        <button class="danger" onclick={() => { void moveToTrash(context!.item); context = null; }}>Move to {platform === "windows" ? "Recycle Bin" : "Trash"}</button>
+      {/if}
     </div>
   {/if}
 </section>
@@ -940,7 +1143,7 @@
   .files-workspace.places-hidden.preview-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) 2.5rem; }
   button, input { font: inherit; }
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
-  .filebar > button, .switch button, .native-open { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
+  .filebar > button, .switch button, .native-open, .icon-size { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
   .filebar > button:disabled { opacity: .35; }
   .filebar > button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); box-shadow: inset 0 0 0 1px var(--accent); }
   .crumb { min-width: 8rem; flex: 1; padding: .45rem .65rem; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: .78rem; }
@@ -973,16 +1176,23 @@
   .fleet-note { display: flex; gap: .4rem; align-items: center; margin-top: .7rem; }.fleet-note i { width: 7px; height: 7px; background: var(--ok); border-radius: 50%; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
-  .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
+  .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }
   .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
-  .viewport:active { cursor: grabbing; }.world { position: absolute; inset: 0; transform-origin: 0 0; }
+  .world { position: absolute; inset: 0; transform-origin: 0 0; }
   .canvas-frame { position: absolute; z-index: 0; border: 1px solid oklch(0.62 .2 292 / .55); border-radius: 15px; background: oklch(0.62 .2 292 / .08); box-shadow: inset 0 0 0 1px oklch(1 0 0 / .025); padding: .55rem; }
   .canvas-frame input { width: calc(100% - 2rem); border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; }.canvas-frame > button { float: right; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { width: 100%; height: 1.15em; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: hidden; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
-  .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }.zoom { position: absolute; right: .7rem; bottom: .7rem; padding: .25rem .5rem; border-radius: 6px; background: var(--surface); color: var(--ink-faint); font-size: .68rem; }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
+  .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
+  .selection-marquee { position: absolute; z-index: 5; border: 1px solid var(--accent); background: var(--accent-soft); pointer-events: none; }
+  .zoom-control { position: absolute; right: .7rem; bottom: .7rem; z-index: 8; }
+  .zoom { padding: .3rem .55rem; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink-faint); font-size: .68rem; }
+  .zoom-menu { position: absolute; right: 0; bottom: calc(100% + .35rem); min-width: 9rem; display: grid; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-2); box-shadow: var(--shadow); }
+  .zoom-menu button { padding: .4rem .55rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }
+  .zoom-menu button:hover, .zoom-menu button.active { background: var(--accent-soft); }
+  .zoom-menu hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
   .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }

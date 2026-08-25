@@ -30,7 +30,7 @@ compile_error!(
 );
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -1058,6 +1058,8 @@ struct LocalFileEntry {
     modified: Option<u64>,
     hidden: bool,
     symlink: bool,
+    #[serde(rename = "virtualItem")]
+    virtual_item: bool,
     #[serde(rename = "shellIcon")]
     shell_icon: Option<String>,
 }
@@ -1082,10 +1084,78 @@ struct LocalFileBrowser {
 struct LocalFileCursor {
     id: String,
     path: PathBuf,
-    reader: std::fs::ReadDir,
+    readers: VecDeque<std::fs::ReadDir>,
+    synthetic: VecDeque<LocalFileEntry>,
     pending: Option<LocalFileEntry>,
     seen_ids: HashMap<String, usize>,
+    seen_names: HashSet<String>,
+    merge_names: bool,
     touched: Instant,
+}
+
+fn next_local_dir_entry(current: &mut LocalFileCursor) -> Option<std::fs::DirEntry> {
+    loop {
+        match current.readers.front_mut()?.next() {
+            Some(Ok(item)) => {
+                if current.merge_names {
+                    let key = item.file_name().to_string_lossy().to_lowercase();
+                    if !current.seen_names.insert(key) {
+                        continue;
+                    }
+                }
+                return Some(item);
+            }
+            Some(Err(_)) => continue,
+            None => {
+                current.readers.pop_front();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+const RECYCLE_BIN_PARSE_NAME: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+
+#[cfg(windows)]
+fn recycle_bin_entry() -> LocalFileEntry {
+    LocalFileEntry {
+        id: "windows-shell:recycle-bin".into(),
+        name: "Recycle Bin".into(),
+        path: RECYCLE_BIN_PARSE_NAME.into(),
+        dir: true,
+        size: 0,
+        modified: None,
+        hidden: false,
+        symlink: false,
+        shell_icon: shell_icon::recycle_bin_icon(),
+        virtual_item: true,
+    }
+}
+
+#[cfg(windows)]
+fn windows_desktop_parts(
+    canonical: &Path,
+) -> (Option<std::fs::ReadDir>, VecDeque<LocalFileEntry>, bool) {
+    let is_desktop = dirs::desktop_dir()
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|desktop| desktop == canonical);
+    if !is_desktop {
+        return (None, VecDeque::new(), false);
+    }
+    let public_reader = std::env::var_os("PUBLIC")
+        .map(PathBuf::from)
+        .map(|path| path.join("Desktop"))
+        .and_then(|path| path.canonicalize().ok())
+        .filter(|path| path != canonical)
+        .and_then(|path| std::fs::read_dir(path).ok());
+    (public_reader, VecDeque::from([recycle_bin_entry()]), true)
+}
+
+#[cfg(not(windows))]
+fn windows_desktop_parts(
+    _canonical: &Path,
+) -> (Option<std::fs::ReadDir>, VecDeque<LocalFileEntry>, bool) {
+    (None, VecDeque::new(), false)
 }
 
 #[derive(serde::Serialize)]
@@ -1257,12 +1327,21 @@ async fn local_file_list(
                 return Err("that location is not a folder".into());
             }
             let directory_meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
+            let (public_reader, synthetic, merge_names) = windows_desktop_parts(&canonical);
+            let mut readers = VecDeque::new();
+            readers.push_back(std::fs::read_dir(&canonical).map_err(|e| e.to_string())?);
+            if let Some(reader) = public_reader {
+                readers.push_back(reader);
+            }
             LocalFileCursor {
                 id: local_file_id(&canonical, &directory_meta, false),
-                reader: std::fs::read_dir(&canonical).map_err(|e| e.to_string())?,
                 path: canonical,
+                readers,
+                synthetic,
                 pending: None,
                 seen_ids: HashMap::new(),
+                seen_names: HashSet::new(),
+                merge_names,
                 touched: now,
             }
         };
@@ -1294,6 +1373,7 @@ async fn local_file_list(
             let shell_icon = windows_shell_link_name(&name)
                 .then(|| shell_icon::shortcut_icon(&entry_path))
                 .flatten();
+
             #[cfg(not(windows))]
             let shell_icon = None;
             let base_id = local_file_id(&entry_path, &identity_meta, symlink);
@@ -1322,6 +1402,7 @@ async fn local_file_list(
                 hidden,
                 shell_icon,
                 symlink,
+                virtual_item: false,
             })
         };
 
@@ -1330,19 +1411,25 @@ async fn local_file_list(
             entries.push(entry);
         }
         while entries.len() < PAGE_SIZE {
-            let Some(item) = current.reader.next() else {
+            if let Some(entry) = current.synthetic.pop_front() {
+                entries.push(entry);
+                continue;
+            }
+            let Some(item) = next_local_dir_entry(&mut current) else {
                 break;
             };
-            let Ok(item) = item else { continue };
             if let Some(entry) = convert(item, &mut current.seen_ids) {
                 entries.push(entry);
             }
         }
         while entries.len() == PAGE_SIZE && current.pending.is_none() {
-            let Some(item) = current.reader.next() else {
+            if let Some(entry) = current.synthetic.pop_front() {
+                current.pending = Some(entry);
+                break;
+            }
+            let Some(item) = next_local_dir_entry(&mut current) else {
                 break;
             };
-            let Ok(item) = item else { continue };
             current.pending = convert(item, &mut current.seen_ids);
         }
 
@@ -1441,7 +1528,9 @@ fn launch_native(path: &Path, reveal: bool) -> Result<(), String> {
     #[cfg(windows)]
     let status = {
         let mut command = std::process::Command::new("explorer.exe");
-        if reveal && path.is_file() {
+        if path == Path::new(RECYCLE_BIN_PARSE_NAME) {
+            command.arg("shell:RecycleBinFolder");
+        } else if reveal && path.is_file() {
             command.arg(format!("/select,{}", path.to_string_lossy()));
         } else {
             command.arg(path);
@@ -1488,18 +1577,24 @@ unsafe fn windows_shell_context_menu(
 ) -> windows::core::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::{
-        core::{PCSTR, PCWSTR},
+        core::{w, PCSTR, PCWSTR},
         Win32::{
             Foundation::{LPARAM, POINT, WPARAM},
             System::Com::{CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED},
             UI::{
+                Input::KeyboardAndMouse::{
+                    mouse_event, GetAsyncKeyState, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+                    VK_RBUTTON,
+                },
                 Shell::{
                     BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName,
                     CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
                 },
                 WindowsAndMessaging::{
-                    CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
-                    TrackPopupMenu, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+                    CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
+                    MenuItemFromPoint, PostMessageW, SetForegroundWindow, TrackPopupMenu,
+                    SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_NULL,
+                    WS_POPUP,
                 },
             },
         },
@@ -1507,7 +1602,8 @@ unsafe fn windows_shell_context_menu(
 
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     let outcome = (|| -> windows::core::Result<()> {
-        let wide: Vec<u16> = path
+        let shell_path = shell_icon::shell_compatible_path(path);
+        let wide: Vec<u16> = shell_path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1516,7 +1612,24 @@ unsafe fn windows_shell_context_menu(
             unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)? };
         let shell_menu: IContextMenu =
             unsafe { item.BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)? };
+        let menu_owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )?
+        };
         let menu = unsafe { CreatePopupMenu()? };
+        let mut replay_right_click = false;
         let menu_outcome = (|| -> windows::core::Result<()> {
             unsafe {
                 shell_menu
@@ -1529,6 +1642,10 @@ unsafe fn windows_shell_context_menu(
                 GetCursorPos(&mut point)?;
                 let _ = SetForegroundWindow(hwnd);
             }
+            // Clear the initiating click's transition bit. If the popup later
+            // dismisses on a different right-click, the fresh state below
+            // tells us to hand that click back to the WebView.
+            let _ = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) };
             let command = unsafe {
                 TrackPopupMenu(
                     menu,
@@ -1536,13 +1653,20 @@ unsafe fn windows_shell_context_menu(
                     point.x,
                     point.y,
                     None,
-                    hwnd,
+                    menu_owner,
                     None,
                 )
                 .0 as u32
             };
+            let mut dismissal_point = POINT::default();
+            let outside_menu = unsafe { GetCursorPos(&mut dismissal_point) }.is_ok()
+                && unsafe { MenuItemFromPoint(Some(menu_owner), menu, dismissal_point) } == -1;
+            replay_right_click = command == 0 && outside_menu && {
+                let state = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) } as u16;
+                state & 0x8001 != 0
+            };
             // Windows documents this nudge for repeated TrackPopupMenu calls.
-            let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+            let _ = unsafe { PostMessageW(Some(menu_owner), WM_NULL, WPARAM(0), LPARAM(0)) };
             if command != 0 {
                 let invoke = CMINVOKECOMMANDINFO {
                     cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
@@ -1557,6 +1681,13 @@ unsafe fn windows_shell_context_menu(
             Ok(())
         })();
         let _ = unsafe { DestroyMenu(menu) };
+        let _ = unsafe { DestroyWindow(menu_owner) };
+        if replay_right_click {
+            unsafe {
+                mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            }
+        }
         menu_outcome
     })();
     if initialized {
@@ -1572,20 +1703,20 @@ async fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> 
         #[allow(clippy::unnecessary_cast)]
         let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
         let (send, receive) = tokio::sync::oneshot::channel();
-        window
-            .run_on_main_thread(move || {
+        std::thread::Builder::new()
+            .name("allmystuff-shell-menu".into())
+            .spawn(move || {
                 let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
                 let result = unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) }
                     .map_err(|error| error.to_string());
-                if let Err(error) = &result {
-                    tracing::warn!(%error, "couldn't show Windows Shell context menu");
-                }
                 let _ = send.send(result);
             })
-            .map_err(|e| e.to_string())?;
-        return receive
-            .await
-            .map_err(|_| "Windows Shell menu task ended unexpectedly".to_string())?;
+            .map_err(|error| error.to_string())?;
+        let result = receive.await.map_err(|error| error.to_string())?;
+        if let Err(error) = &result {
+            tracing::warn!(%error, "couldn't show Windows Shell context menu");
+        }
+        return result;
     }
     #[cfg(not(windows))]
     Err("native file context menus are not implemented on this desktop yet".into())

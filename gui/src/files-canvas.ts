@@ -112,27 +112,69 @@ export function fileReferenceId(origin: string, path: string, platform: string):
   return `${origin}:${windows ? normalized.toLocaleLowerCase("en-US") : normalized}`;
 }
 
-export const FILE_TILE_SIZES = [64, 80, 96, 112, 128, 144] as const;
+/** Explorer's three desktop icon sizes. The icon and its grid cell are
+ * deliberately separate: Windows reserves room for a two-line label. */
+export const FILE_TILE_SIZES = [32, 48, 96] as const;
 
 export function nearestFileTileSize(input: number): number {
-  const value = Number.isFinite(input) ? input : 96;
+  const value = Number.isFinite(input) ? input : 48;
   return FILE_TILE_SIZES.reduce((best, size) =>
     Math.abs(size - value) < Math.abs(best - value) ? size : best,
   );
 }
 
-/** Native desktops fill downward before starting the next column. Keeping a
- * small minimum column length also prevents compact app windows from flipping
- * the same directory into an apparent row after the first measurement. */
-export function desktopColumnPosition(index: number, tileSize: number, canvasHeight: number): Point {
-  const columnWidth = tileSize + 36;
-  const rowHeight = tileSize + 58;
-  const measuredRows = Math.floor(Math.max(rowHeight, canvasHeight - 144) / rowHeight);
-  const itemsPerColumn = Math.max(4, measuredRows);
+export interface NativeFileGridMetrics {
+  iconSize: number;
+  tileWidth: number;
+  tileHeight: number;
+  columnWidth: number;
+  rowHeight: number;
+}
+
+export function nativeFileGridMetrics(input: number, platform: string): NativeFileGridMetrics {
+  const iconSize = nearestFileTileSize(input);
+  const windows = platform.toLowerCase().startsWith("win");
+  if (windows) {
+    if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 72, columnWidth: 88, rowHeight: 80 };
+    if (iconSize === 96) return { iconSize, tileWidth: 124, tileHeight: 144, columnWidth: 136, rowHeight: 152 };
+    return { iconSize, tileWidth: 88, tileHeight: 92, columnWidth: 100, rowHeight: 100 };
+  }
+  if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 72, columnWidth: 88, rowHeight: 80 };
+  if (iconSize === 96) return { iconSize, tileWidth: 128, tileHeight: 148, columnWidth: 140, rowHeight: 156 };
+  return { iconSize, tileWidth: 92, tileHeight: 96, columnWidth: 104, rowHeight: 104 };
+}
+
+/** Native desktops fill downward before starting the next column. A stable
+ * minimum column length prevents a compact app window from turning a short
+ * desktop into a visual row when its first real measurement arrives. */
+export function desktopColumnPosition(
+  index: number,
+  tileSize: number,
+  canvasHeight: number,
+  platform = "windows",
+): Point {
+  const metrics = nativeFileGridMetrics(tileSize, platform);
+  const measuredRows = Math.floor(Math.max(metrics.rowHeight, canvasHeight - 48) / metrics.rowHeight);
+  const itemsPerColumn = Math.max(8, measuredRows);
   return {
-    x: 64 + Math.floor(index / itemsPerColumn) * columnWidth,
-    y: 72 + (index % itemsPerColumn) * rowHeight,
+    x: 24 + Math.floor(index / itemsPerColumn) * metrics.columnWidth,
+    y: 24 + (index % itemsPerColumn) * metrics.rowHeight,
   };
+}
+
+/** Versions before layout-v2 persisted their generated horizontal fallback on
+ * every click. Recognize that exact generator without matching arbitrary
+ * hand-positioned or framed items. */
+export function isLegacyAutoRowPlacement(placement: CanvasPlacement): boolean {
+  if (placement.parentId !== null || Math.abs(placement.y - 72) > 0.01) return false;
+  return [64, 80, 92, 96, 112, 128, 144, 150].some((size) => {
+    const column = (placement.x - 64) / (size + 36);
+    return column >= 0 && Math.abs(column - Math.round(column)) < 0.0001;
+  });
+}
+
+export function rectsIntersect(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
 export function nativeWindowsLinkExtension(name: string, platform: string): ".lnk" | ".url" | null {

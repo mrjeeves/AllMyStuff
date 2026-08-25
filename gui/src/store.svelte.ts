@@ -654,13 +654,15 @@ export interface FilesSettings {
   thumbnailSize: number;
   showHidden: boolean;
   showPreview: boolean;
+  iconSizeModel: 2;
 }
 
 const DEFAULT_FILES_SETTINGS: FilesSettings = {
   defaultView: "canvas",
-  thumbnailSize: 96,
+  thumbnailSize: 48,
   showHidden: false,
   showPreview: true,
+  iconSizeModel: 2,
 };
 
 function loadFilesSettings(): FilesSettings {
@@ -668,9 +670,10 @@ function loadFilesSettings(): FilesSettings {
     const saved = JSON.parse(localStorage.getItem(FILES_SETTINGS_STORE_KEY) ?? "{}");
     return {
       defaultView: saved.defaultView === "details" ? "details" : "canvas",
-      thumbnailSize: nearestFileTileSize(Number(saved.thumbnailSize)),
+      thumbnailSize: saved.iconSizeModel === 2 ? nearestFileTileSize(Number(saved.thumbnailSize)) : 48,
       showHidden: saved.showHidden === true,
       showPreview: saved.showPreview !== false,
+      iconSizeModel: 2,
     };
   } catch {
     return { ...DEFAULT_FILES_SETTINGS };
@@ -2805,6 +2808,7 @@ class AppStore {
       ...this.filesSettings,
       ...patch,
       thumbnailSize: nearestFileTileSize(Number(patch.thumbnailSize ?? this.filesSettings.thumbnailSize)),
+      iconSizeModel: 2,
     };
     try {
       localStorage.setItem(FILES_SETTINGS_STORE_KEY, JSON.stringify(this.filesSettings));

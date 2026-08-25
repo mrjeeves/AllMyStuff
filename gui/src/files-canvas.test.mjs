@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, mergeCanvasRecords, nativeFileDisplayName, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, sharedFilesystemObject } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, sharedFilesystemObject } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -41,20 +41,35 @@ test("Windows shell-link presentation hides only final native suffixes", () => {
   assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "linux"), "AllMyAgents.lnk");
 });
 
-test("file tile sizes snap to bounded non-overlapping notches", () => {
-  assert.deepEqual(FILE_TILE_SIZES, [64, 80, 96, 112, 128, 144]);
-  assert.equal(nearestFileTileSize(63), 64);
-  assert.equal(nearestFileTileSize(91), 96);
-  assert.equal(nearestFileTileSize(150), 144);
-  assert.equal(nearestFileTileSize(Number.NaN), 96);
+test("file icon sizes use the native Explorer notches and separate grid cells", () => {
+  assert.deepEqual(FILE_TILE_SIZES, [32, 48, 96]);
+  assert.equal(nearestFileTileSize(31), 32);
+  assert.equal(nearestFileTileSize(63), 48);
+  assert.equal(nearestFileTileSize(95), 96);
+  assert.equal(nearestFileTileSize(Number.NaN), 48);
+  assert.deepEqual(nativeFileGridMetrics(48, "windows"), {
+    iconSize: 48, tileWidth: 88, tileHeight: 92, columnWidth: 100, rowHeight: 100,
+  });
 });
 
 test("desktop fallback stays column-major across compact canvas measurement", () => {
-  const initial = Array.from({ length: 5 }, (_, index) => desktopColumnPosition(index, 96, 720));
-  const measured = Array.from({ length: 5 }, (_, index) => desktopColumnPosition(index, 96, 280));
+  const initial = Array.from({ length: 9 }, (_, index) => desktopColumnPosition(index, 48, 720));
+  const measured = Array.from({ length: 9 }, (_, index) => desktopColumnPosition(index, 48, 280));
   assert.deepEqual(measured, initial);
   assert.ok(measured[1].y > measured[0].y);
-  assert.ok(measured[4].x > measured[0].x);
+  assert.ok(measured[8].x > measured[0].x);
+});
+
+test("legacy migration matches only the old generated row", () => {
+  assert.equal(isLegacyAutoRowPlacement({ id: "a", x: 64, y: 72, parentId: null }), true);
+  assert.equal(isLegacyAutoRowPlacement({ id: "b", x: 164, y: 72, parentId: null }), true);
+  assert.equal(isLegacyAutoRowPlacement({ id: "manual", x: 165, y: 72, parentId: null }), false);
+  assert.equal(isLegacyAutoRowPlacement({ id: "framed", x: 164, y: 72, parentId: "frame" }), false);
+});
+
+test("marquee intersection includes partially covered native cells", () => {
+  assert.equal(rectsIntersect({ x: 20, y: 20, width: 20, height: 20 }, { x: 35, y: 35, width: 30, height: 30 }), true);
+  assert.equal(rectsIntersect({ x: 20, y: 20, width: 10, height: 10 }, { x: 35, y: 35, width: 30, height: 30 }), false);
 });
 
 test("concurrent frame reparenting cannot leave a cyclic hierarchy", () => {

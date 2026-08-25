@@ -3,7 +3,11 @@
 //! Asking the shell for the `.lnk` icon preserves target icons, custom shortcut
 //! icons, and Windows' own fallback behavior instead of guessing from a suffix.
 
-use std::{ffi::c_void, path::Path};
+use std::{
+    ffi::c_void,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use windows::{
@@ -15,20 +19,47 @@ use windows::{
         },
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
         UI::{
-            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
+            Shell::{
+                SHGetFileInfoW, SHGetStockIconInfo, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+                SHGFI_LINKOVERLAY, SHGSI_ICON, SHGSI_LARGEICON, SHSTOCKICONINFO, SIID_RECYCLER,
+            },
             WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON},
         },
     },
 };
 
+pub(crate) fn shell_compatible_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if !wide.starts_with(&verbatim) {
+        return path.to_owned();
+    }
+
+    let unc = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    let unc_lower = [b'u' as u16, b'n' as u16, b'c' as u16, b'\\' as u16];
+    let normalized = if wide
+        .get(4..8)
+        .is_some_and(|prefix| prefix == unc || prefix == unc_lower)
+    {
+        let mut value = vec![b'\\' as u16, b'\\' as u16];
+        value.extend_from_slice(&wide[8..]);
+        value
+    } else {
+        wide[4..].to_vec()
+    };
+    PathBuf::from(OsString::from_wide(&normalized))
+}
+
 const ICON_SIZE: i32 = 96;
 
 pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
     // SHGetFileInfo requires COM on the calling thread. Directory pages run on
     // Tokio workers, so the UI thread's COM apartment does not cover them.
-    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     let icon = shortcut_icon_initialized(path);
     if initialized {
         unsafe { CoUninitialize() };
@@ -36,10 +67,27 @@ pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
     icon
 }
 
+pub(crate) fn recycle_bin_icon() -> Option<String> {
+    let mut info = SHSTOCKICONINFO::default();
+    info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+    unsafe {
+        SHGetStockIconInfo(SIID_RECYCLER, SHGSI_ICON | SHGSI_LARGEICON, &mut info).ok()?;
+    }
+    if info.hIcon.0.is_null() {
+        return None;
+    }
+    let rendered = render_icon(info.hIcon);
+    unsafe {
+        let _ = DestroyIcon(info.hIcon);
+    }
+    rendered
+}
+
 fn shortcut_icon_initialized(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt as _;
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let shell_path = shell_compatible_path(path);
+    let mut wide: Vec<u16> = shell_path.as_os_str().encode_wide().collect();
     wide.push(0);
     let mut info = SHFILEINFOW::default();
     let found = unsafe {
@@ -48,7 +96,7 @@ fn shortcut_icon_initialized(path: &Path) -> Option<String> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             Some(&mut info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_LINKOVERLAY,
         )
     };
     if found == 0 || info.hIcon.0.is_null() {
@@ -171,12 +219,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolved_shell_icon_is_a_png() {
+    fn shell_paths_drop_only_windows_verbatim_syntax() {
+        assert_eq!(
+            shell_compatible_path(Path::new(r"\\?\C:\Users\Chris\Desktop\App.lnk")),
+            PathBuf::from(r"C:\Users\Chris\Desktop\App.lnk")
+        );
+        assert_eq!(
+            shell_compatible_path(Path::new(r"\\?\UNC\server\share\App.lnk")),
+            PathBuf::from(r"\\server\share\App.lnk")
+        );
+        assert_eq!(
+            shell_compatible_path(Path::new(r"C:\ordinary\App.lnk")),
+            PathBuf::from(r"C:\ordinary\App.lnk")
+        );
+    }
+
+    #[test]
+    fn resolved_verbatim_shell_icon_is_a_png() {
         let path = std::env::var_os("ALLMYSTUFF_ICON_PROBE")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_exe().expect("test executable path"));
+            .unwrap_or_else(|| std::env::current_exe().expect("test executable path"))
+            .canonicalize()
+            .expect("canonical verbatim probe path");
         let encoded = shortcut_icon(&path)
             .unwrap_or_else(|| panic!("Windows Shell returned no icon for {}", path.display()));
+        let decoded = STANDARD.decode(encoded).expect("base64 PNG");
+        assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()),);
+    }
+
+    #[test]
+    fn recycle_bin_stock_icon_is_a_png() {
+        let encoded = recycle_bin_icon().expect("Windows Shell returned no Recycle Bin icon");
         let decoded = STANDARD.decode(encoded).expect("base64 PNG");
         assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()),);
     }

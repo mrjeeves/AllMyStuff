@@ -170,6 +170,7 @@ export interface LocalFileEntry {
   hidden: boolean;
   symlink: boolean;
   shellIcon?: string | null;
+  virtualItem?: boolean;
 }
 
 export interface LocalFileListing {

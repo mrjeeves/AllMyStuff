@@ -170,7 +170,9 @@
   );
 
   const fleetFileNodes = $derived(
-    app.catalog.nodes.filter((node) => app.filesAllowed(node)),
+    app.catalog.nodes.filter((node) =>
+      !app.isMe(node.id) && (app.isFleetMember(node.id) || app.filesAllowed(node))
+    ),
   );
 
   const collidingNames = $derived.by(() => {
@@ -560,9 +562,7 @@
       );
       const fleetComputers = [
         computerNodeEntry(app.localId, app.localNode?.label || nativeComputerName(), false),
-        ...app.catalog.nodes
-          .filter((node) => app.filesAllowed(node))
-          .map((node) => computerNodeEntry(node.id, node.label, true, node.online)),
+        ...fleetFileNodes.map((node) => computerNodeEntry(node.id, node.label, true, node.online && app.filesAllowed(node))),
       ];
       entries = [...fleetComputers, ...desktopEntries];
       nextCursor = listing.nextCursor ?? null;
@@ -591,7 +591,15 @@
       const node = app.catalog.nodes.find(
         (candidate) => canonicalDeviceId(candidate.id) === canonical,
       );
-      if (!node?.online) {
+      if (!node) {
+        app.toast("warn", deviceLabel + " is no longer in this fleet");
+        return;
+      }
+      if (!app.filesAllowed(node)) {
+        app.toast("warn", deviceLabel + " does not support fleet Files yet");
+        return;
+      }
+      if (!node.online) {
         app.toast("warn", deviceLabel + " is offline right now");
         return;
       }
@@ -2145,7 +2153,7 @@
             </div>
           {/if}
           {#each fleetFileNodes as node (node.id)}
-            <button class:active={computerBranchActive(node.id)} class:offline={!node.online} onclick={() => { void navigateComputer(node.id, node.label); }} title={node.online ? node.label : node.label + " (offline)"}><span aria-hidden="true">&#9635;</span>{node.label}</button>
+            <button class:active={computerBranchActive(node.id)} class:offline={!node.online || !app.filesAllowed(node)} onclick={() => { void navigateComputer(node.id, node.label); }} title={!app.filesAllowed(node) ? node.label + " (Files unavailable)" : node.online ? node.label : node.label + " (offline)"}><span aria-hidden="true">&#9635;</span>{node.label}</button>
             {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Drives on " + node.label}>
                 {#each entries as drive (drive.id)}

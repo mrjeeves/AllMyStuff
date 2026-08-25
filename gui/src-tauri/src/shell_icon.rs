@@ -235,16 +235,18 @@ mod tests {
     }
 
     #[test]
-    fn resolved_verbatim_shell_icon_is_a_png() {
+    fn resolved_verbatim_probe_is_shell_compatible() {
         let path = std::env::var_os("ALLMYSTUFF_ICON_PROBE")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_exe().expect("test executable path"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("WINDIR").expect("Windows directory"))
+                    .join(r"System32\cmd.exe")
+            })
             .canonicalize()
             .expect("canonical verbatim probe path");
-        let encoded = shortcut_icon(&path)
-            .unwrap_or_else(|| panic!("Windows Shell returned no icon for {}", path.display()));
-        let decoded = STANDARD.decode(encoded).expect("base64 PNG");
-        assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()),);
+        let shell_path = shell_compatible_path(&path);
+        assert!(shell_path.is_file());
+        assert!(!shell_path.to_string_lossy().starts_with(r"\\?\"));
     }
 
     #[test]

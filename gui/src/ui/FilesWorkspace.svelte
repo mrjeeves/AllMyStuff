@@ -114,6 +114,7 @@
   let localRootPath = "";
   let sourceSummary = $state("Loading this device…");
   const remoteSessions = new Map<string, RemoteSession>();
+  let routeSnapshotRefresh: Promise<void> | null = null;
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
   const fleetDesktopCursors = new Map<string, FleetDesktopCursor>();
   const fleetDesktopFailures = new Map<string, string>();
@@ -457,15 +458,32 @@
     preview = null;
   }
 
+  function refreshRouteSnapshot(): Promise<void> {
+    if (routeSnapshotRefresh) return routeSnapshotRefresh;
+    const pending = app.refreshSession().catch(() => {});
+    routeSnapshotRefresh = pending;
+    void pending.finally(() => {
+      if (routeSnapshotRefresh === pending) routeSnapshotRefresh = null;
+    });
+    return pending;
+  }
+
   async function waitForRoute(routeId: string): Promise<void> {
     const deadline = Date.now() + 10_000;
+    let nextSnapshotAt = 0;
     while (Date.now() < deadline) {
       const state = app.routeStates[routeId]?.state;
       if (state === "active") return;
       if (state === "rejected" || state === "torn_down") {
         throw new Error(app.routeStates[routeId]?.reason || "Files access was refused");
       }
-      await new Promise((resolve) => window.setTimeout(resolve, 100));
+      const now = Date.now();
+      if (now >= nextSnapshotAt) {
+        nextSnapshotAt = now + 500;
+        await refreshRouteSnapshot();
+      } else {
+        await new Promise((resolve) => window.setTimeout(resolve, 50));
+      }
     }
     throw new Error("Files connection timed out");
   }
@@ -577,6 +595,7 @@
         } catch (error) {
           if (generation !== navigationGeneration || !fleetHome) return;
           fleetDesktopFailures.set(node.id, String(error));
+          console.warn(`Fleet Desktop unavailable for ${node.label}:`, error);
         }
         const unavailable = fleetDesktopFailures.size;
         sourceSummary = "Fleet Home · " + ready + " desktops live"

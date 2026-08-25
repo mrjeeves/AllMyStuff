@@ -5,6 +5,8 @@
   import {
     filesCanvasApply,
     filesNamespaceAdopt,
+    fileDownload,
+    fileDownloadCancel,
     fileSend,
     watchFiles,
     filesCanvasSnapshot,
@@ -18,6 +20,7 @@
     localFilePreview,
     localFileRename,
     localFileTrash,
+    onFileSaved,
     onFilesCanvas,
     type LocalFileEntry,
     type LocalFileLocation,
@@ -104,6 +107,7 @@
   const remoteSessions = new Map<string, RemoteSession>();
   const fleetHomeFailures = new Map<string, string>();
   const fleetPageCursors = new Map<string, { deviceId: string; path: string; cursor: string }>();
+  const pendingRemoteOpens = new Map<string, { name: string; deviceLabel: string }>();
   let currentRemoteDirectory = $state<{ deviceId: string; routeId: string; path: string; home: string } | null>(null);
   let loadingPage = $state(false);
   let navigationGeneration = 0;
@@ -529,6 +533,7 @@
   onMount(() => {
     let mounted = true;
     let stop = () => {};
+    let stopSaved = () => {};
     try {
       placesOpen = localStorage.getItem("allmystuff.files.placesOpen") !== "false";
       previewOpen = localStorage.getItem("allmystuff.files.previewOpen") !== "false";
@@ -553,9 +558,26 @@
       app.toast("warn", `Couldn't start Files: ${String(error)}`);
     });
     void onFilesCanvas((next) => { records = next; }).then((unlisten) => { stop = unlisten; });
+    void onFileSaved((event) => {
+      const key = `${event.route}:${event.req}`;
+      const pending = pendingRemoteOpens.get(key);
+      if (!pending) return;
+      pendingRemoteOpens.delete(key);
+      if (event.error || !event.path) {
+        app.toast("warn", `Couldn't open ${pending.name}: ${event.error || "download failed"}`);
+        return;
+      }
+      void localFileOpen(event.path).then(() => {
+        app.toast("ok", `Opened ${pending.name} from ${pending.deviceLabel}`);
+      }).catch((error) => {
+        app.toast("warn", `Couldn't open ${pending.name}: ${String(error)}`);
+      });
+    }).then((unlisten) => { stopSaved = unlisten; });
     return () => {
       mounted = false;
       cancelPendingItemRename();
+      pendingRemoteOpens.clear();
+      stopSaved();
       closeRemoteSessions();
       stop();
     };
@@ -1014,15 +1036,15 @@
     preview = null;
     const primary = entries.find((entry) => entry.id === selectedId);
     if (!primary || primary.dir) return;
+    if (primary.binding.kind === "remote") {
+      preview = { kind: "unsupported" };
+      return;
+    }
     try {
       const result = await requestPreview(primary);
       if (selectedId !== primary.id) return;
       preview = result;
       if (result.kind === "image") retainThumbnail(primary.id, await thumbnailFor(primary, result));
-    if (primary.binding.kind === "remote") {
-      preview = { kind: "unsupported" };
-      return;
-    }
     } catch {
       if (selectedId === primary.id) preview = { kind: "unsupported" };
     }
@@ -1031,8 +1053,30 @@
   async function open(item: WorkspaceEntry) {
     recent = [item, ...recent.filter((entry) => entry.id !== item.id)].slice(0, 8);
     if (item.binding.kind === "remote") {
-      if (item.dir && !item.virtualItem) await navigateRemoteItem(item);
-      else app.toast("ok", `${displayName(item)} is available through ${item.binding.deviceLabel}`);
+      if (item.dir && !item.virtualItem) {
+        await navigateRemoteItem(item);
+        return;
+      }
+      const session = remoteSessions.get(item.binding.deviceId);
+      if (!session) {
+        app.toast("warn", "That device's Files connection is no longer active");
+        return;
+      }
+      const req = session.nextReq++;
+      const key = `${session.routeId}:${req}`;
+      try {
+        await fileDownload(session.routeId, req, item.name);
+        pendingRemoteOpens.set(key, {
+          name: displayName(item),
+          deviceLabel: item.binding.deviceLabel,
+        });
+        await fileSend(session.routeId, { kind: "read", req, path: item.path });
+        app.toast("ok", `Fetching ${displayName(item)} from ${item.binding.deviceLabel}…`);
+      } catch (error) {
+        pendingRemoteOpens.delete(key);
+        await fileDownloadCancel(session.routeId, req).catch(() => false);
+        app.toast("warn", `Couldn't open ${displayName(item)}: ${String(error)}`);
+      }
       return;
     }
     if (item.dir && !item.virtualItem) await navigate(item.path);

@@ -15098,6 +15098,18 @@ impl Mesh {
     }
 
     /// Stream one chunk into its registered download, if any. Returns
+    /// Cancel a registered sink whose request could not be sent. The partial
+    /// file is removed immediately; route teardown remains the broader safety
+    /// net for transfers interrupted later.
+    pub fn file_download_cancel(&self, route_id: &str, req: u64) -> bool {
+        let key = (route_id.to_string(), req);
+        let Some(sink) = self.downloads.lock().remove(&key) else {
+            return false;
+        };
+        let _ = std::fs::remove_file(sink.path);
+        true
+    }
+
     /// `true` when the chunk was consumed here (don't queue it). Finishing
     /// (or failing) emits `allmystuff://file-saved` so the window can say
     /// where it landed.

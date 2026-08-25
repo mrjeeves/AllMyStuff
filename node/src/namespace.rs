@@ -324,7 +324,9 @@ fn maybe_collect_catalog(transaction: &Transaction<'_>, now: i64) -> Result<(), 
         .map_err(|error| format!("expire namespace bindings: {error}"))?;
 
     let count: i64 = transaction
-        .query_row("SELECT COUNT(*) FROM directory_entries", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM directory_entries", [], |row| {
+            row.get(0)
+        })
         .map_err(|error| format!("count namespace entries: {error}"))?;
     let overflow = count.saturating_sub(MAX_CATALOG_ENTRIES);
     if overflow > 0 {

@@ -1975,6 +1975,23 @@ async fn file_download(
 
 /// Open (or focus) the dedicated files window for `node` — one OS window
 /// per machine, the finder-like view of its disk. The window loads the
+#[tauri::command]
+async fn file_download_cancel(
+    state: State<'_, AppState>,
+    route_id: String,
+    req: u64,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request(
+            "file_download_cancel",
+            json!({ "route_id": route_id, "req": req }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
 /// same app with `?files=<node>`.
 #[tauri::command]
 async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
@@ -4253,6 +4270,7 @@ fn main() {
             file_poll,
             file_unwatch,
             file_download,
+            file_download_cancel,
             open_files_window,
             files_namespace_adopt,
             files_canvas_snapshot,

@@ -1346,6 +1346,11 @@ pub async fn dispatch(
             let name: String = try_arg!(arg(a, "name"));
             json_result(mesh.file_download(route_id, req_id, &name))
         }
+        "file_download_cancel" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let req_id: u64 = try_arg!(arg(a, "req"));
+            DispatchOut::Json(Value::Bool(mesh.file_download_cancel(&route_id, req_id)))
+        }
 
         // ---- sites (reverse proxy) ---------------------------------------
         "site_scan" => {

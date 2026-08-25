@@ -1305,6 +1305,14 @@ export async function fileDownload(
 
 /** A registered download finished (`allmystuff://file-saved`): where it
  *  landed, or the error that stopped it. */
+export async function fileDownloadCancel(
+  routeId: string,
+  req: number,
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  return requiredInvoke<boolean>("file_download_cancel", { routeId, req });
+}
+
 export async function onFileSaved(
   cb: (e: {
     route: string;

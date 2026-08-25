@@ -1254,6 +1254,56 @@ fn local_file_id(path: &Path, meta: &std::fs::Metadata, symlink: bool) -> String
     path_fallback_id("entry", path, meta, false)
 }
 
+fn local_file_entry(path: &Path) -> Result<LocalFileEntry, String> {
+    let name = path
+        .file_name()
+        .ok_or("that item has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let identity_meta = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let symlink = identity_meta.file_type().is_symlink();
+    let target_meta = if symlink {
+        std::fs::metadata(path).ok()
+    } else {
+        Some(identity_meta.clone())
+    };
+    let display_meta = target_meta.as_ref().unwrap_or(&identity_meta);
+    #[cfg(windows)]
+    let hidden = {
+        use std::os::windows::fs::MetadataExt as _;
+        windows_file_is_hidden(identity_meta.file_attributes())
+    };
+    #[cfg(not(windows))]
+    let hidden = name.starts_with('.');
+    #[cfg(windows)]
+    let shell_icon = windows_shell_link_name(&name)
+        .then(|| shell_icon::shortcut_icon(path))
+        .flatten();
+    #[cfg(not(windows))]
+    let shell_icon = None;
+
+    Ok(LocalFileEntry {
+        id: local_file_id(path, &identity_meta, symlink),
+        name,
+        path: local_path_for_display(path),
+        dir: display_meta.is_dir(),
+        size: if display_meta.is_file() {
+            display_meta.len()
+        } else {
+            0
+        },
+        modified: display_meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        hidden,
+        shell_icon,
+        symlink,
+        virtual_item: false,
+    })
+}
+
 fn location(id: &str, label: &str, path: Option<PathBuf>, kind: &str) -> Option<LocalFileLocation> {
     let path = path?;
     if !path.exists() {
@@ -1360,61 +1410,14 @@ async fn local_file_list(
         let convert = |item: std::fs::DirEntry,
                        seen_ids: &mut HashMap<String, usize>|
          -> Option<LocalFileEntry> {
-            let entry_path = item.path();
-            let name = item.file_name().to_string_lossy().into_owned();
-            let symlink = item
-                .file_type()
-                .map(|kind| kind.is_symlink())
-                .unwrap_or(false);
-            let identity_meta = std::fs::symlink_metadata(&entry_path).ok()?;
-            let target_meta = if symlink {
-                std::fs::metadata(&entry_path).ok()
-            } else {
-                Some(identity_meta.clone())
-            };
-            let display_meta = target_meta.as_ref().unwrap_or(&identity_meta);
-            #[cfg(windows)]
-            let hidden = {
-                use std::os::windows::fs::MetadataExt as _;
-                windows_file_is_hidden(identity_meta.file_attributes())
-            };
-            #[cfg(not(windows))]
-            let hidden = name.starts_with('.');
-            #[cfg(windows)]
-            let shell_icon = windows_shell_link_name(&name)
-                .then(|| shell_icon::shortcut_icon(&entry_path))
-                .flatten();
-
-            #[cfg(not(windows))]
-            let shell_icon = None;
-            let base_id = local_file_id(&entry_path, &identity_meta, symlink);
+            let mut entry = local_file_entry(&item.path()).ok()?;
+            let base_id = entry.id.clone();
             let count = seen_ids.entry(base_id.clone()).or_insert(0);
             *count += 1;
-            let id = if *count == 1 {
-                base_id
-            } else {
-                format!("{base_id}:entry:{name}")
-            };
-            Some(LocalFileEntry {
-                id,
-                name,
-                path: local_path_for_display(&entry_path),
-                dir: display_meta.is_dir(),
-                size: if display_meta.is_file() {
-                    display_meta.len()
-                } else {
-                    0
-                },
-                modified: display_meta
-                    .modified()
-                    .ok()
-                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()),
-                hidden,
-                shell_icon,
-                symlink,
-                virtual_item: false,
-            })
+            if *count > 1 {
+                entry.id = format!("{base_id}:entry:{}", entry.name);
+            }
+            Some(entry)
         };
 
         let mut entries = Vec::with_capacity(PAGE_SIZE);
@@ -1741,18 +1744,43 @@ fn safe_child(parent: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn local_file_mkdir(parent: String, name: String) -> Result<String, String> {
+async fn local_file_mkdir(
+    parent: String,
+    name: String,
+    unique: Option<bool>,
+) -> Result<LocalFileEntry, String> {
     tokio::task::spawn_blocking(move || {
-        let path = safe_child(&PathBuf::from(parent), &name)?;
-        std::fs::create_dir(&path).map_err(|e| e.to_string())?;
-        Ok(path.to_string_lossy().into_owned())
+        let parent = PathBuf::from(parent);
+        let base_name = name.trim().to_string();
+        safe_child(&parent, &base_name)?;
+        let mut sequence = 1_u32;
+        loop {
+            let candidate_name = if sequence == 1 {
+                base_name.clone()
+            } else {
+                format!("{base_name} ({sequence})")
+            };
+            let path = safe_child(&parent, &candidate_name)?;
+            match std::fs::create_dir(&path) {
+                Ok(()) => return local_file_entry(&path),
+                Err(error)
+                    if unique.unwrap_or(false)
+                        && error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or("couldn't find an available folder name")?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn local_file_rename(path: String, name: String) -> Result<String, String> {
+async fn local_file_rename(path: String, name: String) -> Result<LocalFileEntry, String> {
     tokio::task::spawn_blocking(move || {
         let from = PathBuf::from(path);
         let parent = from.parent().ok_or("that item has no parent folder")?;
@@ -1768,7 +1796,7 @@ async fn local_file_rename(path: String, name: String) -> Result<String, String>
             }
         }
         std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
-        Ok(to.to_string_lossy().into_owned())
+        local_file_entry(&to)
     })
     .await
     .map_err(|e| e.to_string())?

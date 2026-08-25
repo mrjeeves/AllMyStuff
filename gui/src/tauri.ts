@@ -241,11 +241,11 @@ export function localFileContextMenu(path: string): Promise<void> {
   return requiredInvoke<void>("local_file_context_menu", { path });
 }
 
-export function localFileMkdir(parent: string, name: string): Promise<string> {
-  return requiredInvoke("local_file_mkdir", { parent, name });
+export function localFileMkdir(parent: string, name: string, unique = false): Promise<LocalFileEntry> {
+  return requiredInvoke("local_file_mkdir", { parent, name, unique });
 }
 
-export function localFileRename(path: string, name: string): Promise<string> {
+export function localFileRename(path: string, name: string): Promise<LocalFileEntry> {
   return requiredInvoke("local_file_rename", { path, name });
 }
 

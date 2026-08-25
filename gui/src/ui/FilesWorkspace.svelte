@@ -55,6 +55,8 @@
   let selectedIds = $state<Set<string>>(new Set());
   let selectionAnchorId = $state<string | null>(null);
   let editingFrameId = $state<string | null>(null);
+  let editingItemId = $state<string | null>(null);
+  let pendingItemRenameTimer: number | null = null;
   let marquee = $state<{ x: number; y: number; width: number; height: number } | null>(null);
   let preview = $state<LocalFilePreview | null>(null);
   let map = $state<FilesMap>("files");
@@ -206,12 +208,17 @@
       if (desktop) await navigate(desktop.path);
     });
     void onFilesCanvas((next) => { records = next; }).then((unlisten) => { stop = unlisten; });
-    return () => stop();
+    return () => {
+      cancelPendingItemRename();
+      stop();
+    };
   });
 
   async function navigate(next: string, remember = true) {
     const generation = ++navigationGeneration;
     loading = true;
+    cancelPendingItemRename();
+    editingItemId = null;
     context = null;
     selectedId = null;
     selectedIds = new Set();
@@ -540,6 +547,91 @@
     requestAnimationFrame(() => { node.focus(); node.select(); });
   }
 
+  function focusItemRename(node: HTMLInputElement, selectionEnd: number) {
+    requestAnimationFrame(() => {
+      node.focus();
+      node.setSelectionRange(0, selectionEnd);
+    });
+  }
+
+  function renameSelectionEnd(item: LocalFileEntry): number {
+    const label = displayName(item);
+    if (item.dir || windowsLinkExtension(item)) return label.length;
+    const extension = label.lastIndexOf(".");
+    return extension > 0 ? extension : label.length;
+  }
+
+  function cancelPendingItemRename() {
+    if (pendingItemRenameTimer !== null) window.clearTimeout(pendingItemRenameTimer);
+    pendingItemRenameTimer = null;
+  }
+
+  function beginItemRename(item: LocalFileEntry) {
+    if (item.virtualItem) return;
+    cancelPendingItemRename();
+    context = null;
+    if (!selectedIds.has(item.id) || selectedIds.size !== 1) void select(item);
+    editingItemId = item.id;
+  }
+
+  function scheduleItemRename(item: LocalFileEntry) {
+    cancelPendingItemRename();
+    // Keep double-click open and slow-click rename from racing each other.
+    pendingItemRenameTimer = window.setTimeout(() => {
+      pendingItemRenameTimer = null;
+      if (selectedIds.size === 1 && selectedIds.has(item.id)) beginItemRename(item);
+    }, 600);
+  }
+
+  function replaceRenamedEntry(previous: LocalFileEntry, renamed: LocalFileEntry) {
+    const index = entries.findIndex((entry) => entry.id === previous.id);
+    if (index < 0) return;
+    entries = entries.map((entry, entryIndex) => entryIndex === index ? renamed : entry);
+    recent = recent.map((entry) => entry.id === previous.id ? renamed : entry);
+    if (previous.id === renamed.id) return;
+
+    selectedIds = new Set(Array.from(selectedIds, (id) => id === previous.id ? renamed.id : id));
+    if (selectedId === previous.id) selectedId = renamed.id;
+    if (selectionAnchorId === previous.id) selectionAnchorId = renamed.id;
+    if (thumbnails[previous.id]) {
+      const nextThumbnails = { ...thumbnails, [renamed.id]: thumbnails[previous.id]! };
+      delete nextThumbnails[previous.id];
+      thumbnails = nextThumbnails;
+      thumbnailOrder = thumbnailOrder.map((id) => id === previous.id ? renamed.id : id);
+    }
+    if (liveItemPositions[previous.id]) {
+      const nextLive = { ...liveItemPositions, [renamed.id]: { ...liveItemPositions[previous.id]!, id: renamed.id } };
+      delete nextLive[previous.id];
+      liveItemPositions = nextLive;
+    }
+    const placement = placements.get(previous.id);
+    if (placement) {
+      void save([
+        { id: `${itemPrefix}${previous.id}`, kind: "item", value: null, deleted: true },
+        { id: `${itemPrefix}${renamed.id}`, kind: "item", value: { ...placement, id: renamed.id } },
+      ]);
+    }
+  }
+
+  async function commitItemRename(item: LocalFileEntry, value: string) {
+    const requested = value.trim();
+    editingItemId = null;
+    if (!requested || requested === displayName(item)) return;
+    const suffix = windowsLinkExtension(item);
+    const name = suffix && !requested.toLowerCase().endsWith(suffix) ? `${requested}${suffix}` : requested;
+    if (name === item.name) return;
+    const operationDirectory = directoryId;
+    try {
+      const renamed = await localFileRename(item.path, name);
+      if (operationDirectory === directoryId) replaceRenamedEntry(item, renamed);
+    } catch (error) {
+      app.toast("warn", String(error));
+      if (operationDirectory === directoryId && entries.some((entry) => entry.id === item.id)) {
+        editingItemId = item.id;
+      }
+    }
+  }
+
   function commitFrameTitle(frame: CanvasFrame, value: string) {
     const title = value.trim();
     editingFrameId = null;
@@ -592,7 +684,11 @@
   function dragItem(event: PointerEvent, item: LocalFileEntry) {
     if (event.button !== 0) return;
     event.stopPropagation();
+    cancelPendingItemRename();
+    const eventTarget = event.target;
+    const titleClick = eventTarget instanceof Element && Boolean(eventTarget.closest(".file-label"));
     const preserveSelection = selectedIds.has(item.id) && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+    const renameOnRelease = titleClick && preserveSelection && selectedIds.size === 1;
     if (!preserveSelection) void select(item, event);
     if (!selectedIds.has(item.id)) return;
     const dragged = entries.filter((entry) => selectedIds.has(entry.id));
@@ -623,7 +719,8 @@
       if (previewGeneration !== geometryPreviewGeneration) return;
       if (!moved) {
         clearGeometryPreview(previewGeneration);
-        if (preserveSelection && dragged.length > 1) void select(item);
+        if (renameOnRelease) scheduleItemRename(item);
+        else if (preserveSelection && dragged.length > 1) void select(item);
         return;
       }
       const mutations = dragged.map((entry) => {
@@ -935,18 +1032,19 @@
   }
 
   async function createFolder() {
-    const name = window.prompt("New folder name");
-    if (!name) return;
-    try { await localFileMkdir(path, name); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
-  }
-
-  async function rename(item: LocalFileEntry) {
-    const requested = window.prompt("Rename", displayName(item));
-    if (!requested) return;
-    const suffix = windowsLinkExtension(item);
-    const name = suffix && !requested.toLowerCase().endsWith(suffix) ? `${requested}${suffix}` : requested;
-    if (name === item.name) return;
-    try { await localFileRename(item.path, name); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
+    const operationDirectory = directoryId;
+    try {
+      const created = await localFileMkdir(path, "New Folder", true);
+      if (operationDirectory !== directoryId) return;
+      query = "";
+      entries = entries.some((entry) => entry.id === created.id)
+        ? entries.map((entry) => entry.id === created.id ? created : entry)
+        : [...entries, created];
+      void select(created);
+      editingItemId = created.id;
+    } catch (error) {
+      app.toast("warn", String(error));
+    }
   }
 
   async function moveToTrash(item: LocalFileEntry) {
@@ -1034,6 +1132,7 @@
 </script>
 
 <section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={(event) => {
+  cancelPendingItemRename();
   const target = event.target as Element;
   if (!target.closest(".context-menu")) context = null;
   if (!target.closest(".zoom-control")) zoomMenu = false;
@@ -1149,12 +1248,51 @@
       <div class="details">
         <div class="detail-head"><span>Name</span><span>Date modified</span><span>Type</span><span>Size</span></div>
         {#each visible as item}
-          <button class:selected={selectedIds.has(item.id)} onclick={(event) => select(item, event)} ondblclick={() => open(item)} oncontextmenu={(event) => showContextMenu(event, item)}>
-            <span class="detail-name"><i>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</i>{displayName(item)}</span>
+          <div
+            class="detail-row"
+            class:selected={selectedIds.has(item.id)}
+            role="button"
+            tabindex="0"
+            onclick={(event) => {
+              const target = event.target;
+              const titleClick = target instanceof Element && Boolean(target.closest(".detail-label"));
+              if (titleClick && selectedIds.size === 1 && selectedIds.has(item.id)) scheduleItemRename(item);
+              else void select(item, event);
+            }}
+            ondblclick={() => { cancelPendingItemRename(); if (editingItemId !== item.id) void open(item); }}
+            onkeydown={(event) => {
+              if (event.key === "F2") { event.preventDefault(); beginItemRename(item); }
+              else if (event.key === "Enter") { event.preventDefault(); void open(item); }
+            }}
+            oncontextmenu={(event) => showContextMenu(event, item)}
+          >
+            <span class="detail-name">
+              <i>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</i>
+              {#if editingItemId === item.id}
+                <input
+                  class="detail-rename-input"
+                  use:focusItemRename={renameSelectionEnd(item)}
+                  value={displayName(item)}
+                  aria-label={`Rename ${displayName(item)}`}
+                  onblur={(event) => { void commitItemRename(item, event.currentTarget.value); }}
+                  onkeydown={(event) => {
+                    event.stopPropagation();
+                    if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
+                    else if (event.key === "Escape") { event.preventDefault(); event.currentTarget.value = displayName(item); event.currentTarget.blur(); }
+                  }}
+                  onpointerdown={(event) => event.stopPropagation()}
+                  onclick={(event) => event.stopPropagation()}
+                  ondblclick={(event) => event.stopPropagation()}
+                  oncontextmenu={(event) => event.stopPropagation()}
+                />
+              {:else}
+                <span class="detail-label">{displayName(item)}</span>
+              {/if}
+            </span>
             <span>{item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</span>
             <span>{fileType(item)}</span>
             <span>{item.dir ? "—" : humanBytes(item.size)}</span>
-          </button>
+          </div>
         {/each}
         {#if !complete}<button class="details-load" onclick={loadMore} disabled={loadingPage}><span>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</span></button>{/if}
       </div>
@@ -1181,20 +1319,47 @@
           {#if marquee}<div class="selection-marquee" style={`left:${marquee.x}px;top:${marquee.y}px;width:${marquee.width}px;height:${marquee.height}px`}></div>{/if}
           {#each visible as item (item.id)}
             {@const position = itemPosition(item)}
-            <button
+            <div
               class="file-tile"
               class:selected={selectedIds.has(item.id)}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
+              role="button"
+              tabindex="0"
+              aria-label={displayName(item)}
               onpointerdown={(event) => dragItem(event, item)}
               ondragstart={(event) => event.preventDefault()}
-              ondblclick={() => open(item)}
+              ondblclick={() => { cancelPendingItemRename(); if (editingItemId !== item.id) void open(item); }}
+              onkeydown={(event) => {
+                if (event.key === "F2") { event.preventDefault(); beginItemRename(item); }
+                else if (event.key === "Enter") { event.preventDefault(); void open(item); }
+                else if (event.key === " ") { event.preventDefault(); void select(item); }
+              }}
               oncontextmenu={(event) => showContextMenu(event, item)}
             >
               <span class="file-icon" use:loadThumbnail={item} style={`width:${grid.iconSize}px;height:${grid.iconSize}px;font-size:${grid.iconSize}px`}>
                 {#if thumbnails[item.id]}<img draggable={false} src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img draggable={false} src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
               </span>
-              <span>{displayName(item)}</span>
-            </button>
+              {#if editingItemId === item.id}
+                <input
+                  class="file-rename-input"
+                  use:focusItemRename={renameSelectionEnd(item)}
+                  value={displayName(item)}
+                  aria-label={`Rename ${displayName(item)}`}
+                  onblur={(event) => { void commitItemRename(item, event.currentTarget.value); }}
+                  onkeydown={(event) => {
+                    event.stopPropagation();
+                    if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
+                    else if (event.key === "Escape") { event.preventDefault(); event.currentTarget.value = displayName(item); event.currentTarget.blur(); }
+                  }}
+                  onpointerdown={(event) => event.stopPropagation()}
+                  onclick={(event) => event.stopPropagation()}
+                  ondblclick={(event) => event.stopPropagation()}
+                  oncontextmenu={(event) => event.stopPropagation()}
+                />
+              {:else}
+                <span class="file-label">{displayName(item)}</span>
+              {/if}
+            </div>
           {/each}
         </div>
         {#if loading}<div class="empty">Reading folder…</div>{:else if visible.length === 0}<div class="empty">No matching items</div>{/if}
@@ -1247,7 +1412,7 @@
       <button onclick={() => { void localFileOpen(context!.item.path, true); context = null; }}>Show in {nativeBrowserName()}</button>
       <hr />
       {#if !context.item.virtualItem}
-        <button onclick={() => { void rename(context!.item); context = null; }}>Rename</button>
+        <button onclick={() => { beginItemRename(context!.item); context = null; }}>Rename</button>
         <button onclick={() => { void navigator.clipboard.writeText(context!.item.path); context = null; }}>Copy path</button>
         <hr />
         <button class="danger" onclick={() => { void moveToTrash(context!.item); context = null; }}>Move to {platform === "windows" ? "Recycle Bin" : "Trash"}</button>
@@ -1308,7 +1473,7 @@
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .2rem .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .74rem; line-height: 1.2; user-select: text; }
   .file-tile { user-select: none; }
   .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
@@ -1320,7 +1485,7 @@
   .zoom-menu button:hover, .zoom-menu button.active { background: var(--accent-soft); }
   .zoom-menu hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
-  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .details > button { display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.details > button:hover, .details > button.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
+  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .detail-row { box-sizing: border-box; display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.detail-row:hover, .detail-row.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { flex: 0 0 auto; display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.detail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.detail-rename-input { min-width: 0; flex: 1; padding: .18rem .3rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; user-select: text; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
   .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview .sidebar-body > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
   .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }

@@ -8,6 +8,16 @@ export interface NativeLocationCrumb {
   path: string;
 }
 
+/** Terminal replies for the Files workspace's one-request/one-reply RPCs.
+ * Streaming chunks are handled by the download path, not this waiter. */
+export function isWorkspaceFileReplyKind(kind: string): boolean {
+  return kind === "entries"
+    || kind === "volume_list"
+    || kind === "metadata"
+    || kind === "ok"
+    || kind === "err";
+}
+
 /** Build clickable native-path ancestry without pretending every host uses
  * this viewer's path syntax. Absolute POSIX paths win over the presence of a
  * legal backslash filename; Windows handles drive, UNC, and extended paths. */

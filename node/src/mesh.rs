@@ -13974,15 +13974,7 @@ impl Mesh {
             self.file_send(route_id.to_string(), event).await?;
             let mut events = Vec::new();
             while let Some(event) = replies.recv().await {
-                let terminal = matches!(
-                    event,
-                    FileEvent::Entries { .. }
-                        | FileEvent::QuotaInfo { .. }
-                        | FileEvent::Metadata { .. }
-                        | FileEvent::Ok { .. }
-                        | FileEvent::Err { .. }
-                        | FileEvent::Chunk { eof: true, .. }
-                );
+                let terminal = completes_file_rpc(&event);
                 events.push(event);
                 if terminal {
                     break;
@@ -18178,6 +18170,19 @@ fn append_chunk(path: &Path, data: &[u8], first: bool) -> std::io::Result<()> {
     opts.open(path)?.write_all(data)
 }
 
+fn completes_file_rpc(event: &FileEvent) -> bool {
+    matches!(
+        event,
+        FileEvent::Entries { .. }
+            | FileEvent::VolumeList { .. }
+            | FileEvent::QuotaInfo { .. }
+            | FileEvent::Metadata { .. }
+            | FileEvent::Ok { .. }
+            | FileEvent::Err { .. }
+            | FileEvent::Chunk { eof: true, .. }
+    )
+}
+
 fn is_viewer_file_request(event: &FileEvent) -> bool {
     matches!(
         event,
@@ -18368,10 +18373,14 @@ mod tests {
     }
 
     #[test]
-    fn volume_inventory_is_a_viewer_file_request() {
+    fn volume_inventory_request_and_reply_are_classified() {
         assert!(is_viewer_file_request(&FileEvent::Volumes { req: 7 }));
         assert!(is_viewer_file_request(&FileEvent::Quota { req: 8 }));
         assert!(!is_viewer_file_request(&FileEvent::VolumeList {
+            req: 7,
+            volumes: Vec::new(),
+        }));
+        assert!(completes_file_rpc(&FileEvent::VolumeList {
             req: 7,
             volumes: Vec::new(),
         }));

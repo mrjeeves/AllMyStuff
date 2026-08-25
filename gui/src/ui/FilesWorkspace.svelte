@@ -32,6 +32,7 @@
     desktopColumnPosition,
     FILE_TILE_SIZES,
     isLegacyAutoRowPlacement,
+    isWorkspaceFileReplyKind,
     nativeFileGridMetrics,
     nativeFileDisplayName,
     nativeLocationTrail,
@@ -468,7 +469,7 @@
   function receiveRemote(session: RemoteSession, event: FileEvent) {
     const pending = session.pending.get(event.req);
     if (!pending) return;
-    if (!["entries", "metadata", "ok", "err"].includes(event.kind)) return;
+    if (!isWorkspaceFileReplyKind(event.kind)) return;
     window.clearTimeout(pending.timer);
     session.pending.delete(event.req);
     if (event.kind === "err") pending.reject(new Error(event.reason));

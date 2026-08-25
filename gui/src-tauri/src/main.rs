@@ -1166,6 +1166,14 @@ enum LocalPreview {
     Unsupported,
 }
 
+fn local_path_for_display(path: &Path) -> String {
+    #[cfg(windows)]
+    let shown = shell_icon::shell_compatible_path(path);
+    #[cfg(not(windows))]
+    let shown = path.to_path_buf();
+    shown.to_string_lossy().into_owned()
+}
+
 fn path_fallback_id(kind: &str, path: &Path, meta: &std::fs::Metadata, fold_case: bool) -> String {
     let shown = path.to_string_lossy();
     let normalized = if fold_case {
@@ -1254,7 +1262,7 @@ fn location(id: &str, label: &str, path: Option<PathBuf>, kind: &str) -> Option<
     Some(LocalFileLocation {
         id: id.into(),
         label: label.into(),
-        path: path.to_string_lossy().into_owned(),
+        path: local_path_for_display(&path),
         kind: kind.into(),
     })
 }
@@ -1315,7 +1323,10 @@ async fn local_file_list(
                 .cursors
                 .remove(&token)
                 .ok_or_else(|| "that folder page expired; refresh it".to_string())?;
-            if PathBuf::from(&path) != current.path {
+            let requested = PathBuf::from(&path)
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            if requested != current.path {
                 return Err("that folder page belongs to another location".into());
             }
             current
@@ -1387,7 +1398,7 @@ async fn local_file_list(
             Some(LocalFileEntry {
                 id,
                 name,
-                path: entry_path.to_string_lossy().into_owned(),
+                path: local_path_for_display(&entry_path),
                 dir: display_meta.is_dir(),
                 size: if display_meta.is_file() {
                     display_meta.len()
@@ -1439,7 +1450,7 @@ async fn local_file_list(
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         let listing_id = current.id.clone();
-        let listing_path = current.path.to_string_lossy().into_owned();
+        let listing_path = local_path_for_display(&current.path);
         let complete = current.pending.is_none();
         let next_cursor = if complete {
             None
@@ -4509,5 +4520,14 @@ mod tests {
         assert!(windows_file_is_hidden(FILE_ATTRIBUTE_HIDDEN));
         assert!(windows_file_is_hidden(FILE_ATTRIBUTE_SYSTEM));
         assert!(!windows_file_is_hidden(FILE_ATTRIBUTE_NORMAL));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_file_paths_hide_windows_device_syntax() {
+        assert_eq!(
+            local_path_for_display(Path::new(r"\\?\C:\Users\Chris\Desktop")),
+            r"C:\Users\Chris\Desktop"
+        );
     }
 }

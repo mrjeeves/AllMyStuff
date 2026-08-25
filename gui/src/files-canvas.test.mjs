@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, sharedFilesystemObject } from "./files-canvas.ts";
+import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
@@ -50,6 +50,21 @@ test("file icon sizes use the native Explorer notches and separate grid cells", 
   assert.deepEqual(nativeFileGridMetrics(48, "windows"), {
     iconSize: 48, tileWidth: 88, tileHeight: 92, columnWidth: 100, rowHeight: 100,
   });
+});
+
+test("native size changes resolve top-level collisions without moving framed items", () => {
+  const metrics = nativeFileGridMetrics(96, "windows");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "a", x: 24, y: 24, parentId: null },
+    { id: "b", x: 24, y: 100, parentId: null },
+    { id: "framed", x: 24, y: 100, parentId: "frame:a" },
+  ], metrics);
+  assert.deepEqual(resolved.map(({ y }) => y), [24, 252, 100]);
+});
+
+test("drag previews and drops share one zoom-aware coordinate conversion", () => {
+  assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 1.5), { x: 60, y: 20 });
+  assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 0), { x: 80, y: 10 });
 });
 
 test("desktop fallback stays column-major across compact canvas measurement", () => {

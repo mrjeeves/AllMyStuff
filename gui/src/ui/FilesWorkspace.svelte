@@ -29,6 +29,8 @@
     nativeFileDisplayName,
     nativeWindowsLinkExtension,
     rectsIntersect,
+    resolveDesktopTileCollisions,
+    translateCanvasPoint,
     descendantsOf,
     mergeCanvasRecords,
     normalizeFrameNesting,
@@ -85,6 +87,24 @@
   let wallpaperPath = $state("");
   let wallpaper = $state("");
   let canvasHeight = $state(720);
+  type FrameGeometry = Pick<CanvasFrame, "x" | "y" | "width" | "height">;
+  let liveFrameGeometry = $state<Record<string, FrameGeometry>>({});
+  let liveItemPositions = $state<Record<string, CanvasPlacement>>({});
+  let geometryPreviewGeneration = 0;
+
+  function beginGeometryPreview() {
+    geometryPreviewGeneration += 1;
+    liveFrameGeometry = {};
+    liveItemPositions = {};
+    return geometryPreviewGeneration;
+  }
+
+  function clearGeometryPreview(generation: number) {
+    if (geometryPreviewGeneration === generation) {
+      liveFrameGeometry = {};
+      liveItemPositions = {};
+    }
+  }
 
   const visible = $derived(
     entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
@@ -143,6 +163,11 @@
       }
     }
     return out;
+  });
+  const displayPlacements = $derived.by(() => {
+    const desired = entries.map((item) => placements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) });
+    const resolved = resolveDesktopTileCollisions(desired, grid);
+    return new Map(resolved.map((placement) => [placement.id, placement]));
   });
   const filesystemPartners = $derived.by(() => app.sharePartners.flatMap((partner) => {
     const sharedByYou = partner.sharedByYou.flatMap(({ node, grant }) => {
@@ -343,7 +368,11 @@
   }
 
   function itemPosition(item: LocalFileEntry) {
-    return placements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) };
+    return liveItemPositions[item.id] ?? displayPlacements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) };
+  }
+
+  function frameGeometry(frame: CanvasFrame): FrameGeometry {
+    return liveFrameGeometry[frame.id] ?? frame;
   }
 
   function requestPreview(item: LocalFileEntry): Promise<LocalFilePreview> {
@@ -554,40 +583,52 @@
     if (!selectedIds.has(item.id)) return;
     const dragged = entries.filter((entry) => selectedIds.has(entry.id));
     const starts = new Map(dragged.map((entry) => [entry.id, itemPosition(entry)]));
-    const optimisticIds = new Set(dragged.map((entry) => `${itemPrefix}${entry.id}`));
     const origin = { x: event.clientX, y: event.clientY };
+    const pointerId = event.pointerId;
+    const previewGeneration = beginGeometryPreview();
     let moved = false;
     const move = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId || previewGeneration !== geometryPreviewGeneration) return;
       const clientDx = next.clientX - origin.x;
       const clientDy = next.clientY - origin.y;
       if (!moved && Math.hypot(clientDx, clientDy) < 4) return;
       moved = true;
-      const dx = clientDx / zoom;
-      const dy = clientDy / zoom;
-      const optimistic = dragged.map((entry) => {
+      liveItemPositions = Object.fromEntries(dragged.map((entry) => {
         const start = starts.get(entry.id)!;
-        const value = { id: entry.id, x: start.x + dx, y: start.y + dy, parentId: start.parentId };
-        return { id: `${itemPrefix}${entry.id}`, kind: "item" as const, value, stamp: { counter: Number.MAX_SAFE_INTEGER, actor: "optimistic" } };
-      });
-      records = [...records.filter((record) => !optimisticIds.has(record.id)), ...optimistic];
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
+        return [entry.id, { ...start, ...point }];
+      }));
     };
     const up = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      if (!moved) return;
-      const dx = (next.clientX - origin.x) / zoom;
-      const dy = (next.clientY - origin.y) / zoom;
+      window.removeEventListener("pointercancel", cancel);
+      if (previewGeneration !== geometryPreviewGeneration) return;
+      if (!moved) {
+        clearGeometryPreview(previewGeneration);
+        return;
+      }
       const mutations = dragged.map((entry) => {
         const start = starts.get(entry.id)!;
-        const position = { id: entry.id, x: start.x + dx, y: start.y + dy, parentId: null as string | null };
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
+        const position = { id: entry.id, ...point, parentId: null as string | null };
         position.parentId = containingFrame({ ...position, width: grid.tileWidth, height: grid.tileHeight }, frames);
         return { id: `${itemPrefix}${entry.id}`, kind: "item" as const, value: position };
       });
-      records = records.filter((record) => !optimisticIds.has(record.id));
-      void save(mutations);
+      liveItemPositions = Object.fromEntries(mutations.map((mutation) => [mutation.value.id, mutation.value]));
+      void save(mutations).finally(() => clearGeometryPreview(previewGeneration));
+    };
+    const cancel = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   function dragFrame(event: PointerEvent, frame: CanvasFrame) {
@@ -603,53 +644,100 @@
     );
     const itemStarts = new Map(movedItems.map(([id, placement]) => [id, { x: placement.x, y: placement.y }]));
     const canvasZoom = map === "files" ? zoom : 1;
+    const pointerId = event.pointerId;
+    const previewGeneration = beginGeometryPreview();
     const move = (next: PointerEvent) => {
-      const dx = (next.clientX - origin.x) / canvasZoom;
-      const dy = (next.clientY - origin.y) / canvasZoom;
-      for (const candidate of movedFrames) {
+      if (next.pointerId !== pointerId || previewGeneration !== geometryPreviewGeneration) return;
+      liveFrameGeometry = Object.fromEntries(movedFrames.map((candidate) => {
         const start = frameStarts.get(candidate.id)!;
-        candidate.x = start.x + dx;
-        candidate.y = start.y + dy;
-      }
-      for (const [id, placement] of movedItems) {
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
+        return [candidate.id, { ...candidate, ...point }];
+      }));
+      liveItemPositions = Object.fromEntries(movedItems.map(([id, placement]) => {
         const start = itemStarts.get(id)!;
-        placement.x = start.x + dx;
-        placement.y = start.y + dy;
-      }
-      records = [...records];
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
+        return [id, { ...placement, ...point }];
+      }));
     };
-    const up = () => {
+    const up = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      frame.parentId = containingFrame(frame, frames, children);
-      void save([
-        ...movedFrames.map(frameRecord),
-        ...movedItems.map(([id, placement]) => ({ id: `item:${map}:${scope}:${id}`, kind: "item" as const, value: placement })),
-      ]);
+      window.removeEventListener("pointercancel", cancel);
+      if (previewGeneration !== geometryPreviewGeneration) return;
+      const finalFrames = movedFrames.map((candidate) => {
+        const start = frameStarts.get(candidate.id)!;
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
+        return { ...candidate, ...point };
+      });
+      const finalById = new Map(finalFrames.map((candidate) => [candidate.id, candidate]));
+      const candidateFrames = frames.map((candidate) => finalById.get(candidate.id) ?? candidate);
+      const finalFrame = finalById.get(frame.id)!;
+      finalFrame.parentId = containingFrame(finalFrame, candidateFrames, children);
+      const finalItems = movedItems.map(([id, placement]) => {
+        const start = itemStarts.get(id)!;
+        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
+        return { ...placement, ...point };
+      });
+      liveFrameGeometry = Object.fromEntries(finalFrames.map((candidate) => [candidate.id, candidate]));
+      liveItemPositions = Object.fromEntries(finalItems.map((placement) => [placement.id, placement]));
+      const mutations = [
+        ...finalFrames.map(frameRecord),
+        ...finalItems.map((placement) => ({ id: `${itemPrefix}${placement.id}`, kind: "item" as const, value: placement })),
+      ];
+      void save(mutations).finally(() => clearGeometryPreview(previewGeneration));
+    };
+    const cancel = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   function resizeFrame(event: PointerEvent, frame: CanvasFrame) {
     if (event.button !== 0) return;
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY };
-    const start = { width: frame.width, height: frame.height };
+    const start = frameGeometry(frame);
     const canvasZoom = map === "files" ? zoom : 1;
+    const pointerId = event.pointerId;
+    const previewGeneration = beginGeometryPreview();
+    const geometry = (next: PointerEvent): FrameGeometry => ({
+      ...start,
+      width: Math.max(180, start.width + (next.clientX - origin.x) / canvasZoom),
+      height: Math.max(120, start.height + (next.clientY - origin.y) / canvasZoom),
+    });
     const move = (next: PointerEvent) => {
-      frame.width = Math.max(180, start.width + (next.clientX - origin.x) / canvasZoom);
-      frame.height = Math.max(120, start.height + (next.clientY - origin.y) / canvasZoom);
-      records = [...records];
+      if (next.pointerId !== pointerId || previewGeneration !== geometryPreviewGeneration) return;
+      liveFrameGeometry = { ...liveFrameGeometry, [frame.id]: geometry(next) };
     };
-    const up = () => {
+    const up = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
-      frame.parentId = containingFrame(frame, frames, descendantsOf(frame.id, frames));
-      void save([frameRecord(frame)]);
+      window.removeEventListener("pointercancel", cancel);
+      if (previewGeneration !== geometryPreviewGeneration) return;
+      const finalFrame = { ...frame, ...geometry(next) };
+      const candidateFrames = frames.map((candidate) => candidate.id === frame.id ? finalFrame : candidate);
+      finalFrame.parentId = containingFrame(finalFrame, candidateFrames, descendantsOf(frame.id, frames));
+      liveFrameGeometry = { [frame.id]: finalFrame };
+      void save([frameRecord(finalFrame)]).finally(() => clearGeometryPreview(previewGeneration));
+    };
+    const cancel = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   function panCanvas(event: PointerEvent) {
@@ -1024,7 +1112,8 @@
           <section class="share-frame empty-share"><h2>No shared filesystem objects</h2><p>Other share types remain available elsewhere; this Files view appears only when a concrete file, folder, or drive is shared.</p></section>
         {/each}
         {#each frames as frame}
-          <article class="canvas-frame user" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
+          {@const geometry = frameGeometry(frame)}
+          <article class="canvas-frame user" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
             <input value={frame.title} onchange={(event) => { frame.title = event.currentTarget.value; void save([frameRecord(frame)]); }} onpointerdown={(event) => event.stopPropagation()} />
             <button title="Delete frame, keep its contents" onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
             <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
@@ -1050,7 +1139,8 @@
       <div class="viewport" bind:this={viewportElement} class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
           {#each frames as frame}
-            <article class="canvas-frame" style={`left:${frame.x}px;top:${frame.y}px;width:${frame.width}px;height:${frame.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
+            {@const geometry = frameGeometry(frame)}
+            <article class="canvas-frame" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
               <input value={frame.title} onchange={(event) => { frame.title = event.currentTarget.value; void save([frameRecord(frame)]); }} onpointerdown={(event) => event.stopPropagation()} />
               <button title="Delete frame, keep its contents" onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
               <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
@@ -1183,8 +1273,8 @@
   .canvas-frame input { width: calc(100% - 2rem); border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; }.canvas-frame > button { float: right; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
-  .file-tile { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: calc(100% + 1rem); min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
+  .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .2rem .35rem; touch-action: none; }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
   .selection-marquee { position: absolute; z-index: 5; border: 1px solid var(--accent); background: var(--accent-soft); pointer-events: none; }
   .zoom-control { position: absolute; right: .7rem; bottom: .7rem; z-index: 8; }

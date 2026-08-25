@@ -19,9 +19,12 @@ use windows::{
         },
         Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
         UI::{
+            Controls::{IImageList, ILD_TRANSPARENT},
             Shell::{
-                SHGetFileInfoW, SHGetStockIconInfo, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-                SHGFI_LINKOVERLAY, SHGSI_ICON, SHGSI_LARGEICON, SHSTOCKICONINFO, SIID_RECYCLER,
+                SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHFILEINFOW, SHGFI_ICON,
+                SHGFI_LINKOVERLAY, SHGFI_OVERLAYINDEX, SHGFI_SYSICONINDEX, SHGSI_ICON,
+                SHGSI_LARGEICON, SHGSI_SYSICONINDEX, SHIL_JUMBO, SHIL_LARGE, SHSTOCKICONINFO,
+                SIID_RECYCLER,
             },
             WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON},
         },
@@ -53,34 +56,47 @@ pub(crate) fn shell_compatible_path(path: &Path) -> PathBuf {
 }
 
 const ICON_SIZE: i32 = 96;
+const OVERLAY_SIZE: i32 = 32;
 
-pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
+fn with_shell_com<T>(operation: impl FnOnce() -> T) -> T {
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-
-    // SHGetFileInfo requires COM on the calling thread. Directory pages run on
-    // Tokio workers, so the UI thread's COM apartment does not cover them.
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-    let icon = shortcut_icon_initialized(path);
+    let result = operation();
     if initialized {
         unsafe { CoUninitialize() };
     }
-    icon
+    result
+}
+
+pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
+    with_shell_com(|| shortcut_icon_initialized(path))
 }
 
 pub(crate) fn recycle_bin_icon() -> Option<String> {
-    let mut info = SHSTOCKICONINFO::default();
-    info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
-    unsafe {
-        SHGetStockIconInfo(SIID_RECYCLER, SHGSI_ICON | SHGSI_LARGEICON, &mut info).ok()?;
-    }
-    if info.hIcon.0.is_null() {
-        return None;
-    }
-    let rendered = render_icon(info.hIcon);
-    unsafe {
-        let _ = DestroyIcon(info.hIcon);
-    }
-    rendered
+    with_shell_com(|| {
+        let mut info = SHSTOCKICONINFO::default();
+        info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        unsafe {
+            SHGetStockIconInfo(
+                SIID_RECYCLER,
+                SHGSI_ICON | SHGSI_LARGEICON | SHGSI_SYSICONINDEX,
+                &mut info,
+            )
+            .ok()?;
+        }
+        let fallback = if info.hIcon.0.is_null() {
+            None
+        } else {
+            render_icon(info.hIcon)
+        };
+        let rendered = jumbo_icon(info.iSysImageIndex, 0).or(fallback);
+        if !info.hIcon.0.is_null() {
+            unsafe {
+                let _ = DestroyIcon(info.hIcon);
+            }
+        }
+        rendered
+    })
 }
 
 fn shortcut_icon_initialized(path: &Path) -> Option<String> {
@@ -96,21 +112,67 @@ fn shortcut_icon_initialized(path: &Path) -> Option<String> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             Some(&mut info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_LINKOVERLAY,
+            SHGFI_ICON | SHGFI_LINKOVERLAY | SHGFI_OVERLAYINDEX | SHGFI_SYSICONINDEX,
         )
     };
-    if found == 0 || info.hIcon.0.is_null() {
+    if found == 0 {
         return None;
     }
+    let packed = info.iIcon as u32;
+    let fallback = if info.hIcon.0.is_null() {
+        None
+    } else {
+        render_icon(info.hIcon)
+    };
+    let rendered = jumbo_icon((packed & 0x00ff_ffff) as i32, packed >> 24).or(fallback);
+    if !info.hIcon.0.is_null() {
+        unsafe {
+            let _ = DestroyIcon(info.hIcon);
+        }
+    }
+    rendered
+}
 
-    let rendered = render_icon(info.hIcon);
+fn jumbo_icon(image_index: i32, overlay_index: u32) -> Option<String> {
+    let images: IImageList = unsafe { SHGetImageList(SHIL_JUMBO as i32).ok()? };
+    let icon = unsafe { images.GetIcon(image_index, ILD_TRANSPARENT.0).ok()? };
+    if icon.0.is_null() {
+        return None;
+    }
+    let overlay = if overlay_index == 0 {
+        None
+    } else {
+        let resolved = (|| {
+            let overlays: IImageList = unsafe { SHGetImageList(SHIL_LARGE as i32).ok()? };
+            let overlay_image = unsafe { overlays.GetOverlayImage(overlay_index as i32).ok()? };
+            let overlay = unsafe { overlays.GetIcon(overlay_image, ILD_TRANSPARENT.0).ok()? };
+            (!overlay.0.is_null()).then_some(overlay)
+        })();
+        match resolved {
+            Some(overlay) => Some(overlay),
+            None => {
+                unsafe {
+                    let _ = DestroyIcon(icon);
+                }
+                return None;
+            }
+        }
+    };
+    let rendered = render_icon_layers(icon, overlay);
     unsafe {
-        let _ = DestroyIcon(info.hIcon);
+        let _ = DestroyIcon(icon);
+        if let Some(overlay) = overlay {
+            let _ = DestroyIcon(overlay);
+        }
     }
     rendered
 }
 
 fn render_icon(icon: HICON) -> Option<String> {
+    render_icon_layers(icon, None)
+}
+
+fn render_icon_layers(icon: HICON, overlay: Option<HICON>) -> Option<String> {
     let dc = unsafe { CreateCompatibleDC(None) };
     if dc.0.is_null() {
         return None;
@@ -136,10 +198,30 @@ fn render_icon(icon: HICON) -> Option<String> {
         };
     let old = unsafe { SelectObject(dc, bitmap.into()) };
     let byte_len = (ICON_SIZE * ICON_SIZE * 4) as usize;
+    let draw = || {
+        unsafe { DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL) }.ok()?;
+        if let Some(overlay) = overlay {
+            unsafe {
+                DrawIconEx(
+                    dc,
+                    0,
+                    ICON_SIZE - OVERLAY_SIZE,
+                    overlay,
+                    OVERLAY_SIZE,
+                    OVERLAY_SIZE,
+                    0,
+                    None,
+                    DI_NORMAL,
+                )
+            }
+            .ok()?;
+        }
+        Some(())
+    };
 
     let rgba = (|| {
         unsafe { std::ptr::write_bytes(bits.cast::<u8>(), 0, byte_len) };
-        unsafe { DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL) }.ok()?;
+        draw()?;
         let black = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), byte_len) }.to_vec();
         let has_alpha = black.chunks_exact(4).any(|pixel| pixel[3] != 0);
         let mut rgba = Vec::with_capacity(byte_len);
@@ -169,7 +251,7 @@ fn render_icon(icon: HICON) -> Option<String> {
             for pixel in surface.chunks_exact_mut(4) {
                 pixel.copy_from_slice(&[255, 255, 255, 255]);
             }
-            unsafe { DrawIconEx(dc, 0, 0, icon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL) }.ok()?;
+            draw()?;
             let white = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), byte_len) };
             for (black_pixel, white_pixel) in black.chunks_exact(4).zip(white.chunks_exact(4)) {
                 let background = (0..3)

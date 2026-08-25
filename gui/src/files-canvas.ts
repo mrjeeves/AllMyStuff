@@ -144,6 +144,16 @@ export function nativeFileGridMetrics(input: number, platform: string): NativeFi
   return { iconSize, tileWidth: 92, tileHeight: 96, columnWidth: 104, rowHeight: 104 };
 }
 
+/** Apply a screen-space pointer delta to world-space canvas geometry. Frames,
+ * icons, previews, and final drops all use this one conversion. */
+export function translateCanvasPoint(start: Point, origin: Point, current: Point, zoom = 1): Point {
+  const scale = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  return {
+    x: start.x + (current.x - origin.x) / scale,
+    y: start.y + (current.y - origin.y) / scale,
+  };
+}
+
 /** Native desktops fill downward before starting the next column. A stable
  * minimum column length prevents a compact app window from turning a short
  * desktop into a visual row when its first real measurement arrives. */
@@ -175,6 +185,32 @@ export function isLegacyAutoRowPlacement(placement: CanvasPlacement): boolean {
 
 export function rectsIntersect(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+/** Keep top-level desktop cells collision-free at every native size notch.
+ * This is a deterministic render projection; fleet layout records stay unchanged. */
+export function resolveDesktopTileCollisions(
+  placements: readonly CanvasPlacement[],
+  metrics: NativeFileGridMetrics,
+): CanvasPlacement[] {
+  const resolved: CanvasPlacement[] = [];
+  for (const source of placements) {
+    const next = { ...source };
+    if (next.parentId === null) {
+      let attempts = 0;
+      while (attempts <= resolved.length && resolved.some((other) =>
+        other.parentId === null && rectsIntersect(
+          { ...next, width: metrics.tileWidth, height: metrics.tileHeight },
+          { ...other, width: metrics.tileWidth, height: metrics.tileHeight },
+        )
+      )) {
+        next.y += metrics.rowHeight;
+        attempts += 1;
+      }
+    }
+    resolved.push(next);
+  }
+  return resolved;
 }
 
 export function nativeWindowsLinkExtension(name: string, platform: string): ".lnk" | ".url" | null {

@@ -114,6 +114,10 @@
   let localRootPath = "";
   let sourceSummary = $state("Loading this device…");
   const remoteSessions = new Map<string, RemoteSession>();
+  type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
+  const fleetDesktopCursors = new Map<string, FleetDesktopCursor>();
+  const fleetDesktopFailures = new Map<string, string>();
+  const FLEET_DESKTOP_CURSOR = "__fleet_desktop__";
   const pendingRemoteOpens = new Map<string, { name: string; deviceLabel: string }>();
   const remoteDirectoryIds = new Map<string, string>();
   let currentRemoteDirectory = $state<{
@@ -537,6 +541,55 @@
     if (event.kind !== "volume_list") throw new Error("The remote device returned an invalid volume list");
     return event.volumes;
   }
+  async function loadRemoteFleetDesktops(generation: number) {
+    const nodes = fleetFileNodes.filter((node) => node.online && app.filesAllowed(node));
+    if (nodes.length === 0) return;
+    let nextNode = 0;
+    let ready = 1;
+    sourceSummary = "Fleet Home · syncing " + nodes.length + " remote desktops";
+
+    const worker = async () => {
+      while (generation === navigationGeneration && fleetHome) {
+        const node = nodes[nextNode++];
+        if (!node) return;
+        try {
+          const session = await ensureRemoteSession(node.id, node.label);
+          const listing = await remoteList(session, "~/Desktop");
+          if (generation !== navigationGeneration || !fleetHome) return;
+          const additions = await adoptWorkspaceEntries(
+            "fleet:home",
+            listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
+          );
+          if (generation !== navigationGeneration || !fleetHome) return;
+          const known = new Set(entries.map((item) => item.id));
+          entries = [...entries, ...additions.filter((item) => !known.has(item.id))];
+          if (listing.next_cursor) {
+            fleetDesktopCursors.set(node.id, {
+              deviceId: node.id,
+              deviceLabel: node.label,
+              path: listing.path,
+              cursor: listing.next_cursor,
+            });
+            if (!nextCursor) nextCursor = FLEET_DESKTOP_CURSOR;
+            complete = false;
+          }
+          ready += 1;
+        } catch (error) {
+          if (generation !== navigationGeneration || !fleetHome) return;
+          fleetDesktopFailures.set(node.id, String(error));
+        }
+        const unavailable = fleetDesktopFailures.size;
+        sourceSummary = "Fleet Home · " + ready + " desktops live"
+          + (unavailable ? " · " + unavailable + " unavailable" : "");
+      }
+    };
+
+    await Promise.all(Array.from(
+      { length: Math.min(2, nodes.length) },
+      () => worker(),
+    ));
+  }
+
 
   async function navigateFleetHome() {
     const desktop = locations.find((place) => place.id === "desktop") ?? locations[0];
@@ -546,6 +599,8 @@
     computerHome = false;
     currentComputer = null;
     currentRemoteDirectory = null;
+    fleetDesktopCursors.clear();
+    fleetDesktopFailures.clear();
     clearWorkspaceSelection();
     try {
       const listing = await localFileList(desktop.path);
@@ -574,6 +629,7 @@
       thumbnailOrder = [];
       sourceSummary = "Fleet Home · " + fleetComputers.length + " computers";
       loading = false;
+      void loadRemoteFleetDesktops(generation);
     } catch (error) {
       if (generation === navigationGeneration) app.toast("warn", `Couldn't open Fleet Home: ${String(error)}`);
     } finally {
@@ -877,6 +933,43 @@
         );
         nextCursor = listing.next_cursor ?? null;
         complete = !nextCursor;
+      } else if (fleetHome && cursor === FLEET_DESKTOP_CURSOR) {
+        const source = fleetDesktopCursors.values().next().value;
+        if (!source) {
+          nextCursor = null;
+          complete = true;
+          return;
+        }
+        const session = remoteSessions.get(source.deviceId);
+        if (!session) {
+          fleetDesktopCursors.delete(source.deviceId);
+          nextCursor = fleetDesktopCursors.size > 0 ? FLEET_DESKTOP_CURSOR : null;
+          complete = fleetDesktopCursors.size === 0;
+          throw new Error(source.deviceLabel + "'s Desktop connection ended");
+        }
+        try {
+          const listing = await remoteList(session, source.path, source.cursor);
+          if (generation !== navigationGeneration || !fleetHome) return;
+          additions = await adoptWorkspaceEntries(
+            "fleet:home",
+            listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
+          );
+          if (listing.next_cursor) {
+            fleetDesktopCursors.set(source.deviceId, {
+              ...source,
+              path: listing.path,
+              cursor: listing.next_cursor,
+            });
+          } else {
+            fleetDesktopCursors.delete(source.deviceId);
+          }
+        } catch (error) {
+          fleetDesktopCursors.delete(source.deviceId);
+          throw error;
+        } finally {
+          nextCursor = fleetDesktopCursors.size > 0 ? FLEET_DESKTOP_CURSOR : null;
+          complete = fleetDesktopCursors.size === 0;
+        }
       } else {
         const sourcePath = fleetHome ? localRootPath : path;
         const listing = await localFileList(sourcePath, cursor);
@@ -885,8 +978,9 @@
           fleetHome ? "fleet:home" : directoryId,
           listing.entries.map(localWorkspaceEntry),
         );
-        nextCursor = listing.nextCursor ?? null;
-        complete = listing.complete;
+        nextCursor = listing.nextCursor
+          ?? (fleetHome && fleetDesktopCursors.size > 0 ? FLEET_DESKTOP_CURSOR : null);
+        complete = listing.complete && !nextCursor;
       }
       const known = new Set(entries.map((entry) => entry.id));
       entries = [...entries, ...additions.filter((entry) => !known.has(entry.id))];

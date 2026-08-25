@@ -1492,6 +1492,23 @@ async fn local_file_list(
 }
 
 #[tauri::command]
+async fn local_file_icon(path: String) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        return tokio::task::spawn_blocking(move || {
+            Ok(shell_icon::filesystem_icon(Path::new(&path)))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 async fn local_file_preview(path: String) -> Result<LocalPreview, String> {
     tokio::task::spawn_blocking(move || {
         use base64::Engine as _;
@@ -4227,6 +4244,7 @@ fn main() {
             files_canvas_purge_tombstones,
             local_file_locations,
             local_file_list,
+            local_file_icon,
             local_file_preview,
             local_file_open,
             local_file_context_menu,

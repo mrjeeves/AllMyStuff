@@ -233,6 +233,12 @@ export function localFilePreview(path: string): Promise<LocalFilePreview> {
         : { kind: "unsupported" });
 }
 
+export function localFileIcon(path: string): Promise<string | null> {
+  return isTauri()
+    ? requiredInvoke<string | null>("local_file_icon", { path })
+    : Promise.resolve(null);
+}
+
 export function localFileOpen(path: string, reveal = false): Promise<void> {
   return requiredInvoke("local_file_open", { path, reveal });
 }

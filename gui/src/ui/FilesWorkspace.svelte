@@ -7,6 +7,7 @@
     filesCanvasSnapshot,
     shareFolderFrom,
     localFileContextMenu,
+    localFileIcon,
     localFileList,
     localFileLocations,
     localFileMkdir,
@@ -72,6 +73,7 @@
   let frameTool = $state(false);
   let draftFrame = $state<CanvasFrame | null>(null);
   let thumbnails = $state<Record<string, string>>({});
+  let nativeIcons = $state<Record<string, string>>({});
   let history = $state<string[]>([]);
   let historyIndex = $state(-1);
   let nextCursor = $state<string | null>(null);
@@ -83,8 +85,17 @@
   let previewOpen = $state(app.filesSettings.showPreview);
   const previewRequests = new Map<string, Promise<LocalFilePreview>>();
   const thumbnailRequests = new Map<string, Promise<string>>();
+  const nativeIconRequests = new Map<string, Promise<string | null>>();
+  const nativeIconQueue: Array<{
+    path: string;
+    resolve: (icon: string | null) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  let activeNativeIconRequests = 0;
+  const MAX_NATIVE_ICON_REQUESTS = 4;
   const migratingLayouts = new Set<string>();
   let thumbnailOrder: string[] = [];
+  let nativeIconOrder: string[] = [];
   let placesWidth = $state(224);
   let previewWidth = $state(288);
   let wallpaperPath = $state("");
@@ -94,22 +105,6 @@
   let liveFrameGeometry = $state<Record<string, FrameGeometry>>({});
   let liveItemPositions = $state<Record<string, CanvasPlacement>>({});
   let geometryPreviewGeneration = 0;
-  let activeDeviceIds = $state<Set<string>>(new Set());
-  let availabilityDropDeviceId = $state<string | null>(null);
-
-  type FleetDevice = {
-    id: string;
-    label: string;
-    local: boolean;
-    online: boolean;
-    os: string;
-    product: string;
-  };
-
-  type AvailabilityPolicy = {
-    version: 1;
-    devices: string[];
-  };
 
   function beginGeometryPreview() {
     geometryPreviewGeneration += 1;
@@ -145,27 +140,6 @@
   });
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
   const scope = $derived(`local:${app.localId}:${directoryId || path}`);
-  const fleetDevices = $derived.by(() => {
-    const members = [...(app.ownedFleet?.members ?? [])];
-    if (!members.some((member) => app.isMe(member.device))) {
-      members.unshift({ device: app.localId, label: app.localNode?.label ?? "This computer" });
-    }
-    const devices: FleetDevice[] = [];
-    for (const member of members) {
-      if (devices.some((device) => app.isSameMachine(device.id, member.device))) continue;
-      const node = app.catalog.nodes.find((candidate) => app.isSameMachine(candidate.id, member.device));
-      const local = app.isMe(member.device);
-      devices.push({
-        id: member.device,
-        label: member.label?.trim() || node?.label?.trim() || (local ? "This computer" : "Fleet computer"),
-        local,
-        online: local || node?.online === true,
-        os: node?.summary?.os?.trim() ?? "",
-        product: node?.summary?.product?.trim() ?? "",
-      });
-    }
-    return devices.sort((a, b) => Number(b.local) - Number(a.local) || Number(b.online) - Number(a.online) || a.label.localeCompare(b.label));
-  });
   const framePrefix = $derived(map === "files" ? `frame:${map}:${scope}:` : `frame:${map}:`);
   const frames = $derived(
     normalizeFrameNesting(
@@ -175,18 +149,6 @@
     ),
   );
   const itemPrefix = $derived(`item:${map}:${scope}:`);
-  const availabilityPrefix = $derived(`preference:availability-v1:${scope}:`);
-  const availabilityPolicies = $derived.by(() => {
-    const policies = new Map<string, AvailabilityPolicy>();
-    for (const record of records) {
-      if (record.deleted || record.kind !== "preference" || !record.id.startsWith(availabilityPrefix)) continue;
-      const value = record.value as Partial<AvailabilityPolicy> | null;
-      if (value?.version !== 1 || !Array.isArray(value.devices)) continue;
-      const devices = value.devices.filter((device): device is string => typeof device === "string" && device.length > 0);
-      policies.set(record.id.slice(availabilityPrefix.length), { version: 1, devices });
-    }
-    return policies;
-  });
   const layoutPreferenceId = $derived(`preference:layout-v2:${map}:${scope}`);
   const layoutVersioned = $derived(records.some((record) =>
     !record.deleted &&
@@ -236,139 +198,6 @@
   function absorb(incoming: CanvasRecord[]) {
     records = mergeCanvasRecords(records, incoming).records;
   }
-  function sameDeviceIn(ids: Iterable<string>, deviceId: string): boolean {
-    return Array.from(ids).some((id) => app.isSameMachine(id, deviceId));
-  }
-
-  function fleetDevice(deviceId: string): FleetDevice | undefined {
-    return fleetDevices.find((device) => app.isSameMachine(device.id, deviceId));
-  }
-
-  function availabilityKey(subject: "item" | "frame", id: string): string {
-    return `${subject}:${id}`;
-  }
-
-  function policyDevices(subject: "item" | "frame", id: string): string[] {
-    return availabilityPolicies.get(availabilityKey(subject, id))?.devices ?? [];
-  }
-
-  function policyHasDevice(subject: "item" | "frame", id: string, deviceId: string): boolean {
-    return sameDeviceIn(policyDevices(subject, id), deviceId);
-  }
-
-  function itemAvailabilitySource(item: LocalFileEntry, deviceId: string): "local" | "item" | "frame" | null {
-    if (app.isMe(deviceId)) return "local";
-    if (policyHasDevice("item", item.id, deviceId)) return "item";
-    let parentId = placements.get(item.id)?.parentId ?? null;
-    const seen = new Set<string>();
-    while (parentId && !seen.has(parentId)) {
-      if (policyHasDevice("frame", parentId, deviceId)) return "frame";
-      seen.add(parentId);
-      parentId = frames.find((frame) => frame.id === parentId)?.parentId ?? null;
-    }
-    return null;
-  }
-
-  function itemMatchesDeviceLens(item: LocalFileEntry): boolean {
-    const lenses = fleetDevices.filter((device) => sameDeviceIn(activeDeviceIds, device.id));
-    return lenses.length === 0 || lenses.every((device) => itemAvailabilitySource(item, device.id) !== null);
-  }
-
-  function deviceIsActive(deviceId: string): boolean {
-    return sameDeviceIn(activeDeviceIds, deviceId);
-  }
-
-  function deviceIcon(device: FleetDevice): string {
-    const os = device.os.toLowerCase();
-    if (os.includes("mac")) return "⌘";
-    if (os.includes("linux")) return "◈";
-    if (device.product.toLowerCase().includes("nas")) return "▤";
-    return "▣";
-  }
-
-  function toggleDeviceLens(event: MouseEvent, device: FleetDevice) {
-    const additive = event.ctrlKey || event.metaKey || event.shiftKey;
-    const next = new Set(activeDeviceIds);
-    const existing = Array.from(next).find((id) => app.isSameMachine(id, device.id));
-    if (additive) {
-      if (existing) next.delete(existing);
-      else next.add(device.id);
-    } else if (existing && next.size === 1) {
-      next.clear();
-    } else {
-      next.clear();
-      next.add(device.id);
-    }
-    activeDeviceIds = next;
-  }
-
-  function policyMutation(subject: "item" | "frame", id: string, devices: string[]) {
-    const recordId = `${availabilityPrefix}${availabilityKey(subject, id)}`;
-    return devices.length
-      ? { id: recordId, kind: "preference" as const, value: { version: 1, devices } satisfies AvailabilityPolicy }
-      : { id: recordId, kind: "preference" as const, value: null, deleted: true };
-  }
-
-  function withDevice(devices: string[], deviceId: string): string[] {
-    return sameDeviceIn(devices, deviceId) ? devices : [...devices, deviceId];
-  }
-
-  function withoutDevice(devices: string[], deviceId: string): string[] {
-    return devices.filter((id) => !app.isSameMachine(id, deviceId));
-  }
-
-  async function keepItemsOnDevice(items: LocalFileEntry[], device: FleetDevice) {
-    if (device.local) {
-      app.toast("info", "These items are already on this computer.");
-      return;
-    }
-    const mutations = items.flatMap((item) => {
-      const current = policyDevices("item", item.id);
-      const next = withDevice(current, device.id);
-      return next === current ? [] : [policyMutation("item", item.id, next)];
-    });
-    if (!mutations.length) {
-      app.toast("info", `Already set to stay available on ${device.label}.`);
-      return;
-    }
-    await save(mutations);
-    app.toast("ok", `Keep intent saved for ${items.length === 1 ? displayName(items[0]!) : `${items.length} items`} on ${device.label}. Byte placement is not active yet.`);
-  }
-
-  async function keepFrameOnDevice(frame: CanvasFrame, device: FleetDevice) {
-    if (device.local) {
-      app.toast("info", "This frame is already available on this computer.");
-      return;
-    }
-    const current = policyDevices("frame", frame.id);
-    const next = withDevice(current, device.id);
-    if (next === current) {
-      app.toast("info", `${frame.title} is already set to stay available on ${device.label}.`);
-      return;
-    }
-    await save([policyMutation("frame", frame.id, next)]);
-    app.toast("ok", `${frame.title} will stay available on ${device.label}, including future contents. Byte placement is not active yet.`);
-  }
-
-  async function removeKeepIntent(subject: "item" | "frame", id: string, device: FleetDevice) {
-    const current = policyDevices(subject, id);
-    const next = withoutDevice(current, device.id);
-    if (next.length === current.length) return;
-    await save([policyMutation(subject, id, next)]);
-  }
-
-  function dropDeviceAt(clientX: number, clientY: number): FleetDevice | null {
-    const element = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>("[data-fleet-device]");
-    return element?.dataset.fleetDevice ? fleetDevice(element.dataset.fleetDevice) ?? null : null;
-  }
-
-  function updateAvailabilityDropTarget(clientX: number, clientY: number) {
-    availabilityDropDeviceId = dropDeviceAt(clientX, clientY)?.id ?? null;
-  }
-
-  function clearAvailabilityDropTarget() {
-    availabilityDropDeviceId = null;
-  }
 
   onMount(() => {
     let stop = () => {};
@@ -410,6 +239,7 @@
       const listing = await localFileList(next);
       if (generation !== navigationGeneration) return;
       directoryId = listing.id;
+      map = "files";
       if (remember && listing.path !== path) {
         const kept = history.slice(0, historyIndex + 1);
         if (kept.at(-1) !== listing.path) kept.push(listing.path);
@@ -607,6 +437,63 @@
       if (expired) delete next[expired];
     }
     thumbnails = next;
+  }
+
+  function nativeIconFor(item: LocalFileEntry): string | null {
+    return item.shellIcon || nativeIcons[item.id] || null;
+  }
+
+  function pumpNativeIconQueue() {
+    while (activeNativeIconRequests < MAX_NATIVE_ICON_REQUESTS) {
+      const task = nativeIconQueue.shift();
+      if (!task) return;
+      activeNativeIconRequests += 1;
+      void localFileIcon(task.path)
+        .then(task.resolve, task.reject)
+        .finally(() => {
+          activeNativeIconRequests -= 1;
+          pumpNativeIconQueue();
+        });
+    }
+  }
+
+  function requestNativeIcon(item: LocalFileEntry): Promise<string | null> {
+    const existing = nativeIconRequests.get(item.id);
+    if (existing) return existing;
+    const request = new Promise<string | null>((resolve, reject) => {
+      nativeIconQueue.push({ path: item.path, resolve, reject });
+      pumpNativeIconQueue();
+    });
+    const tracked = request.finally(() => {
+      if (nativeIconRequests.get(item.id) === tracked) nativeIconRequests.delete(item.id);
+    });
+    nativeIconRequests.set(item.id, tracked);
+    return tracked;
+  }
+
+  function retainNativeIcon(id: string, data: string | null) {
+    if (!data) return;
+    nativeIconOrder = [...nativeIconOrder.filter((entry) => entry !== id), id];
+    const next = { ...nativeIcons, [id]: data };
+    while (nativeIconOrder.length > 256) {
+      const expired = nativeIconOrder.shift();
+      if (expired) delete next[expired];
+    }
+    nativeIcons = next;
+  }
+
+  function loadNativeIcon(node: HTMLElement, item: LocalFileEntry) {
+    if (platform !== "windows" || nativeIconFor(item)) return {};
+    let cancelled = false;
+    const observer = new IntersectionObserver((events) => {
+      if (!events.some((event) => event.isIntersecting)) return;
+      observer.disconnect();
+      void requestNativeIcon(item)
+        .then((data) => { if (!cancelled) retainNativeIcon(item.id, data); })
+        .catch(() => {});
+    }, { rootMargin: "120px" });
+    observer.observe(node);
+    return { destroy() { cancelled = true; observer.disconnect(); } };
   }
 
   async function select(item: LocalFileEntry, event?: MouseEvent | PointerEvent) {
@@ -818,6 +705,12 @@
       thumbnails = nextThumbnails;
       thumbnailOrder = thumbnailOrder.map((id) => id === previous.id ? renamed.id : id);
     }
+    if (nativeIcons[previous.id]) {
+      const nextIcons = { ...nativeIcons, [renamed.id]: nativeIcons[previous.id]! };
+      delete nextIcons[previous.id];
+      nativeIcons = nextIcons;
+      nativeIconOrder = nativeIconOrder.map((id) => id === previous.id ? renamed.id : id);
+    }
     if (liveItemPositions[previous.id]) {
       const nextLive = { ...liveItemPositions, [renamed.id]: { ...liveItemPositions[previous.id]!, id: renamed.id } };
       delete nextLive[previous.id];
@@ -924,7 +817,6 @@
       const clientDy = next.clientY - origin.y;
       if (!moved && Math.hypot(clientDx, clientDy) < 4) return;
       moved = true;
-      updateAvailabilityDropTarget(next.clientX, next.clientY);
       liveItemPositions = Object.fromEntries(dragged.map((entry) => {
         const start = starts.get(entry.id)!;
         const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
@@ -937,13 +829,6 @@
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
       if (previewGeneration !== geometryPreviewGeneration) return;
-      const dropDevice = moved ? dropDeviceAt(next.clientX, next.clientY) : null;
-      clearAvailabilityDropTarget();
-      if (dropDevice) {
-        clearGeometryPreview(previewGeneration);
-        void keepItemsOnDevice(dragged, dropDevice);
-        return;
-      }
       if (!moved) {
         clearGeometryPreview(previewGeneration);
         if (renameOnRelease) scheduleItemRename(item);
@@ -965,7 +850,6 @@
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
-      clearAvailabilityDropTarget();
       clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
@@ -990,7 +874,6 @@
     const previewGeneration = beginGeometryPreview();
     const move = (next: PointerEvent) => {
       if (next.pointerId !== pointerId || previewGeneration !== geometryPreviewGeneration) return;
-      updateAvailabilityDropTarget(next.clientX, next.clientY);
       liveFrameGeometry = Object.fromEntries(movedFrames.map((candidate) => {
         const start = frameStarts.get(candidate.id)!;
         const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
@@ -1008,13 +891,6 @@
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
       if (previewGeneration !== geometryPreviewGeneration) return;
-      const dropDevice = dropDeviceAt(next.clientX, next.clientY);
-      clearAvailabilityDropTarget();
-      if (dropDevice) {
-        clearGeometryPreview(previewGeneration);
-        void keepFrameOnDevice(frame, dropDevice);
-        return;
-      }
       const finalFrames = movedFrames.map((candidate) => {
         const start = frameStarts.get(candidate.id)!;
         const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, canvasZoom);
@@ -1042,7 +918,6 @@
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
-      clearAvailabilityDropTarget();
       clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
@@ -1286,13 +1161,7 @@
 
   async function moveToTrash(item: LocalFileEntry) {
     if (!window.confirm(`Move “${displayName(item)}” to the ${platform === "windows" ? "Recycle Bin" : "Trash"}?`)) return;
-    try {
-      await localFileTrash([item.path]);
-      if (policyDevices("item", item.id).length) await save([policyMutation("item", item.id, [])]);
-      await navigate(path);
-    } catch (error) {
-      app.toast("warn", String(error));
-    }
+    try { await localFileTrash([item.path]); await navigate(path); } catch (error) { app.toast("warn", String(error)); }
   }
 
   function deleteFrame(frame: CanvasFrame) {
@@ -1308,7 +1177,6 @@
         kind: "item" as const,
         value: placement,
       })),
-      ...(policyDevices("frame", frame.id).length ? [policyMutation("frame", frame.id, [])] : []),
     ]);
   }
 
@@ -1389,10 +1257,6 @@
     <input class="search" bind:value={query} disabled={map !== "files"} placeholder="Search this folder" aria-label="Search this folder" />
     <button onclick={createFolder} disabled={map !== "files"} title="New folder">＋ Folder</button>
     <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
-    <div class="switch" role="group" aria-label="Canvas content">
-      <button class:active={map === "files"} onclick={() => changeMap("files")}>Files</button>
-      <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}>Sharing map</button>
-    </div>
     {#if map === "files"}
       <div class="switch" role="group" aria-label="View">
         <button class:active={view === "canvas"} onclick={() => changeView("canvas")} title="Thumbnails">▦</button>
@@ -1420,21 +1284,20 @@
         {/each}
         <h3>Recent</h3>
         {#if recent.length === 0}<p>Opened files appear here.</p>{/if}
-        {#each recent as item}<button onclick={() => open(item)}><span>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>{/each}
+        {#each recent as item}<button onclick={() => open(item)}><span use:loadNativeIcon={item}>{#if nativeIconFor(item)}<img class="shell-icon" src={`data:image/png;base64,${nativeIconFor(item)}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>{/each}
         <h3>{platform === "macos" ? "Locations" : "This PC"}</h3>
         {#each locations.filter((place) => place.kind === "volume") as place}
           <button class:active={path === place.path} onclick={() => navigate(place.path)}><span>💽</span>{place.label}</button>
         {/each}
-        <h3>Fleet</h3>
-        <button class:active={map === "files" && activeDeviceIds.size === 0} onclick={() => { changeMap("files"); activeDeviceIds = new Set(); }}><span>◎</span>Fleet presence</button>
+        <h3>Sharing</h3>
         <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}><span>⇄</span>Shared with me / out</button>
         {#if map === "sharing"}
           <h3>Drag from current folder</h3>
           {#each visible.slice(0, 64) as item (item.id)}
-            <button draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><span>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>
+            <button draggable={true} ondragstart={(event) => dragLocalFile(event, item)} title={item.path}><span use:loadNativeIcon={item}>{#if nativeIconFor(item)}<img class="shell-icon" src={`data:image/png;base64,${nativeIconFor(item)}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>
           {/each}
         {/if}
-        <div class="fleet-note"><i></i>Frames, layout, and keep intent sync fleet-wide</div>
+        <div class="fleet-note"><i></i>Canvas metadata syncs fleet-wide</div>
         <div class="background-control">
           <button onclick={chooseWallpaper}><span>▧</span>Background</button>
           {#if wallpaperPath}<button class="clear-background" title="Clear background" onclick={clearWallpaper}>×</button>{/if}
@@ -1495,7 +1358,6 @@
           <div
             class="detail-row"
             class:selected={selectedIds.has(item.id)}
-            class:outside-lens={!itemMatchesDeviceLens(item)}
             role="button"
             tabindex="0"
             onclick={(event) => {
@@ -1512,7 +1374,7 @@
             oncontextmenu={(event) => showContextMenu(event, item)}
           >
             <span class="detail-name">
-              <i>{#if item.shellIcon}<img class="shell-icon" src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}</i>
+              <i use:loadNativeIcon={item}>{#if nativeIconFor(item)}<img class="shell-icon" src={`data:image/png;base64,${nativeIconFor(item)}`} alt="" />{:else}{icon(item)}{/if}</i>
               {#if editingItemId === item.id}
                 <input
                   class="detail-rename-input"
@@ -1553,12 +1415,6 @@
                 {:else}
                   <button class="frame-title-label" title="Rename frame" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); editingFrameId = frame.id; }}>{frame.title}</button>
                 {/if}
-                {#each policyDevices("frame", frame.id) as deviceId (deviceId)}
-                  {@const target = fleetDevice(deviceId)}
-                  {#if target && !target.local}
-                    <button class="frame-keep-chip" title={`Keep intent on ${target.label} · click to remove`} onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); void removeKeepIntent("frame", frame.id, target); }}>{deviceIcon(target)} ×</button>
-                  {/if}
-                {/each}
                 <button class="frame-delete" title="Delete frame, keep its contents" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
               </div>
               <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
@@ -1573,7 +1429,6 @@
             <div
               class="file-tile"
               class:selected={selectedIds.has(item.id)}
-              class:outside-lens={!itemMatchesDeviceLens(item)}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
               role="button"
               tabindex="0"
@@ -1588,13 +1443,8 @@
               }}
               oncontextmenu={(event) => showContextMenu(event, item)}
             >
-              <span class="file-icon" use:loadThumbnail={item} style={`width:${grid.iconSize}px;height:${grid.iconSize}px;font-size:${grid.iconSize}px`}>
-                {#if thumbnails[item.id]}<img draggable={false} src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img draggable={false} src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
-              </span>
-              <span class="file-presence" aria-label="Planned device availability">
-                {#each fleetDevices.filter((device) => !device.local && itemAvailabilitySource(item, device.id) !== null) as device (device.id)}
-                  <i title={`Keep intent on ${device.label}`}>{deviceIcon(device)}</i>
-                {/each}
+              <span class="file-icon" use:loadThumbnail={item} use:loadNativeIcon={item} style={`width:${grid.iconSize}px;height:${grid.iconSize}px;font-size:${grid.iconSize}px`}>
+                {#if thumbnails[item.id]}<img draggable={false} src={thumbnails[item.id]} alt="" />{:else if nativeIconFor(item)}<img draggable={false} src={`data:image/png;base64,${nativeIconFor(item)}`} alt="" />{:else}{icon(item)}{/if}
               </span>
               {#if editingItemId === item.id}
                 <input
@@ -1635,37 +1485,6 @@
         </div>
       </div>
     {/if}
-    {#if map === "files"}
-      <section class="fleet-presence" aria-label="Fleet presence" onpointerdown={(event) => event.stopPropagation()}>
-        <div class="presence-copy">
-          <b>Fleet presence</b>
-          <span>{activeDeviceIds.size ? "Device lens · dimmed items are not kept there" : "One file world · computers are availability targets"}</span>
-        </div>
-        <div class="presence-devices" role="group" aria-label="Show files by computer availability">
-          <button class="fleet-device all-devices" class:active={activeDeviceIds.size === 0} onclick={() => { activeDeviceIds = new Set(); }} title="Show the fleet's complete logical file world">
-            <i>◎</i>
-            <span><b>All files</b><small>Fleet-wide</small></span>
-          </button>
-          {#each fleetDevices as device (device.id)}
-            {@const planned = visible.filter((item) => itemAvailabilitySource(item, device.id) !== null).length}
-            <button
-              class="fleet-device"
-              class:active={deviceIsActive(device.id)}
-              class:drop-target={availabilityDropDeviceId !== null && app.isSameMachine(availabilityDropDeviceId, device.id)}
-              class:offline={!device.online}
-              data-fleet-device={device.id}
-              aria-pressed={deviceIsActive(device.id)}
-              onclick={(event) => toggleDeviceLens(event, device)}
-              title={`Click to see this world through ${device.label}. Drag files or a frame here to keep them available there.`}
-            >
-              <i>{deviceIcon(device)}<em class:online={device.online}></em></i>
-              <span><b>{device.label}</b><small>{device.local ? "Here now" : device.online ? `${planned} planned here` : "Offline · intent queues"}</small></span>
-            </button>
-          {/each}
-        </div>
-        <div class="presence-legend"><span><i class="solid"></i>available now</span><span><i class="intent"></i>keep intent</span><span>Drag a frame to apply one inherited policy to all present and future contents.</span></div>
-      </section>
-    {/if}
   </main>
 
   <aside class="preview" class:collapsed={!previewOpen || !app.filesSettings.showPreview}>
@@ -1677,34 +1496,14 @@
     {#if previewOpen && app.filesSettings.showPreview}
       <div class="sidebar-body">
         {#if selected}
-          <div class="preview-art">
+          <div class="preview-art" use:loadNativeIcon={selected}>
             {#if preview?.kind === "image"}<img src={`data:${preview.mime};base64,${preview.data}`} alt="" />
-            {:else if selected.shellIcon}<img src={`data:image/png;base64,${selected.shellIcon}`} alt="" />
+            {:else if nativeIconFor(selected)}<img src={`data:image/png;base64,${nativeIconFor(selected)}`} alt="" />
             {:else}<span>{icon(selected)}</span>{/if}
           </div>
           <h2>{displayName(selected)}</h2>
           <p>{selected.dir ? "Folder" : humanBytes(selected.size)}</p>
           {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
-          <section class="availability-panel" aria-label="File availability">
-            <header><b>Availability</b><small>Placement intent</small></header>
-            {#each fleetDevices as device (device.id)}
-              {@const source = itemAvailabilitySource(selected, device.id)}
-              <div class:offline={!device.online}>
-                <i>{deviceIcon(device)}<em class:online={device.online}></em></i>
-                <span><b>{device.label}</b><small>{device.local ? "Physical copy here" : source === "frame" ? "Inherited from frame" : source === "item" ? "Keep requested" : device.online ? "Not kept here" : "Offline"}</small></span>
-                {#if device.local}
-                  <em>Now</em>
-                {:else if source === "item"}
-                  <button title="Remove this item's direct keep intent" onclick={() => { void removeKeepIntent("item", selected.id, device); }}>Remove</button>
-                {:else if source === "frame"}
-                  <em>Frame</em>
-                {:else}
-                  <button onclick={() => { void keepItemsOnDevice([selected], device); }}>Keep here</button>
-                {/if}
-              </div>
-            {/each}
-            <p>These controls save sparse fleet-wide intent only. They do not start transfers in this showcase.</p>
-          </section>
           <dl><dt>Location</dt><dd>{path}</dd><dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>{#if isWindowsShellLink(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}</dl>
           <button class="native-open" onclick={() => localFileOpen(selected.path, true)}>Show in {nativeBrowserName()}</button>
         {:else}
@@ -1801,18 +1600,4 @@
   @media (max-width: 1050px) { .search { display: none; } }
   @media (max-width: 760px) { .filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
   .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-file { min-width: 0; min-height: 5.75rem; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }
-  .fleet-presence { position: absolute; left: .7rem; right: .7rem; bottom: .7rem; z-index: 9; min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .5rem .75rem; align-items: center; padding: .65rem .75rem .5rem; border: 1px solid var(--line-strong); border-radius: 14px; background: color-mix(in oklch, var(--surface) 92%, transparent); box-shadow: var(--shadow-lg); backdrop-filter: blur(18px); }
-  .presence-copy { min-width: 11rem; display: grid; align-content: center; gap: .12rem; }.presence-copy b { color: var(--ink); font-size: .76rem; }.presence-copy span { max-width: 14rem; color: var(--ink-faint); font-size: .65rem; line-height: 1.25; }
-  .presence-devices { min-width: 0; display: flex; gap: .4rem; overflow-x: auto; padding: .1rem; scrollbar-width: thin; }
-  .fleet-device { position: relative; flex: 0 0 auto; min-width: 9.5rem; max-width: 13rem; display: grid; grid-template-columns: 2rem minmax(0, 1fr); align-items: center; gap: .45rem; padding: .42rem .55rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--ink-soft); text-align: left; transition: border-color 120ms ease, background 120ms ease, transform 120ms ease, opacity 120ms ease; }
-  .fleet-device:hover, .fleet-device.active { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }.fleet-device.drop-target { border-color: var(--ok); background: color-mix(in oklch, var(--ok) 18%, var(--surface-2)); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 30%, transparent); transform: translateY(-3px); }.fleet-device.offline { opacity: .62; }.fleet-device.all-devices { min-width: 7.5rem; }
-  .fleet-device > i { position: relative; display: grid; place-items: center; width: 2rem; height: 2rem; border-radius: 7px; background: var(--bg); color: var(--accent-ink); font-style: normal; font-size: 1.2rem; }.fleet-device > i em, .availability-panel > div > i em { position: absolute; right: -.1rem; bottom: -.1rem; width: .48rem; height: .48rem; border: 2px solid var(--surface-2); border-radius: 50%; background: var(--ink-faint); }.fleet-device > i em.online, .availability-panel > div > i em.online { background: var(--ok); }
-  .fleet-device > span, .availability-panel > div > span { min-width: 0; display: grid; gap: .08rem; }.fleet-device b, .fleet-device small, .availability-panel b, .availability-panel small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.fleet-device b { font-size: .7rem; }.fleet-device small { color: var(--ink-faint); font-size: .6rem; }
-  .presence-legend { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .35rem 1rem; align-items: center; color: var(--ink-faint); font-size: .6rem; }.presence-legend span { display: flex; align-items: center; gap: .3rem; }.presence-legend i { width: .45rem; height: .45rem; border-radius: 50%; }.presence-legend i.solid { background: var(--ok); }.presence-legend i.intent { border: 1px solid var(--accent); background: transparent; }
-  .file-tile, .detail-row { transition: opacity 140ms ease, filter 140ms ease; }.file-tile.outside-lens, .detail-row.outside-lens { opacity: .2; filter: grayscale(.7); }.file-tile.outside-lens.selected, .detail-row.outside-lens.selected { opacity: .58; }
-  .file-presence { position: absolute; top: .05rem; right: .05rem; z-index: 3; display: flex; gap: 2px; pointer-events: none; }.file-presence:empty { display: none; }.file-presence i { display: grid; place-items: center; width: .95rem; height: .95rem; border: 1px solid var(--accent); border-radius: 50%; background: var(--surface); color: var(--accent-ink); font-style: normal; font-size: .55rem; box-shadow: var(--shadow); }
-  .frame-keep-chip { flex: 0 0 auto; padding: .08rem .28rem; border: 1px solid var(--accent); border-radius: 999px; background: var(--surface); color: var(--accent-ink); font-size: .58rem; cursor: pointer; }
-  .availability-panel { display: grid; gap: .35rem; margin: .8rem 0; padding: .55rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }.availability-panel header { display: flex; justify-content: space-between; gap: .5rem; padding: 0 .15rem .25rem; }.availability-panel header b { font-size: .72rem; }.availability-panel header small { color: var(--ink-faint); font-size: .6rem; }.availability-panel > div { display: grid; grid-template-columns: 1.65rem minmax(0, 1fr) auto; align-items: center; gap: .4rem; min-width: 0; }.availability-panel > div.offline { opacity: .66; }.availability-panel > div > i { position: relative; display: grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 5px; background: var(--surface-2); color: var(--accent-ink); font-style: normal; font-size: .8rem; }.availability-panel > div > span b { font-size: .64rem; }.availability-panel > div > span small { color: var(--ink-faint); font-size: .56rem; }.availability-panel > div > button { padding: .22rem .35rem; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-2); color: var(--ink-soft); font-size: .58rem; }.availability-panel > div > em { color: var(--ink-faint); font-size: .58rem; font-style: normal; }.availability-panel > p { margin: .2rem .1rem 0; padding: .4rem 0 0; border-top: 1px solid var(--line); color: var(--ink-faint); font-size: .58rem; line-height: 1.35; }
-  .zoom-control, .load-more { bottom: 8.25rem; }.details { padding-bottom: 8.75rem; }
-  @media (max-width: 850px) { .fleet-presence { grid-template-columns: 1fr; }.presence-copy { display: none; }.presence-legend { display: none; }.zoom-control, .load-more { bottom: 6rem; }.details { padding-bottom: 6.5rem; } }
 </style>

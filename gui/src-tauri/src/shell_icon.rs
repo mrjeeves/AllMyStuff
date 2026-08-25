@@ -69,7 +69,14 @@ fn with_shell_com<T>(operation: impl FnOnce() -> T) -> T {
 }
 
 pub(crate) fn shortcut_icon(path: &Path) -> Option<String> {
-    with_shell_com(|| shortcut_icon_initialized(path))
+    with_shell_com(|| file_icon_initialized(path, true))
+}
+
+/// Resolve the same icon Windows Explorer uses for an ordinary filesystem
+/// object. This intentionally stays out of directory listings; callers fetch
+/// it lazily for visible items so native icons do not bloat every page.
+pub(crate) fn filesystem_icon(path: &Path) -> Option<String> {
+    with_shell_com(|| file_icon_initialized(path, false))
 }
 
 pub(crate) fn recycle_bin_icon() -> Option<String> {
@@ -99,20 +106,25 @@ pub(crate) fn recycle_bin_icon() -> Option<String> {
     })
 }
 
-fn shortcut_icon_initialized(path: &Path) -> Option<String> {
+fn file_icon_initialized(path: &Path, link_overlay: bool) -> Option<String> {
     use std::os::windows::ffi::OsStrExt as _;
 
     let shell_path = shell_compatible_path(path);
     let mut wide: Vec<u16> = shell_path.as_os_str().encode_wide().collect();
     wide.push(0);
     let mut info = SHFILEINFOW::default();
+    let flags = if link_overlay {
+        SHGFI_ICON | SHGFI_LINKOVERLAY | SHGFI_OVERLAYINDEX | SHGFI_SYSICONINDEX
+    } else {
+        SHGFI_ICON | SHGFI_SYSICONINDEX
+    };
     let found = unsafe {
         SHGetFileInfoW(
             PCWSTR(wide.as_ptr()),
             FILE_FLAGS_AND_ATTRIBUTES(0),
             Some(&mut info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LINKOVERLAY | SHGFI_OVERLAYINDEX | SHGFI_SYSICONINDEX,
+            flags,
         )
     };
     if found == 0 {
@@ -124,7 +136,8 @@ fn shortcut_icon_initialized(path: &Path) -> Option<String> {
     } else {
         render_icon(info.hIcon)
     };
-    let rendered = jumbo_icon((packed & 0x00ff_ffff) as i32, packed >> 24).or(fallback);
+    let overlay_index = if link_overlay { packed >> 24 } else { 0 };
+    let rendered = jumbo_icon((packed & 0x00ff_ffff) as i32, overlay_index).or(fallback);
     if !info.hIcon.0.is_null() {
         unsafe {
             let _ = DestroyIcon(info.hIcon);
@@ -329,6 +342,14 @@ mod tests {
         let shell_path = shell_compatible_path(&path);
         assert!(shell_path.is_file());
         assert!(!shell_path.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn filesystem_folder_icon_is_a_png() {
+        let encoded =
+            filesystem_icon(&std::env::temp_dir()).expect("Windows Shell returned no folder icon");
+        let decoded = STANDARD.decode(encoded).expect("base64 PNG");
+        assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
     }
 
     #[test]

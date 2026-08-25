@@ -1591,7 +1591,7 @@ unsafe fn windows_shell_context_menu(
 ) -> windows::core::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows::{
-        core::{w, PCSTR, PCWSTR},
+        core::{w, PCSTR, PCWSTR, PSTR},
         Win32::{
             Foundation::{LPARAM, POINT, WPARAM},
             System::Com::{CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED},
@@ -1602,7 +1602,8 @@ unsafe fn windows_shell_context_menu(
                 },
                 Shell::{
                     BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName,
-                    CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
+                    SHObjectProperties, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
+                    GCS_VERBA, SHOP_FILEPATH,
                 },
                 WindowsAndMessaging::{
                     CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
@@ -1682,15 +1683,49 @@ unsafe fn windows_shell_context_menu(
             // Windows documents this nudge for repeated TrackPopupMenu calls.
             let _ = unsafe { PostMessageW(Some(menu_owner), WM_NULL, WPARAM(0), LPARAM(0)) };
             if command != 0 {
-                let invoke = CMINVOKECOMMANDINFO {
-                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                    hwnd,
-                    // Shell command ids are passed as MAKEINTRESOURCEA offsets.
-                    lpVerb: PCSTR((command - 1) as usize as *const u8),
-                    nShow: SW_SHOWNORMAL.0,
-                    ..Default::default()
-                };
-                unsafe { shell_menu.InvokeCommand(&invoke)? };
+                let offset = command - 1;
+                let mut verb_buffer = [0_u8; 64];
+                let canonical_verb = unsafe {
+                    shell_menu.GetCommandString(
+                        offset as usize,
+                        GCS_VERBA,
+                        None,
+                        PSTR(verb_buffer.as_mut_ptr()),
+                        verb_buffer.len() as u32,
+                    )
+                }
+                .ok()
+                .and_then(|_| {
+                    let end = verb_buffer.iter().position(|byte| *byte == 0)?;
+                    std::str::from_utf8(&verb_buffer[..end]).ok()
+                });
+                // The generic numeric dispatch is correct for extension verbs,
+                // but Windows can accept a .lnk Properties offset and then fail
+                // to build its sheet outside Explorer. Use the Shell API whose
+                // contract is specifically to invoke Properties on a file path.
+                let properties_opened = canonical_verb
+                    .is_some_and(|verb| verb.eq_ignore_ascii_case("properties"))
+                    && shell_path.is_absolute()
+                    && unsafe {
+                        SHObjectProperties(
+                            Some(hwnd),
+                            SHOP_FILEPATH,
+                            PCWSTR(wide.as_ptr()),
+                            PCWSTR::null(),
+                        )
+                        .as_bool()
+                    };
+                if !properties_opened {
+                    let invoke = CMINVOKECOMMANDINFO {
+                        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                        hwnd,
+                        // Shell command ids are passed as MAKEINTRESOURCEA offsets.
+                        lpVerb: PCSTR(offset as usize as *const u8),
+                        nShow: SW_SHOWNORMAL.0,
+                        ..Default::default()
+                    };
+                    unsafe { shell_menu.InvokeCommand(&invoke)? };
+                }
             }
             Ok(())
         })();

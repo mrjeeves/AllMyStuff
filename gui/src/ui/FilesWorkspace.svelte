@@ -54,6 +54,7 @@
   let selectedId = $state<string | null>(null);
   let selectedIds = $state<Set<string>>(new Set());
   let selectionAnchorId = $state<string | null>(null);
+  let editingFrameId = $state<string | null>(null);
   let marquee = $state<{ x: number; y: number; width: number; height: number } | null>(null);
   let preview = $state<LocalFilePreview | null>(null);
   let map = $state<FilesMap>("files");
@@ -535,6 +536,18 @@
     return { id: frame.id, kind: "frame" as const, value: frame };
   }
 
+  function focusFrameTitle(node: HTMLInputElement) {
+    requestAnimationFrame(() => { node.focus(); node.select(); });
+  }
+
+  function commitFrameTitle(frame: CanvasFrame, value: string) {
+    const title = value.trim();
+    editingFrameId = null;
+    if (!title || title === frame.title) return;
+    frame.title = title;
+    void save([frameRecord({ ...frame, title })]);
+  }
+
   async function save(mutations: Array<{ id: string; kind: "frame" | "item" | "preference"; value: unknown; deleted?: boolean }>) {
     const queued = [...mutations];
     if (
@@ -802,7 +815,7 @@
       window.addEventListener("pointerup", up, { once: true });
       return;
     }
-    if (map !== "files" || target.closest(".file-tile, .canvas-frame, .load-more, .zoom-control, .share-frame")) return;
+    if (map !== "files" || target.closest(".file-tile, .frame-titlebar, .resize-handle, .load-more, .zoom-control, .share-frame")) return;
     if (event.button === 2) {
       event.preventDefault();
       const start = { ...pan };
@@ -1117,9 +1130,15 @@
         {/each}
         {#each frames as frame}
           {@const geometry = frameGeometry(frame)}
-          <article class="canvas-frame user" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
-            <input value={frame.title} onchange={(event) => { frame.title = event.currentTarget.value; void save([frameRecord(frame)]); }} onpointerdown={(event) => event.stopPropagation()} />
-            <button title="Delete frame, keep its contents" onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
+          <article class="canvas-frame user" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`}>
+            <div class="frame-titlebar" role="group" aria-label={`Move and edit ${frame.title}`} title="Drag frame" onpointerdown={(event) => dragFrame(event, frame)}>
+              {#if editingFrameId === frame.id}
+                <input class="frame-title-input" use:focusFrameTitle value={frame.title} aria-label="Frame title" onblur={(event) => commitFrameTitle(frame, event.currentTarget.value)} onkeydown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); } else if (event.key === "Escape") { event.preventDefault(); event.currentTarget.value = frame.title; event.currentTarget.blur(); } }} onpointerdown={(event) => event.stopPropagation()} />
+              {:else}
+                <button class="frame-title-label" title="Rename frame" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); editingFrameId = frame.id; }}>{frame.title}</button>
+              {/if}
+              <button class="frame-delete" title="Delete frame, keep its contents" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
+            </div>
             <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
           </article>
         {/each}
@@ -1144,9 +1163,15 @@
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
           {#each frames as frame}
             {@const geometry = frameGeometry(frame)}
-            <article class="canvas-frame" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`} onpointerdown={(event) => dragFrame(event, frame)}>
-              <input value={frame.title} onchange={(event) => { frame.title = event.currentTarget.value; void save([frameRecord(frame)]); }} onpointerdown={(event) => event.stopPropagation()} />
-              <button title="Delete frame, keep its contents" onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
+            <article class="canvas-frame" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`}>
+              <div class="frame-titlebar" role="group" aria-label={`Move and edit ${frame.title}`} title="Drag frame" onpointerdown={(event) => dragFrame(event, frame)}>
+                {#if editingFrameId === frame.id}
+                  <input class="frame-title-input" use:focusFrameTitle value={frame.title} aria-label="Frame title" onblur={(event) => commitFrameTitle(frame, event.currentTarget.value)} onkeydown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); } else if (event.key === "Escape") { event.preventDefault(); event.currentTarget.value = frame.title; event.currentTarget.blur(); } }} onpointerdown={(event) => event.stopPropagation()} />
+                {:else}
+                  <button class="frame-title-label" title="Rename frame" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); editingFrameId = frame.id; }}>{frame.title}</button>
+                {/if}
+                <button class="frame-delete" title="Delete frame, keep its contents" onpointerdown={(event) => event.stopPropagation()} onclick={(event) => { event.stopPropagation(); deleteFrame(frame); }}>×</button>
+              </div>
               <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
             </article>
           {/each}
@@ -1275,7 +1300,11 @@
   .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
   .world { position: absolute; inset: 0; transform-origin: 0 0; }
   .canvas-frame { position: absolute; z-index: 0; border: 1px solid oklch(0.62 .2 292 / .55); border-radius: 15px; background: oklch(0.62 .2 292 / .08); box-shadow: inset 0 0 0 1px oklch(1 0 0 / .025); padding: .55rem; }
-  .canvas-frame input { width: calc(100% - 2rem); border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; }.canvas-frame > button { float: right; border: 0; background: transparent; color: var(--ink-faint); }
+  .frame-titlebar { position: relative; z-index: 3; display: flex; align-items: center; gap: .35rem; min-height: 1.45rem; cursor: grab; touch-action: none; }
+  .frame-titlebar:active { cursor: grabbing; }
+  .frame-title-label { flex: 0 1 auto; width: max-content; max-width: calc(100% - 2rem); overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
+  .frame-title-input { flex: 1; min-width: 0; width: auto; padding: .1rem .2rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--surface); color: var(--c-share-ink); font-weight: 750; }
+  .frame-delete { flex: 0 0 auto; margin-left: auto; padding: 0 .2rem; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .2rem .35rem; touch-action: none; }

@@ -579,12 +579,15 @@
   function dragItem(event: PointerEvent, item: LocalFileEntry) {
     if (event.button !== 0) return;
     event.stopPropagation();
-    void select(item, event);
+    const preserveSelection = selectedIds.has(item.id) && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+    if (!preserveSelection) void select(item, event);
     if (!selectedIds.has(item.id)) return;
     const dragged = entries.filter((entry) => selectedIds.has(entry.id));
     const starts = new Map(dragged.map((entry) => [entry.id, itemPosition(entry)]));
     const origin = { x: event.clientX, y: event.clientY };
     const pointerId = event.pointerId;
+    const dragTarget = event.currentTarget as HTMLElement;
+    dragTarget.setPointerCapture(pointerId);
     const previewGeneration = beginGeometryPreview();
     let moved = false;
     const move = (next: PointerEvent) => {
@@ -607,6 +610,7 @@
       if (previewGeneration !== geometryPreviewGeneration) return;
       if (!moved) {
         clearGeometryPreview(previewGeneration);
+        if (preserveSelection && dragged.length > 1) void select(item);
         return;
       }
       const mutations = dragged.map((entry) => {
@@ -1157,11 +1161,12 @@
               class:selected={selectedIds.has(item.id)}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
               onpointerdown={(event) => dragItem(event, item)}
+              ondragstart={(event) => event.preventDefault()}
               ondblclick={() => open(item)}
               oncontextmenu={(event) => showContextMenu(event, item)}
             >
               <span class="file-icon" use:loadThumbnail={item} style={`width:${grid.iconSize}px;height:${grid.iconSize}px;font-size:${grid.iconSize}px`}>
-                {#if thumbnails[item.id]}<img src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
+                {#if thumbnails[item.id]}<img draggable={false} src={thumbnails[item.id]} alt="" />{:else if item.shellIcon}<img draggable={false} src={`data:image/png;base64,${item.shellIcon}`} alt="" />{:else}{icon(item)}{/if}
               </span>
               <span>{displayName(item)}</span>
             </button>
@@ -1275,6 +1280,8 @@
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .2rem .35rem; touch-action: none; }
   .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-tile > span:last-child { width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }
+  .file-tile { user-select: none; }
+  .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
   .selection-marquee { position: absolute; z-index: 5; border: 1px solid var(--accent); background: var(--accent-soft); pointer-events: none; }
   .zoom-control { position: absolute; right: .7rem; bottom: .7rem; z-index: 8; }

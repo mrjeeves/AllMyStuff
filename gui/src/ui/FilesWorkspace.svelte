@@ -521,7 +521,36 @@
     context = { ...menuPosition, item };
   }
 
+  const INLINE_RENAME_SELECTOR = ".file-rename-input, .detail-rename-input, .frame-title-input";
+
+  function acceptInlineRenames(event?: PointerEvent) {
+    const target = event?.target;
+    if (
+      target instanceof Element &&
+      target.closest(INLINE_RENAME_SELECTOR)
+    ) return;
+
+    const itemEditor = document.querySelector<HTMLInputElement>(".file-rename-input, .detail-rename-input");
+    const item = entries.find((entry) => entry.id === editingItemId);
+    if (itemEditor && item) {
+      if (document.activeElement === itemEditor) itemEditor.blur();
+      else void commitItemRename(item, itemEditor.value);
+    } else if (editingItemId) {
+      editingItemId = null;
+    }
+
+    const frameEditor = document.querySelector<HTMLInputElement>(".frame-title-input");
+    const frame = frames.find((candidate) => candidate.id === editingFrameId);
+    if (frameEditor && frame) {
+      if (document.activeElement === frameEditor) frameEditor.blur();
+      else commitFrameTitle(frame, frameEditor.value);
+    } else if (editingFrameId) {
+      editingFrameId = null;
+    }
+  }
+
   function dismissTransientMenus(event?: PointerEvent) {
+    acceptInlineRenames(event);
     const target = event?.target;
     if (!(target instanceof Element) || !target.closest(".context-menu")) {
       context = null;

@@ -1,4 +1,6 @@
 # Files canvas
+> **Historical implementation note:** this document describes the first local-filesystem canvas prototype. Its local-data-plane model is superseded by [Fleet Filesystem and Canvas Architecture](fleet-filesystem-design.md), which defines one authoritative fleet namespace. Keep this document only for interaction behavior that the canonical design has not replaced.
+
 
 Files is the middle AllMyStuff mode: Normal remains the relationship-first view,
 Files is an OS-familiar file workspace, and Advanced remains the full graph.

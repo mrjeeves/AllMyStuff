@@ -1,4 +1,6 @@
 # Files mode: scale and data boundaries
+> **Historical implementation note:** the filesystem-source-of-truth model below is superseded by [Fleet Filesystem and Canvas Architecture](fleet-filesystem-design.md). Its bounded-work rules remain requirements, but the canonical system uses a sharded fleet namespace catalog with lazy native mounts.
+
 
 Files mode must remain useful on machines with tens of millions of files and
 tens of terabytes of storage. The filesystem is the source of truth. Files mode

@@ -166,6 +166,7 @@ pub struct Mesh {
     fleetfiles: Arc<FleetfilesReplica>,
     fleetfiles_transfer_gate: Arc<Semaphore>,
     fleetfiles_waiters: Mutex<HashMap<(String, String), oneshot::Sender<FleetfilesMessage>>>,
+    fleetfiles_draining: Mutex<HashSet<String>>,
     /// User-initiated scans/transfers, keyed by UI-minted id. The flag makes
     /// both directory walking and each bounded upload chunk cancellable.
     file_transfer_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -1795,6 +1796,7 @@ impl Mesh {
             )),
             fleetfiles_transfer_gate: Arc::new(Semaphore::new(2)),
             fleetfiles_waiters: Mutex::new(HashMap::new()),
+            fleetfiles_draining: Mutex::new(HashSet::new()),
             drive_relationships: Mutex::new(drive_relationships),
             drive_relationship_path,
             drive_forgets: Mutex::new(drive_forgets),
@@ -4002,6 +4004,9 @@ impl Mesh {
                         // repeatedly shipping the whole canvas.
                         self.probe_files_canvas_to(&from, &network).await;
                         self.probe_storage_plan_to(&from, &network).await;
+                    }
+                    if !is_self {
+                        self.schedule_fleetfiles_drain(&from);
                     }
                     if changed {
                         self.emit_snapshot();
@@ -17642,46 +17647,109 @@ impl Mesh {
             .any(|allocation| allocation.enabled && same_node(&allocation.device, &local));
         let needed = usize::from(plan.policy.value.ordinary_replicas.max(1))
             .saturating_sub(usize::from(local_is_replica));
-        let scores = self
+        let evidence = self
             .service_profiles
             .snapshot()
             .into_iter()
             .map(|profile| {
                 (
                     pubkey_part(&profile.peer).to_string(),
-                    profile.service_score,
+                    (profile.state == "online", profile.service_score),
                 )
             })
             .collect::<HashMap<_, _>>();
         let mut targets = plan
             .allocations
             .into_iter()
-            .filter(|allocation| {
-                allocation.enabled
-                    && !same_node(&allocation.device, &local)
-                    && self.network_for_peer(&allocation.device).is_some()
-            })
+            .filter(|allocation| allocation.enabled && !same_node(&allocation.device, &local))
             .map(|allocation| allocation.device)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         targets.sort_by(|left, right| {
-            let left_score = scores.get(pubkey_part(left)).copied().unwrap_or(0.5);
-            let right_score = scores.get(pubkey_part(right)).copied().unwrap_or(0.5);
-            right_score
-                .partial_cmp(&left_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let left_evidence = evidence
+                .get(pubkey_part(left))
+                .copied()
+                .unwrap_or((false, 0.5));
+            let right_evidence = evidence
+                .get(pubkey_part(right))
+                .copied()
+                .unwrap_or((false, 0.5));
+            right_evidence
+                .0
+                .cmp(&left_evidence.0)
+                .then_with(|| {
+                    right_evidence
+                        .1
+                        .partial_cmp(&left_evidence.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| left.cmp(right))
         });
         targets.truncate(needed);
         if targets.len() < needed {
             tracing::debug!(
-                "Fleetfiles change has {} of {needed} required reachable replica targets",
+                "Fleetfiles change has {} of {needed} required allocated replica targets",
                 targets.len()
             );
         }
         for target in targets {
-            self.send_fleetfiles_mutation(&target, &mutation).await?;
+            self.fleetfiles.queue_for(&target, &mutation)?;
+            let online = evidence
+                .get(pubkey_part(&target))
+                .is_some_and(|(online, _)| *online);
+            if online {
+                self.send_fleetfiles_mutation(&target, &mutation).await?;
+                self.fleetfiles.acknowledge(&target, &mutation)?;
+            }
+        }
+        Ok(())
+    }
+    /// Drain only when presence tells us the peer is reachable. The per-peer
+    /// guard prevents duplicate presence frames from creating overlapping
+    /// sends, and the item limit bounds work per appearance without polling.
+    fn schedule_fleetfiles_drain(self: &Arc<Self>, peer: &str) {
+        let target = pubkey_part(peer).to_string();
+        if target.is_empty() || !self.fleetfiles_draining.lock().insert(target.clone()) {
+            return;
+        }
+        let mesh = self.clone();
+        crate::spawn(async move {
+            if let Err(error) = mesh.drain_fleetfiles_queue(&target).await {
+                tracing::debug!(
+                    "Fleetfiles queued replication to {} paused: {error}",
+                    short_id(&target)
+                );
+            }
+            mesh.fleetfiles_draining.lock().remove(&target);
+        });
+    }
+
+    async fn drain_fleetfiles_queue(&self, target: &str) -> Result<(), String> {
+        const MAX_PER_APPEARANCE: usize = 32;
+        let local = self.local_node_id().unwrap_or_default();
+        let allocated = self
+            .storage_plan
+            .snapshot()
+            .allocations
+            .into_iter()
+            .any(|allocation| {
+                allocation.enabled
+                    && !same_node(&allocation.device, &local)
+                    && same_node(&allocation.device, target)
+            });
+        if !allocated {
+            return Ok(());
+        }
+        let _permit = self
+            .fleetfiles_transfer_gate
+            .acquire()
+            .await
+            .map_err(|_| "Fleetfiles transfer scheduler stopped")?;
+        for mutation in self.fleetfiles.pending_for(target, MAX_PER_APPEARANCE)? {
+            self.send_fleetfiles_mutation(target, &mutation).await?;
+            self.fleetfiles.acknowledge(target, &mutation)?;
+            tokio::task::yield_now().await;
         }
         Ok(())
     }

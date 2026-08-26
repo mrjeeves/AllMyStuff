@@ -156,7 +156,20 @@ impl FleetfilesReplica {
                    updated_at INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS path_versions_stamp
-                   ON path_versions(counter, actor);",
+                   ON path_versions(counter, actor);
+                 CREATE TABLE IF NOT EXISTS replication_queue (
+                   target TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   counter INTEGER NOT NULL,
+                   actor TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   size INTEGER NOT NULL,
+                   sha256 TEXT,
+                   queued_at INTEGER NOT NULL,
+                   PRIMARY KEY(target, path)
+                 );
+                 CREATE INDEX IF NOT EXISTS replication_queue_target
+                   ON replication_queue(target, queued_at, path);",
             )
             .expect("Fleetfiles metadata schema must initialize");
         let staging = root.join(".allmystuff-staging");
@@ -222,6 +235,116 @@ impl FleetfilesReplica {
             .ok()
             .and_then(|bytes| u64::try_from(bytes).ok())
             .unwrap_or(0)
+    }
+
+    pub fn queue_for(&self, target: &str, mutation: &LocalMutation) -> Result<(), String> {
+        if target.is_empty() || target.len() > 512 {
+            return Err("invalid Fleetfiles replica target".into());
+        }
+        let (path, version, kind, size, sha256) = match mutation {
+            LocalMutation::File {
+                version,
+                path,
+                size,
+                sha256,
+                ..
+            } => (path, version, "file", *size, Some(sha256.as_str())),
+            LocalMutation::Directory { version, path, .. } => (path, version, "directory", 0, None),
+            LocalMutation::Delete { version, path, .. } => (path, version, "delete", 0, None),
+        };
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO replication_queue(
+                   target,path,counter,actor,kind,size,sha256,queued_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,unixepoch())
+                 ON CONFLICT(target,path) DO UPDATE SET
+                   counter=excluded.counter, actor=excluded.actor, kind=excluded.kind,
+                   size=excluded.size, sha256=excluded.sha256, queued_at=excluded.queued_at",
+                params![
+                    target,
+                    path,
+                    version.counter,
+                    version.actor,
+                    kind,
+                    size,
+                    sha256
+                ],
+            )
+            .map_err(|error| format!("queue Fleetfiles replica: {error}"))?;
+        Ok(())
+    }
+
+    pub fn pending_for(&self, target: &str, limit: usize) -> Result<Vec<LocalMutation>, String> {
+        let limit = limit.clamp(1, 128);
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT path,counter,actor,kind,size,sha256
+                 FROM replication_queue
+                 WHERE target=?1
+                 ORDER BY queued_at,path
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("prepare Fleetfiles replica queue: {error}"))?;
+        let rows = statement
+            .query_map(params![target, limit as u64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|error| format!("read Fleetfiles replica queue: {error}"))?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (path, counter, actor, kind, size, sha256) =
+                row.map_err(|error| format!("decode Fleetfiles replica queue: {error}"))?;
+            let version = VersionStamp { counter, actor };
+            let operation = operation_id(&version, &path);
+            pending.push(match kind.as_str() {
+                "file" => LocalMutation::File {
+                    operation,
+                    version,
+                    source: resolve_portable(&self.root, &path)?,
+                    path,
+                    size,
+                    sha256: sha256.ok_or("queued Fleetfiles file has no content hash")?,
+                },
+                "directory" => LocalMutation::Directory {
+                    operation,
+                    version,
+                    path,
+                },
+                "delete" => LocalMutation::Delete {
+                    operation,
+                    version,
+                    path,
+                },
+                _ => return Err("queued Fleetfiles mutation has an invalid kind".into()),
+            });
+        }
+        Ok(pending)
+    }
+
+    pub fn acknowledge(&self, target: &str, mutation: &LocalMutation) -> Result<(), String> {
+        let (path, version) = match mutation {
+            LocalMutation::File { path, version, .. }
+            | LocalMutation::Directory { path, version, .. }
+            | LocalMutation::Delete { path, version, .. } => (path, version),
+        };
+        self.connection
+            .lock()
+            .execute(
+                "DELETE FROM replication_queue
+                 WHERE target=?1 AND path=?2 AND counter=?3 AND actor=?4",
+                params![target, path, version.counter, version.actor],
+            )
+            .map_err(|error| format!("acknowledge Fleetfiles replica: {error}"))?;
+        Ok(())
     }
 
     pub fn capture(&self, path: &Path, actor: &str) -> Result<Option<LocalMutation>, String> {
@@ -808,6 +931,54 @@ mod tests {
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into()
             )
             .unwrap());
+        drop(replica);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn durable_queue_is_latest_wins_and_acknowledges_exact_versions() {
+        let root = std::env::temp_dir().join(format!(
+            "allmystuff-fleetfiles-queue-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let replica = FleetfilesReplica::memory(root.clone());
+        let older = LocalMutation::Directory {
+            operation: "older".into(),
+            version: VersionStamp {
+                counter: 1,
+                actor: "local".into(),
+            },
+            path: "project".into(),
+        };
+        let newer = LocalMutation::Delete {
+            operation: "newer".into(),
+            version: VersionStamp {
+                counter: 2,
+                actor: "local".into(),
+            },
+            path: "project".into(),
+        };
+
+        replica.queue_for("peer", &older).unwrap();
+        replica.queue_for("peer", &newer).unwrap();
+        let pending = replica.pending_for("peer", 32).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            LocalMutation::Delete {
+                version: VersionStamp { counter: 2, .. },
+                ..
+            }
+        ));
+
+        replica.acknowledge("peer", &older).unwrap();
+        assert_eq!(replica.pending_for("peer", 32).unwrap().len(), 1);
+        replica.acknowledge("peer", &newer).unwrap();
+        assert!(replica.pending_for("peer", 32).unwrap().is_empty());
+
         drop(replica);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -799,10 +799,20 @@ fn resolve_portable(root: &Path, path: &str) -> Result<PathBuf, String> {
 }
 
 fn is_internal(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .is_some_and(|component| component.as_os_str() == ".allmystuff-staging")
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name == ".allmystuff-staging"
+            || name == ".DS_Store"
+            || name == ".Spotlight-V100"
+            || name == ".Trashes"
+            || name == ".fseventsd"
+            || name == ".TemporaryItems"
+            || name == ".DocumentRevisions-V100"
+            || name.starts_with("._")
+    })
 }
 
 fn replace_file(staging: &Path, target: &Path) -> Result<(), String> {
@@ -891,6 +901,17 @@ mod tests {
         assert!(validate_portable_path("bad:name").is_err());
         assert!(validate_portable_path("CON.txt").is_err());
         assert!(validate_portable_path("trailing.").is_err());
+    }
+
+    #[test]
+    fn ignores_replication_staging_and_macos_bookkeeping_only() {
+        let root = PathBuf::from("fleetfiles-root");
+        assert!(is_internal(&root, &root.join(".allmystuff-staging/chunk")));
+        assert!(is_internal(&root, &root.join("photos/.DS_Store")));
+        assert!(is_internal(&root, &root.join("photos/._image.png")));
+        assert!(is_internal(&root, &root.join(".Spotlight-V100/index")));
+        assert!(!is_internal(&root, &root.join(".env")));
+        assert!(!is_internal(&root, &root.join("photos/image.png")));
     }
 
     #[test]

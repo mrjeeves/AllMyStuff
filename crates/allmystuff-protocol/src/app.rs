@@ -54,6 +54,11 @@ pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
 /// authenticated closed fleet network.
 pub const CHANNEL_FILES_CANVAS: &str = "allmystuff/files-canvas/v1";
 pub const CHANNEL_FLEET_STORAGE: &str = "allmystuff/fleet-storage/v1";
+/// Fleet-private, bounded metadata and content transactions for Fleetfiles.
+/// This is separate from storage policy: policy says where replicas may live;
+/// this channel carries immutable version transfers and commit acknowledgements
+/// between eligible fleet members.
+pub const CHANNEL_FLEETFILES: &str = "allmystuff/fleetfiles/v1";
 
 /// Well-known LAN-local claim-rendezvous network. Every AllMyStuff node
 /// joins it with daemon signaling `{strategy: "none", mdns: true}` — the
@@ -235,7 +240,6 @@ pub struct StorageSummary {
     /// Portable scheduler hint: ssd, hdd, removable, or unknown.
     pub kind: String,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]

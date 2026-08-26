@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::UiSink;
 
@@ -31,8 +31,9 @@ use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
     DriveRouteOffer, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
     RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
-    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_FLEET_STORAGE,
-    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_FLEETFILES,
+    CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -49,6 +50,8 @@ use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
 use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
+use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, LocalMutation};
+
 use crate::input_inject::Injector;
 use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
 use crate::ownership::Ownership;
@@ -158,6 +161,11 @@ pub struct Mesh {
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
     files: FilesPlane,
+    /// Transactional version table, bounded watcher, and verified inbound
+    /// staging for the canonical Fleetfiles namespace.
+    fleetfiles: Arc<FleetfilesReplica>,
+    fleetfiles_transfer_gate: Arc<Semaphore>,
+    fleetfiles_waiters: Mutex<HashMap<(String, String), oneshot::Sender<FleetfilesMessage>>>,
     /// User-initiated scans/transfers, keyed by UI-minted id. The flag makes
     /// both directory walking and each bounded upload chunk cancellable.
     file_transfer_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -1782,6 +1790,11 @@ impl Mesh {
             drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
             drive_reconnect_path,
+            fleetfiles: Arc::new(FleetfilesReplica::load(
+                fleetfiles_root().expect("Fleetfiles state directory must be available"),
+            )),
+            fleetfiles_transfer_gate: Arc::new(Semaphore::new(2)),
+            fleetfiles_waiters: Mutex::new(HashMap::new()),
             drive_relationships: Mutex::new(drive_relationships),
             drive_relationship_path,
             drive_forgets: Mutex::new(drive_forgets),
@@ -2586,6 +2599,50 @@ impl Mesh {
             }
         };
         let native_startup = self.drive_mounts.begin_startup().await;
+        match self.fleetfiles.start_watcher() {
+            Ok(changes) => {
+                let mesh = self.clone();
+                let _ = std::thread::Builder::new()
+                    .name("amst-fleetfiles-watch".into())
+                    .spawn(move || {
+                        const SETTLE: Duration = Duration::from_millis(750);
+                        const MAX_PENDING: usize = 4096;
+                        let mut pending = HashMap::<PathBuf, Instant>::new();
+                        loop {
+                            match changes.recv_timeout(Duration::from_millis(100)) {
+                                Ok(change) => {
+                                    if pending.len() < MAX_PENDING || pending.contains_key(&change.path) {
+                                        pending.insert(change.path, Instant::now() + SETTLE);
+                                    } else {
+                                        tracing::warn!("Fleetfiles watcher coalescer reached its bounded path limit; reconciliation is required");
+                                    }
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                            let now = Instant::now();
+                            let ready = pending
+                                .iter()
+                                .filter(|(_, deadline)| **deadline <= now)
+                                .map(|(path, _)| path.clone())
+                                .collect::<Vec<_>>();
+                            for path in ready {
+                                pending.remove(&path);
+                                let mesh = mesh.clone();
+                                crate::spawn(async move {
+                                    if let Err(error) = mesh.replicate_fleetfiles_change(path).await {
+                                        tracing::warn!("Fleetfiles change was not replicated: {error}");
+                                    }
+                                });
+                            }
+                            if mesh.fleetfiles.take_overflow() {
+                                tracing::warn!("Fleetfiles watcher overflowed its bounded queue; reconciliation is required");
+                            }
+                        }
+                    });
+            }
+            Err(error) => tracing::warn!("couldn't watch Fleetfiles changes: {error}"),
+        }
         let native_mesh = self.clone();
         crate::spawn(async move {
             let _native_startup = native_startup;
@@ -4704,6 +4761,23 @@ impl Mesh {
                         self.sync_storage_plan_to(&from, &network).await;
                     }
                 }
+            }
+            CHANNEL_FLEETFILES => {
+                if !self.is_fleet_network(&network) || !self.sender_may_control(&from) {
+                    tracing::warn!(
+                        "ignoring Fleetfiles transaction from {} outside the authenticated fleet",
+                        short_id(&from)
+                    );
+                    return;
+                }
+                let Ok(message) = serde_json::from_value::<FleetfilesMessage>(payload) else {
+                    tracing::warn!(
+                        "ignoring malformed Fleetfiles transaction from {}",
+                        short_id(&from)
+                    );
+                    return;
+                };
+                self.handle_fleetfiles_message(&from, message).await;
             }
             CHANNEL_ROOMS => {
                 // The rooms plane is deliberately thin backend-side: rooms
@@ -12085,6 +12159,7 @@ impl Mesh {
             CHANNEL_PRESENCE,
             CHANNEL_LOCAL_CLAIM_PRESENCE,
             CHANNEL_CONTROL,
+            CHANNEL_FLEETFILES,
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
             CHANNEL_FILES_CANVAS,
@@ -17530,6 +17605,376 @@ impl Mesh {
             .await;
     }
 
+    async fn replicate_fleetfiles_change(self: Arc<Self>, path: PathBuf) -> Result<(), String> {
+        let _permit = self
+            .fleetfiles_transfer_gate
+            .acquire()
+            .await
+            .map_err(|_| "Fleetfiles transfer scheduler stopped")?;
+        let actor = self
+            .resolve_local_id()
+            .await
+            .map(|id| pubkey_part(&id).to_string())
+            .ok_or("Fleetfiles identity is not ready")?;
+        let replica = self.fleetfiles.clone();
+        let mutation = tokio::task::spawn_blocking(move || replica.capture(&path, &actor))
+            .await
+            .map_err(|error| format!("Fleetfiles capture worker stopped: {error}"))??;
+        let Some(mutation) = mutation else {
+            return Ok(());
+        };
+
+        let local = self.local_node_id().unwrap_or_default();
+        let targets = self
+            .storage_plan
+            .snapshot()
+            .allocations
+            .into_iter()
+            .filter(|allocation| {
+                allocation.enabled
+                    && !same_node(&allocation.device, &local)
+                    && self.network_for_peer(&allocation.device).is_some()
+            })
+            .map(|allocation| allocation.device)
+            .collect::<std::collections::BTreeSet<_>>();
+        if targets.is_empty() {
+            tracing::debug!("Fleetfiles change is committed locally but has no reachable allocated replica target");
+            return Ok(());
+        }
+        for target in targets {
+            self.send_fleetfiles_mutation(&target, &mutation).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_fleetfiles_mutation(
+        &self,
+        peer: &str,
+        mutation: &LocalMutation,
+    ) -> Result<(), String> {
+        match mutation {
+            LocalMutation::Directory {
+                operation,
+                version,
+                path,
+            } => {
+                let reply = self
+                    .send_fleetfiles_and_wait(
+                        peer,
+                        operation,
+                        FleetfilesMessage::Directory {
+                            operation: operation.clone(),
+                            version: version.clone(),
+                            path: path.clone(),
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                committed_result(reply)
+            }
+            LocalMutation::Delete {
+                operation,
+                version,
+                path,
+            } => {
+                let reply = self
+                    .send_fleetfiles_and_wait(
+                        peer,
+                        operation,
+                        FleetfilesMessage::Delete {
+                            operation: operation.clone(),
+                            version: version.clone(),
+                            path: path.clone(),
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                committed_result(reply)
+            }
+            LocalMutation::File {
+                operation,
+                version,
+                path,
+                size,
+                sha256,
+                source,
+            } => {
+                let ready = self
+                    .send_fleetfiles_and_wait(
+                        peer,
+                        operation,
+                        FleetfilesMessage::FileBegin {
+                            operation: operation.clone(),
+                            version: version.clone(),
+                            path: path.clone(),
+                            size: *size,
+                            sha256: sha256.clone(),
+                        },
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                match ready {
+                    FleetfilesMessage::Ready {
+                        accepted: true,
+                        needs_content: false,
+                        ..
+                    } => return Ok(()),
+                    FleetfilesMessage::Ready {
+                        accepted: true,
+                        needs_content: true,
+                        ..
+                    } => {}
+                    FleetfilesMessage::Ready { detail, .. } => {
+                        return Err(detail
+                            .unwrap_or_else(|| "Fleetfiles replica refused the version".into()));
+                    }
+                    _ => return Err("Fleetfiles replica sent the wrong readiness response".into()),
+                }
+
+                let mut reader = ChunkReader::open(source)?;
+                while let Some((offset, data)) = reader.next()? {
+                    self.send_fleetfiles_message(
+                        peer,
+                        FleetfilesMessage::FileChunk {
+                            operation: operation.clone(),
+                            offset,
+                            data,
+                        },
+                    )
+                    .await?;
+                }
+                let committed = self
+                    .send_fleetfiles_and_wait(
+                        peer,
+                        operation,
+                        FleetfilesMessage::FileCommit {
+                            operation: operation.clone(),
+                        },
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+                committed_result(committed)
+            }
+        }
+    }
+
+    async fn send_fleetfiles_message(
+        &self,
+        peer: &str,
+        message: FleetfilesMessage,
+    ) -> Result<(), String> {
+        let network = self
+            .network_for_peer(peer)
+            .ok_or("Fleetfiles replica target is not reachable")?;
+        let payload = serde_json::to_value(message).map_err(|error| error.to_string())?;
+        let response = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network,
+                channel: CHANNEL_FLEETFILES.into(),
+                peer: pubkey_part(peer).into(),
+                payload,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "Fleetfiles transfer was refused".into()))
+        }
+    }
+
+    async fn send_fleetfiles_and_wait(
+        &self,
+        peer: &str,
+        operation: &str,
+        message: FleetfilesMessage,
+        timeout: Duration,
+    ) -> Result<FleetfilesMessage, String> {
+        let key = (pubkey_part(peer).to_string(), operation.to_string());
+        let (tx, rx) = oneshot::channel();
+        if self
+            .fleetfiles_waiters
+            .lock()
+            .insert(key.clone(), tx)
+            .is_some()
+        {
+            return Err(
+                "a Fleetfiles acknowledgement is already pending for that operation".into(),
+            );
+        }
+        if let Err(error) = self.send_fleetfiles_message(peer, message).await {
+            self.fleetfiles_waiters.lock().remove(&key);
+            return Err(error);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => {
+                self.fleetfiles_waiters.lock().remove(&key);
+                Err("Fleetfiles acknowledgement channel closed".into())
+            }
+            Err(_) => {
+                self.fleetfiles_waiters.lock().remove(&key);
+                Err("Fleetfiles replica did not acknowledge the operation in time".into())
+            }
+        }
+    }
+
+    fn local_has_fleetfiles_allocation(&self) -> bool {
+        let Some(local) = self.local_node_id() else {
+            return false;
+        };
+        self.storage_plan
+            .snapshot()
+            .allocations
+            .iter()
+            .any(|allocation| allocation.enabled && same_node(&allocation.device, &local))
+    }
+
+    async fn handle_fleetfiles_message(&self, from: &str, message: FleetfilesMessage) {
+        let operation = match &message {
+            FleetfilesMessage::FileBegin { operation, .. }
+            | FleetfilesMessage::FileChunk { operation, .. }
+            | FleetfilesMessage::FileCommit { operation }
+            | FleetfilesMessage::Directory { operation, .. }
+            | FleetfilesMessage::Delete { operation, .. }
+            | FleetfilesMessage::Ready { operation, .. }
+            | FleetfilesMessage::Committed { operation, .. } => operation.clone(),
+        };
+        if matches!(
+            message,
+            FleetfilesMessage::Ready { .. } | FleetfilesMessage::Committed { .. }
+        ) {
+            let key = (pubkey_part(from).to_string(), operation.clone());
+            if let Some(waiter) = self.fleetfiles_waiters.lock().remove(&key) {
+                let _ = waiter.send(message);
+            } else {
+                tracing::debug!(
+                    "late or duplicate Fleetfiles acknowledgement from {} for {operation}",
+                    short_id(from)
+                );
+            }
+            return;
+        }
+
+        if !self.local_has_fleetfiles_allocation() {
+            let reply = match message {
+                FleetfilesMessage::FileBegin { .. } => Some(FleetfilesMessage::Ready {
+                    operation,
+                    accepted: false,
+                    needs_content: false,
+                    detail: Some("this device has no enabled Fleetfiles storage allocation".into()),
+                }),
+                FleetfilesMessage::FileChunk { .. } => None,
+                _ => Some(FleetfilesMessage::Committed {
+                    operation,
+                    accepted: false,
+                    detail: Some("this device has no enabled Fleetfiles storage allocation".into()),
+                }),
+            };
+            if let Some(reply) = reply {
+                let _ = self.send_fleetfiles_message(from, reply).await;
+            }
+            return;
+        }
+
+        match message {
+            FleetfilesMessage::FileBegin {
+                operation,
+                version,
+                path,
+                size,
+                sha256,
+            } => {
+                let result = self.fleetfiles.begin_file(
+                    from,
+                    operation.clone(),
+                    version,
+                    path,
+                    size,
+                    sha256,
+                );
+                let (accepted, needs_content, detail) = match result {
+                    Ok(needs_content) => (true, needs_content, None),
+                    Err(error) => (false, false, Some(error)),
+                };
+                let _ = self
+                    .send_fleetfiles_message(
+                        from,
+                        FleetfilesMessage::Ready {
+                            operation,
+                            accepted,
+                            needs_content,
+                            detail,
+                        },
+                    )
+                    .await;
+            }
+            FleetfilesMessage::FileChunk {
+                operation,
+                offset,
+                data,
+            } => {
+                if let Err(error) = self.fleetfiles.write_chunk(from, &operation, offset, &data) {
+                    tracing::warn!(
+                        "Fleetfiles chunk from {} failed for {operation}: {error}",
+                        short_id(from)
+                    );
+                }
+            }
+            FleetfilesMessage::FileCommit { operation } => {
+                let result = self.fleetfiles.commit_file(from, &operation);
+                let _ = self
+                    .send_fleetfiles_message(
+                        from,
+                        FleetfilesMessage::Committed {
+                            operation,
+                            accepted: result.is_ok(),
+                            detail: result.err(),
+                        },
+                    )
+                    .await;
+            }
+            FleetfilesMessage::Directory {
+                operation,
+                version,
+                path,
+            } => {
+                let result = self.fleetfiles.apply_directory(version, &path);
+                let _ = self
+                    .send_fleetfiles_message(
+                        from,
+                        FleetfilesMessage::Committed {
+                            operation,
+                            accepted: result.is_ok(),
+                            detail: result.err(),
+                        },
+                    )
+                    .await;
+            }
+            FleetfilesMessage::Delete {
+                operation,
+                version,
+                path,
+            } => {
+                let result = self.fleetfiles.apply_delete(version, &path);
+                let _ = self
+                    .send_fleetfiles_message(
+                        from,
+                        FleetfilesMessage::Committed {
+                            operation,
+                            accepted: result.is_ok(),
+                            detail: result.err(),
+                        },
+                    )
+                    .await;
+            }
+            FleetfilesMessage::Ready { .. } | FleetfilesMessage::Committed { .. } => unreachable!(),
+        }
+    }
+
     async fn broadcast_storage_patch(
         &self,
         policy: Option<PolicyRecord>,
@@ -19032,6 +19477,16 @@ fn append_chunk(path: &Path, data: &[u8], first: bool) -> std::io::Result<()> {
         opts.append(true);
     }
     opts.open(path)?.write_all(data)
+}
+
+fn committed_result(message: FleetfilesMessage) -> Result<(), String> {
+    match message {
+        FleetfilesMessage::Committed { accepted: true, .. } => Ok(()),
+        FleetfilesMessage::Committed { detail, .. } => {
+            Err(detail.unwrap_or_else(|| "Fleetfiles replica did not commit the operation".into()))
+        }
+        _ => Err("Fleetfiles replica sent the wrong commit response".into()),
+    }
 }
 
 fn completes_file_rpc(event: &FileEvent) -> bool {

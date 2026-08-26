@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { filesCanvasStatus, type FilesCanvasStatus } from "../../tauri";
+  import { FILE_TILE_SIZES } from "../../files-canvas";
   import StorageSection from "./StorageSection.svelte";
 
   let status = $state<FilesCanvasStatus | null>(null);
@@ -27,10 +28,12 @@
       <button class:active={app.filesSettings.defaultView === "details"} onclick={() => app.updateFilesSettings({ defaultView: "details" })}>Details</button>
     </div>
 
-    <label class="range">
-      <span><b>Thumbnail size</b><output>{app.filesSettings.thumbnailSize}px</output></span>
-      <input type="range" min="64" max="144" step="16" value={app.filesSettings.thumbnailSize} onchange={(event) => app.updateFilesSettings({ thumbnailSize: event.currentTarget.valueAsNumber })} />
-    </label>
+    <div class="preference">
+      <b>Icon size</b>
+      <div class="segmented" role="group" aria-label="Default icon size">
+        {#each FILE_TILE_SIZES as size}<button class:active={app.filesSettings.thumbnailSize === size} onclick={() => app.updateFilesSettings({ thumbnailSize: size })}>{size === 32 ? "Small" : size === 48 ? "Medium" : "Large"}</button>{/each}
+      </div>
+    </div>
 
     <label class="toggle">
       <input type="checkbox" checked={app.filesSettings.showPreview} onchange={(event) => app.updateFilesSettings({ showPreview: event.currentTarget.checked })} />
@@ -65,10 +68,7 @@
   .segmented { display: inline-flex; align-self: flex-start; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }
   .segmented button { border: 0; border-radius: 6px; padding: .38rem .8rem; background: transparent; color: var(--ink-soft); }
   .segmented button.active { background: var(--accent-soft); color: var(--accent-ink); }
-  .range { display: grid; gap: .45rem; font-size: .8rem; }
-  .range > span { display: flex; justify-content: space-between; }
-  output { color: var(--ink-faint); }
-  input[type="range"] { width: 100%; }
+  .preference { display: grid; gap: .45rem; font-size: .8rem; }
   .toggle { display: flex; align-items: flex-start; gap: .65rem; font-size: .82rem; }
   .toggle input { margin-top: .15rem; }
   .toggle span { display: grid; gap: .16rem; }

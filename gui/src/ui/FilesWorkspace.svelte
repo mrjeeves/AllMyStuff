@@ -126,7 +126,6 @@
   let computerHome = $state(false);
   let currentComputer = $state<{ deviceId: string; deviceLabel: string; routeId?: string } | null>(null);
   let localRootPath = "";
-  let sourceSummary = $state("Loading this device…");
   const remoteSessions = new Map<string, RemoteSession>();
   let routeSnapshotRefresh: Promise<void> | null = null;
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
@@ -174,6 +173,7 @@
   let navigationGeneration = 0;
   let address = $state("");
   let placesOpen = $state(true);
+  let devicesOpen = $state(false);
   let previewOpen = $state(app.filesSettings.showPreview);
   const previewRequests = new Map<string, Promise<LocalFilePreview>>();
   const thumbnailRequests = new Map<string, Promise<string>>();
@@ -279,14 +279,6 @@
     return Array.from(distinct.values());
   });
 
-  const collidingNames = $derived.by(() => {
-    const counts = new Map<string, number>();
-    for (const item of entries) {
-      const key = displayName(item).normalize("NFC").toLocaleLowerCase();
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    return new Set(Array.from(counts, ([name, count]) => count > 1 ? name : null).filter((name): name is string => Boolean(name)));
-  });
   const grid = $derived(nativeFileGridMetrics(tileSize, platform));
   const layoutIndex = $derived.by(() => new Map(
     [...entries]
@@ -302,28 +294,8 @@
     view = app.filesSettings.defaultView;
     tileSize = app.filesSettings.thumbnailSize;
   });
-  $effect(() => {
-    const nodes = fleetFileNodes;
-    if (!fleetHome || loading || directoryId !== "fleet:home") return;
-    reconcileFleetComputerEntries(nodes);
-  });
 
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
-const nativeMountTarget = $derived.by(() => {
-    if (selected?.dir && !selected.computerNode && selected.binding.kind === "remote") {
-      return {
-        deviceId: selected.binding.deviceId,
-        path: selected.path,
-        label: displayName(selected),
-      };
-    }
-    if (currentRemoteDirectory) return {
-      deviceId: currentRemoteDirectory.deviceId,
-      path: currentRemoteDirectory.path,
-      label: currentRemoteDirectory.path.split(/[\\/]/).filter(Boolean).at(-1) || currentRemoteDirectory.deviceLabel,
-    };
-    return null;
-  });
   const navigatorTrail = $derived(
     fleetHome || computerHome
       ? []
@@ -414,6 +386,10 @@ const nativeMountTarget = $derived.by(() => {
     return (hash >>> 0).toString(16).padStart(8, "0");
   }
 
+  function computerEntryId(deviceId: string): string {
+    return "entry:" + canonicalDeviceId(deviceId) + ":computer-root";
+  }
+
   function localWorkspaceEntry(item: LocalFileEntry): WorkspaceEntry {
     const nativeId = item.id;
     return {
@@ -440,7 +416,7 @@ const nativeMountTarget = $derived.by(() => {
       ? { kind: "remote", deviceId, deviceLabel, nativeId, routeId: "" }
       : { kind: "local", deviceId, deviceLabel, nativeId };
     return {
-      id: "entry:" + canonical + ":" + nativeId,
+      id: computerEntryId(canonical),
       name: deviceLabel,
       path: "computer://" + encodeURIComponent(canonical),
       dir: true,
@@ -454,33 +430,6 @@ const nativeMountTarget = $derived.by(() => {
       shellIcon: null,
       binding,
     };
-  }
-  type FleetFileNode = (typeof fleetFileNodes)[number];
-
-  function fleetComputerEntries(nodes: readonly FleetFileNode[] = fleetFileNodes): WorkspaceEntry[] {
-    return [
-      computerNodeEntry(app.localId, app.localNode?.label || nativeComputerName(), false),
-      ...nodes.map((node) =>
-        computerNodeEntry(node.id, node.label, true, node.online && app.filesAllowed(node))
-      ),
-    ];
-  }
-
-  function reconcileFleetComputerEntries(nodes: readonly FleetFileNode[] = fleetFileNodes) {
-    const desired = fleetComputerEntries(nodes);
-    const current = entries.filter((entry) => entry.computerNode);
-    const unchanged = current.length === desired.length && current.every((entry, index) => {
-      const next = desired[index];
-      return entry.id === next.id
-        && entry.name === next.name
-        && entry.computerOnline === next.computerOnline
-        && entry.binding.deviceId === next.binding.deviceId;
-    });
-    if (unchanged) return;
-    entries = [
-      ...desired,
-      ...entries.filter((entry) => !entry.computerNode),
-    ];
   }
 
   function computerLocationEntry(location: LocalFileLocation): WorkspaceEntry {
@@ -1038,15 +987,13 @@ const nativeMountTarget = $derived.by(() => {
         "fleet:home",
         listing.entries.map(localWorkspaceEntry),
       );
-      const fleetComputers = fleetComputerEntries();
-      entries = [...fleetComputers, ...desktopEntries];
+      entries = desktopEntries;
       nextCursor = listing.nextCursor ?? null;
       complete = listing.complete;
       history = ["fleet://home"];
       historyIndex = 0;
       thumbnails = {};
       thumbnailOrder = [];
-      sourceSummary = "Fleetfiles Desktop · " + fleetComputers.length + " fleet computers";
       loading = false;
       void startLocalDirectorySubscription(listing.path, generation, "fleet-home");
     } catch (error) {
@@ -1102,13 +1049,12 @@ const nativeMountTarget = $derived.by(() => {
       currentComputer = { deviceId, deviceLabel, routeId };
       map = "files";
       path = "computer://" + encodeURIComponent(canonical);
-      address = "Fleet Home / " + deviceLabel + " / " + (local ? nativeComputerName() : "Computer");
+      address = "Devices / " + deviceLabel;
       entries = nextEntries;
       nextCursor = null;
       complete = true;
       thumbnails = {};
       thumbnailOrder = [];
-      sourceSummary = deviceLabel + " · " + nextEntries.length + " drives";
       if (remember) {
         const kept = history.slice(0, historyIndex + 1);
         if (kept.at(-1) !== path) kept.push(path);
@@ -1184,17 +1130,10 @@ const nativeMountTarget = $derived.by(() => {
     const title = selected?.dir
       ? displayName(selected)
       : fleetHome
-        ? "Fleet Home"
+        ? "Fleetfiles"
         : currentComputer?.deviceLabel || currentRemoteDirectory?.deviceLabel || address;
     void openFilesWorkspaceWindow("workspace:" + JSON.stringify(location), title)
       .catch((error) => app.toast("warn", "Couldn't open a new Files window: " + String(error)));
-  }
-
-  function mountWorkspaceLocation() {
-    if (!nativeMountTarget) return;
-    void app.mapFolderFromNode(
-      nativeMountTarget.deviceId, nativeMountTarget.path, nativeMountTarget.label,
-    );
   }
 
   async function navigateInitialWorkspaceLocation(target: string) {
@@ -1257,6 +1196,7 @@ const nativeMountTarget = $derived.by(() => {
     document.addEventListener("visibilitychange", remoteDirectoryVisibilityChanged);
     try {
       placesOpen = localStorage.getItem("allmystuff.files.placesOpen") !== "false";
+      devicesOpen = localStorage.getItem("allmystuff.files.devicesOpen") === "true";
       previewOpen = localStorage.getItem("allmystuff.files.previewOpen") !== "false";
       placesWidth = Math.max(160, Math.min(420, Number(localStorage.getItem("allmystuff.files.placesWidth")) || 224));
       previewWidth = Math.max(220, Math.min(520, Number(localStorage.getItem("allmystuff.files.previewWidth")) || 288));
@@ -1387,7 +1327,7 @@ const nativeMountTarget = $derived.by(() => {
       directoryId = `remote:${session.deviceId}:${nativeId}`;
       map = "files";
       path = `fleet://directory/${encodeURIComponent(session.deviceId)}/${encodeURIComponent(nativeId)}`;
-      address = `${session.deviceLabel} / ${listing.path}`;
+      address = `Devices / ${session.deviceLabel} / ${listing.path}`;
       entries = await adoptWorkspaceEntries(
         directoryId,
         listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
@@ -1398,7 +1338,6 @@ const nativeMountTarget = $derived.by(() => {
       thumbnailOrder = [];
       history = ["fleet://home", path];
       historyIndex = 1;
-      sourceSummary = `Fleet directory · available through ${session.deviceLabel}`;
       void startRemoteDirectorySubscription(session, listing.path, generation, "directory");
     } catch (error) {
       if (generation === navigationGeneration) app.toast("warn", `Couldn't open that fleet folder: ${String(error)}`);
@@ -1570,6 +1509,11 @@ const nativeMountTarget = $derived.by(() => {
   function togglePlaces() {
     placesOpen = !placesOpen;
     try { localStorage.setItem("allmystuff.files.placesOpen", String(placesOpen)); } catch {}
+  }
+
+  function toggleDevices() {
+    devicesOpen = !devicesOpen;
+    try { localStorage.setItem("allmystuff.files.devicesOpen", String(devicesOpen)); } catch {}
   }
 
   function togglePreview() {
@@ -2342,9 +2286,19 @@ function newTransferId(): string {
     for (const element of document.elementsFromPoint(clientX, clientY)) {
       const tile = element.closest<HTMLElement>("[data-files-entry-id]");
       const id = tile?.dataset.filesEntryId;
-      if (!id || dragged.has(id)) continue;
-      const target = entries.find((entry) => entry.id === id);
-      if (target?.dir && target.binding.kind === "remote" && target.computerOnline !== false) return target;
+      if (id && !dragged.has(id)) {
+        const target = entries.find((entry) => entry.id === id);
+        if (target?.dir && target.binding.kind === "remote" && target.computerOnline !== false) return target;
+      }
+      const device = element.closest<HTMLElement>("[data-files-device-id]");
+      const deviceId = device?.dataset.filesDeviceId;
+      if (!deviceId) continue;
+      const node = fleetFileNodes.find((candidate) =>
+        canonicalDeviceId(candidate.id) === canonicalDeviceId(deviceId)
+      );
+      if (node?.online && app.filesAllowed(node)) {
+        return computerNodeEntry(node.id, node.label, true, true);
+      }
     }
     return null;
   }
@@ -2870,11 +2824,10 @@ function newTransferId(): string {
     <button title="Up one folder" disabled={fleetHome} onclick={goUp}>↑</button>
     <button onclick={refreshWorkspace} title="Refresh">↻</button>
     <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Location" spellcheck="false" />
-    <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleet Home" : computerHome ? "Search drives" : "Search this folder"} aria-label="Search files" />
+    <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleetfiles" : computerHome ? "Search device" : "Search this folder"} aria-label="Search files" />
     <button onclick={createFolder} disabled={map !== "files" || computerHome} title="New folder">＋ Folder</button>
     <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
     <button onclick={openWorkspaceInNewWindow} disabled={map !== "files"} title={selected?.dir ? `Open ${displayName(selected)} in a new AllMyStuff window` : "Open this location in a new AllMyStuff window"}>↗ Window</button>
-    <button onclick={mountWorkspaceLocation} disabled={!nativeMountTarget} title="Mount this remote location in the native operating-system file browser">⌁ Mount</button>
     <button class:active={operationsOpen} onclick={() => { operationsOpen = !operationsOpen; }} title="Show file operations">⇅{activeOperationCount ? " " + activeOperationCount : ""}</button>
     {#if map === "files"}
       <div class="switch" role="group" aria-label="View">
@@ -2902,8 +2855,10 @@ function newTransferId(): string {
         <div class="location-branch fleet-root">
           <button class:current={fleetHome && map === "files"} aria-current={fleetHome && map === "files" ? "location" : undefined} onclick={navigateFleetHome}><span aria-hidden="true">▱</span>Desktop</button>
         </div>
-        <div class="tree-section-label">Computers</div>
-        <div class="computer-tree" aria-label="Fleet filesystem tree">
+        <button class="tree-section-toggle" aria-expanded={devicesOpen || computerHome || Boolean(currentRemoteDirectory)} onclick={toggleDevices} title="Browse files on a device">
+          <span aria-hidden="true">{devicesOpen || computerHome || currentRemoteDirectory ? "⌄" : "›"}</span>Devices
+        </button>
+        {#if devicesOpen || computerHome || currentRemoteDirectory}<div class="computer-tree" aria-label="Device file sources">
           <button class:active={computerBranchActive(app.localId)} onclick={() => { void navigateComputer(); }} title={app.localNode?.label || nativeComputerName()}><span class="tree-expander" aria-hidden="true">{computerBranchActive(app.localId) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
           {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(app.localId)}
             <div class="location-branch" aria-label="Drives on this computer">
@@ -2921,7 +2876,16 @@ function newTransferId(): string {
             </div>
           {/if}
           {#each fleetFileNodes as node (node.id)}
-            <button class:active={computerBranchActive(node.id)} class:offline={!node.online || !app.filesAllowed(node)} onclick={() => { void navigateComputer(node.id, node.label); }} title={!app.filesAllowed(node) ? node.label + " (Files unavailable)" : node.online ? node.label : node.label + " (offline)"}><span class="tree-expander" aria-hidden="true">{computerBranchActive(node.id) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{node.label}</button>
+            <button
+              data-files-device-id={node.id}
+              class:active={computerBranchActive(node.id)}
+              class:offline={!node.online || !app.filesAllowed(node)}
+              class:transfer-target={transferDropTargetId === computerEntryId(node.id)}
+              onclick={() => { void navigateComputer(node.id, node.label); }}
+              title={!app.filesAllowed(node) ? node.label + " (Files unavailable)" : node.online ? node.label : node.label + " (offline)"}
+            >
+              <span class="tree-expander" aria-hidden="true">{computerBranchActive(node.id) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{node.label}
+            </button>
             {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Drives on " + node.label}>
                 {#each entries as drive (drive.id)}
@@ -2939,9 +2903,9 @@ function newTransferId(): string {
             {/if}
           {/each}
         </div>
-        <p class="source-summary">{sourceSummary}</p>
+        {/if}
         <h3>Recent</h3>
-        {#if recent.length === 0}<p>Files opened from anywhere in the fleet appear here.</p>{/if}
+        {#if recent.length === 0}<p>Opened files appear here.</p>{/if}
         {#each recent as item}<button onclick={() => open(item)} title={item.binding.deviceLabel}><span use:loadNativeIcon={item}>{#if nativeIconFor(item)}<img class="shell-icon" src={`data:image/png;base64,${nativeIconFor(item)}`} alt="" />{:else}{icon(item)}{/if}</span>{displayName(item)}</button>{/each}
         <h3>Sharing lens</h3>
         <button class:active={map === "sharing"} onclick={() => changeMap("sharing")}><span>⇄</span>Shared with me / out</button>
@@ -2962,11 +2926,11 @@ function newTransferId(): string {
   <main class="browser" use:measureCanvas style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
     {#if map === "sharing"}
       <div class="sharing-canvas" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
-        <p class="share-map-help">Only actual shared files, folders, and drives appear here. Drag a shared-out item onto empty canvas to retract it.</p>
+        <p class="share-map-help">Drag files into a person’s frame to share. Drag them out to stop sharing.</p>
         {#each filesystemPartners as relation (relation.partner.person.id)}
           <section class="share-frame partner" role="group" aria-label={`Files shared with ${relation.partner.person.name}`} ondragover={(event) => event.preventDefault()} ondrop={(event) => shareDrop(event, relation.partner)}>
             <h2>{relation.partner.person.name}</h2>
-            <p>This fleet's concrete filesystem sharing surface. Folder grants include their live descendants without listing every child here.</p>
+            <p>Drop files or folders here to share them. Shared folders include everything inside.</p>
             {#if relation.sharedByYou.length}
               <h3>Shared out</h3>
               <div class="share-items">
@@ -2985,7 +2949,7 @@ function newTransferId(): string {
             {/if}
           </section>
         {:else}
-          <section class="share-frame empty-share"><h2>No shared filesystem objects</h2><p>Other share types remain available elsewhere; this Files view appears only when a concrete file, folder, or drive is shared.</p></section>
+          <section class="share-frame empty-share"><h2>Nothing shared yet</h2><p>Drag a file or folder here to begin.</p></section>
         {/each}
         {#each frames as frame}
           {@const geometry = frameGeometry(frame)}
@@ -3048,9 +3012,6 @@ function newTransferId(): string {
                 />
               {:else}
                 <span class="detail-label">{displayName(item)}</span>
-                {#if item.binding.kind === "remote" || collidingNames.has(displayName(item).normalize("NFC").toLocaleLowerCase())}
-                  <small class="detail-source">{item.binding.deviceLabel}</small>
-                {/if}
               {/if}
             </span>
             <span>{item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</span>
@@ -3125,9 +3086,6 @@ function newTransferId(): string {
                 />
               {:else}
                 <span class="file-label">{displayName(item)}</span>
-              {/if}
-              {#if item.binding.kind === "remote" || collidingNames.has(displayName(item).normalize("NFC").toLocaleLowerCase())}
-                <span class="source-label" title={`Available through ${item.binding.deviceLabel}`}>{item.binding.deviceLabel}</span>
               {/if}
             </div>
           {/each}
@@ -3328,11 +3286,13 @@ function newTransferId(): string {
   .location-branch button:hover, .location-branch button.current { background: var(--surface-2); color: var(--ink); }
   .location-branch button.current { color: var(--ink); font-weight: 600; }
   .computer-tree > button.active { color: var(--accent-ink); }
+  .computer-tree > button.transfer-target { color: var(--accent-ink); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
   .computer-tree > button.offline, .file-tile.offline, .detail-row.offline { opacity: .52; }
-  .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }.source-summary { margin: .25rem 0 .4rem; }
+  .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
-  .tree-section-label { margin: .65rem .45rem .25rem; color: var(--ink-faint); font-size: .62rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .tree-section-toggle { margin-top: .45rem; color: var(--ink-faint) !important; font-size: .66rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .tree-section-toggle span { flex: 0 0 .72rem; text-align: center; }
   .location-branch.fleet-root { margin-bottom: .5rem; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }
   .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
@@ -3345,9 +3305,8 @@ function newTransferId(): string {
   .frame-delete { flex: 0 0 auto; margin-left: auto; padding: 0 .2rem; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
-  .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .16rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .24rem .35rem; touch-action: none; }
+  .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .3rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .24rem .35rem; touch-action: none; }
   .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 3px 4px oklch(0 0 0 / .28)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.35em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .78rem; font-weight: 500; line-height: 1.18; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .78rem; line-height: 1.2; user-select: text; }
-  .source-label { box-sizing: border-box; width: 100%; overflow: hidden; padding: 0 .2rem; color: color-mix(in oklab, var(--ink-faint) 88%, transparent); font-size: .61rem; line-height: 1.05; text-align: center; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
   .file-tile { user-select: none; }
   .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }

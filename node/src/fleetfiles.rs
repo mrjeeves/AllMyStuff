@@ -19,7 +19,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const TRANSFER_CHUNK: usize = 64 * 1024;
+/// Raw bytes per transfer frame. Base64 expands by 4/3, so 40 KiB plus the
+/// operation/channel JSON envelope remains below WebRTC's ~64 KiB message
+/// ceiling. This matches the proven files-plane budget.
+pub const TRANSFER_CHUNK: usize = 40 * 1024;
 const CHANGE_QUEUE: usize = 4096;
 const MAX_INBOUND: usize = 32;
 const MAX_PATH_BYTES: usize = 32 * 1024;
@@ -912,6 +915,21 @@ mod tests {
         assert!(is_internal(&root, &root.join(".Spotlight-V100/index")));
         assert!(!is_internal(&root, &root.join(".env")));
         assert!(!is_internal(&root, &root.join("photos/image.png")));
+    }
+
+    #[test]
+    fn transfer_chunk_stays_below_the_data_channel_envelope_budget() {
+        let encoded = serde_json::to_vec(&FleetfilesMessage::FileChunk {
+            operation: "f".repeat(80),
+            offset: u64::MAX,
+            data: vec![0xff; TRANSFER_CHUNK],
+        })
+        .unwrap();
+        assert!(
+            encoded.len() < 56 * 1024,
+            "Fleetfiles chunk JSON was {} bytes",
+            encoded.len()
+        );
     }
 
     #[test]

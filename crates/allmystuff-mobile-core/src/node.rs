@@ -76,6 +76,7 @@ pub fn mobile_profile(
             cpu: cfg.model.clone(),
             ram_bytes: cfg.ram_bytes,
             device_count,
+            storage: Vec::new(),
             product: String::new(),
         },
         capabilities,

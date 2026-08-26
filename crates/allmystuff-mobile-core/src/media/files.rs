@@ -123,6 +123,7 @@ impl FileClient {
             path: path.into(),
             data,
             append,
+            create_new: false,
             eof,
         })
     }

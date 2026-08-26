@@ -59,6 +59,7 @@ base64 = "0.22"
 trash = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 parking_lot = "0.12"
+notify = "8.2"
 # Resolves the user's home for the persisted "Always On" window preference
 # (window_behavior.rs), mirroring the node's networks store.
 dirs = "5"

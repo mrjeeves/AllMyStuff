@@ -53,6 +53,7 @@ pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
 /// network transition cannot strand it, but receivers accept it only on their
 /// authenticated closed fleet network.
 pub const CHANNEL_FILES_CANVAS: &str = "allmystuff/files-canvas/v1";
+pub const CHANNEL_FLEET_STORAGE: &str = "allmystuff/fleet-storage/v1";
 
 /// Well-known LAN-local claim-rendezvous network. Every AllMyStuff node
 /// joins it with daemon signaling `{strategy: "none", mdns: true}` — the
@@ -220,6 +221,22 @@ pub const FEATURE_KVM: &str = "kvm";
 /// the summary: a partial summary (some hardware fields missing, e.g. an older
 /// or mid-scan peer) fills the gaps with defaults instead of failing the whole
 /// `NodeProfile` decode. See [`NodeProfile::summary`].
+/// Bounded storage contribution summary carried in presence. Native mount
+/// paths never leave their owning device; the stable inventory id is enough
+/// for a fleet allocation policy to name the resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageSummary {
+    pub id: String,
+    pub name: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub removable: bool,
+    /// Portable scheduler hint: ssd, hdd, removable, or unknown.
+    pub kind: String,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct InventorySummary {
@@ -228,6 +245,9 @@ pub struct InventorySummary {
     pub ram_bytes: u64,
     /// Headline device count for the "12 things" chip.
     pub device_count: u32,
+    /// Bounded storage capacity summaries for placement. No native paths.
+    pub storage: Vec<StorageSummary>,
+
     /// Product / model name — the machine's own identity ("OptiPlex 7090",
     /// "MacBook Pro"), the DMI product field without its maker prefix. This
     /// rides presence so a CEC technician can tell one customer's box from
@@ -1395,6 +1415,7 @@ mod tests {
                 cpu: "Test CPU".into(),
                 ram_bytes: 16 << 30,
                 device_count: 12,
+                storage: Vec::new(),
                 product: "OptiPlex 7090".into(),
             },
             capabilities: vec![Capability::new(

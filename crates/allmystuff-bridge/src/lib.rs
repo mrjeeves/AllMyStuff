@@ -30,7 +30,7 @@
 
 use allmystuff_graph::{Capability, Flow, MediaKind, NodeId};
 use allmystuff_inventory::{InputKind, Inventory};
-use allmystuff_protocol::InventorySummary;
+use allmystuff_protocol::{InventorySummary, StorageSummary};
 
 pub mod sites;
 
@@ -257,6 +257,18 @@ pub fn node_summary(inv: &Inventory) -> InventorySummary {
         cpu: inv.cpu.brand.clone(),
         ram_bytes: inv.memory.total_bytes,
         device_count: inv.device_count() as u32,
+        storage: inv
+            .storage
+            .iter()
+            .map(|volume| StorageSummary {
+                id: volume.id.clone(),
+                name: volume.name.clone(),
+                total_bytes: volume.total_bytes,
+                available_bytes: volume.available_bytes,
+                removable: volume.removable,
+                kind: format!("{:?}", volume.kind).to_lowercase(),
+            })
+            .collect(),
         // The product/model name identifies the machine to a CEC technician;
         // empty when DMI has nothing usable (the wire default).
         product: inv.host.product.clone().unwrap_or_default(),

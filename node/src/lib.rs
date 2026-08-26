@@ -133,8 +133,10 @@ pub(crate) mod persist;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
 /// device" and the fleet's `RestartDevice` command.
 pub mod reboot;
+pub mod service_profiles;
 pub mod shares;
 pub mod sites;
+pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —
 /// the same line on NVIDIA, AMD, and Intel boxes.

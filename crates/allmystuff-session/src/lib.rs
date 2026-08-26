@@ -759,6 +759,7 @@ mod tests {
                 cpu: "cpu".into(),
                 ram_bytes: 1 << 30,
                 device_count: 3,
+                storage: Vec::new(),
                 product: "Test Model".into(),
             },
             capabilities: vec![allmystuff_graph::Capability::new(

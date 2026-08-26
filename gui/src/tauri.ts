@@ -203,6 +203,10 @@ export function localFileLocations(): Promise<LocalFileLocation[]> {
         { id: "downloads", label: "Downloads", path: "/Users/you/Downloads", kind: "favorite" },
       ]);
 }
+export function fleetfilesLocalDesktop(): Promise<{ path: string }> {
+  return requiredInvoke("fleetfiles_local_desktop");
+}
+
 
 export function localFileList(path: string, cursor?: string): Promise<LocalFileListing> {
   if (!isTauri()) {
@@ -223,6 +227,96 @@ export function localFileList(path: string, cursor?: string): Promise<LocalFileL
     });
   }
   return requiredInvoke<LocalFileListing>("local_file_list", { path, cursor });
+}
+
+export interface LocalDirectoryChanged {
+  token: number;
+  seq: number;
+  overflow: boolean;
+}
+
+export async function watchLocalDirectory(
+  path: string,
+  cb: (event: LocalDirectoryChanged) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const [{ listen }, { invoke }] = await Promise.all([
+    import("@tauri-apps/api/event"),
+    import("@tauri-apps/api/core"),
+  ]);
+  type Started = { token: number; leaseMs: number };
+  let token: number | null = null;
+  let expiresAt = 0;
+  let renewTimer: number | null = null;
+  let stopped = false;
+  const unlisten = await listen<LocalDirectoryChanged>(
+    "allmystuff://local-directory-changed",
+    ({ payload }) => {
+      if (payload.token === token) cb(payload);
+    },
+  );
+
+  const clearRenewal = () => {
+    if (renewTimer !== null) window.clearTimeout(renewTimer);
+    renewTimer = null;
+  };
+  const stopToken = (value: number | null) => {
+    if (value !== null) void invoke("local_directory_unwatch", { token: value }).catch(() => {});
+  };
+  const install = async () => {
+    const prior = token;
+    const started = await invoke<Started>("local_directory_watch", { path });
+    if (stopped) {
+      stopToken(started.token);
+      return;
+    }
+    token = started.token;
+    expiresAt = Date.now() + started.leaseMs;
+    stopToken(prior);
+    scheduleRenewal(started.leaseMs * 0.8);
+  };
+  const scheduleRenewal = (delay: number) => {
+    clearRenewal();
+    if (stopped || document.visibilityState !== "visible") return;
+    renewTimer = window.setTimeout(() => {
+      renewTimer = null;
+      void install().catch((error) => {
+        console.info("Local directory watcher lease renewal failed:", error);
+      });
+    }, Math.max(1_000, delay));
+  };
+  const visibilityChanged = () => {
+    if (document.visibilityState !== "visible") {
+      clearRenewal();
+      return;
+    }
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      void install().catch((error) => {
+        console.info("Local directory watcher could not resume:", error);
+      });
+    } else {
+      scheduleRenewal(remaining * 0.8);
+    }
+  };
+  document.addEventListener("visibilitychange", visibilityChanged);
+  try {
+    await install();
+  } catch (error) {
+    stopped = true;
+    document.removeEventListener("visibilitychange", visibilityChanged);
+    unlisten();
+    throw error;
+  }
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearRenewal();
+    document.removeEventListener("visibilitychange", visibilityChanged);
+    unlisten();
+    stopToken(token);
+    token = null;
+  };
 }
 
 export function localFilePreview(path: string): Promise<LocalFilePreview> {
@@ -258,6 +352,173 @@ export function localFileRename(path: string, name: string): Promise<LocalFileEn
 export function localFileTrash(paths: string[]): Promise<void> {
   return requiredInvoke("local_file_trash", { paths });
 }
+export interface LocalFileTransferImpact {
+  files: number;
+  folders: number;
+  bytes: number;
+  symlinks: number;
+  unreadable: number;
+  unreadable_examples: string[];
+  top_level: string[];
+  requires_confirmation: boolean;
+}
+
+export function localFileTransferScan(id: string, paths: string[]): Promise<LocalFileTransferImpact> {
+  return requiredInvoke("local_file_transfer_scan", { id, paths });
+}
+
+export function localFileTransferStart(
+  id: string,
+  routeId: string,
+  paths: string[],
+  destination: string,
+  targetLabel: string,
+  impact: LocalFileTransferImpact,
+): Promise<{ files: number; folders: number; bytes: number }> {
+  return requiredInvoke("local_file_transfer_start", {
+    id,
+    routeId,
+    paths,
+    destination,
+    expectedFiles: impact.files,
+    targetLabel,
+    expectedFolders: impact.folders,
+    expectedBytes: impact.bytes,
+  });
+}
+
+export function localFileTransferCancel(id: string): Promise<boolean> {
+  return requiredInvoke("local_file_transfer_cancel", { id });
+}
+export interface LocalFileTransferOperation {
+  id: string;
+  phase: "transferring" | "cancelling" | "complete" | "failed" | "cancelled";
+  targetLabel: string;
+  files: number;
+  folders: number;
+  bytes: number;
+  error?: string | null;
+  startedAt: number;
+}
+
+export function localFileTransferOperations(): Promise<{ operations: LocalFileTransferOperation[] }> {
+  return requiredInvoke("local_file_transfer_operations");
+}
+
+export async function onFileOperations(
+  cb: (operations: LocalFileTransferOperation[]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ operations: LocalFileTransferOperation[] }>(
+    "allmystuff://file-operations",
+    (event) => cb(event.payload.operations),
+  );
+}
+
+
+export interface FleetServiceProfile {
+  peer: string;
+  state: "online" | "offline" | "unknown";
+  observedHours: number;
+  availability: number;
+  averageLatencyMs?: number | null;
+  throughputMbps?: number | null;
+  operationReliability: number;
+  confidence: number;
+  serviceScore: number;
+  connections: number;
+  disconnects: number;
+  successes: number;
+  failures: number;
+}
+
+export function fleetServiceProfiles(): Promise<{ profiles: FleetServiceProfile[] }> {
+  return isTauri()
+    ? requiredInvoke("fleet_service_profiles")
+    : Promise.resolve({ profiles: [] });
+}
+
+export interface FleetStorageVolume {
+  id: string;
+  name: string;
+  path?: string | null;
+  filesystem?: string | null;
+  totalBytes: number;
+  availableBytes: number;
+  removable: boolean;
+  kind: "ssd" | "hdd" | "removable" | "unknown";
+}
+
+export function fleetStorageLocalVolumes(): Promise<FleetStorageVolume[]> {
+  return isTauri()
+    ? requiredInvoke("fleet_storage_local_volumes")
+    : Promise.resolve([]);
+}
+
+
+export interface FleetStoragePolicy {
+  ordinaryReplicas: number;
+  criticalReplicas: number;
+  reservePercent: number;
+  versionRetentionDays: number;
+  rebalanceGibPerDay: number;
+  pauseOnMetered: boolean;
+}
+
+export interface FleetStorageAllocation {
+  id: string;
+  device: string;
+  volume: string;
+  quotaBytes: number;
+  enabled: boolean;
+  stamp: { counter: number; actor: string };
+}
+
+export interface FleetStorageStatus {
+  plan: {
+    policy: {
+      value: FleetStoragePolicy;
+      stamp: { counter: number; actor: string };
+    };
+    allocations: FleetStorageAllocation[];
+  };
+  profiles: FleetServiceProfile[];
+}
+
+export function fleetStorageStatus(): Promise<FleetStorageStatus> {
+  return requiredInvoke("fleet_storage_status");
+}
+
+export function fleetStorageSetPolicy(policy: FleetStoragePolicy): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_policy", { policy });
+}
+
+export function fleetStorageSetAllocation(
+  device: string,
+  volume: string,
+  quotaBytes: number,
+  enabled: boolean,
+): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_allocation", {
+    device,
+    volume,
+    quotaBytes,
+    enabled,
+  });
+}
+
+export async function onFleetStorage(
+  cb: (plan: FleetStorageStatus["plan"]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ plan: FleetStorageStatus["plan"] }>(
+    "allmystuff://fleet-storage",
+    (event) => cb(event.payload.plan),
+  );
+}
+
 
 export interface NamespaceObservation {
   provisionalId: string;
@@ -1217,6 +1478,29 @@ export async function openFilesWindow(node: string): Promise<void> {
 export function filesWindowTarget(): string | null {
   if (typeof window === "undefined") return null;
   return new URLSearchParams(window.location.search).get("files");
+}
+
+export async function openFilesWorkspaceWindow(target: string, title: string): Promise<void> {
+  if (!isTauri()) return;
+  const instance = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await requiredInvoke("open_files_workspace_window", { target, title, instance });
+}
+
+export function filesWorkspaceWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  const encoded = new URLSearchParams(window.location.search).get("files-workspace");
+  if (!encoded) return null;
+  try {
+    const standard = encoded.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = standard + "=".repeat((4 - standard.length % 4) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
 }
 
 /** Send one file request down an active files route (this window is the

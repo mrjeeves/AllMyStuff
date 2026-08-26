@@ -32,7 +32,10 @@ compile_error!(
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -43,6 +46,7 @@ use allmystuff_graph::{Grant, Person};
 #[cfg(all(windows, not(debug_assertions)))]
 use allmystuff_node::node_control::running_node_satisfies;
 use allmystuff_node::node_control::{ensure_node_running, NodeChild, NodeClient, NodeEvent};
+use notify::Watcher as _;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
@@ -93,6 +97,10 @@ impl OwnedNode {
     }
 }
 
+struct LocalDirectoryWatch {
+    _watcher: notify::RecommendedWatcher,
+}
+
 struct AppState {
     node: Arc<NodeClient>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
@@ -100,6 +108,8 @@ struct AppState {
     /// the app); a reused service node has no child here and keeps running.
     node_child: Mutex<OwnedNode>,
     local_files: Arc<Mutex<LocalFileBrowser>>,
+    local_directory_watchers: Arc<Mutex<HashMap<u64, LocalDirectoryWatch>>>,
+    next_local_directory_watch: AtomicU64,
 }
 
 // ---- this machine -----------------------------------------------------
@@ -1158,13 +1168,34 @@ fn windows_desktop_parts(
     if !is_desktop {
         return (None, VecDeque::new(), false);
     }
-    let public_reader = std::env::var_os("PUBLIC")
+    let public_path = std::env::var_os("PUBLIC")
         .map(PathBuf::from)
         .map(|path| path.join("Desktop"))
         .and_then(|path| path.canonicalize().ok())
-        .filter(|path| path != canonical)
-        .and_then(|path| std::fs::read_dir(path).ok());
+        .filter(|path| path != canonical);
+    let public_reader = public_path.and_then(|path| std::fs::read_dir(path).ok());
     (public_reader, VecDeque::from([recycle_bin_entry()]), true)
+}
+
+#[cfg(windows)]
+fn windows_desktop_watch_path(canonical: &Path) -> Option<PathBuf> {
+    let is_desktop = dirs::desktop_dir()
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|desktop| desktop == canonical);
+    is_desktop
+        .then(|| {
+            std::env::var_os("PUBLIC")
+                .map(PathBuf::from)
+                .map(|path| path.join("Desktop"))
+                .and_then(|path| path.canonicalize().ok())
+                .filter(|path| path != canonical)
+        })
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn windows_desktop_watch_path(_canonical: &Path) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(not(windows))]
@@ -1552,6 +1583,128 @@ async fn local_file_list(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDirectoryChanged {
+    token: u64,
+    seq: u64,
+    overflow: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDirectoryWatchStarted {
+    token: u64,
+    lease_ms: u64,
+}
+
+#[tauri::command]
+fn local_directory_watch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<LocalDirectoryWatchStarted, String> {
+    const MAX_WATCHES: usize = 32;
+    const DEBOUNCE: Duration = Duration::from_millis(100);
+    const LEASE: Duration = Duration::from_secs(30 * 60);
+    let directory = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !directory.is_dir() {
+        return Err("that watch target is not a directory".into());
+    }
+    if state.local_directory_watchers.lock().len() >= MAX_WATCHES {
+        return Err("too many live local directory subscriptions".into());
+    }
+    let token = state
+        .next_local_directory_watch
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1);
+    let (dirty_tx, dirty_rx) = mpsc::sync_channel::<()>(1);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let callback_overflow = overflow.clone();
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        match result {
+            Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => return,
+            Ok(_) => {}
+            Err(_) => callback_overflow.store(true, Ordering::Relaxed),
+        }
+        let _ = dirty_tx.try_send(());
+    })
+    .map_err(|error| format!("couldn't create directory watcher: {error}"))?;
+    watcher
+        .watch(&directory, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| format!("couldn't watch that directory: {error}"))?;
+    if let Some(public_desktop) = windows_desktop_watch_path(&directory) {
+        watcher
+            .watch(&public_desktop, notify::RecursiveMode::NonRecursive)
+            .map_err(|error| format!("couldn't watch the public Desktop: {error}"))?;
+    }
+    let watchers = state.local_directory_watchers.clone();
+    watchers
+        .lock()
+        .insert(token, LocalDirectoryWatch { _watcher: watcher });
+
+    let expires_at = Instant::now() + LEASE;
+    let worker_watchers = watchers.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("amst-local-files-watch-{token}"))
+        .spawn(move || {
+            let mut seq = 0_u64;
+            loop {
+                let now = Instant::now();
+                if now >= expires_at {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+                match dirty_rx.recv_timeout(expires_at.saturating_duration_since(now)) {
+                    Ok(()) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        worker_watchers.lock().remove(&token);
+                        return;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                std::thread::sleep(DEBOUNCE);
+                if Instant::now() >= expires_at {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+                loop {
+                    match dirty_rx.try_recv() {
+                        Ok(()) => {}
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                seq = seq.saturating_add(1);
+                if app
+                    .emit(
+                        "allmystuff://local-directory-changed",
+                        LocalDirectoryChanged {
+                            token,
+                            seq,
+                            overflow: overflow.swap(false, Ordering::Relaxed),
+                        },
+                    )
+                    .is_err()
+                {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+            }
+        });
+    Ok(LocalDirectoryWatchStarted {
+        token,
+        lease_ms: LEASE.as_millis() as u64,
+    })
+}
+
+#[tauri::command]
+fn local_directory_unwatch(state: State<'_, AppState>, token: u64) {
+    state.local_directory_watchers.lock().remove(&token);
 }
 
 #[tauri::command]
@@ -1946,6 +2099,162 @@ async fn file_send(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+#[tauri::command]
+async fn local_file_transfer_scan(
+    state: State<'_, AppState>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("file_transfer_scan", json!({ "id": id, "paths": paths }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn local_file_transfer_start(
+    state: State<'_, AppState>,
+    id: String,
+    route_id: String,
+    paths: Vec<String>,
+    destination: String,
+    target_label: String,
+    expected_files: u64,
+    expected_folders: u64,
+    expected_bytes: u64,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "file_transfer_start",
+            json!({
+                "id": id,
+                "route_id": route_id,
+                "paths": paths,
+                "destination": destination,
+                "target_label": target_label,
+                "expected_files": expected_files,
+                "expected_folders": expected_folders,
+                "expected_bytes": expected_bytes,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn local_file_transfer_cancel(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request("file_transfer_cancel", json!({ "id": id }))
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn local_file_transfer_operations(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("file_transfer_operations", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_local_desktop(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleetfiles_local_desktop", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_storage_status", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_set_policy(
+    state: State<'_, AppState>,
+    policy: Value,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_storage_set_policy", json!({ "policy": policy }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_set_allocation(
+    state: State<'_, AppState>,
+    device: String,
+    volume: String,
+    quota_bytes: u64,
+    enabled: bool,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleet_storage_set_allocation",
+            json!({
+                "device": device,
+                "volume": volume,
+                "quota_bytes": quota_bytes,
+                "enabled": enabled,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn fleet_service_profiles(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_service_profiles", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetStorageVolume {
+    id: String,
+    name: String,
+    path: Option<String>,
+    filesystem: Option<String>,
+    total_bytes: u64,
+    available_bytes: u64,
+    removable: bool,
+    kind: String,
+}
+
+#[tauri::command]
+fn fleet_storage_local_volumes() -> Vec<FleetStorageVolume> {
+    allmystuff_inventory::scan()
+        .storage
+        .into_iter()
+        .map(|volume| FleetStorageVolume {
+            id: volume.id,
+            name: volume.name,
+            path: volume.mount_point,
+            filesystem: volume.filesystem,
+            total_bytes: volume.total_bytes,
+            available_bytes: volume.available_bytes,
+            removable: volume.removable,
+            kind: format!("{:?}", volume.kind).to_lowercase(),
+        })
+        .collect()
+}
 
 /// Register the calling files window's interest in a route's responses.
 /// Frames buffer backend-side from route-activation; the window drains
@@ -2049,6 +2358,31 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
         "AllMyStuff files",
         (940.0, 640.0),
         (480.0, 320.0),
+        AUMID_FILES,
+    )
+}
+
+#[tauri::command]
+async fn open_files_workspace_window(
+    app: tauri::AppHandle,
+    target: String,
+    title: String,
+    instance: String,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target);
+    let label = format!("files-workspace-{}", window_slug(&instance));
+    open_secondary_window(
+        &app,
+        &label,
+        format!("index.html?files-workspace={encoded}"),
+        if title.trim().is_empty() {
+            "AllMyStuff Files"
+        } else {
+            &title
+        },
+        (1120.0, 760.0),
+        (640.0, 420.0),
         AUMID_FILES,
     )
 }
@@ -4290,6 +4624,9 @@ fn main() {
             kvm_mesh_add,
             kvm_mesh_remove,
             share_grant,
+            fleet_storage_status,
+            fleet_storage_set_policy,
+            fleet_storage_set_allocation,
             share_revoke,
             share_stop,
             send_input,
@@ -4308,17 +4645,25 @@ fn main() {
             open_video_window,
             term_send,
             term_watch,
+            fleet_service_profiles,
+            fleet_storage_local_volumes,
             term_poll,
             term_unwatch,
             terminal_sessions,
             open_terminal_window,
             file_send,
+            local_file_transfer_scan,
+            local_file_transfer_start,
+            local_file_transfer_cancel,
+            local_file_transfer_operations,
+            fleetfiles_local_desktop,
             file_watch,
             file_poll,
             file_unwatch,
             file_download,
             file_download_cancel,
             open_files_window,
+            open_files_workspace_window,
             files_namespace_adopt,
             files_canvas_snapshot,
             files_canvas_status,
@@ -4326,6 +4671,8 @@ fn main() {
             files_canvas_purge_tombstones,
             local_file_locations,
             local_file_list,
+            local_directory_watch,
+            local_directory_unwatch,
             local_file_icon,
             local_file_preview,
             local_file_open,
@@ -4443,6 +4790,8 @@ fn main() {
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
                 local_files: Arc::new(Mutex::new(LocalFileBrowser::default())),
+                local_directory_watchers: Arc::new(Mutex::new(HashMap::new())),
+                next_local_directory_watch: AtomicU64::new(1),
             });
             // Installer hooks cover new NSIS installs. Existing installations
             // can arrive here through the self-updater, so migrate the old

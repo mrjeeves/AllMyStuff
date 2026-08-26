@@ -13,7 +13,7 @@
 //! Everything the front-end sees comes through `allmystuff://session`
 //! snapshots emitted after each change.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,8 +31,8 @@ use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
     DriveRouteOffer, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
     RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
-    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_MEDIA, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_FLEET_STORAGE,
+    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -52,8 +52,13 @@ use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
 use crate::ownership::Ownership;
+use crate::service_profiles::{ServiceProfiles, TransferOutcome};
 use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
+use crate::storage_plan::{
+    PolicyRecord, StorageAllocation, StoragePlanMessage, StoragePlanStore, StoragePolicy,
+    PLAN_CHUNK,
+};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge, DecoderPreference};
@@ -61,6 +66,19 @@ use std::time::{Duration, Instant};
 
 type ClipboardReceiptWaiters =
     Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileOperationStatus {
+    id: String,
+    phase: String,
+    target_label: String,
+    files: u64,
+    folders: u64,
+    bytes: u64,
+    error: Option<String>,
+    started_at: u64,
+}
 
 /// A claimable profile carried over an already-active ordinary mesh when the
 /// LAN claim rendezvous has independently sighted the same peer but its own
@@ -140,11 +158,21 @@ pub struct Mesh {
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
     files: FilesPlane,
+    /// User-initiated scans/transfers, keyed by UI-minted id. The flag makes
+    /// both directory walking and each bounded upload chunk cancellable.
+    file_transfer_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    file_operations: Mutex<VecDeque<FileOperationStatus>>,
     /// Durable identities and local native bindings for Files pages that have
     /// actually been visited. This is bounded page adoption, not disk indexing.
     namespace: NamespaceCatalog,
     /// Layout-only Files canvas document. Bytes/listings never enter it.
+    /// Bounded, time-decayed observations from real fleet lifecycle and file
+    /// operations. Scheduling evidence only; never a user-activity history.
+    service_profiles: ServiceProfiles,
     canvas: CanvasStore,
+    /// Fleet-wide operational storage allocation and durability policy. This
+    /// is intentionally separate from canvas layout metadata.
+    storage_plan: StoragePlanStore,
     /// OS-native drive letters/mounts backed by active Storage routes.
     drive_mounts: DriveMounts,
     /// Explicit inbound pull requests. A drive pushed at us needs owner/fleet
@@ -1737,7 +1765,11 @@ impl Mesh {
             term_rx_seq: Mutex::new(HashMap::new()),
             term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
+            file_transfer_jobs: Mutex::new(HashMap::new()),
+            file_operations: Mutex::new(VecDeque::new()),
             namespace: NamespaceCatalog::load(),
+            service_profiles: ServiceProfiles::load(),
+            storage_plan: StoragePlanStore::load(),
             canvas: CanvasStore::load(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
@@ -3445,6 +3477,22 @@ impl Mesh {
                     // a device surfacing there has its hand up; one dropping
                     // out (leave, crash timeout) has withdrawn. Only a
                     // watching technician keeps the cache; the polled
+                    if let Some(device) = event.get("device_id").and_then(Value::as_str) {
+                        let is_self = self
+                            .local_node_id()
+                            .is_some_and(|me| same_node(&me, device));
+                        if !is_self && self.sender_may_control(device) {
+                            match peer_kind {
+                                Some("approved" | "sighted") => {
+                                    self.service_profiles.note_state(pubkey_part(device), true)
+                                }
+                                Some("dropped") => {
+                                    self.service_profiles.note_state(pubkey_part(device), false)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     // `cec_help_list` reconcile heals any event this stream
                     // drops.
                     if event_network == allmystuff_cec_protocol::ASK_NETWORK_ID
@@ -3857,6 +3905,7 @@ impl Mesh {
                         );
                         self.ownership_check(Some(&from), Some(&network)).await;
                         self.sync_files_canvas_to(&from, &network).await;
+                        self.sync_storage_plan_to(&from, &network).await;
                         // (The old "re-beacon the help room at whoever just
                         // came up" nudge lived here. A raised hand is
                         // asking-room *membership* now — the engine's own
@@ -3868,6 +3917,7 @@ impl Mesh {
                         // patches lost during that partition still heal without
                         // repeatedly shipping the whole canvas.
                         self.probe_files_canvas_to(&from, &network).await;
+                        self.probe_storage_plan_to(&from, &network).await;
                     }
                     if changed {
                         self.emit_snapshot();
@@ -4580,6 +4630,51 @@ impl Mesh {
                                 json!({ "records": self.canvas.snapshot() }),
                             );
                         }
+                    }
+                }
+            }
+            CHANNEL_FLEET_STORAGE => {
+                if !self.is_fleet_network(&network) || !self.sender_may_control(&from) {
+                    tracing::warn!(
+                        "ignoring fleet storage plan from {} outside the authenticated fleet",
+                        short_id(&from)
+                    );
+                    return;
+                }
+                let Ok(message) = serde_json::from_value::<StoragePlanMessage>(payload) else {
+                    return;
+                };
+                match message {
+                    StoragePlanMessage::Patch {
+                        policy,
+                        allocations,
+                    } => {
+                        let sender = pubkey_part(&from).to_string();
+                        let may_manage = self.fleet_peer_may_manage(&network, &from).await;
+                        if self
+                            .storage_plan
+                            .merge(&sender, may_manage, policy, allocations)
+                        {
+                            self.reconcile_local_storage_allocations();
+                            self.sink.emit(
+                                "allmystuff://fleet-storage",
+                                json!({ "plan": self.storage_plan.snapshot() }),
+                            );
+                        }
+                    }
+                    StoragePlanMessage::Digest { digest } => {
+                        if digest != self.storage_plan.digest() {
+                            let sender_may_manage =
+                                self.fleet_peer_may_manage(&network, &from).await;
+                            if self.local_may_manage_storage().await || !sender_may_manage {
+                                self.sync_storage_plan_to(&from, &network).await;
+                            } else {
+                                self.request_storage_plan_from(&from, &network).await;
+                            }
+                        }
+                    }
+                    StoragePlanMessage::SyncRequest => {
+                        self.sync_storage_plan_to(&from, &network).await;
                     }
                 }
             }
@@ -11966,6 +12061,7 @@ impl Mesh {
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
             CHANNEL_FILES_CANVAS,
+            CHANNEL_FLEET_STORAGE,
             // CEC Support rides the same engine on its own channels; subscribing
             // everywhere is harmless (they're empty on non-CEC meshes) and means
             // a CEC Silent mesh is live for connect-requests the moment it's
@@ -13818,6 +13914,8 @@ impl Mesh {
                 | FileEvent::Volumes { .. }
                 | FileEvent::List { .. }
                 | FileEvent::Read { .. }
+                | FileEvent::WatchDirectory { .. }
+                | FileEvent::UnwatchDirectory { .. }
                 | FileEvent::Stat { .. }
                 | FileEvent::ReadRange { .. }
                 | FileEvent::Mkdir { .. }
@@ -13993,7 +14091,546 @@ impl Mesh {
     }
 
     pub(crate) fn next_file_request_id(&self) -> u64 {
-        self.file_seq.fetch_add(1, Ordering::Relaxed)
+        self.file_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+    fn publish_file_operations(&self, snapshot: Vec<FileOperationStatus>) {
+        self.sink.emit(
+            "allmystuff://file-operations",
+            json!({ "operations": snapshot }),
+        );
+    }
+
+    fn set_file_operation(&self, status: FileOperationStatus) {
+        let snapshot = {
+            let mut operations = self.file_operations.lock();
+            operations.retain(|operation| operation.id != status.id);
+            operations.push_front(status);
+            operations.truncate(50);
+            operations.iter().cloned().collect::<Vec<_>>()
+        };
+        self.publish_file_operations(snapshot);
+    }
+
+    fn update_file_operation(&self, id: &str, phase: &str, error: Option<String>) {
+        let snapshot = {
+            let mut operations = self.file_operations.lock();
+            let Some(operation) = operations.iter_mut().find(|operation| operation.id == id) else {
+                return;
+            };
+            operation.phase = phase.into();
+            operation.error = error;
+            operations.iter().cloned().collect::<Vec<_>>()
+        };
+        self.publish_file_operations(snapshot);
+    }
+
+    pub fn file_transfer_operations(&self) -> Value {
+        json!({
+            "operations": self.file_operations.lock().iter().cloned().collect::<Vec<_>>()
+        })
+    }
+
+    fn begin_file_transfer_job(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
+        if id.is_empty()
+            || id.len() > 80
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("invalid transfer id".into());
+        }
+        let mut jobs = self.file_transfer_jobs.lock();
+        if jobs.len() >= 32 {
+            return Err("too many file operations are already active".into());
+        }
+        if jobs.contains_key(id) {
+            return Err("that file operation is already active".into());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        jobs.insert(id.to_string(), cancel.clone());
+        Ok(cancel)
+    }
+
+    fn finish_file_transfer_job(&self, id: &str, cancel: &Arc<AtomicBool>) {
+        let mut jobs = self.file_transfer_jobs.lock();
+        if jobs
+            .get(id)
+            .is_some_and(|active| Arc::ptr_eq(active, cancel))
+        {
+            jobs.remove(id);
+        }
+    }
+
+    pub fn file_transfer_cancel(&self, id: &str) -> bool {
+        let Some(cancel) = self.file_transfer_jobs.lock().get(id).cloned() else {
+            return false;
+        };
+        cancel.store(true, Ordering::Relaxed);
+        self.update_file_operation(id, "cancelling", None);
+        true
+    }
+
+    pub async fn file_transfer_scan(
+        self: &Arc<Self>,
+        id: String,
+        paths: Vec<String>,
+    ) -> Result<crate::files::TransferImpact, String> {
+        let cancel = self.begin_file_transfer_job(&id)?;
+        let task_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::files::scan_transfer_sources(&paths, &task_cancel)
+        })
+        .await
+        .map_err(|error| format!("file impact scan stopped: {error}"))?;
+        self.finish_file_transfer_job(&id, &cancel);
+        result
+    }
+
+    fn transfer_join(base: &str, child: &str) -> String {
+        let separator = if base.contains('\\') { '\\' } else { '/' };
+        if base.ends_with(separator) {
+            format!("{base}{child}")
+        } else {
+            format!("{base}{separator}{child}")
+        }
+    }
+
+    fn transfer_relative_path(base: &str, relative: &Path) -> Result<String, String> {
+        let mut output = base.to_string();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err("a transfer item had an invalid relative path".into());
+            };
+            output = Self::transfer_join(&output, &name.to_string_lossy());
+        }
+        Ok(output)
+    }
+    async fn transfer_expect_ok(
+        self: &Arc<Self>,
+        route_id: &str,
+        event: FileEvent,
+    ) -> Result<(), String> {
+        let replies = self
+            .drive_file_request_timeout(route_id, event, Duration::from_secs(60))
+            .await?;
+        match replies.last() {
+            Some(FileEvent::Ok { .. }) => Ok(()),
+            Some(FileEvent::Err { reason, .. }) => Err(reason.clone()),
+            other => Err(format!("unexpected file reply: {other:?}")),
+        }
+    }
+
+    fn file_route_peer(&self, route_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .map(|route| pubkey_part(route.peer.as_str()).to_string())
+    }
+
+    async fn transfer_exists(
+        self: &Arc<Self>,
+        route_id: &str,
+        peer: Option<&str>,
+        path: String,
+    ) -> Result<bool, String> {
+        let req = self.next_file_request_id();
+        let started = Instant::now();
+        let result = self
+            .drive_file_request_timeout(
+                route_id,
+                FileEvent::Check { req, path },
+                Duration::from_secs(30),
+            )
+            .await;
+        if let Some(peer) = peer {
+            self.service_profiles
+                .note_request(peer, started.elapsed(), result.is_ok());
+        }
+        let replies = result?;
+        match replies.last() {
+            Some(FileEvent::Exists { exists, .. }) => Ok(*exists),
+            Some(FileEvent::Err { reason, .. }) => Err(reason.clone()),
+            other => Err(format!("unexpected destination check reply: {other:?}")),
+        }
+    }
+
+    async fn transfer_upload_file(
+        self: &Arc<Self>,
+        route_id: &str,
+        source: &Path,
+        destination: String,
+        cancel: &AtomicBool,
+    ) -> Result<u64, String> {
+        use tokio::io::AsyncReadExt as _;
+        let mut file = tokio::fs::File::open(source)
+            .await
+            .map_err(|error| format!("{}: {error}", source.display()))?;
+        let total = file
+            .metadata()
+            .await
+            .map_err(|error| format!("{}: {error}", source.display()))?
+            .len();
+        let req = self.next_file_request_id();
+        let mut replies = self.files.begin_rpc(route_id, req);
+        let mut sent = 0_u64;
+        let mut buffer = vec![0_u8; crate::files::CHUNK_BYTES];
+        let result = async {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                let remaining = total.saturating_sub(sent);
+                let take = remaining.min(buffer.len() as u64) as usize;
+                let read = if take == 0 {
+                    0
+                } else {
+                    file.read(&mut buffer[..take])
+                        .await
+                        .map_err(|error| format!("{}: {error}", source.display()))?
+                };
+                let eof = read == 0 || sent.saturating_add(read as u64) >= total;
+                self.file_send(
+                    route_id.to_string(),
+                    FileEvent::Write {
+                        req,
+                        path: destination.clone(),
+                        data: buffer[..read].to_vec(),
+                        append: sent > 0,
+                        create_new: sent == 0,
+                        eof,
+                    },
+                )
+                .await?;
+                sent = sent.saturating_add(read as u64);
+                if eof {
+                    break;
+                }
+                if let Ok(FileEvent::Err { reason, .. }) = replies.try_recv() {
+                    return Err(reason);
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(60), replies.recv()).await {
+                Ok(Some(FileEvent::Ok { .. })) => Ok(sent),
+                Ok(Some(FileEvent::Err { reason, .. })) => Err(reason),
+                Ok(Some(other)) => Err(format!("unexpected upload reply: {other:?}")),
+                Ok(None) => Err("destination disconnected during upload".into()),
+                Err(_) => Err("destination did not confirm the upload".into()),
+            }
+        }
+        .await;
+        self.files.cancel_rpc(route_id, req);
+        result
+    }
+    pub async fn file_transfer_start(
+        self: &Arc<Self>,
+        id: String,
+        route_id: String,
+        paths: Vec<String>,
+        destination: String,
+        target_label: String,
+        expected_files: u64,
+        expected_folders: u64,
+        expected_bytes: u64,
+    ) -> Result<Value, String> {
+        let cancel = self.begin_file_transfer_job(&id)?;
+        let peer = self.file_route_peer(&route_id);
+        let started = Instant::now();
+        self.set_file_operation(FileOperationStatus {
+            id: id.clone(),
+            phase: "transferring".into(),
+            target_label,
+            files: expected_files,
+            folders: expected_folders,
+            bytes: expected_bytes,
+            error: None,
+            started_at: unix_now_ms(),
+        });
+        let result = async {
+            let top_level = paths.iter().map(|raw| {
+                Path::new(raw).file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .ok_or_else(|| "a filesystem root cannot be sent".to_string())
+            }).collect::<Result<Vec<_>, _>>()?;
+            for name in &top_level {
+                if self.transfer_exists(&route_id, peer.as_deref(), Self::transfer_join(&destination, name)).await? {
+                    return Err(format!("“{name}” already exists at the destination"));
+                }
+            }
+            let staging = Self::transfer_join(&destination, &format!(".allmystuff-transfer-{id}"));
+            if self.transfer_exists(&route_id, peer.as_deref(), staging.clone()).await? {
+                return Err("that transfer staging area already exists".into());
+            }
+            self.transfer_expect_ok(
+                &route_id,
+                FileEvent::Mkdir { req: self.next_file_request_id(), path: staging.clone() },
+            ).await?;
+
+            let transfer = async {
+                let mut walker = crate::files::start_transfer_walk(paths, cancel.clone())?;
+                let mut files = 0_u64;
+                let mut folders = 0_u64;
+                let mut bytes = 0_u64;
+                while let Some(entry) = walker.recv().await {
+                    let entry = entry?;
+                    if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+                    let target = Self::transfer_relative_path(&staging, &entry.relative)?;
+                    if entry.dir {
+                        self.transfer_expect_ok(
+                            &route_id,
+                            FileEvent::Mkdir { req: self.next_file_request_id(), path: target },
+                        ).await?;
+                        folders = folders.saturating_add(1);
+                    } else {
+                        bytes = bytes.saturating_add(
+                            self.transfer_upload_file(&route_id, &entry.source, target, &cancel).await?
+                        );
+                        files = files.saturating_add(1);
+                    }
+                }
+                if (files, folders, bytes) != (expected_files, expected_folders, expected_bytes) {
+                    return Err("the selected files changed after the impact review; review the transfer again".into());
+                }
+                if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+
+                for name in &top_level {
+                    if self.transfer_exists(&route_id, peer.as_deref(), Self::transfer_join(&destination, name)).await? {
+                        return Err(format!("“{name}” appeared at the destination before commit"));
+                    }
+                }
+                let mut committed: Vec<String> = Vec::new();
+                for name in &top_level {
+                    let from = Self::transfer_join(&staging, name);
+                    let to = Self::transfer_join(&destination, name);
+                    if let Err(error) = self.transfer_expect_ok(
+                        &route_id,
+                        FileEvent::Rename { req: self.next_file_request_id(), from, to },
+                    ).await {
+                        let mut rollback_errors = Vec::new();
+                        for prior in committed.iter().rev() {
+                            let from = Self::transfer_join(&destination, prior);
+                            let to = Self::transfer_join(&staging, prior);
+                            if let Err(rollback) = self.transfer_expect_ok(
+                                &route_id,
+                                FileEvent::Rename { req: self.next_file_request_id(), from, to },
+                            ).await {
+                                rollback_errors.push(rollback);
+                            }
+                        }
+                        return if rollback_errors.is_empty() {
+                            Err(format!("commit failed and was rolled back: {error}"))
+                        } else {
+                            Err(format!("commit failed ({error}); rollback also needs attention: {}", rollback_errors.join("; ")))
+                        };
+                    }
+                    committed.push(name.clone());
+                }
+                Ok(json!({ "files": files, "folders": folders, "bytes": bytes }))
+            }.await;
+
+            if transfer.is_ok() || !matches!(&transfer, Err(error) if error.contains("rollback also needs attention")) {
+                let _ = self.transfer_expect_ok(
+                    &route_id,
+                    FileEvent::Delete { req: self.next_file_request_id(), path: staging },
+                ).await;
+            }
+            transfer
+        }.await;
+        self.finish_file_transfer_job(&id, &cancel);
+        if let Some(peer) = peer {
+            let outcome = match &result {
+                Ok(_) => TransferOutcome::Succeeded,
+                Err(error) if error.eq_ignore_ascii_case("cancelled") => TransferOutcome::Cancelled,
+                Err(_) => TransferOutcome::Failed,
+            };
+            let bytes = result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("bytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            self.service_profiles
+                .note_transfer(&peer, bytes, started.elapsed(), outcome);
+        }
+        match &result {
+            Ok(_) => self.update_file_operation(&id, "complete", None),
+            Err(error) if error.eq_ignore_ascii_case("cancelled") => {
+                self.update_file_operation(&id, "cancelled", None)
+            }
+            Err(error) => self.update_file_operation(&id, "failed", Some(error.clone())),
+        }
+        result
+    }
+
+    /// Bounded local scheduling evidence for fleet storage and worker choice.
+    pub fn fleet_service_profiles(&self) -> Value {
+        json!({ "profiles": self.service_profiles.snapshot() })
+    }
+
+    pub fn fleetfiles_local_desktop(&self) -> Result<Value, String> {
+        let root = allmystuff_protocol::myownmesh_state_dir()
+            .ok_or("the Fleetfiles state directory is unavailable")?
+            .join("Fleetfiles");
+        let desktop = root.join("Desktop");
+        std::fs::create_dir_all(&desktop)
+            .map_err(|error| format!("create the virtual Fleetfiles Desktop: {error}"))?;
+        Ok(json!({ "path": desktop.to_string_lossy() }))
+    }
+
+    pub fn fleet_storage_status(&self) -> Value {
+        json!({
+            "plan": self.storage_plan.snapshot(),
+            "profiles": self.service_profiles.snapshot(),
+        })
+    }
+
+    async fn local_may_manage_storage(&self) -> bool {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return true;
+        };
+        matches!(
+            self.fleet_signed_role(&network).await.as_deref(),
+            Some("owner" | "controller")
+        )
+    }
+
+    fn known_storage_volume(
+        &self,
+        device: &str,
+        volume: &str,
+    ) -> Option<allmystuff_protocol::StorageSummary> {
+        let state = self.state.lock();
+        let profile = if self
+            .local_node_id()
+            .is_some_and(|local| same_node(&local, device))
+        {
+            state.profile.as_ref()
+        } else {
+            state.session.as_ref().and_then(|session| {
+                session
+                    .peers()
+                    .find(|peer| same_node(peer.node.as_str(), device))
+            })
+        }?;
+        profile
+            .summary
+            .storage
+            .iter()
+            .find(|candidate| candidate.id == volume)
+            .cloned()
+    }
+
+    fn materialize_local_storage_root(&self, volume: &str) -> Result<(), String> {
+        let inventory = allmystuff_inventory::scan();
+        let resource = inventory
+            .storage
+            .into_iter()
+            .find(|candidate| candidate.id == volume)
+            .ok_or("that storage volume is no longer available")?;
+        let mount = PathBuf::from(
+            resource
+                .mount_point
+                .ok_or("that storage volume has no writable mount point")?,
+        );
+        let preferred = mount.join(".allmystuff-fleetfiles");
+        let root = match std::fs::create_dir_all(&preferred) {
+            Ok(()) => preferred,
+            Err(primary_error) => {
+                let fallback = allmystuff_protocol::myownmesh_state_dir()
+                    .filter(|state| state.starts_with(&mount))
+                    .map(|state| state.join(".allmystuff-fleetfiles"))
+                    .ok_or_else(|| format!("create Fleetfiles storage root: {primary_error}"))?;
+                std::fs::create_dir_all(&fallback).map_err(|fallback_error| {
+                    format!(
+                        "create Fleetfiles storage root: {primary_error}; fallback: {fallback_error}"
+                    )
+                })?;
+                fallback
+            }
+        };
+        crate::files::mark_internal_staging_hidden(&root)
+            .map_err(|error| format!("hide Fleetfiles storage root: {error}"))
+    }
+
+    fn reconcile_local_storage_allocations(&self) {
+        let Some(local) = self.local_node_id() else {
+            return;
+        };
+        for allocation in self.storage_plan.snapshot().allocations {
+            if allocation.enabled && same_node(&allocation.device, &local) {
+                if let Err(error) = self.materialize_local_storage_root(&allocation.volume) {
+                    tracing::warn!(
+                        "could not materialize local Fleetfiles allocation {}: {error}",
+                        allocation.id
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn fleet_storage_set_policy(
+        self: &Arc<Self>,
+        policy: StoragePolicy,
+    ) -> Result<Value, String> {
+        if !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can change storage policy".into());
+        }
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let record = self.storage_plan.set_policy(&actor, policy)?;
+        self.broadcast_storage_patch(Some(record.clone()), Vec::new())
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(record).unwrap_or(Value::Null))
+    }
+
+    pub async fn fleet_storage_set_allocation(
+        self: &Arc<Self>,
+        device: String,
+        volume: String,
+        quota_bytes: u64,
+        enabled: bool,
+    ) -> Result<Value, String> {
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let device = pubkey_part(&device).to_string();
+        let local = same_node(&actor, &device);
+        if !local && !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can allocate another device".into());
+        }
+        let resource = self
+            .known_storage_volume(&device, &volume)
+            .ok_or("that volume is not currently advertised by the device")?;
+        if quota_bytes == 0 || quota_bytes > resource.total_bytes {
+            return Err("allocation must fit within the volume's total capacity".into());
+        }
+        if local && enabled {
+            self.materialize_local_storage_root(&volume)?;
+        }
+        let allocation = self.storage_plan.set_allocation(
+            &actor,
+            device,
+            volume.clone(),
+            quota_bytes,
+            enabled,
+        )?;
+        self.broadcast_storage_patch(None, vec![allocation.clone()])
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(allocation).unwrap_or(Value::Null))
     }
 
     // ---- sites (the reverse proxy) --------------------------------------
@@ -16786,6 +17423,126 @@ impl Mesh {
             .await;
     }
 
+    async fn broadcast_storage_patch(
+        &self,
+        policy: Option<PolicyRecord>,
+        allocations: Vec<StorageAllocation>,
+    ) {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return;
+        };
+        let chunk_count = allocations.len().max(1).div_ceil(PLAN_CHUNK);
+        for index in 0..chunk_count {
+            let start = index * PLAN_CHUNK;
+            let end = (start + PLAN_CHUNK).min(allocations.len());
+            let message = StoragePlanMessage::Patch {
+                policy: (index == 0).then(|| policy.clone()).flatten(),
+                allocations: allocations[start..end].to_vec(),
+            };
+            let Ok(payload) = serde_json::to_value(message) else {
+                continue;
+            };
+            let response = self
+                .client
+                .request(&Request::ChannelSendAll {
+                    network: network.clone(),
+                    channel: CHANNEL_FLEET_STORAGE.into(),
+                    payload,
+                })
+                .await;
+            if !matches!(response, Ok(response) if response.ok) {
+                tracing::debug!("fleet storage patch will converge on reconnect");
+                break;
+            }
+        }
+    }
+
+    async fn sync_storage_plan_to(&self, peer: &str, network: &str) {
+        if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
+            return;
+        }
+        let Some(local) = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+        else {
+            return;
+        };
+        let may_manage = self.local_may_manage_storage().await;
+        let snapshot = self.storage_plan.snapshot();
+        let allocations = if may_manage {
+            snapshot.allocations
+        } else {
+            snapshot
+                .allocations
+                .into_iter()
+                .filter(|allocation| allocation.device == local && allocation.stamp.actor == local)
+                .collect()
+        };
+        let policy = may_manage.then_some(snapshot.policy);
+        if policy.is_none() && allocations.is_empty() {
+            return;
+        }
+        let chunk_count = allocations.len().max(1).div_ceil(PLAN_CHUNK);
+        for index in 0..chunk_count {
+            let start = index * PLAN_CHUNK;
+            let end = (start + PLAN_CHUNK).min(allocations.len());
+            let message = StoragePlanMessage::Patch {
+                policy: (index == 0).then(|| policy.clone()).flatten(),
+                allocations: allocations[start..end].to_vec(),
+            };
+            let Ok(payload) = serde_json::to_value(message) else {
+                continue;
+            };
+            let response = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network: network.into(),
+                    channel: CHANNEL_FLEET_STORAGE.into(),
+                    peer: pubkey_part(peer).into(),
+                    payload,
+                })
+                .await;
+            if !matches!(response, Ok(response) if response.ok) {
+                break;
+            }
+        }
+    }
+
+    async fn request_storage_plan_from(&self, peer: &str, network: &str) {
+        let Ok(payload) = serde_json::to_value(StoragePlanMessage::SyncRequest) else {
+            return;
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.into(),
+                channel: CHANNEL_FLEET_STORAGE.into(),
+                peer: pubkey_part(peer).into(),
+                payload,
+            })
+            .await;
+    }
+
+    async fn probe_storage_plan_to(&self, peer: &str, network: &str) {
+        if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
+            return;
+        }
+        let Ok(payload) = serde_json::to_value(StoragePlanMessage::Digest {
+            digest: self.storage_plan.digest(),
+        }) else {
+            return;
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.into(),
+                channel: CHANNEL_FLEET_STORAGE.into(),
+                peer: pubkey_part(peer).into(),
+                payload,
+            })
+            .await;
+    }
+
     pub async fn room_send(
         &self,
         members: Vec<String>,
@@ -18176,7 +18933,9 @@ fn completes_file_rpc(event: &FileEvent) -> bool {
         FileEvent::Entries { .. }
             | FileEvent::VolumeList { .. }
             | FileEvent::QuotaInfo { .. }
+            | FileEvent::Watching { .. }
             | FileEvent::Metadata { .. }
+            | FileEvent::Exists { .. }
             | FileEvent::Ok { .. }
             | FileEvent::Err { .. }
             | FileEvent::Chunk { eof: true, .. }
@@ -18188,9 +18947,12 @@ fn is_viewer_file_request(event: &FileEvent) -> bool {
         event,
         FileEvent::Quota { .. }
             | FileEvent::Volumes { .. }
+            | FileEvent::WatchDirectory { .. }
+            | FileEvent::UnwatchDirectory { .. }
             | FileEvent::List { .. }
             | FileEvent::Read { .. }
             | FileEvent::Stat { .. }
+            | FileEvent::Check { .. }
             | FileEvent::ReadRange { .. }
             | FileEvent::Fetch { .. }
             | FileEvent::Write { .. }

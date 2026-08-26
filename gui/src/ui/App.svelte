@@ -14,6 +14,7 @@
     chatWindowTarget,
     consoleWindowTarget,
     filesWindowTarget,
+    filesWorkspaceWindowTarget,
     isCecWindow,
     roomWindowTarget,
     setWindowTitle,
@@ -54,6 +55,7 @@
   const consoleTarget = consoleWindowTarget();
   const terminalTarget = terminalWindowTarget();
   const filesTarget = filesWindowTarget();
+  const filesWorkspaceTarget = filesWorkspaceWindowTarget();
   const roomTarget = roomWindowTarget();
   const videoTarget = videoWindowTarget();
   const cecTarget = isCecWindow();
@@ -125,6 +127,8 @@
   <VideoPopoutHost target={videoTarget} />
 {:else if terminalTarget}
   <TerminalHost target={terminalTarget} />
+{:else if filesWorkspaceTarget}
+  <FilesWorkspace initialLocation={filesWorkspaceTarget} />
 {:else if filesTarget}
   <FilesHost target={filesTarget} />
 {:else if consoleTarget}

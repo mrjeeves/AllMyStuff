@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { filesCanvasStatus, type FilesCanvasStatus } from "../../tauri";
+  import StorageSection from "./StorageSection.svelte";
 
   let status = $state<FilesCanvasStatus | null>(null);
   let statusError = $state(false);
@@ -16,6 +17,8 @@
 <div class="section">
   <h3>Files</h3>
   <p class="lead">Choose how Files looks on this device.</p>
+
+  <StorageSection />
 
   <section class="block">
     <div class="title">Default view</div>

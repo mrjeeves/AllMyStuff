@@ -1326,6 +1326,61 @@ pub async fn dispatch(
             let event: FileEvent = try_arg!(arg(a, "event"));
             json_result(mesh.file_send(route_id, event).await)
         }
+        "file_transfer_scan" => {
+            let id: String = try_arg!(arg(a, "id"));
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            json_result(mesh.file_transfer_scan(id, paths).await)
+        }
+        "file_transfer_start" => {
+            let id: String = try_arg!(arg(a, "id"));
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            let destination: String = try_arg!(arg(a, "destination"));
+            let target_label = a
+                .get("target_label")
+                .and_then(Value::as_str)
+                .unwrap_or(&destination)
+                .to_string();
+            let expected_files: u64 = try_arg!(arg(a, "expected_files"));
+            let expected_folders: u64 = try_arg!(arg(a, "expected_folders"));
+            let expected_bytes: u64 = try_arg!(arg(a, "expected_bytes"));
+            json_result(
+                mesh.file_transfer_start(
+                    id,
+                    route_id,
+                    paths,
+                    destination,
+                    target_label,
+                    expected_files,
+                    expected_folders,
+                    expected_bytes,
+                )
+                .await,
+            )
+        }
+        "file_transfer_cancel" => {
+            let id: String = try_arg!(arg(a, "id"));
+            DispatchOut::Json(Value::Bool(mesh.file_transfer_cancel(&id)))
+        }
+        "fleet_service_profiles" => DispatchOut::Json(mesh.fleet_service_profiles()),
+        "fleet_storage_status" => DispatchOut::Json(mesh.fleet_storage_status()),
+        "file_transfer_operations" => DispatchOut::Json(mesh.file_transfer_operations()),
+        "fleetfiles_local_desktop" => json_result(mesh.fleetfiles_local_desktop()),
+        "fleet_storage_set_policy" => {
+            let policy: crate::storage_plan::StoragePolicy = try_arg!(arg(a, "policy"));
+            json_result(mesh.fleet_storage_set_policy(policy).await)
+        }
+        "fleet_storage_set_allocation" => {
+            let device: String = try_arg!(arg(a, "device"));
+            let volume: String = try_arg!(arg(a, "volume"));
+            let quota_bytes: u64 = try_arg!(arg(a, "quota_bytes"));
+            let enabled: bool = try_arg!(arg(a, "enabled"));
+            json_result(
+                mesh.fleet_storage_set_allocation(device, volume, quota_bytes, enabled)
+                    .await,
+            )
+        }
+
         "file_watch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             DispatchOut::Json(json!(mesh.file_watch(&route_id)))

@@ -22,10 +22,12 @@ use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use allmystuff_session::{FileEntry, FileEvent};
+use notify::Watcher as _;
 use parking_lot::Mutex;
 
 use crate::byte_queues::ByteQueues;
@@ -44,6 +46,13 @@ const LIST_PAGE_DEFAULT: usize = 256;
 const LIST_PAGE_MAX: usize = 512;
 const LIST_CURSOR_MAX: usize = 64;
 const LIST_CURSOR_TTL: Duration = Duration::from_secs(5 * 60);
+const DIRECTORY_WATCH_MAX: usize = 256;
+const DIRECTORY_WATCH_PER_ROUTE_MAX: usize = 32;
+const DIRECTORY_WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const DIRECTORY_WATCH_LEASE: Duration = Duration::from_secs(30 * 60);
+#[cfg(test)]
+const DIRECTORY_WATCH_LEASE: Duration = Duration::from_millis(500);
 
 struct RemoteListCursor {
     requested_path: String,
@@ -52,6 +61,10 @@ struct RemoteListCursor {
     reader: std::fs::ReadDir,
     pending: Option<std::fs::DirEntry>,
     touched: Instant,
+}
+
+struct DirectoryWatch {
+    _watcher: notify::RecommendedWatcher,
 }
 
 pub struct FilesPlane {
@@ -63,6 +76,8 @@ pub struct FilesPlane {
     /// mid-stream instead of pumping bytes at a gone peer.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Live native iterators for upgraded peers: opaque, route-scoped,
+    /// Non-recursive subscriptions owned by their Files route and request id.
+    directory_watchers: Arc<Mutex<HashMap<(String, u64), DirectoryWatch>>>,
     /// TTL'd, and globally capped.
     list_cursors: Arc<Mutex<HashMap<(String, String), RemoteListCursor>>>,
     /// Active Storage routes are explicit volume mappings. Their route id is
@@ -85,6 +100,7 @@ impl FilesPlane {
         FilesPlane {
             queues: ByteQueues::new(MAX_QUEUED_BYTES),
             cancels: Mutex::new(HashMap::new()),
+            directory_watchers: Arc::new(Mutex::new(HashMap::new())),
             list_cursors: Arc::new(Mutex::new(HashMap::new())),
             roots: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -117,6 +133,13 @@ impl FilesPlane {
         root: Option<PathBuf>,
     ) -> tokio::sync::mpsc::Receiver<FileEvent> {
         let (tx, rx) = tokio::sync::mpsc::channel::<FileEvent>(OP_QUEUE);
+        if let FileEvent::WatchDirectory { req, path } = &event {
+            return self.watch_directory(route_id, *req, path, root.as_deref());
+        }
+        if let FileEvent::UnwatchDirectory { req, watch_req } = &event {
+            return self.unwatch_directory(route_id, *req, *watch_req);
+        }
+
         let cancel = self.cancel_flag(route_id);
         let rid = route_id.to_string();
         let list_cursors = self.list_cursors.clone();
@@ -139,6 +162,143 @@ impl FilesPlane {
             .or_default()
             .clone()
     }
+    fn immediate_file_event(event: FileEvent) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(OP_QUEUE);
+        let _ = tx.try_send(event);
+        rx
+    }
+
+    fn watch_directory(
+        &self,
+        route_id: &str,
+        req: u64,
+        path: &str,
+        root: Option<&Path>,
+    ) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        let directory = match resolve_for(path, root) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                return Self::immediate_file_event(FileEvent::Err {
+                    req,
+                    reason: "that watch target is not a directory".into(),
+                });
+            }
+            Err(reason) => return Self::immediate_file_event(FileEvent::Err { req, reason }),
+        };
+        let shown_path = directory.to_string_lossy().into_owned();
+        let key = (route_id.to_string(), req);
+        let mut watches = self.directory_watchers.lock();
+        let route_count = watches
+            .keys()
+            .filter(|(route, _)| route == route_id)
+            .count();
+        if watches.len() >= DIRECTORY_WATCH_MAX || route_count >= DIRECTORY_WATCH_PER_ROUTE_MAX {
+            return Self::immediate_file_event(FileEvent::Err {
+                req,
+                reason: "too many live directory subscriptions".into(),
+            });
+        }
+
+        let (dirty_tx, dirty_rx) = mpsc::sync_channel::<()>(1);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let callback_overflow = overflow.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                match result {
+                    Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => return,
+                    Ok(_) => {}
+                    Err(_) => callback_overflow.store(true, Ordering::Relaxed),
+                }
+                let _ = dirty_tx.try_send(());
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    return Self::immediate_file_event(FileEvent::Err {
+                        req,
+                        reason: format!("couldn't create directory watcher: {error}"),
+                    });
+                }
+            };
+        if let Err(error) = watcher.watch(&directory, notify::RecursiveMode::NonRecursive) {
+            return Self::immediate_file_event(FileEvent::Err {
+                req,
+                reason: format!("couldn't watch that directory: {error}"),
+            });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(OP_QUEUE);
+        watches.insert(key.clone(), DirectoryWatch { _watcher: watcher });
+        drop(watches);
+        let route_label = route_id.to_string();
+        let directory_watchers = self.directory_watchers.clone();
+        let expires_at = Instant::now() + DIRECTORY_WATCH_LEASE;
+        let _ = std::thread::Builder::new()
+            .name(format!("amst-files-watch {route_label}"))
+            .spawn(move || {
+                if tx
+                    .blocking_send(FileEvent::Watching {
+                        req,
+                        path: shown_path,
+                        lease_ms: DIRECTORY_WATCH_LEASE.as_millis() as u64,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let mut seq = 0_u64;
+                loop {
+                    let now = Instant::now();
+                    if now >= expires_at {
+                        directory_watchers.lock().remove(&key);
+                        return;
+                    }
+                    match dirty_rx.recv_timeout(expires_at.saturating_duration_since(now)) {
+                        Ok(()) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            directory_watchers.lock().remove(&key);
+                            return;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    std::thread::sleep(DIRECTORY_WATCH_DEBOUNCE);
+                    if Instant::now() >= expires_at {
+                        directory_watchers.lock().remove(&key);
+                        return;
+                    }
+                    loop {
+                        match dirty_rx.try_recv() {
+                            Ok(()) => {}
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    seq = seq.saturating_add(1);
+                    if tx
+                        .blocking_send(FileEvent::DirectoryChanged {
+                            req,
+                            change_seq: seq,
+                            overflow: overflow.swap(false, Ordering::Relaxed),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        rx
+    }
+
+    fn unwatch_directory(
+        &self,
+        route_id: &str,
+        req: u64,
+        watch_req: u64,
+    ) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        self.directory_watchers
+            .lock()
+            .remove(&(route_id.to_string(), watch_req));
+        Self::immediate_file_event(FileEvent::Ok { req })
+    }
 
     /// Tear down whatever this route had here — in-flight host ops
     /// (cancelled at their next chunk) and/or the viewer buffer.
@@ -149,6 +309,9 @@ impl FilesPlane {
         }
         self.queues.remove(route_id);
         self.roots.lock().remove(route_id);
+        self.directory_watchers
+            .lock()
+            .retain(|(route, _), _| route != route_id);
         self.list_cursors
             .lock()
             .retain(|(route, _), _| route != route_id);
@@ -220,6 +383,8 @@ impl FilesPlane {
             FileEvent::Entries { .. }
                 | FileEvent::VolumeList { .. }
                 | FileEvent::QuotaInfo { .. }
+                | FileEvent::Watching { .. }
+                | FileEvent::Exists { .. }
                 | FileEvent::Metadata { .. }
                 | FileEvent::Ok { .. }
                 | FileEvent::Err { .. }
@@ -331,6 +496,19 @@ fn run_op(
             Ok(entry) => FileEvent::Metadata { req, entry },
             Err(reason) => FileEvent::Err { req, reason },
         }),
+        FileEvent::Check { req, path } => Some(match resolve_for(&path, root) {
+            Ok(path) => match std::fs::symlink_metadata(path) {
+                Ok(_) => FileEvent::Exists { req, exists: true },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    FileEvent::Exists { req, exists: false }
+                }
+                Err(error) => FileEvent::Err {
+                    req,
+                    reason: error.to_string(),
+                },
+            },
+            Err(reason) => FileEvent::Err { req, reason },
+        }),
         FileEvent::ReadRange {
             req,
             path,
@@ -344,7 +522,13 @@ fn run_op(
             req,
             (|| {
                 let p = resolve_for(&path, root)?;
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())
+                std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+                if p.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".allmystuff-transfer-"))
+                {
+                    mark_internal_staging_hidden(&p)?;
+                }
+                Ok(())
             })(),
         )),
         FileEvent::Rename { req, from, to } => {
@@ -422,6 +606,7 @@ pub fn write_piece_in_root(event: &FileEvent, root: Option<&Path>) -> Option<Fil
         path,
         data,
         append,
+        create_new,
         eof,
     } = event
     else {
@@ -434,6 +619,11 @@ pub fn write_piece_in_root(event: &FileEvent, root: Option<&Path>) -> Option<Fil
     let r = (|| -> std::io::Result<()> {
         let mut f = if *append {
             std::fs::OpenOptions::new().append(true).open(&p)?
+        } else if *create_new {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)?
         } else {
             std::fs::File::create(&p)?
         };
@@ -478,6 +668,31 @@ pub fn write_range_in_root(event: &FileEvent, root: Option<&Path>) -> Option<Fil
         file.flush()
     })();
     Some(reply(*req, r.map_err(|e| e.to_string())))
+}
+#[cfg(windows)]
+pub(crate) fn mark_internal_staging_hidden(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, INVALID_FILE_ATTRIBUTES,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attributes | FILE_ATTRIBUTE_HIDDEN) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn mark_internal_staging_hidden(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Resolve a viewer path to a host path: `""`/`"~"` (and `~/…`) mean this
@@ -931,6 +1146,189 @@ fn stream_read_range(
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TransferImpact {
+    pub files: u64,
+    pub folders: u64,
+    pub bytes: u64,
+    pub symlinks: u64,
+    pub unreadable: u64,
+    pub unreadable_examples: Vec<String>,
+    pub top_level: Vec<String>,
+    pub requires_confirmation: bool,
+}
+
+#[derive(Debug)]
+pub struct TransferEntry {
+    pub source: PathBuf,
+    pub relative: PathBuf,
+    pub dir: bool,
+}
+
+fn transfer_top_levels(paths: &[String]) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    if paths.is_empty() {
+        return Err("choose at least one file or folder".into());
+    }
+    let mut names = std::collections::HashSet::new();
+    paths
+        .iter()
+        .map(|raw| {
+            let source = PathBuf::from(raw);
+            let name = source
+                .file_name()
+                .ok_or("a filesystem root cannot be sent")?
+                .to_owned();
+            let folded = name.to_string_lossy().to_lowercase();
+            if !names.insert(folded) {
+                return Err("two selected items have the same destination name".into());
+            }
+            Ok((source, PathBuf::from(name)))
+        })
+        .collect()
+}
+
+pub fn scan_transfer_sources(
+    paths: &[String],
+    cancel: &AtomicBool,
+) -> Result<TransferImpact, String> {
+    let roots = transfer_top_levels(paths)?;
+    let mut impact = TransferImpact {
+        files: 0,
+        folders: 0,
+        bytes: 0,
+        symlinks: 0,
+        unreadable: 0,
+        unreadable_examples: Vec::new(),
+        top_level: roots
+            .iter()
+            .map(|(_, relative)| relative.to_string_lossy().into_owned())
+            .collect(),
+        requires_confirmation: false,
+    };
+    let mut stack: Vec<PathBuf> = roots.into_iter().map(|(source, _)| source).collect();
+    while let Some(source) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                impact.unreadable = impact.unreadable.saturating_add(1);
+                if impact.unreadable_examples.len() < 5 {
+                    impact
+                        .unreadable_examples
+                        .push(format!("{}: {error}", source.display()));
+                }
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            impact.symlinks = impact.symlinks.saturating_add(1);
+            continue;
+        }
+        if metadata.is_dir() {
+            impact.folders = impact.folders.saturating_add(1);
+            match std::fs::read_dir(&source) {
+                Ok(children) => {
+                    for child in children {
+                        match child {
+                            Ok(child) => stack.push(child.path()),
+                            Err(error) => {
+                                impact.unreadable = impact.unreadable.saturating_add(1);
+                                if impact.unreadable_examples.len() < 5 {
+                                    impact
+                                        .unreadable_examples
+                                        .push(format!("{}: {error}", source.display()));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    impact.unreadable = impact.unreadable.saturating_add(1);
+                    if impact.unreadable_examples.len() < 5 {
+                        impact
+                            .unreadable_examples
+                            .push(format!("{}: {error}", source.display()));
+                    }
+                }
+            }
+        } else {
+            impact.files = impact.files.saturating_add(1);
+            impact.bytes = impact.bytes.saturating_add(metadata.len());
+        }
+    }
+    impact.requires_confirmation =
+        impact.folders > 0 || impact.files >= 1_000 || impact.bytes >= 1_073_741_824;
+    Ok(impact)
+}
+
+pub fn start_transfer_walk(
+    paths: Vec<String>,
+    cancel: Arc<AtomicBool>,
+) -> Result<tokio::sync::mpsc::Receiver<Result<TransferEntry, String>>, String> {
+    let roots = transfer_top_levels(&paths)?;
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    std::thread::Builder::new()
+        .name("amst-transfer-walk".into())
+        .spawn(move || {
+            let mut stack = roots;
+            while let Some((source, relative)) = stack.pop() {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.blocking_send(Err("cancelled".into()));
+                    return;
+                }
+                let metadata = match std::fs::symlink_metadata(&source) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(format!("{}: {error}", source.display())));
+                        return;
+                    }
+                };
+                if metadata.file_type().is_symlink() {
+                    let _ = tx.blocking_send(Err(format!(
+                        "{} is a symbolic link; transfer was not started",
+                        source.display()
+                    )));
+                    return;
+                }
+                let dir = metadata.is_dir();
+                if tx
+                    .blocking_send(Ok(TransferEntry {
+                        source: source.clone(),
+                        relative: relative.clone(),
+                        dir,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+                if dir {
+                    let children = match std::fs::read_dir(&source) {
+                        Ok(children) => children,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Err(format!("{}: {error}", source.display())));
+                            return;
+                        }
+                    };
+                    for child in children {
+                        let child = match child {
+                            Ok(child) => child,
+                            Err(error) => {
+                                let _ =
+                                    tx.blocking_send(Err(format!("{}: {error}", source.display())));
+                                return;
+                            }
+                        };
+                        stack.push((child.path(), relative.join(child.file_name())));
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("couldn't start the transfer walk: {error}"))?;
+    Ok(rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1485,7 @@ mod tests {
             data: b"hello ".to_vec(),
             append: false,
             eof: false,
+            create_new: false,
         });
         assert_eq!(first, None, "mid-upload pieces are silent");
         let last = write_piece(&FileEvent::Write {
@@ -1095,6 +1494,7 @@ mod tests {
             data: b"upload".to_vec(),
             append: true,
             eof: true,
+            create_new: false,
         });
         assert_eq!(last, Some(FileEvent::Ok { req: 7 }));
         assert_eq!(std::fs::read(resolve(&path)).unwrap(), b"hello upload");
@@ -1106,6 +1506,7 @@ mod tests {
             data: vec![1],
             append: false,
             eof: false,
+            create_new: false,
         });
         assert!(matches!(bad, Some(FileEvent::Err { req: 8, .. })));
         std::fs::remove_dir_all(dir).unwrap();
@@ -1161,6 +1562,114 @@ mod tests {
         ));
         assert_eq!(events, vec![FileEvent::Ok { req: 4 }]);
         assert!(!dir.join("made").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_watch_coalesces_and_unwatch_releases_it() {
+        let dir = tempdir("watch");
+        let shown = dir.to_string_lossy().into_owned();
+        let plane = FilesPlane::new();
+        let mut changes = plane.handle(
+            "watch-route",
+            FileEvent::WatchDirectory {
+                req: 41,
+                path: shown.clone(),
+            },
+        );
+        assert!(matches!(
+            changes.blocking_recv(),
+            Some(FileEvent::Watching { req: 41, path, .. }) if path == shown
+        ));
+
+        for index in 0..12 {
+            std::fs::write(dir.join(format!("burst-{index}.txt")), [index]).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let changed = loop {
+            match changes.try_recv() {
+                Ok(event) => break event,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!("directory watch did not report its burst: {other:?}"),
+            }
+        };
+        assert!(matches!(
+            changed,
+            FileEvent::DirectoryChanged {
+                req: 41,
+                change_seq: 1,
+                overflow: false,
+            }
+        ));
+
+        let stopped = drain(plane.handle(
+            "watch-route",
+            FileEvent::UnwatchDirectory {
+                req: 42,
+                watch_req: 41,
+            },
+        ));
+        assert_eq!(stopped, vec![FileEvent::Ok { req: 42 }]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match changes.try_recv() {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Ok(FileEvent::DirectoryChanged { .. }) => {}
+                Ok(event) => panic!("unexpected watch event after unwatch: {event:?}"),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!("unwatch kept its sender alive: {other:?}"),
+            }
+        }
+        std::fs::write(dir.join("after-unwatch.txt"), b"quiet").unwrap();
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_watch_lease_releases_abandoned_viewers() {
+        let dir = tempdir("watch-lease");
+        let plane = FilesPlane::new();
+        let mut changes = plane.handle(
+            "abandoned-route",
+            FileEvent::WatchDirectory {
+                req: 51,
+                path: dir.to_string_lossy().into_owned(),
+            },
+        );
+        assert!(matches!(
+            changes.blocking_recv(),
+            Some(FileEvent::Watching {
+                req: 51,
+                lease_ms: 500,
+                ..
+            })
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match changes.try_recv() {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Ok(event) => panic!("abandoned watch emitted an unexpected event: {event:?}"),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!("abandoned watch outlived its lease: {other:?}"),
+            }
+        }
+        assert!(
+            plane.directory_watchers.lock().is_empty(),
+            "expired watch still owns a native watcher"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

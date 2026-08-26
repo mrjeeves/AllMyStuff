@@ -396,7 +396,7 @@
         const bytes = new Uint8Array(await file.arrayBuffer());
         if (bytes.length === 0) {
           await fileSend(routeId, {
-            kind: "write", req, path: dest, data: "", append: false, eof: true,
+            kind: "write", req, path: dest, data: "", append: false, create_new: true, eof: true,
           });
           continue;
         }
@@ -410,6 +410,7 @@
             path: dest,
             data: b64encode(piece),
             append: off > 0,
+            create_new: off === 0,
             eof: off + piece.length >= bytes.length,
           });
           t.done = Math.min(off + piece.length, bytes.length);

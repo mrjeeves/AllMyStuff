@@ -13,7 +13,9 @@ export interface NativeLocationCrumb {
 export function isWorkspaceFileReplyKind(kind: string): boolean {
   return kind === "entries"
     || kind === "volume_list"
+    || kind === "watching"
     || kind === "metadata"
+    || kind === "exists"
     || kind === "ok"
     || kind === "err";
 }
@@ -209,13 +211,13 @@ export function nativeFileGridMetrics(input: number, platform: string): NativeFi
   const iconSize = nearestFileTileSize(input);
   const windows = platform.toLowerCase().startsWith("win");
   if (windows) {
-    if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 72, columnWidth: 88, rowHeight: 80 };
-    if (iconSize === 96) return { iconSize, tileWidth: 124, tileHeight: 144, columnWidth: 136, rowHeight: 152 };
-    return { iconSize, tileWidth: 88, tileHeight: 92, columnWidth: 100, rowHeight: 100 };
+    if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 82, columnWidth: 88, rowHeight: 90 };
+    if (iconSize === 96) return { iconSize, tileWidth: 124, tileHeight: 158, columnWidth: 136, rowHeight: 166 };
+    return { iconSize, tileWidth: 88, tileHeight: 104, columnWidth: 100, rowHeight: 112 };
   }
-  if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 72, columnWidth: 88, rowHeight: 80 };
-  if (iconSize === 96) return { iconSize, tileWidth: 128, tileHeight: 148, columnWidth: 140, rowHeight: 156 };
-  return { iconSize, tileWidth: 92, tileHeight: 96, columnWidth: 104, rowHeight: 104 };
+  if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 82, columnWidth: 88, rowHeight: 90 };
+  if (iconSize === 96) return { iconSize, tileWidth: 128, tileHeight: 160, columnWidth: 140, rowHeight: 168 };
+  return { iconSize, tileWidth: 92, tileHeight: 106, columnWidth: 104, rowHeight: 114 };
 }
 
 /** Apply a screen-space pointer delta to world-space canvas geometry. Frames,

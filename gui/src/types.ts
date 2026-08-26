@@ -146,11 +146,22 @@ export interface Standing {
   kind: "self" | "mesh" | "shared" | "fleet" | "mine" | "claimable" | "theirs" | "free";
 }
 
+export interface StorageSummary {
+  id: string;
+  name: string;
+  total_bytes: number;
+  available_bytes: number;
+  removable: boolean;
+  kind: "ssd" | "hdd" | "removable" | "unknown" | string;
+}
+
+
 export interface InventorySummary {
   os: string;
   cpu: string;
   ram_bytes: number;
   device_count: number;
+  storage?: StorageSummary[];
   /** Product / model name ("OptiPlex 7090", "MacBook Pro") — the machine's
    *  own identity, so a CEC technician can tell one customer's box from
    *  another. Optional: absent from adverts by an AllMyStuff older than the
@@ -703,18 +714,24 @@ export interface FileVolume {
 export type FileEvent =
   | { kind: "volumes"; req: number }
   | { kind: "list"; req: number; path: string; cursor?: string | null; limit?: number | null }
+  | { kind: "watch_directory"; req: number; path: string }
+  | { kind: "unwatch_directory"; req: number; watch_req: number }
   | { kind: "read"; req: number; path: string }
   | { kind: "stat"; req: number; path: string }
+  | { kind: "check"; req: number; path: string }
   | { kind: "read_range"; req: number; path: string; offset: number; len: number }
   | { kind: "fetch"; req: number; token: string }
-  | { kind: "write"; req: number; path: string; data: string; append?: boolean; eof?: boolean }
+  | { kind: "write"; req: number; path: string; data: string; append?: boolean; create_new?: boolean; eof?: boolean }
   | { kind: "write_range"; req: number; path: string; offset: number; data: string; truncate?: boolean }
   | { kind: "mkdir"; req: number; path: string }
   | { kind: "rename"; req: number; from: string; to: string }
   | { kind: "delete"; req: number; path: string }
   | { kind: "entries"; req: number; path: string; home: string; entries: FileEntry[]; next_cursor?: string | null }
+  | { kind: "watching"; req: number; path: string; lease_ms: number }
+  | { kind: "directory_changed"; req: number; change_seq: number; overflow?: boolean }
   | { kind: "volume_list"; req: number; volumes: FileVolume[] }
   | { kind: "metadata"; req: number; entry: FileEntry }
+  | { kind: "exists"; req: number; exists: boolean }
   | { kind: "chunk"; req: number; data: string; total: number; eof?: boolean }
   | { kind: "ok"; req: number }
   | { kind: "err"; req: number; reason: string };

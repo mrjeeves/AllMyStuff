@@ -287,6 +287,16 @@ pub enum FileEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u16>,
     },
+    /// Subscribe to immediate changes below one represented directory.
+    WatchDirectory {
+        req: u64,
+        path: String,
+    },
+    /// Stop a directory subscription created by `WatchDirectory`.
+    UnwatchDirectory {
+        req: u64,
+        watch_req: u64,
+    },
     /// Read a whole file. Answered with a stream of `Chunk`s (the last
     /// has `eof: true`) or `Err`.
     Read {
@@ -295,6 +305,12 @@ pub enum FileEvent {
     },
     /// Read file metadata without transferring its contents.
     Stat {
+        req: u64,
+        path: String,
+    },
+    /// Check whether a destination exists without conflating absence with a
+    /// permission or I/O error. Transactional transfers use this before commit.
+    Check {
         req: u64,
         path: String,
     },
@@ -327,6 +343,12 @@ pub enum FileEvent {
         data: Vec<u8>,
         #[serde(default)]
         append: bool,
+        /// Refuse to replace an existing file when applying the first piece.
+        /// New send-to-device flows set this after their UI preflight so a
+        /// race can never silently overwrite the destination.
+        #[serde(default)]
+        create_new: bool,
+
         #[serde(default)]
         eof: bool,
     },
@@ -367,6 +389,21 @@ pub enum FileEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
+    /// A directory subscription is installed before this acknowledgement.
+    Watching {
+        req: u64,
+        path: String,
+        lease_ms: u64,
+    },
+    /// Coalesced, unsolicited invalidation for one directory subscription.
+    /// The viewer relists only the represented page. Sequence gaps and
+    /// backend errors set `overflow`, requiring the same bounded resnapshot.
+    DirectoryChanged {
+        req: u64,
+        change_seq: u64,
+        #[serde(default)]
+        overflow: bool,
+    },
     VolumeList {
         req: u64,
         volumes: Vec<FileVolume>,
@@ -381,6 +418,11 @@ pub enum FileEvent {
     Metadata {
         req: u64,
         entry: FileEntry,
+    },
+    /// Result of a Check. Unlike Stat, false is not an error.
+    Exists {
+        req: u64,
+        exists: bool,
     },
     /// One piece of a `Read`. `total` is the file's full size (so the
     /// viewer can show progress); `eof` marks the last piece.
@@ -416,8 +458,11 @@ impl FileEvent {
             FileEvent::Quota { req }
             | FileEvent::Volumes { req }
             | FileEvent::List { req, .. }
+            | FileEvent::WatchDirectory { req, .. }
+            | FileEvent::UnwatchDirectory { req, .. }
             | FileEvent::Read { req, .. }
             | FileEvent::Stat { req, .. }
+            | FileEvent::Check { req, .. }
             | FileEvent::ReadRange { req, .. }
             | FileEvent::Fetch { req, .. }
             | FileEvent::Write { req, .. }
@@ -427,8 +472,11 @@ impl FileEvent {
             | FileEvent::Delete { req, .. }
             | FileEvent::Entries { req, .. }
             | FileEvent::VolumeList { req, .. }
+            | FileEvent::Watching { req, .. }
+            | FileEvent::DirectoryChanged { req, .. }
             | FileEvent::QuotaInfo { req, .. }
             | FileEvent::Metadata { req, .. }
+            | FileEvent::Exists { req, .. }
             | FileEvent::Chunk { req, .. }
             | FileEvent::Ok { req }
             | FileEvent::Err { req, .. } => *req,
@@ -1192,6 +1240,24 @@ mod tests {
                 cursor: None,
                 limit: None,
             },
+            FileEvent::WatchDirectory {
+                req: 13,
+                path: "/home/u".into(),
+            },
+            FileEvent::UnwatchDirectory {
+                req: 14,
+                watch_req: 13,
+            },
+            FileEvent::Watching {
+                req: 15,
+                path: "/home/u".into(),
+                lease_ms: 1_800_000,
+            },
+            FileEvent::DirectoryChanged {
+                req: 13,
+                change_seq: 2,
+                overflow: true,
+            },
             FileEvent::Read {
                 req: 2,
                 path: "/home/u/notes.txt".into(),
@@ -1201,6 +1267,7 @@ mod tests {
                 path: "/home/u/up.bin".into(),
                 data: vec![0xFF, 0x00],
                 append: true,
+                create_new: false,
                 eof: true,
             },
             FileEvent::Mkdir {

@@ -35,6 +35,9 @@ test("fallback file identity folds Windows paths but not POSIX case", () => {
 test("workspace RPC accepts a volume inventory as a completed reply", () => {
   assert.equal(isWorkspaceFileReplyKind("volume_list"), true);
   assert.equal(isWorkspaceFileReplyKind("entries"), true);
+  assert.equal(isWorkspaceFileReplyKind("watching"), true);
+  assert.equal(isWorkspaceFileReplyKind("directory_changed"), false);
+  assert.equal(isWorkspaceFileReplyKind("exists"), true);
   assert.equal(isWorkspaceFileReplyKind("chunk"), false);
   assert.equal(isWorkspaceFileReplyKind("volumes"), false);
 });
@@ -79,7 +82,7 @@ test("file icon sizes use the native Explorer notches and separate grid cells", 
   assert.equal(nearestFileTileSize(95), 96);
   assert.equal(nearestFileTileSize(Number.NaN), 48);
   assert.deepEqual(nativeFileGridMetrics(48, "windows"), {
-    iconSize: 48, tileWidth: 88, tileHeight: 92, columnWidth: 100, rowHeight: 100,
+    iconSize: 48, tileWidth: 88, tileHeight: 104, columnWidth: 100, rowHeight: 112,
   });
 });
 
@@ -90,7 +93,7 @@ test("native size changes resolve top-level collisions without moving framed ite
     { id: "b", x: 24, y: 100, parentId: null },
     { id: "framed", x: 24, y: 100, parentId: "frame:a" },
   ], metrics);
-  assert.deepEqual(resolved.map(({ y }) => y), [24, 252, 100]);
+  assert.deepEqual(resolved.map(({ y }) => y), [24, 266, 100]);
 });
 
 test("drag previews and drops share one zoom-aware coordinate conversion", () => {

@@ -2,6 +2,8 @@
 
 Status: canonical product and implementation direction for the Files mode.
 
+This architecture implements the higher-level [Fleet Computer Operation Promise](OPERATION-PROMISE.md). Where a local-filesystem prototype or implementation shortcut conflicts with that promise, the promise wins.
+
 This document supersedes the local-filesystem-first assumptions in `FILES-CANVAS.md` and `files-scale-design.md`. Native filesystems remain important adapters and storage locations, but they are not the user-facing organizing model.
 
 ## Product invariant

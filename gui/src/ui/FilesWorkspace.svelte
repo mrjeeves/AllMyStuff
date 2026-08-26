@@ -4,6 +4,7 @@
   import { humanBytes, type FileEntry, type FileEvent, type FileVolume } from "../types";
   import {
     filesCanvasApply,
+    fleetfilesLocalDesktop,
     filesNamespaceAdopt,
     fileDownload,
     fileDownloadCancel,
@@ -15,6 +16,13 @@
     localFileIcon,
     localFileList,
     localFileLocations,
+    watchLocalDirectory,
+    localFileTransferScan,
+    localFileTransferOperations,
+    onFileOperations,
+    localFileTransferStart,
+    localFileTransferCancel,
+    openFilesWorkspaceWindow,
     localFileMkdir,
     localFileOpen,
     localFilePreview,
@@ -24,7 +32,9 @@
     onFilesCanvas,
     type LocalFileEntry,
     type LocalFileLocation,
+    type LocalFileTransferOperation,
     type LocalFilePreview,
+    type LocalFileTransferImpact,
   } from "../tauri";
   import {
     contains,
@@ -52,6 +62,8 @@
     type SharedFilesystemKind,
   } from "../files-canvas";
 
+  let { initialLocation = null }: { initialLocation?: string | null } = $props();
+
 
   type WorkspaceBinding =
     | { kind: "local"; deviceId: string; deviceLabel: string; nativeId: string }
@@ -62,6 +74,7 @@
     computerNode?: boolean;
     computerOnline?: boolean;
   };
+  type DirectoryChangedEvent = Extract<FileEvent, { kind: "directory_changed" }>;
   type RemoteSession = {
     deviceId: string;
     deviceLabel: string;
@@ -73,6 +86,7 @@
       reject: (reason: Error) => void;
       timer: number;
     }>;
+    directoryChanges: Map<number, (event: DirectoryChangedEvent) => void>;
   };
   let locations = $state<LocalFileLocation[]>([]);
   let path = $state("");
@@ -117,9 +131,34 @@
   let routeSnapshotRefresh: Promise<void> | null = null;
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
   const fleetDesktopCursors = new Map<string, FleetDesktopCursor>();
-  const fleetDesktopFailures = new Map<string, string>();
-  const fleetDesktopAttempts = new Map<string, number>();
-  const fleetDesktopReady = new Map<string, number>();
+  type RemoteDirectorySubscription = {
+    key: string;
+    session: RemoteSession;
+    watchReq: number;
+    path: string;
+    scope: "fleet-home" | "directory";
+    generation: number;
+    lastSeq: number;
+    stopped: boolean;
+    refreshing: boolean;
+    dirty: boolean;
+    refreshTimer: number | null;
+    leaseTimer: number | null;
+    expiresAt: number;
+  };
+  const remoteDirectorySubscriptions = new Map<string, RemoteDirectorySubscription>();
+  type LocalDirectorySubscription = {
+    path: string;
+    scope: "fleet-home" | "directory";
+    generation: number;
+    lastSeq: number;
+    stopped: boolean;
+    stop: (() => void) | null;
+    refreshing: boolean;
+    dirty: boolean;
+    refreshTimer: number | null;
+  };
+  let localDirectorySubscription: LocalDirectorySubscription | null = null;
   const FLEET_DESKTOP_CURSOR = "__fleet_desktop__";
   const pendingRemoteOpens = new Map<string, { name: string; deviceLabel: string }>();
   const remoteDirectoryIds = new Map<string, string>();
@@ -154,6 +193,54 @@
   let wallpaperPath = $state("");
   let wallpaper = $state("");
   let canvasHeight = $state(720);
+  type TransferDialog = {
+    id: string;
+    phase: "scanning" | "review" | "transferring" | "cancelling" | "failed";
+    paths: string[];
+    routeId: string;
+    destination: string;
+    targetLabel: string;
+    impact: LocalFileTransferImpact | null;
+    error: string;
+  };
+  let transferDialog = $state<TransferDialog | null>(null);
+  let transferDropTargetId = $state<string | null>(null);
+  type TransferOperation = {
+    id: string;
+    phase: "transferring" | "cancelling" | "complete" | "failed" | "cancelled";
+    targetLabel: string;
+    impact: LocalFileTransferImpact;
+    error: string;
+    startedAt: number;
+  };
+  let transferOperations = $state<TransferOperation[]>([]);
+  let operationsOpen = $state(false);
+  const activeOperationCount = $derived(
+    transferOperations.filter((operation) =>
+      operation.phase === "transferring" || operation.phase === "cancelling"
+    ).length,
+  );
+
+  function absorbTransferOperations(operations: LocalFileTransferOperation[]) {
+    transferOperations = operations.map((operation) => ({
+      id: operation.id,
+      phase: operation.phase,
+      targetLabel: operation.targetLabel,
+      impact: {
+        files: operation.files,
+        folders: operation.folders,
+        bytes: operation.bytes,
+        symlinks: 0,
+        unreadable: 0,
+        unreadable_examples: [],
+        top_level: [],
+        requires_confirmation: false,
+      },
+      error: operation.error ?? "",
+      startedAt: operation.startedAt,
+    }));
+  }
+
   type FrameGeometry = Pick<CanvasFrame, "x" | "y" | "width" | "height">;
   let liveFrameGeometry = $state<Record<string, FrameGeometry>>({});
   let liveItemPositions = $state<Record<string, CanvasPlacement>>({});
@@ -219,14 +306,24 @@
     const nodes = fleetFileNodes;
     if (!fleetHome || loading || directoryId !== "fleet:home") return;
     reconcileFleetComputerEntries(nodes);
-    const generation = navigationGeneration;
-    if (nodes.some((node) => node.online && app.filesAllowed(node)
-      && fleetDesktopAttempts.get(canonicalDeviceId(node.id)) !== generation)) {
-      void loadRemoteFleetDesktops(generation);
-    }
   });
 
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
+const nativeMountTarget = $derived.by(() => {
+    if (selected?.dir && !selected.computerNode && selected.binding.kind === "remote") {
+      return {
+        deviceId: selected.binding.deviceId,
+        path: selected.path,
+        label: displayName(selected),
+      };
+    }
+    if (currentRemoteDirectory) return {
+      deviceId: currentRemoteDirectory.deviceId,
+      path: currentRemoteDirectory.path,
+      label: currentRemoteDirectory.path.split(/[\\/]/).filter(Boolean).at(-1) || currentRemoteDirectory.deviceLabel,
+    };
+    return null;
+  });
   const navigatorTrail = $derived(
     fleetHome || computerHome
       ? []
@@ -538,6 +635,10 @@
   }
 
   function receiveRemote(session: RemoteSession, event: FileEvent) {
+    if (event.kind === "directory_changed") {
+      session.directoryChanges.get(event.req)?.(event);
+      return;
+    }
     const pending = session.pending.get(event.req);
     if (!pending) return;
     if (!isWorkspaceFileReplyKind(event.kind)) return;
@@ -559,6 +660,7 @@
       nextReq: 1,
       stop: null,
       pending: new Map(),
+      directoryChanges: new Map(),
     };
     remoteSessions.set(deviceId, session);
     try {
@@ -572,13 +674,18 @@
     }
   }
 
-  function remoteRequest(session: RemoteSession, event: Omit<FileEvent, "req">): Promise<FileEvent> {
-    const req = session.nextReq++;
+  function remoteRequest(
+    session: RemoteSession,
+    event: Omit<FileEvent, "req">,
+    requestId?: number,
+    timeoutMs = 12_000,
+  ): Promise<FileEvent> {
+    const req = requestId ?? session.nextReq++;
     return new Promise<FileEvent>((resolve, reject) => {
       const timer = window.setTimeout(() => {
         session.pending.delete(req);
         reject(new Error("The remote file operation timed out"));
-      }, 12_000);
+      }, timeoutMs);
       session.pending.set(req, { resolve, reject, timer });
       void fileSend(session.routeId, { ...event, req } as FileEvent).catch((error) => {
         window.clearTimeout(timer);
@@ -608,75 +715,316 @@
     if (event.kind !== "volume_list") throw new Error("The remote device returned an invalid volume list");
     return event.volumes;
   }
-  async function loadRemoteFleetDesktops(generation: number) {
-    const nodes = fleetFileNodes.filter((node) =>
-      node.online
-      && app.filesAllowed(node)
-      && fleetDesktopAttempts.get(canonicalDeviceId(node.id)) !== generation
-    );
-    if (nodes.length === 0) return;
-    for (const node of nodes) fleetDesktopAttempts.set(canonicalDeviceId(node.id), generation);
-    let nextNode = 0;
-    sourceSummary = "Fleet Home · syncing " + nodes.length + " remote desktops";
 
-    const worker = async () => {
-      while (generation === navigationGeneration && fleetHome) {
-        const node = nodes[nextNode++];
-        if (!node) return;
-        try {
-          const session = await ensureRemoteSession(node.id, node.label);
-          const listing = await remoteList(session, "~/Desktop");
-          if (generation !== navigationGeneration || !fleetHome) return;
-          const additions = await adoptWorkspaceEntries(
-            "fleet:home",
-            listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
-          );
-          if (generation !== navigationGeneration || !fleetHome) return;
-          const known = new Set(entries.map((item) => item.id));
-          entries = [...entries, ...additions.filter((item) => !known.has(item.id))];
-          if (listing.next_cursor) {
-            fleetDesktopCursors.set(node.id, {
-              deviceId: node.id,
-              deviceLabel: node.label,
-              path: listing.path,
-              cursor: listing.next_cursor,
-            });
-            if (!nextCursor) nextCursor = FLEET_DESKTOP_CURSOR;
-            complete = false;
-          }
-          fleetDesktopReady.set(canonicalDeviceId(node.id), generation);
-        } catch (error) {
-          if (generation !== navigationGeneration || !fleetHome) return;
-          fleetDesktopFailures.set(canonicalDeviceId(node.id), String(error));
-          console.warn(`Fleet Desktop unavailable for ${node.label}:`, error);
-        }
-        const ready = 1 + Array.from(fleetDesktopReady.values())
-          .filter((loadedGeneration) => loadedGeneration === generation).length;
-        const unavailable = fleetDesktopFailures.size;
-        sourceSummary = "Fleet Home · " + ready + " desktops live"
-          + (unavailable ? " · " + unavailable + " unavailable" : "");
-      }
-    };
-
-    await Promise.all(Array.from(
-      { length: Math.min(2, nodes.length) },
-      () => worker(),
-    ));
+  function remoteSubscriptionKey(
+    session: RemoteSession,
+    watchedPath: string,
+    scope: RemoteDirectorySubscription["scope"],
+  ): string {
+    return scope + ":" + remotePathKey(canonicalDeviceId(session.deviceId), watchedPath);
   }
 
+  function stopRemoteDirectorySubscription(subscription: RemoteDirectorySubscription) {
+    if (subscription.stopped) return;
+    subscription.stopped = true;
+    if (subscription.refreshTimer !== null) window.clearTimeout(subscription.refreshTimer);
+    if (subscription.leaseTimer !== null) window.clearTimeout(subscription.leaseTimer);
+    subscription.refreshTimer = null;
+    subscription.leaseTimer = null;
+    subscription.session.directoryChanges.delete(subscription.watchReq);
+    if (remoteDirectorySubscriptions.get(subscription.key) === subscription) {
+      remoteDirectorySubscriptions.delete(subscription.key);
+    }
+    const req = subscription.session.nextReq++;
+    void fileSend(subscription.session.routeId, {
+      kind: "unwatch_directory",
+      req,
+      watch_req: subscription.watchReq,
+    }).catch(() => {});
+  }
+
+  function stopRemoteDirectorySubscriptions() {
+    for (const subscription of Array.from(remoteDirectorySubscriptions.values())) {
+      stopRemoteDirectorySubscription(subscription);
+    }
+  }
+
+  function mergeRemoteRefresh(
+    prior: WorkspaceEntry[],
+    additions: WorkspaceEntry[],
+    matchesSource: (entry: WorkspaceEntry) => boolean,
+    completeListing: boolean,
+  ): WorkspaceEntry[] {
+    if (completeListing) {
+      const kept = prior.filter((entry) => !matchesSource(entry));
+      return [...kept, ...additions];
+    }
+    const updates = new Map(additions.map((entry) => [entry.id, entry]));
+    const merged = prior.map((entry) => {
+      if (!matchesSource(entry)) return entry;
+      const update = updates.get(entry.id);
+      if (!update) return entry;
+      updates.delete(entry.id);
+      return update;
+    });
+    return [...merged, ...updates.values()];
+  }
+
+  async function refreshRemoteDirectory(subscription: RemoteDirectorySubscription) {
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const listing = await remoteList(subscription.session, subscription.path);
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const parentId = subscription.scope === "fleet-home" ? "fleet:home" : directoryId;
+    const additions = await adoptWorkspaceEntries(
+      parentId,
+      listing.entries.map((item) => remoteWorkspaceEntry(subscription.session, listing.path, item)),
+    );
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const sourceId = canonicalDeviceId(subscription.session.deviceId);
+    const matchesSource = (entry: WorkspaceEntry) =>
+      !entry.computerNode && canonicalDeviceId(entry.binding.deviceId) === sourceId;
+    const listingComplete = !listing.next_cursor;
+
+    if (subscription.scope === "fleet-home") {
+      if (!fleetHome) return;
+      entries = mergeRemoteRefresh(entries, additions, matchesSource, listingComplete);
+      if (listing.next_cursor) {
+        fleetDesktopCursors.set(subscription.session.deviceId, {
+          deviceId: subscription.session.deviceId,
+          deviceLabel: subscription.session.deviceLabel,
+          path: listing.path,
+          cursor: listing.next_cursor,
+        });
+        if (!nextCursor) nextCursor = FLEET_DESKTOP_CURSOR;
+        complete = false;
+      } else {
+        fleetDesktopCursors.delete(subscription.session.deviceId);
+        if (nextCursor === FLEET_DESKTOP_CURSOR && fleetDesktopCursors.size === 0) {
+          nextCursor = null;
+          complete = true;
+        }
+      }
+      return;
+    }
+
+    const current = currentRemoteDirectory;
+    if (!current || remotePathKey(current.deviceId, current.path)
+      !== remotePathKey(subscription.session.deviceId, subscription.path)) return;
+    entries = mergeRemoteRefresh(entries, additions, matchesSource, listingComplete);
+    nextCursor = listing.next_cursor ?? null;
+    complete = listingComplete;
+  }
+
+  function scheduleRemoteDirectoryRefresh(subscription: RemoteDirectorySubscription) {
+    if (subscription.stopped || subscription.refreshTimer !== null) return;
+    subscription.refreshTimer = window.setTimeout(() => {
+      subscription.refreshTimer = null;
+      if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+      if (subscription.refreshing) {
+        subscription.dirty = true;
+        scheduleRemoteDirectoryRefresh(subscription);
+        return;
+      }
+      subscription.dirty = false;
+      subscription.refreshing = true;
+      void refreshRemoteDirectory(subscription).catch((error) => {
+        console.warn("Live fleet directory refresh failed:", error);
+      }).finally(() => {
+        subscription.refreshing = false;
+        if (subscription.dirty) scheduleRemoteDirectoryRefresh(subscription);
+      });
+    }, 250);
+  }
+
+  function restartRemoteDirectorySubscription(subscription: RemoteDirectorySubscription) {
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const { session, path: watchedPath, generation, scope } = subscription;
+    stopRemoteDirectorySubscription(subscription);
+    void startRemoteDirectorySubscription(session, watchedPath, generation, scope);
+  }
+
+  function scheduleRemoteDirectoryLease(
+    subscription: RemoteDirectorySubscription,
+    delayMs: number,
+  ) {
+    if (subscription.leaseTimer !== null) window.clearTimeout(subscription.leaseTimer);
+    subscription.leaseTimer = null;
+    if (subscription.stopped || document.visibilityState !== "visible") return;
+    subscription.leaseTimer = window.setTimeout(() => {
+      subscription.leaseTimer = null;
+      restartRemoteDirectorySubscription(subscription);
+    }, Math.max(1_000, delayMs));
+  }
+
+  function remoteDirectoryVisibilityChanged() {
+    for (const subscription of Array.from(remoteDirectorySubscriptions.values())) {
+      if (document.visibilityState !== "visible") {
+        if (subscription.leaseTimer !== null) window.clearTimeout(subscription.leaseTimer);
+        subscription.leaseTimer = null;
+        continue;
+      }
+      const remaining = subscription.expiresAt - Date.now();
+      if (remaining <= 0) restartRemoteDirectorySubscription(subscription);
+      else scheduleRemoteDirectoryLease(subscription, remaining * 0.8);
+    }
+  }
+
+  async function startRemoteDirectorySubscription(
+    session: RemoteSession,
+    watchedPath: string,
+    generation: number,
+    scope: RemoteDirectorySubscription["scope"],
+  ) {
+    const key = remoteSubscriptionKey(session, watchedPath, scope);
+    const existing = remoteDirectorySubscriptions.get(key);
+    if (existing?.generation === generation && !existing.stopped) return;
+    if (existing) stopRemoteDirectorySubscription(existing);
+    const watchReq = session.nextReq++;
+    const subscription: RemoteDirectorySubscription = {
+      key, session, watchReq, path: watchedPath, scope, generation,
+      lastSeq: 0, stopped: false, refreshing: false, dirty: false,
+      refreshTimer: null, leaseTimer: null, expiresAt: 0,
+    };
+    remoteDirectorySubscriptions.set(key, subscription);
+    session.directoryChanges.set(watchReq, (event) => {
+      if (subscription.stopped || event.change_seq <= subscription.lastSeq) return;
+      subscription.dirty ||= event.overflow
+        || (subscription.lastSeq !== 0 && event.change_seq !== subscription.lastSeq + 1);
+      subscription.lastSeq = event.change_seq;
+      scheduleRemoteDirectoryRefresh(subscription);
+    });
+    try {
+      const reply = await remoteRequest(session, {
+        kind: "watch_directory",
+        path: watchedPath,
+      } as Omit<FileEvent, "req">, watchReq, 3_000);
+      if (reply.kind !== "watching") throw new Error("The peer does not support directory watching");
+      subscription.path = reply.path;
+      subscription.expiresAt = Date.now() + reply.lease_ms;
+      scheduleRemoteDirectoryLease(subscription, reply.lease_ms * 0.8);
+    } catch (error) {
+      stopRemoteDirectorySubscription(subscription);
+      console.info("Live fleet directory watching unavailable; keeping the static listing:", error);
+    }
+  }
+
+  function stopLocalDirectorySubscription() {
+    const subscription = localDirectorySubscription;
+    if (!subscription || subscription.stopped) return;
+    subscription.stopped = true;
+    if (subscription.refreshTimer !== null) window.clearTimeout(subscription.refreshTimer);
+    subscription.refreshTimer = null;
+    subscription.stop?.();
+    subscription.stop = null;
+    if (localDirectorySubscription === subscription) localDirectorySubscription = null;
+  }
+
+  function stopDirectorySubscriptions() {
+    stopLocalDirectorySubscription();
+    stopRemoteDirectorySubscriptions();
+  }
+
+  async function refreshLocalDirectory(subscription: LocalDirectorySubscription) {
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const listing = await localFileList(subscription.path);
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const parentId = subscription.scope === "fleet-home" ? "fleet:home" : listing.id;
+    const additions = await adoptWorkspaceEntries(
+      parentId,
+      listing.entries.map(localWorkspaceEntry),
+    );
+    if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+    const sourceId = canonicalDeviceId(app.localId);
+    const matchesSource = (entry: WorkspaceEntry) =>
+      !entry.computerNode && canonicalDeviceId(entry.binding.deviceId) === sourceId;
+
+    if (subscription.scope === "fleet-home") {
+      if (!fleetHome) return;
+      entries = mergeRemoteRefresh(entries, additions, matchesSource, listing.complete);
+      nextCursor = listing.nextCursor
+        ?? (fleetDesktopCursors.size > 0 ? FLEET_DESKTOP_CURSOR : null);
+      complete = listing.complete && !nextCursor;
+      return;
+    }
+    if (fleetHome || currentRemoteDirectory || listing.path !== path) return;
+    directoryId = listing.id;
+    localRootPath = listing.path;
+    entries = mergeRemoteRefresh(entries, additions, matchesSource, listing.complete);
+    nextCursor = listing.nextCursor ?? null;
+    complete = listing.complete;
+  }
+
+  function scheduleLocalDirectoryRefresh(subscription: LocalDirectorySubscription) {
+    if (subscription.stopped || subscription.refreshTimer !== null) return;
+    subscription.refreshTimer = window.setTimeout(() => {
+      subscription.refreshTimer = null;
+      if (subscription.stopped || subscription.generation !== navigationGeneration) return;
+      if (subscription.refreshing) {
+        subscription.dirty = true;
+        scheduleLocalDirectoryRefresh(subscription);
+        return;
+      }
+      subscription.dirty = false;
+      subscription.refreshing = true;
+      void refreshLocalDirectory(subscription).catch((error) => {
+        console.warn("Live local directory refresh failed:", error);
+      }).finally(() => {
+        subscription.refreshing = false;
+        if (subscription.dirty) scheduleLocalDirectoryRefresh(subscription);
+      });
+    }, 250);
+  }
+
+  async function startLocalDirectorySubscription(
+    watchedPath: string,
+    generation: number,
+    scope: LocalDirectorySubscription["scope"],
+  ) {
+    stopLocalDirectorySubscription();
+    const subscription: LocalDirectorySubscription = {
+      path: watchedPath,
+      scope,
+      generation,
+      lastSeq: 0,
+      stopped: false,
+      stop: null,
+      refreshing: false,
+      dirty: false,
+      refreshTimer: null,
+    };
+    localDirectorySubscription = subscription;
+    try {
+      const stop = await watchLocalDirectory(watchedPath, (event) => {
+        if (subscription.stopped || event.seq <= subscription.lastSeq) return;
+        subscription.dirty ||= event.overflow
+          || (subscription.lastSeq !== 0 && event.seq !== subscription.lastSeq + 1);
+        subscription.lastSeq = event.seq;
+        scheduleLocalDirectoryRefresh(subscription);
+      });
+      if (subscription.stopped || subscription.generation !== navigationGeneration
+        || localDirectorySubscription !== subscription) {
+        stop();
+        return;
+      }
+      subscription.stop = stop;
+    } catch (error) {
+      if (localDirectorySubscription === subscription) localDirectorySubscription = null;
+      subscription.stopped = true;
+      console.info("Live local directory watching unavailable; keeping the static listing:", error);
+    }
+  }
 
   async function navigateFleetHome() {
-    const desktop = locations.find((place) => place.id === "desktop") ?? locations[0];
-    if (!desktop) return;
+    stopDirectorySubscriptions();
     const generation = ++navigationGeneration;
     loading = true;
     computerHome = false;
     currentComputer = null;
     currentRemoteDirectory = null;
     fleetDesktopCursors.clear();
-    fleetDesktopFailures.clear();
     clearWorkspaceSelection();
     try {
+      const desktop = await fleetfilesLocalDesktop();
       const listing = await localFileList(desktop.path);
       if (generation !== navigationGeneration) return;
       localRootPath = listing.path;
@@ -684,7 +1032,7 @@
       fleetHome = true;
       map = "files";
       path = "fleet://home";
-      address = "Fleet Home";
+      address = "Fleetfiles / Desktop";
       platform = listing.platform;
       const desktopEntries = await adoptWorkspaceEntries(
         "fleet:home",
@@ -698,9 +1046,9 @@
       historyIndex = 0;
       thumbnails = {};
       thumbnailOrder = [];
-      sourceSummary = "Fleet Home · " + fleetComputers.length + " computers";
+      sourceSummary = "Fleetfiles Desktop · " + fleetComputers.length + " fleet computers";
       loading = false;
-      void loadRemoteFleetDesktops(generation);
+      void startLocalDirectorySubscription(listing.path, generation, "fleet-home");
     } catch (error) {
       if (generation === navigationGeneration) app.toast("warn", `Couldn't open Fleet Home: ${String(error)}`);
     } finally {
@@ -732,6 +1080,7 @@
         return;
       }
     }
+    stopDirectorySubscriptions();
     const generation = ++navigationGeneration;
     loading = true;
     try {
@@ -785,13 +1134,116 @@
     throw new Error("This device's mesh identity is not ready yet");
   }
 
+  type WorkspaceWindowLocation =
+    | { kind: "fleet-home" }
+    | { kind: "computer"; deviceId: string; deviceLabel: string }
+    | { kind: "local-directory"; path: string }
+    | { kind: "remote-directory"; deviceId: string; deviceLabel: string; path: string; nativeId: string };
+
+  function currentWorkspaceWindowLocation(): WorkspaceWindowLocation {
+    const item = selected?.dir ? selected : null;
+    if (item?.computerNode) {
+      return {
+        kind: "computer",
+        deviceId: item.binding.deviceId,
+        deviceLabel: item.binding.deviceLabel,
+      };
+    }
+    if (item?.binding.kind === "remote") {
+      return {
+        kind: "remote-directory",
+        deviceId: item.binding.deviceId,
+        deviceLabel: item.binding.deviceLabel,
+        path: item.path,
+        nativeId: item.binding.nativeId,
+      };
+    }
+    if (item?.binding.kind === "local") return { kind: "local-directory", path: item.path };
+    if (fleetHome) return { kind: "fleet-home" };
+    if (computerHome && currentComputer) {
+      return {
+        kind: "computer",
+        deviceId: currentComputer.deviceId,
+        deviceLabel: currentComputer.deviceLabel,
+      };
+    }
+    if (currentRemoteDirectory) {
+      return {
+        kind: "remote-directory",
+        deviceId: currentRemoteDirectory.deviceId,
+        deviceLabel: currentRemoteDirectory.deviceLabel,
+        path: currentRemoteDirectory.path,
+        nativeId: currentRemoteDirectory.nativeId,
+      };
+    }
+    return { kind: "local-directory", path };
+  }
+
+  function openWorkspaceInNewWindow() {
+    const location = currentWorkspaceWindowLocation();
+    const title = selected?.dir
+      ? displayName(selected)
+      : fleetHome
+        ? "Fleet Home"
+        : currentComputer?.deviceLabel || currentRemoteDirectory?.deviceLabel || address;
+    void openFilesWorkspaceWindow("workspace:" + JSON.stringify(location), title)
+      .catch((error) => app.toast("warn", "Couldn't open a new Files window: " + String(error)));
+  }
+
+  function mountWorkspaceLocation() {
+    if (!nativeMountTarget) return;
+    void app.mapFolderFromNode(
+      nativeMountTarget.deviceId, nativeMountTarget.path, nativeMountTarget.label,
+    );
+  }
+
+  async function navigateInitialWorkspaceLocation(target: string) {
+    if (!target.startsWith("workspace:")) {
+      await navigateFleetHome();
+      return;
+    }
+    let location: WorkspaceWindowLocation;
+    try {
+      location = JSON.parse(target.slice("workspace:".length)) as WorkspaceWindowLocation;
+    } catch {
+      throw new Error("that Files window location is malformed");
+    }
+    if (location.kind === "fleet-home") {
+      await navigateFleetHome();
+      return;
+    }
+    if (location.kind === "local-directory") {
+      await navigate(location.path);
+      return;
+    }
+    if (location.kind === "computer") {
+      await navigateComputer(location.deviceId, location.deviceLabel);
+      return;
+    }
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const node = fleetFileNodes.find((candidate) =>
+        canonicalDeviceId(candidate.id) === canonicalDeviceId(location.deviceId)
+      );
+      if (node?.online && app.filesAllowed(node)) {
+        const session = await ensureRemoteSession(node.id, node.label);
+        await navigateRemoteDirectory(session, location.path, node.label, location.nativeId);
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
+    throw new Error(location.deviceLabel + " is not available in this fleet");
+  }
+
   function closeRemoteSessions() {
+    stopDirectorySubscriptions();
     for (const session of remoteSessions.values()) {
       session.stop?.();
       for (const pending of session.pending.values()) {
         window.clearTimeout(pending.timer);
         pending.reject(new Error("Files workspace closed"));
       }
+      session.directoryChanges.clear();
       void app.filesDisconnect(session.routeId);
     }
     remoteSessions.clear();
@@ -800,7 +1252,9 @@
   onMount(() => {
     let mounted = true;
     let stop = () => {};
+    let stopOperations = () => {};
     let stopSaved = () => {};
+    document.addEventListener("visibilitychange", remoteDirectoryVisibilityChanged);
     try {
       placesOpen = localStorage.getItem("allmystuff.files.placesOpen") !== "false";
       previewOpen = localStorage.getItem("allmystuff.files.previewOpen") !== "false";
@@ -818,13 +1272,17 @@
       if (!mounted) return;
       locations = places;
       records = saved;
-      await navigateFleetHome();
+      if (initialLocation) await navigateInitialWorkspaceLocation(initialLocation);
+      else await navigateFleetHome();
     })().catch((error) => {
       if (!mounted) return;
       loading = false;
       app.toast("warn", `Couldn't start Files: ${String(error)}`);
     });
     void onFilesCanvas((next) => { records = next; }).then((unlisten) => { stop = unlisten; });
+    void localFileTransferOperations().then(({ operations }) => absorbTransferOperations(operations));
+    void onFileOperations(absorbTransferOperations)
+      .then((unlisten) => { stopOperations = unlisten; });
     void onFileSaved((event) => {
       const key = `${event.route}:${event.req}`;
       const pending = pendingRemoteOpens.get(key);
@@ -842,15 +1300,21 @@
     }).then((unlisten) => { stopSaved = unlisten; });
     return () => {
       mounted = false;
+      document.removeEventListener("visibilitychange", remoteDirectoryVisibilityChanged);
       cancelPendingItemRename();
       pendingRemoteOpens.clear();
       stopSaved();
+      if (transferDialog && !["review", "failed"].includes(transferDialog.phase)) {
+        void localFileTransferCancel(transferDialog.id);
+      }
+      stopOperations();
       closeRemoteSessions();
       stop();
     };
   });
 
   async function navigate(next: string, remember = true) {
+    stopDirectorySubscriptions();
     const generation = ++navigationGeneration;
     loading = true;
     clearWorkspaceSelection();
@@ -881,6 +1345,7 @@
       thumbnailOrder = [];
       complete = listing.complete;
       thumbnails = {};
+      void startLocalDirectorySubscription(listing.path, generation, "directory");
     } catch (error) {
       if (generation !== navigationGeneration) return;
       app.toast("warn", `Couldn't open that folder: ${String(error)}`);
@@ -896,6 +1361,7 @@
     _label: string,
     nativeId: string,
   ) {
+    stopDirectorySubscriptions();
     const generation = ++navigationGeneration;
     loading = true;
     clearWorkspaceSelection();
@@ -930,6 +1396,7 @@
       history = ["fleet://home", path];
       historyIndex = 1;
       sourceSummary = `Fleet directory · available through ${session.deviceLabel}`;
+      void startRemoteDirectorySubscription(session, listing.path, generation, "directory");
     } catch (error) {
       if (generation === navigationGeneration) app.toast("warn", `Couldn't open that fleet folder: ${String(error)}`);
     } finally {
@@ -1068,7 +1535,8 @@
     if (event.key !== "Enter") return;
     const next = address.trim();
     if (!next) return;
-    if (next.toLocaleLowerCase() === "fleet home" || next === "fleet://home") {
+    if (["fleet home", "fleetfiles", "fleetfiles / desktop"].includes(next.toLocaleLowerCase())
+      || next === "fleet://home") {
       void navigateFleetHome();
       return;
     }
@@ -1764,6 +2232,119 @@
     ]).finally(() => migratingLayouts.delete(migrationId));
   });
 
+function newTransferId(): string {
+    return typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function updateTransferOperation(id: string, patch: Partial<TransferOperation>) {
+    transferOperations = transferOperations.map((operation) =>
+      operation.id === id ? { ...operation, ...patch } : operation
+    ).slice(0, 50);
+  }
+
+  async function beginReviewedTransfer(dialog: TransferDialog) {
+    if (!dialog.impact || dialog.impact.symlinks > 0 || dialog.impact.unreadable > 0) return;
+    const operation: TransferOperation = {
+      id: dialog.id,
+      phase: "transferring",
+      targetLabel: dialog.targetLabel,
+      impact: dialog.impact,
+      error: "",
+      startedAt: Date.now(),
+    };
+    transferOperations = [operation, ...transferOperations].slice(0, 50);
+    operationsOpen = true;
+    transferDialog = null;
+    try {
+      const result = await localFileTransferStart(
+        dialog.id,
+        dialog.routeId,
+        dialog.paths,
+        dialog.destination,
+        dialog.targetLabel,
+        dialog.impact,
+      );
+      updateTransferOperation(dialog.id, { phase: "complete" });
+      app.toast("ok", `Sent ${result.files} file${result.files === 1 ? "" : "s"} to ${dialog.targetLabel}`);
+    } catch (error) {
+      const cancelled = String(error).toLowerCase().includes("cancelled")
+        || transferOperations.find((item) => item.id === dialog.id)?.phase === "cancelling";
+      updateTransferOperation(dialog.id, {
+        phase: cancelled ? "cancelled" : "failed",
+        error: cancelled ? "" : String(error),
+      });
+    }
+  }
+
+  function cancelTransferOperation(id: string) {
+    const operation = transferOperations.find((item) => item.id === id);
+    if (!operation || operation.phase !== "transferring") return;
+    updateTransferOperation(id, { phase: "cancelling" });
+    void localFileTransferCancel(id);
+  }
+
+  async function prepareLocalTransfer(target: WorkspaceEntry, dragged: WorkspaceEntry[]) {
+    if (transferDialog || target.binding.kind !== "remote" || target.computerOnline === false) return;
+    if (!dragged.every((entry) => entry.binding.kind === "local" && !entry.computerNode)) {
+      app.toast("warn", "Send currently starts from files stored on this computer");
+      return;
+    }
+    const session = await ensureRemoteSession(target.binding.deviceId, target.binding.deviceLabel);
+    const dialog: TransferDialog = {
+      id: newTransferId(),
+      phase: "scanning",
+      paths: dragged.map((entry) => entry.path),
+      routeId: session.routeId,
+      destination: target.computerNode ? "~/Desktop" : target.path,
+      targetLabel: target.computerNode ? `${target.binding.deviceLabel} Desktop` : `${displayName(target)} on ${target.binding.deviceLabel}`,
+      impact: null,
+      error: "",
+    };
+    transferDialog = dialog;
+    try {
+      dialog.impact = await localFileTransferScan(dialog.id, dialog.paths);
+      if (transferDialog?.id !== dialog.id) return;
+      dialog.phase = "review";
+      transferDialog = dialog;
+      if (!dialog.impact.requires_confirmation && dialog.impact.symlinks === 0 && dialog.impact.unreadable === 0) {
+        await beginReviewedTransfer(dialog);
+      }
+    } catch (error) {
+      if (transferDialog?.id !== dialog.id) return;
+      if (dialog.phase === "cancelling" || String(error).toLowerCase().includes("cancelled")) {
+        transferDialog = null;
+        return;
+      }
+      dialog.phase = "failed";
+      dialog.error = String(error);
+      transferDialog = dialog;
+    }
+  }
+
+  function cancelTransfer() {
+    const dialog = transferDialog;
+    if (!dialog) return;
+    if (dialog.phase === "review" || dialog.phase === "failed") {
+      transferDialog = null;
+      return;
+    }
+    dialog.phase = "cancelling";
+    transferDialog = dialog;
+    void localFileTransferCancel(dialog.id);
+  }
+
+  function transferTargetAt(clientX: number, clientY: number, dragged: Set<string>): WorkspaceEntry | null {
+    for (const element of document.elementsFromPoint(clientX, clientY)) {
+      const tile = element.closest<HTMLElement>("[data-files-entry-id]");
+      const id = tile?.dataset.filesEntryId;
+      if (!id || dragged.has(id)) continue;
+      const target = entries.find((entry) => entry.id === id);
+      if (target?.dir && target.binding.kind === "remote" && target.computerOnline !== false) return target;
+    }
+    return null;
+  }
   function newFrame() {
     if (map === "files") changeView("canvas");
     frameTool = !frameTool;
@@ -1780,6 +2361,7 @@
     if (!preserveSelection) void select(item, event);
     if (!selectedIds.has(item.id)) return;
     const dragged = entries.filter((entry) => selectedIds.has(entry.id));
+    const draggedIds = new Set(dragged.map((entry) => entry.id));
     const starts = new Map(dragged.map((entry) => [entry.id, itemPosition(entry)]));
     const origin = { x: event.clientX, y: event.clientY };
     const pointerId = event.pointerId;
@@ -1798,6 +2380,8 @@
         const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
         return [entry.id, { ...start, ...point }];
       }));
+      const target = transferTargetAt(next.clientX, next.clientY, draggedIds);
+      transferDropTargetId = target?.id ?? null;
     };
     const up = (next: PointerEvent) => {
       if (next.pointerId !== pointerId) return;
@@ -1809,6 +2393,13 @@
         clearGeometryPreview(previewGeneration);
         if (renameOnRelease) scheduleItemRename(item);
         else if (preserveSelection && dragged.length > 1) void select(item);
+        return;
+      }
+      const transferTarget = transferTargetAt(next.clientX, next.clientY, draggedIds);
+      transferDropTargetId = null;
+      if (transferTarget) {
+        clearGeometryPreview(previewGeneration);
+        void prepareLocalTransfer(transferTarget, dragged).catch((error) => app.toast("warn", String(error)));
         return;
       }
       const mutations = dragged.map((entry) => {
@@ -1826,6 +2417,7 @@
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", cancel);
+      transferDropTargetId = null;
       clearGeometryPreview(previewGeneration);
     };
     window.addEventListener("pointermove", move);
@@ -2278,6 +2870,9 @@
     <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleet Home" : computerHome ? "Search drives" : "Search this folder"} aria-label="Search files" />
     <button onclick={createFolder} disabled={map !== "files" || computerHome} title="New folder">＋ Folder</button>
     <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
+    <button onclick={openWorkspaceInNewWindow} disabled={map !== "files"} title={selected?.dir ? `Open ${displayName(selected)} in a new AllMyStuff window` : "Open this location in a new AllMyStuff window"}>↗ Window</button>
+    <button onclick={mountWorkspaceLocation} disabled={!nativeMountTarget} title="Mount this remote location in the native operating-system file browser">⌁ Mount</button>
+    <button class:active={operationsOpen} onclick={() => { operationsOpen = !operationsOpen; }} title="Show file operations">⇅{activeOperationCount ? " " + activeOperationCount : ""}</button>
     {#if map === "files"}
       <div class="switch" role="group" aria-label="View">
         <button class:active={view === "canvas"} onclick={() => changeView("canvas")} title="Thumbnails">▦</button>
@@ -2300,9 +2895,13 @@
     </div>
     {#if placesOpen}
       <div class="sidebar-body">
-        <button class:active={fleetHome && map === "files"} onclick={navigateFleetHome}><span>⌂</span>Fleet Home</button>
+        <button class="tree-root" onclick={navigateFleetHome}><span>⌄</span>Fleetfiles</button>
+        <div class="location-branch fleet-root">
+          <button class:current={fleetHome && map === "files"} aria-current={fleetHome && map === "files" ? "location" : undefined} onclick={navigateFleetHome}><span aria-hidden="true">▱</span>Desktop</button>
+        </div>
+        <div class="tree-section-label">Computers</div>
         <div class="computer-tree" aria-label="Fleet filesystem tree">
-          <button class:active={computerBranchActive(app.localId)} onclick={() => { void navigateComputer(); }} title={app.localNode?.label || nativeComputerName()}><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
+          <button class:active={computerBranchActive(app.localId)} onclick={() => { void navigateComputer(); }} title={app.localNode?.label || nativeComputerName()}><span class="tree-expander" aria-hidden="true">{computerBranchActive(app.localId) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
           {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(app.localId)}
             <div class="location-branch" aria-label="Drives on this computer">
               {#each entries as drive (drive.id)}
@@ -2312,14 +2911,14 @@
           {:else if !fleetHome && !computerHome && !currentRemoteDirectory}
             <div class="location-branch local" aria-label="Current location">
               {#each navigatorTrail as crumb, index (crumb.path)}
-                <button class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                <button style={`--tree-depth:${index}`} class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
                   {navigatorCrumbLabel(crumb.label, crumb.path)}
                 </button>
               {/each}
             </div>
           {/if}
           {#each fleetFileNodes as node (node.id)}
-            <button class:active={computerBranchActive(node.id)} class:offline={!node.online || !app.filesAllowed(node)} onclick={() => { void navigateComputer(node.id, node.label); }} title={!app.filesAllowed(node) ? node.label + " (Files unavailable)" : node.online ? node.label : node.label + " (offline)"}><span aria-hidden="true">&#9635;</span>{node.label}</button>
+            <button class:active={computerBranchActive(node.id)} class:offline={!node.online || !app.filesAllowed(node)} onclick={() => { void navigateComputer(node.id, node.label); }} title={!app.filesAllowed(node) ? node.label + " (Files unavailable)" : node.online ? node.label : node.label + " (offline)"}><span class="tree-expander" aria-hidden="true">{computerBranchActive(node.id) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{node.label}</button>
             {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Drives on " + node.label}>
                 {#each entries as drive (drive.id)}
@@ -2329,7 +2928,7 @@
             {:else if currentRemoteDirectory && canonicalDeviceId(currentRemoteDirectory.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Current location on " + node.label}>
                 {#each navigatorTrail as crumb, index (crumb.path)}
-                  <button class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                  <button style={`--tree-depth:${index}`} class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
                     {navigatorCrumbLabel(crumb.label, crumb.path)}
                   </button>
                 {/each}
@@ -2485,6 +3084,8 @@
               class="file-tile"
               class:selected={selectedIds.has(item.id)}
               class:offline={item.computerNode && item.computerOnline === false}
+              class:transfer-target={transferDropTargetId === item.id}
+              data-files-entry-id={item.id}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
               role="button"
               tabindex="0"
@@ -2523,7 +3124,7 @@
                 <span class="file-label">{displayName(item)}</span>
               {/if}
               {#if item.binding.kind === "remote" || collidingNames.has(displayName(item).normalize("NFC").toLocaleLowerCase())}
-                <span class="source-badge" title={`Available through ${item.binding.deviceLabel}`}>{item.binding.deviceLabel}</span>
+                <span class="source-label" title={`Available through ${item.binding.deviceLabel}`}>{item.binding.deviceLabel}</span>
               {/if}
             </div>
           {/each}
@@ -2579,6 +3180,84 @@
         {/if}
       </div>
     {/if}
+{#if operationsOpen}
+    <section class="operations-panel" aria-label="File operations">
+      <header>
+        <div><b>Operations</b><span>{activeOperationCount ? activeOperationCount + " active" : "All caught up"}</span></div>
+        <button aria-label="Hide operations" title="Hide operations" onclick={() => { operationsOpen = false; }}>⌄</button>
+      </header>
+      {#if transferOperations.length}
+        <div class="operations-list">
+          {#each transferOperations as operation (operation.id)}
+            <article class:failed={operation.phase === "failed"}>
+              <div class="operation-copy">
+                <b>{operation.phase === "complete" ? "Sent" : operation.phase === "failed" ? "Needs attention" : operation.phase === "cancelled" ? "Cancelled" : operation.phase === "cancelling" ? "Cancelling safely…" : "Sending transactionally…"}</b>
+                <span>{operation.targetLabel}</span>
+                <small>{operation.impact.files.toLocaleString()} files · {operation.impact.folders.toLocaleString()} folders · {humanBytes(operation.impact.bytes)}</small>
+                {#if operation.error}<small class="operation-error">{operation.error}</small>{/if}
+              </div>
+              {#if operation.phase === "transferring"}
+                <button onclick={() => cancelTransferOperation(operation.id)}>Cancel</button>
+              {:else if operation.phase === "cancelling"}
+                <button disabled>Stopping…</button>
+              {:else}
+                <button aria-label="Dismiss operation" title="Dismiss" onclick={() => { transferOperations = transferOperations.filter((item) => item.id !== operation.id); }}>×</button>
+              {/if}
+            </article>
+          {/each}
+        </div>
+        {#if transferOperations.some((operation) => !["transferring", "cancelling"].includes(operation.phase))}
+          <button class="clear-operations" onclick={() => { transferOperations = transferOperations.filter((operation) => ["transferring", "cancelling"].includes(operation.phase)); }}>Clear finished</button>
+        {/if}
+      {:else}
+        <p>No file operations yet.</p>
+      {/if}
+    </section>
+  {/if}
+{#if transferDialog}
+    <div class="transfer-shade" role="presentation">
+      <div class="transfer-dialog" role="dialog" aria-modal="true" aria-labelledby="transfer-title">
+        <h2 id="transfer-title">
+          {transferDialog.phase === "scanning"
+            ? "Assessing transfer impact…"
+            : transferDialog.phase === "review"
+              ? `Send to ${transferDialog.targetLabel}?`
+              : transferDialog.phase === "transferring"
+                ? `Sending to ${transferDialog.targetLabel}…`
+                : transferDialog.phase === "cancelling"
+                  ? "Cancelling safely…"
+                  : "Transfer was not completed"}
+        </h2>
+        {#if transferDialog.impact}
+          <div class="impact-grid">
+            <span><b>{transferDialog.impact.files.toLocaleString()}</b> files</span>
+            <span><b>{transferDialog.impact.folders.toLocaleString()}</b> folders</span>
+            <span><b>{humanBytes(transferDialog.impact.bytes)}</b> total</span>
+          </div>
+          {#if transferDialog.impact.symlinks > 0}
+            <p class="transfer-warning">{transferDialog.impact.symlinks.toLocaleString()} symbolic link(s) make this transfer ambiguous. Nothing will be queued.</p>
+          {/if}
+          {#if transferDialog.impact.unreadable > 0}
+            <p class="transfer-warning">{transferDialog.impact.unreadable.toLocaleString()} item(s) could not be read. Nothing will be queued.</p>
+          {/if}
+          <p class="transfer-note">Files remain invisible at the destination until staging completes and the whole selection passes its final collision check.</p>
+        {:else if transferDialog.phase === "scanning"}
+          <p>Walking the selected tree locally. No file data has been queued or sent.</p>
+        {/if}
+        {#if transferDialog.error}<p class="transfer-warning">{transferDialog.error}</p>{/if}
+        <div class="transfer-actions">
+          <button onclick={cancelTransfer}>{transferDialog.phase === "review" || transferDialog.phase === "failed" ? "Close" : "Cancel"}</button>
+          {#if transferDialog.phase === "review"}
+            <button
+              class="primary"
+              disabled={!transferDialog.impact || transferDialog.impact.symlinks > 0 || transferDialog.impact.unreadable > 0}
+              onclick={() => { if (transferDialog) void beginReviewedTransfer(transferDialog); }}
+            >Send transactionally</button>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
   </aside>
 
   {#if context}
@@ -2636,11 +3315,13 @@
   .places h3:first-child { margin-top: .2rem; }
   .places .sidebar-body > button, .computer-tree > button { width: 100%; display: flex; gap: .6rem; align-items: center; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .places .sidebar-body > button:hover, .places .sidebar-body > button.active, .computer-tree > button:hover, .computer-tree > button.active { background: var(--surface-2); color: var(--ink); }
-  .computer-tree { display: flex; flex-direction: column; }
+  .computer-tree { display: flex; flex-direction: column; margin: .1rem 0 .15rem .72rem; padding-left: .42rem; border-left: 1px solid var(--line); }
+  .computer-tree > button { position: relative; }
+  .computer-tree > button::before { content: ""; position: absolute; left: -.43rem; width: .43rem; border-top: 1px solid var(--line); }
   .computer-tree > button span { flex: 0 0 auto; color: var(--ink-faint); }
-  .location-branch { display: flex; flex-direction: column; margin: 0 0 .2rem 1rem; padding-left: .45rem; border-left: 1px solid var(--line); }
-  .location-branch button { min-width: 0; display: flex; gap: .35rem; align-items: center; padding: .34rem .45rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .location-branch button::before { content: ""; flex: 0 0 .45rem; height: .42rem; margin-left: -.46rem; border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .computer-tree .tree-expander { width: .72rem; margin-right: -.36rem; font-size: .78rem; text-align: center; }
+  .location-branch { display: flex; flex-direction: column; margin: 0 0 .25rem 1.42rem; padding-left: .42rem; border-left: 1px solid var(--line); }
+  .location-branch button { --tree-depth: 0; min-width: 0; display: flex; gap: .35rem; align-items: center; padding: .34rem .45rem .34rem calc(.45rem + var(--tree-depth) * .72rem); border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .location-branch button:hover, .location-branch button.current { background: var(--surface-2); color: var(--ink); }
   .location-branch button.current { color: var(--ink); font-weight: 600; }
   .computer-tree > button.active { color: var(--accent-ink); }
@@ -2648,6 +3329,8 @@
   .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }.source-summary { margin: .25rem 0 .4rem; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
+  .tree-section-label { margin: .65rem .45rem .25rem; color: var(--ink-faint); font-size: .62rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .location-branch.fleet-root { margin-bottom: .5rem; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }
   .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
   .world { position: absolute; inset: 0; transform-origin: 0 0; }
@@ -2659,9 +3342,9 @@
   .frame-delete { flex: 0 0 auto; margin-left: auto; padding: 0 .2rem; border: 0; background: transparent; color: var(--ink-faint); }
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
-  .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .25rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .2rem .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 5px 6px oklch(0 0 0 / .35)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .74rem; line-height: 1.2; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .74rem; line-height: 1.2; user-select: text; }
-  .source-badge { position: absolute; top: 2px; right: 2px; max-width: calc(100% - 4px); overflow: hidden; padding: 1px 4px; border: 1px solid var(--line); border-radius: 999px; background: color-mix(in oklab, var(--surface-2) 88%, transparent); color: var(--ink-faint); font-size: 8px; line-height: 1.15; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+  .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .16rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .24rem .35rem; touch-action: none; }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 3px 4px oklch(0 0 0 / .28)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.35em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .78rem; font-weight: 500; line-height: 1.18; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .78rem; line-height: 1.2; user-select: text; }
+  .source-label { box-sizing: border-box; width: 100%; overflow: hidden; padding: 0 .2rem; color: color-mix(in oklab, var(--ink-faint) 88%, transparent); font-size: .61rem; line-height: 1.05; text-align: center; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
   .file-tile { user-select: none; }
   .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
@@ -2681,4 +3364,28 @@
   @media (max-width: 1050px) { .search { display: none; } }
   @media (max-width: 760px) { .filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
   .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-file { min-width: 0; min-height: 5.75rem; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }
+  .file-tile.transfer-target { border-color: var(--accent); background: color-mix(in oklab, var(--accent-soft) 82%, transparent); box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 28%, transparent); }
+  .operations-panel { position: fixed; right: 1rem; bottom: 1rem; z-index: 120; width: min(25rem, calc(100vw - 2rem)); max-height: min(32rem, calc(100vh - 7rem)); overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; padding: .65rem; border: 1px solid var(--line-strong); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow-lg); color: var(--ink); }
+  .operations-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .2rem .25rem .55rem; }
+  .operations-panel > header div { display: flex; align-items: baseline; gap: .55rem; }
+  .operations-panel > header span { color: var(--ink-faint); font-size: .68rem; }
+  .operations-panel > header button, .clear-operations { border: 0; background: transparent; color: var(--ink-faint); }
+  .operations-list { min-height: 0; overflow: auto; display: grid; gap: .45rem; }
+  .operations-list article { display: flex; align-items: center; justify-content: space-between; gap: .65rem; padding: .65rem; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+  .operations-list article.failed { border-color: color-mix(in oklab, var(--danger) 45%, var(--line)); }
+  .operation-copy { min-width: 0; display: grid; gap: .12rem; }
+  .operation-copy span, .operation-copy small { overflow-wrap: anywhere; }
+  .operation-copy span { font-size: .74rem; }
+  .operation-copy small { color: var(--ink-faint); font-size: .65rem; }
+  .operation-copy .operation-error { color: var(--danger); }
+  .operations-list article > button { flex: 0 0 auto; }
+  .clear-operations { justify-self: end; margin-top: .45rem; font-size: .68rem; }
+  .transfer-shade { position: fixed; inset: 0; z-index: 160; display: grid; place-items: center; padding: 1rem; background: oklch(0 0 0 / .48); backdrop-filter: blur(2px); }
+  .transfer-dialog { box-sizing: border-box; width: min(34rem, 100%); padding: 1.1rem; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow-lg); }
+  .transfer-dialog h2 { margin: 0 0 .8rem; font-size: 1.05rem; }
+  .transfer-dialog > p { color: var(--ink-soft); font-size: .78rem; line-height: 1.45; }
+  .impact-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .55rem; margin: .65rem 0; }.impact-grid span { display: grid; gap: .12rem; padding: .7rem; border: 1px solid var(--line); border-radius: 9px; color: var(--ink-faint); font-size: .7rem; }.impact-grid b { color: var(--ink); font-size: .9rem; }
+  .transfer-dialog .transfer-warning { padding: .6rem .7rem; border: 1px solid color-mix(in oklab, var(--danger) 45%, var(--line)); border-radius: 8px; background: color-mix(in oklab, var(--danger) 9%, transparent); color: var(--danger); }
+  .transfer-note { color: var(--ink-faint) !important; }
+  .transfer-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }.transfer-actions button { min-height: 2.1rem; padding: .4rem .8rem; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface-2); color: var(--ink); }.transfer-actions button.primary { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }.transfer-actions button:disabled { opacity: .4; }
 </style>

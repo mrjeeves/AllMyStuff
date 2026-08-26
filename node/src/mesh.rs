@@ -14669,9 +14669,10 @@ impl Mesh {
         volume: &str,
     ) -> Option<allmystuff_protocol::StorageSummary> {
         let state = self.state.lock();
-        let profile = if self
-            .local_node_id()
-            .is_some_and(|local| same_node(&local, device))
+        let profile = if state
+            .session
+            .as_ref()
+            .is_some_and(|session| same_node(session.me().as_str(), device))
         {
             state.profile.as_ref()
         } else {

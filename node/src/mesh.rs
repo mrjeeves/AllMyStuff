@@ -623,6 +623,12 @@ fn new_drive_mapping_id() -> Result<String, String> {
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn fleetfiles_root() -> Result<PathBuf, String> {
+    allmystuff_protocol::myownmesh_state_dir()
+        .ok_or_else(|| "the Fleetfiles state directory is unavailable".to_string())
+        .map(|state| state.join("Fleetfiles").join("Desktop"))
+}
+
 fn drive_reconnect_store_path() -> Option<PathBuf> {
     Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drives.json"))
 }
@@ -2564,27 +2570,48 @@ impl Mesh {
         // before anything (the forwarders below) spawns.
         crate::set_runtime(tokio::runtime::Handle::current());
 
-        // A hard kill can strand Windows' `net use` entry after its loopback
-        // WebDAV server is gone. Only mappings carrying our private lease
-        // marker are touched; ordinary user/network drives are never swept.
-        self.drive_mounts.cleanup_stale().await;
-        // A partially-written lease can lose its registry marker while the
-        // receiver's durable reconnect record and Windows mapping survive.
-        // That record is equally strong ownership proof, so clear those known
-        // letters before reconnecting them to fresh loopback listeners.
-        let saved_mounts = self
-            .drive_reconnects
-            .lock()
-            .values()
-            .filter(|mapping| !mapping.mount.is_empty())
-            .map(|mapping| mapping.mount.clone())
-            .collect::<std::collections::HashSet<_>>();
-        for mount in saved_mounts {
-            if let Err(error) = self.drive_mounts.remove_known(&mount).await {
-                tracing::warn!("couldn't clear saved native drive {mount}: {error}");
+        // The Fleetfiles namespace itself is local and immediately useful.
+        // Native mount recovery can take Windows tens of seconds while its
+        // redirector releases a stale WebDAV drive, so serialize that work in
+        // the background instead of holding the node control socket hostage.
+        let fleetfiles = match fleetfiles_root() {
+            Ok(root) => {
+                self.files
+                    .map_root(crate::drive_mount::FLEETFILES_ROUTE, root.clone());
+                Some(root)
             }
-        }
-
+            Err(error) => {
+                tracing::warn!("couldn't prepare Fleetfiles: {error}");
+                None
+            }
+        };
+        let native_startup = self.drive_mounts.begin_startup().await;
+        let native_mesh = self.clone();
+        crate::spawn(async move {
+            let _native_startup = native_startup;
+            native_mesh.drive_mounts.cleanup_stale().await;
+            let saved_mounts = native_mesh
+                .drive_reconnects
+                .lock()
+                .values()
+                .filter(|mapping| !mapping.mount.is_empty())
+                .map(|mapping| mapping.mount.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for mount in saved_mounts {
+                if let Err(error) = native_mesh.drive_mounts.remove_known(&mount).await {
+                    tracing::warn!("couldn't clear saved native drive {mount}: {error}");
+                }
+            }
+            if let Some(root) = fleetfiles {
+                if let Err(error) = native_mesh
+                    .drive_mounts
+                    .mount_fleetfiles(native_mesh.clone(), root)
+                    .await
+                {
+                    tracing::warn!("couldn't mount Fleetfiles: {error}");
+                }
+            }
+        });
         // Spawn the media forwarders now that we're on a runtime (see
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
         self.spawn_media_forwarders();
@@ -14066,6 +14093,51 @@ impl Mesh {
         event: FileEvent,
         timeout: Duration,
     ) -> Result<Vec<FileEvent>, String> {
+        if route_id == crate::drive_mount::FLEETFILES_ROUTE {
+            let req = event.req();
+            if matches!(event, FileEvent::Quota { .. }) {
+                return Ok(vec![FileEvent::QuotaInfo {
+                    req,
+                    used: 0,
+                    total: self.fleetfiles_capacity(),
+                }]);
+            }
+            let root = self
+                .files
+                .mapped_root(route_id)
+                .ok_or("the Fleetfiles desktop root is unavailable")?;
+            if matches!(&event, FileEvent::WriteRange { .. }) {
+                return crate::files::write_range_in_root(&event, Some(&root))
+                    .map(|reply| vec![reply])
+                    .ok_or_else(|| "Fleetfiles rejected a ranged write".to_string());
+            }
+            if matches!(&event, FileEvent::Write { .. }) {
+                return crate::files::write_piece_in_root(&event, Some(&root))
+                    .map(|reply| vec![reply])
+                    .ok_or_else(|| {
+                        "Fleetfiles write piece is waiting for its final chunk".to_string()
+                    });
+            }
+            let mut replies = self.files.handle_in_root(route_id, event, Some(root));
+            let result = tokio::time::timeout(timeout, async {
+                let mut events = Vec::new();
+                while let Some(event) = replies.recv().await {
+                    let terminal = completes_file_rpc(&event);
+                    events.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                events
+            })
+            .await;
+            return match result {
+                Ok(events) if !events.is_empty() => Ok(events),
+                Ok(_) => Err("Fleetfiles did not complete the local operation".into()),
+                Err(_) => Err("Fleetfiles local operation timed out".into()),
+            };
+        }
+
         let req = event.req();
         let mut replies = self.files.begin_rpc(route_id, req);
         let result = tokio::time::timeout(timeout, async {
@@ -14471,19 +14543,38 @@ impl Mesh {
     }
 
     pub fn fleetfiles_local_desktop(&self) -> Result<Value, String> {
-        let root = allmystuff_protocol::myownmesh_state_dir()
-            .ok_or("the Fleetfiles state directory is unavailable")?
-            .join("Fleetfiles");
-        let desktop = root.join("Desktop");
+        let desktop = fleetfiles_root()?;
         std::fs::create_dir_all(&desktop)
             .map_err(|error| format!("create the virtual Fleetfiles Desktop: {error}"))?;
         Ok(json!({ "path": desktop.to_string_lossy() }))
     }
 
+    fn fleetfiles_capacity(&self) -> u64 {
+        let snapshot = self.storage_plan.snapshot();
+        let allocated = snapshot
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.enabled)
+            .fold(0_u128, |total, allocation| {
+                total.saturating_add(u128::from(allocation.quota_bytes))
+            });
+        let after_reserve = allocated.saturating_mul(u128::from(
+            100_u8.saturating_sub(snapshot.policy.value.reserve_percent),
+        )) / 100;
+        let protected = after_reserve / u128::from(snapshot.policy.value.ordinary_replicas.max(1));
+        protected.min(u128::from(u64::MAX)) as u64
+    }
+
     pub fn fleet_storage_status(&self) -> Value {
+        let mount = self
+            .drive_mounts
+            .list()
+            .into_iter()
+            .find(|mount| mount.route == crate::drive_mount::FLEETFILES_ROUTE);
         json!({
             "plan": self.storage_plan.snapshot(),
             "profiles": self.service_profiles.snapshot(),
+            "mount": mount,
         })
     }
 
@@ -17202,11 +17293,27 @@ impl Mesh {
     /// about a line that reached nobody.
     /// Adopt one bounded listing page into the fleet namespace catalog. The
     /// returned identities, not native paths, are what the Files canvas uses.
-    pub fn files_namespace_adopt(
+    pub async fn files_namespace_adopt(
         &self,
         parent_id: String,
-        observations: Vec<NamespaceObservation>,
+        mut observations: Vec<NamespaceObservation>,
     ) -> Result<Vec<NamespaceAdoption>, String> {
+        // The GUI can render the local Fleetfiles root before its first
+        // session snapshot has replaced the provisional `this` identity.
+        // Resolve that placeholder here so eager startup cannot create
+        // catalog objects that collide across machines.
+        let local = self
+            .resolve_local_id()
+            .await
+            .map(|id| pubkey_part(id.as_str()).to_string());
+        for observation in &mut observations {
+            if observation.source_device.trim().is_empty() || observation.source_device == "this" {
+                let identity = local
+                    .as_ref()
+                    .ok_or("this device's mesh identity is not ready yet")?;
+                observation.source_device.clone_from(identity);
+            }
+        }
         self.namespace.adopt_page(&parent_id, observations)
     }
 

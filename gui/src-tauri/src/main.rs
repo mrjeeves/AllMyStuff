@@ -1318,7 +1318,7 @@ fn local_file_entry(path: &Path) -> Result<LocalFileEntry, String> {
     #[cfg(windows)]
     let hidden = {
         use std::os::windows::fs::MetadataExt as _;
-        windows_file_is_hidden(identity_meta.file_attributes())
+        name.starts_with('.') || windows_file_is_hidden(identity_meta.file_attributes())
     };
     #[cfg(not(windows))]
     let hidden = name.starts_with('.');

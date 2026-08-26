@@ -1468,7 +1468,7 @@ pub async fn dispatch(
             let parent: String = try_arg!(arg(a, "parent"));
             let observations: Vec<crate::namespace::NamespaceObservation> =
                 try_arg!(arg(a, "observations"));
-            json_result(mesh.files_namespace_adopt(parent, observations))
+            json_result(mesh.files_namespace_adopt(parent, observations).await)
         }
         "files_canvas_snapshot" => DispatchOut::Json(
             serde_json::to_value(mesh.files_canvas_snapshot()).unwrap_or_default(),

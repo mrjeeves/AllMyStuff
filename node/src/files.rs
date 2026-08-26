@@ -857,11 +857,11 @@ fn native_file_id(path: &Path, meta: &std::fs::Metadata, symlink: bool) -> Optio
 fn native_hidden(name: &str, meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
-        let _ = name;
         use std::os::windows::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-        return meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+        return name.starts_with('.')
+            || meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
     }
     #[cfg(not(windows))]
     {
@@ -1356,6 +1356,15 @@ mod tests {
         p
     }
 
+    #[test]
+    fn dot_prefixed_entries_are_hidden_on_every_platform() {
+        let dir = tempdir("dot-hidden");
+        let path = dir.join(".allmystuff-internal");
+        std::fs::write(&path, b"internal").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(native_hidden(".allmystuff-internal", &metadata));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn list_read_roundtrip() {
         let dir = tempdir("list");

@@ -981,7 +981,7 @@
       fleetHome = true;
       map = "files";
       path = "fleet://home";
-      address = "Fleetfiles / Desktop";
+      address = "Fleetfiles";
       platform = listing.platform;
       const desktopEntries = await adoptWorkspaceEntries(
         "fleet:home",
@@ -1068,16 +1068,6 @@
     } finally {
       if (generation === navigationGeneration) loading = false;
     }
-  }
-
-  async function waitForLocalIdentity(): Promise<void> {
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      const identity = canonicalDeviceId(app.localId.trim());
-      if (identity && identity !== "this") return;
-      await new Promise((resolve) => window.setTimeout(resolve, 50));
-    }
-    throw new Error("This device's mesh identity is not ready yet");
   }
 
   type WorkspaceWindowLocation =
@@ -1207,7 +1197,6 @@
       });
     } catch { /* private mode keeps these device-local for this session */ }
     void (async () => {
-      await waitForLocalIdentity();
       const [places, saved] = await Promise.all([localFileLocations(), filesCanvasSnapshot()]);
       if (!mounted) return;
       locations = places;
@@ -2851,10 +2840,7 @@ function newTransferId(): string {
     </div>
     {#if placesOpen}
       <div class="sidebar-body">
-        <button class="tree-root" onclick={navigateFleetHome}><span>⌄</span>Fleetfiles</button>
-        <div class="location-branch fleet-root">
-          <button class:current={fleetHome && map === "files"} aria-current={fleetHome && map === "files" ? "location" : undefined} onclick={navigateFleetHome}><span aria-hidden="true">▱</span>Desktop</button>
-        </div>
+        <button class="tree-root" class:current={fleetHome && map === "files"} aria-current={fleetHome && map === "files" ? "location" : undefined} onclick={navigateFleetHome}><span aria-hidden="true">▱</span>Fleetfiles</button>
         <button class="tree-section-toggle" aria-expanded={devicesOpen || computerHome || Boolean(currentRemoteDirectory)} onclick={toggleDevices} title="Browse files on a device">
           <span aria-hidden="true">{devicesOpen || computerHome || currentRemoteDirectory ? "⌄" : "›"}</span>Devices
         </button>
@@ -3293,7 +3279,6 @@ function newTransferId(): string {
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
   .tree-section-toggle { margin-top: .45rem; color: var(--ink-faint) !important; font-size: .66rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .tree-section-toggle span { flex: 0 0 .72rem; text-align: center; }
-  .location-branch.fleet-root { margin-bottom: .5rem; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }
   .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
   .world { position: absolute; inset: 0; transform-origin: 0 0; }
@@ -3306,7 +3291,7 @@ function newTransferId(): string {
   .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .3rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .24rem .35rem; touch-action: none; }
-  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 3px 4px oklch(0 0 0 / .28)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.35em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .78rem; font-weight: 500; line-height: 1.18; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .78rem; line-height: 1.2; user-select: text; }
+  .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { z-index: 4; background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 3px 4px oklch(0 0 0 / .28)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.35em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .78rem; font-weight: 500; line-height: 1.18; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-tile.selected .file-label { display: block; min-height: 0; overflow: visible; -webkit-line-clamp: unset; line-clamp: unset; padding: .08rem .15rem; border-radius: 3px; background: var(--accent-soft); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .78rem; line-height: 1.2; user-select: text; }
   .file-tile { user-select: none; }
   .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
@@ -3318,7 +3303,7 @@ function newTransferId(): string {
   .zoom-menu button:hover, .zoom-menu button.active { background: var(--accent-soft); }
   .zoom-menu hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
-  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .detail-row { box-sizing: border-box; display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.detail-row:hover, .detail-row.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { flex: 0 0 auto; display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.detail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.detail-rename-input { min-width: 0; flex: 1; padding: .18rem .3rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; user-select: text; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
+  .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .detail-row { box-sizing: border-box; display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.detail-row:hover, .detail-row.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { flex: 0 0 auto; display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.detail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.detail-row.selected .detail-label { overflow: visible; white-space: normal; overflow-wrap: anywhere; }.detail-rename-input { min-width: 0; flex: 1; padding: .18rem .3rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; user-select: text; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
   .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview .sidebar-body > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
   .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }

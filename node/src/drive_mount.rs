@@ -10,7 +10,8 @@ use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use dav_server::{fakels::FakeLs, DavHandler};
+
+pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
 
 use crate::mesh::Mesh;
 
@@ -100,6 +103,7 @@ struct ActiveMount {
 #[derive(Clone, Default)]
 pub struct DriveMounts {
     active: Arc<Mutex<HashMap<String, ActiveMount>>>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DriveMounts {
@@ -117,6 +121,108 @@ impl DriveMounts {
 
     pub async fn cleanup_stale(&self) {
         cleanup_stale_native_mounts().await;
+    }
+    /// Hold native-drive startup recovery ahead of any peer-driven mount.
+    /// The owned guard can move into a background task while node control
+    /// becomes available immediately.
+    pub async fn begin_startup(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lifecycle.clone().lock_owned().await
+    }
+
+    /// Expose the local materialization of the canonical Fleetfiles namespace
+    /// as this machine's one operating-system mount. The mount is an adapter:
+    /// the supplied root remains the authority used by the Files UI and the
+    /// replication engine. Its deterministic route key makes repeated calls
+    /// idempotent and lets the ordinary mount lifecycle clean it up safely.
+    pub async fn mount_fleetfiles(
+        &self,
+        mesh: Arc<Mesh>,
+        root: PathBuf,
+    ) -> Result<NativeDriveInfo, String> {
+        if let Some(existing) = self.active.lock().get(FLEETFILES_ROUTE) {
+            return Ok(existing.info.clone());
+        }
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("couldn't create the Fleetfiles namespace: {error}"))?;
+
+        let active = self.list();
+        let label = "Fleetfiles".to_string();
+        let mount = choose_mount("", &label, &active).await?;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let server = DavHandler::builder()
+            .filesystem(Box::new(RemoteDavFs::new(mesh, FLEETFILES_ROUTE)))
+            .locksystem(FakeLs::new())
+            .build_handler();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let handler = server.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    if let Err(error) = http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(move |request| {
+                                let handler = handler.clone();
+                                async move {
+                                    let request = add_quota_to_empty_propfind(request);
+                                    Ok::<_, Infallible>(handler.handle(request).await)
+                                }
+                            }),
+                        )
+                        .await
+                    {
+                        tracing::debug!("Fleetfiles WebDAV connection ended: {error}");
+                    }
+                });
+            }
+        });
+        #[cfg(windows)]
+        let url = format!("http://localhost:{port}/");
+        #[cfg(not(windows))]
+        let url = format!("http://127.0.0.1:{port}/");
+        let info = NativeDriveInfo {
+            route: FLEETFILES_ROUTE.into(),
+            label: label.clone(),
+            mount: mount.clone(),
+            port,
+        };
+
+        if let Err(error) = remember_native_mount(&info) {
+            server_task.abort();
+            return Err(format!("couldn't record the Fleetfiles mount: {error}"));
+        }
+        if let Err(error) = label_native(&mount, &label, FLEETFILES_ROUTE, port).await {
+            tracing::warn!("couldn't label native Fleetfiles mount {mount}: {error}");
+        }
+        if let Err(error) = mount_native(&mount, &url, &label).await {
+            server_task.abort();
+            if unmount_native(&mount).await.is_ok() {
+                let _ = forget_native_mount(&mount);
+            }
+            let _ = clear_native_label(&mount, Some(port)).await;
+            return Err(error);
+        }
+        if let Err(error) = label_native(&mount, &label, FLEETFILES_ROUTE, port).await {
+            tracing::warn!("couldn't refresh native Fleetfiles label {mount}: {error}");
+        }
+        self.active.lock().insert(
+            FLEETFILES_ROUTE.into(),
+            ActiveMount {
+                info: info.clone(),
+                server: server_task,
+            },
+        );
+        tracing::info!("Fleetfiles mounted at {mount}");
+        Ok(info)
     }
 
     /// Remove a native mount that belongs to AllMyStuff even when its live
@@ -152,6 +258,7 @@ impl DriveMounts {
         label: String,
         requested_mount: String,
     ) -> Result<NativeDriveInfo, String> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(existing) = self.active.lock().get(&route) {
             return Ok(existing.info.clone());
         }
@@ -1354,19 +1461,24 @@ impl DavFile for RemoteFile {
 }
 
 fn map_remote_error(reason: &str) -> FsError {
-    tracing::warn!("native drive operation failed: {reason}");
-    let reason = reason.to_ascii_lowercase();
-    if reason.contains("not found") || reason.contains("cannot find") || reason.contains("no such")
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("not found")
+        || normalized.contains("cannot find")
+        || normalized.contains("no such")
     {
+        tracing::debug!("native drive lookup missed: {reason}");
         FsError::NotFound
-    } else if reason.contains("already") || reason.contains("exists") {
+    } else if normalized.contains("already") || normalized.contains("exists") {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::Exists
-    } else if reason.contains("denied")
-        || reason.contains("permission")
-        || reason.contains("leaves the mapped")
+    } else if normalized.contains("denied")
+        || normalized.contains("permission")
+        || normalized.contains("leaves the mapped")
     {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::Forbidden
     } else {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::GeneralFailure
     }
 }

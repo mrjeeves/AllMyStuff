@@ -14173,7 +14173,7 @@ impl Mesh {
             if matches!(event, FileEvent::Quota { .. }) {
                 return Ok(vec![FileEvent::QuotaInfo {
                     req,
-                    used: 0,
+                    used: self.fleetfiles.logical_used_bytes(),
                     total: self.fleetfiles_capacity(),
                 }]);
             }
@@ -14626,17 +14626,26 @@ impl Mesh {
 
     fn fleetfiles_capacity(&self) -> u64 {
         let snapshot = self.storage_plan.snapshot();
-        let allocated = snapshot
+        let enabled = snapshot
             .allocations
             .iter()
             .filter(|allocation| allocation.enabled)
-            .fold(0_u128, |total, allocation| {
-                total.saturating_add(u128::from(allocation.quota_bytes))
-            });
+            .collect::<Vec<_>>();
+        let replica_count = snapshot.policy.value.ordinary_replicas.max(1);
+        let failure_domains = enabled
+            .iter()
+            .map(|allocation| allocation.device.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if failure_domains.len() < usize::from(replica_count) {
+            return 0;
+        }
+        let allocated = enabled.iter().fold(0_u128, |total, allocation| {
+            total.saturating_add(u128::from(allocation.quota_bytes))
+        });
         let after_reserve = allocated.saturating_mul(u128::from(
             100_u8.saturating_sub(snapshot.policy.value.reserve_percent),
         )) / 100;
-        let protected = after_reserve / u128::from(snapshot.policy.value.ordinary_replicas.max(1));
+        let protected = after_reserve / u128::from(replica_count);
         protected.min(u128::from(u64::MAX)) as u64
     }
 
@@ -17626,9 +17635,25 @@ impl Mesh {
         };
 
         let local = self.local_node_id().unwrap_or_default();
-        let targets = self
-            .storage_plan
+        let plan = self.storage_plan.snapshot();
+        let local_is_replica = plan
+            .allocations
+            .iter()
+            .any(|allocation| allocation.enabled && same_node(&allocation.device, &local));
+        let needed = usize::from(plan.policy.value.ordinary_replicas.max(1))
+            .saturating_sub(usize::from(local_is_replica));
+        let scores = self
+            .service_profiles
             .snapshot()
+            .into_iter()
+            .map(|profile| {
+                (
+                    pubkey_part(&profile.peer).to_string(),
+                    profile.service_score,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut targets = plan
             .allocations
             .into_iter()
             .filter(|allocation| {
@@ -17637,10 +17662,23 @@ impl Mesh {
                     && self.network_for_peer(&allocation.device).is_some()
             })
             .map(|allocation| allocation.device)
-            .collect::<std::collections::BTreeSet<_>>();
-        if targets.is_empty() {
-            tracing::debug!("Fleetfiles change is committed locally but has no reachable allocated replica target");
-            return Ok(());
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| {
+            let left_score = scores.get(pubkey_part(left)).copied().unwrap_or(0.5);
+            let right_score = scores.get(pubkey_part(right)).copied().unwrap_or(0.5);
+            right_score
+                .partial_cmp(&left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+        targets.truncate(needed);
+        if targets.len() < needed {
+            tracing::debug!(
+                "Fleetfiles change has {} of {needed} required reachable replica targets",
+                targets.len()
+            );
         }
         for target in targets {
             self.send_fleetfiles_mutation(&target, &mutation).await?;

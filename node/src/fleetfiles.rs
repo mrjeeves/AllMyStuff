@@ -209,6 +209,21 @@ impl FleetfilesReplica {
         self.overflowed.swap(false, Ordering::Relaxed)
     }
 
+    pub fn logical_used_bytes(&self) -> u64 {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0)
+                 FROM path_versions
+                 WHERE tombstone=0 AND kind='file'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(0)
+    }
+
     pub fn capture(&self, path: &Path, actor: &str) -> Result<Option<LocalMutation>, String> {
         let relative = portable_relative(&self.root, path)?;
         if relative.is_empty() || relative.starts_with(".allmystuff-staging/") {

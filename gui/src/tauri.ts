@@ -401,8 +401,17 @@ export interface LocalFileTransferOperation {
   startedAt: number;
 }
 
-export function localFileTransferOperations(): Promise<{ operations: LocalFileTransferOperation[] }> {
-  return requiredInvoke("local_file_transfer_operations");
+export async function localFileTransferOperations(): Promise<{ operations: LocalFileTransferOperation[] }> {
+  try {
+    return await requiredInvoke("local_file_transfer_operations");
+  } catch (error) {
+    // During `tauri dev`, the frontend can hot-reload before a newly built
+    // node sidecar has replaced the process that is already running. An older
+    // node has no operations ledger to restore, which is equivalent to an
+    // empty ledger; it must not take down the whole Files workspace.
+    if (String(error).includes("unknown node command")) return { operations: [] };
+    throw error;
+  }
 }
 
 export async function onFileOperations(

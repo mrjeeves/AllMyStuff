@@ -439,6 +439,9 @@ fn bundle_serve_sidecar() -> Result<(), String> {
         "allmystuff-serve not built (cargo build --release --manifest-path \
          node/Cargo.toml --bin allmystuff-serve) and no ALLMYSTUFF_SERVE_BIN override",
     )?;
+    // A rebuilt development node must invalidate this build script so the
+    // externalBin slot cannot quietly retain the preceding command surface.
+    println!("cargo:rerun-if-changed={}", src.display());
     let sig = format!("serve:{}:{}", src.display(), file_mtime(&src));
     let sentinel = bin_dir.join(".bundled-serve");
     if !staged_matches(&sidecar, &sentinel, &sig) {

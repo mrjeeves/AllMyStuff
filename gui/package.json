@@ -7,6 +7,7 @@
   "description": "AllMyStuff — the friendly graph for all your stuff. Tauri + Svelte 5.",
   "scripts": {
     "dev": "vite",
+    "dev:tauri": "cargo build --manifest-path ../node/Cargo.toml --bin allmystuff-serve && vite",
     "build": "vite build",
     "test": "node --test --experimental-strip-types src/relative-motion.test.mjs src/cec-provenance.test.mjs src/files-canvas.test.mjs",
     "preview": "vite preview",

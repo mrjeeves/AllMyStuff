@@ -112,6 +112,32 @@ test("native size changes resolve top-level collisions without moving framed ite
   assert.deepEqual(resolved.map(({ y }) => y), [24, 266, 100]);
 });
 
+test("the newest visible drop owns its persisted point when tiles collide", () => {
+  const metrics = nativeFileGridMetrics(96, "macos");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "older", x: 24, y: 24, parentId: null },
+    { id: "dropped", x: 24, y: 100, parentId: null },
+  ], metrics, new Map([
+    ["older", { tier: 1, stamp: { counter: 4, actor: "a" } }],
+    ["dropped", { tier: 1, stamp: { counter: 5, actor: "a" } }],
+  ]));
+  assert.equal(resolved[1].y, 100);
+  assert.ok(resolved[0].y > resolved[1].y);
+});
+
+test("visible desktop files keep their points ahead of newer hidden metadata", () => {
+  const metrics = nativeFileGridMetrics(96, "macos");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "visible", x: 24, y: 24, parentId: null },
+    { id: "dot-file", x: 24, y: 100, parentId: null },
+  ], metrics, new Map([
+    ["visible", { tier: 1, stamp: { counter: 1, actor: "a" } }],
+    ["dot-file", { tier: 0, stamp: { counter: 999, actor: "z" } }],
+  ]));
+  assert.equal(resolved[0].y, 24);
+  assert.ok(resolved[1].y > resolved[0].y);
+});
+
 test("drag previews and drops share one zoom-aware coordinate conversion", () => {
   assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 1.5), { x: 60, y: 20 });
   assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 0), { x: 80, y: 10 });

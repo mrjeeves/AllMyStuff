@@ -281,14 +281,38 @@ export function rectsIntersect(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
+export interface CanvasPlacementPriority {
+  tier: number;
+  stamp?: CanvasStamp;
+}
+
 /** Keep top-level desktop cells collision-free at every native size notch.
- * This is a deterministic render projection; fleet layout records stay unchanged. */
+ * This is a deterministic render projection; fleet layout records stay
+ * unchanged. Higher tiers win their requested point, then the newest canvas
+ * stamp wins within a tier. The original order is only the final tie-break. */
 export function resolveDesktopTileCollisions(
   placements: readonly CanvasPlacement[],
   metrics: NativeFileGridMetrics,
+  priorities: ReadonlyMap<string, CanvasPlacementPriority> = new Map(),
 ): CanvasPlacement[] {
+  const inputOrder = new Map(placements.map((placement, index) => [placement.id, index]));
+  const ordered = [...placements].sort((a, b) => {
+    const aPriority = priorities.get(a.id);
+    const bPriority = priorities.get(b.id);
+    const tier = (bPriority?.tier ?? 0) - (aPriority?.tier ?? 0);
+    if (tier) return tier;
+    if (aPriority?.stamp && bPriority?.stamp) {
+      const stamp = compareStamp(bPriority.stamp, aPriority.stamp);
+      if (stamp) return stamp;
+    } else if (aPriority?.stamp) {
+      return -1;
+    } else if (bPriority?.stamp) {
+      return 1;
+    }
+    return inputOrder.get(a.id)! - inputOrder.get(b.id)!;
+  });
   const resolved: CanvasPlacement[] = [];
-  for (const source of placements) {
+  for (const source of ordered) {
     const next = { ...source };
     if (next.parentId === null) {
       let attempts = 0;
@@ -304,7 +328,8 @@ export function resolveDesktopTileCollisions(
     }
     resolved.push(next);
   }
-  return resolved;
+  const byId = new Map(resolved.map((placement) => [placement.id, placement]));
+  return placements.map((placement) => byId.get(placement.id)!);
 }
 
 export function nativeWindowsLinkExtension(name: string, platform: string): ".lnk" | ".url" | null {

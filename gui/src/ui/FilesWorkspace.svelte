@@ -261,8 +261,11 @@
     }
   }
 
+  const layoutEntries = $derived(
+    entries.filter((entry) => showHidden || !entry.hidden),
+  );
   const visible = $derived(
-    entries.filter((entry) => (showHidden || !entry.hidden) && entry.name.toLowerCase().includes(query.trim().toLowerCase())),
+    layoutEntries.filter((entry) => entry.name.toLowerCase().includes(query.trim().toLowerCase())),
   );
 
   const fleetFileNodes = $derived.by(() => {
@@ -348,9 +351,25 @@
     }
     return out;
   });
+  const placementStamps = $derived.by(() => {
+    const out = new Map<string, CanvasRecord["stamp"]>();
+    const suppressed = new Set(legacyPlacementRecordIds);
+    for (const record of records) {
+      if (!record.deleted && record.kind === "item" && record.id.startsWith(itemPrefix) && !suppressed.has(record.id)) {
+        out.set(record.id.slice(itemPrefix.length), record.stamp);
+      }
+    }
+    return out;
+  });
   const displayPlacements = $derived.by(() => {
-    const desired = entries.map((item) => placements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) });
-    const resolved = resolveDesktopTileCollisions(desired, grid);
+    const desired = layoutEntries.map((item) => placements.get(item.id) ?? { id: item.id, ...fallbackPosition(item) });
+    const priorities = new Map(layoutEntries.map((item) => [item.id, {
+      // Showing hidden files must fit them around the ordinary desktop, not
+      // let .DS_Store or resource forks displace files people can see.
+      tier: item.hidden ? 0 : 1,
+      stamp: placementStamps.get(item.id),
+    }]));
+    const resolved = resolveDesktopTileCollisions(desired, grid, priorities);
     return new Map(resolved.map((placement) => [placement.id, placement]));
   });
   const filesystemPartners = $derived.by(() => app.sharePartners.flatMap((partner) => {

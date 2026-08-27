@@ -1362,6 +1362,10 @@ pub async fn dispatch(
             let id: String = try_arg!(arg(a, "id"));
             DispatchOut::Json(Value::Bool(mesh.file_transfer_cancel(&id)))
         }
+        "file_operation_dismiss" => {
+            let id: String = try_arg!(arg(a, "id"));
+            DispatchOut::Json(Value::Bool(mesh.file_operation_dismiss(&id)))
+        }
         "fleet_service_profiles" => DispatchOut::Json(mesh.fleet_service_profiles()),
         "fleet_storage_status" => DispatchOut::Json(mesh.fleet_storage_status()),
         "file_transfer_operations" => DispatchOut::Json(mesh.file_transfer_operations()),

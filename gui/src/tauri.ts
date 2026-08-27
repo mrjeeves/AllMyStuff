@@ -390,6 +390,10 @@ export function localFileTransferStart(
 export function localFileTransferCancel(id: string): Promise<boolean> {
   return requiredInvoke("local_file_transfer_cancel", { id });
 }
+
+export function localFileOperationDismiss(id: string): Promise<boolean> {
+  return requiredInvoke("local_file_operation_dismiss", { id });
+}
 export interface LocalFileTransferOperation {
   id: string;
   phase: "transferring" | "cancelling" | "complete" | "failed" | "cancelled";
@@ -398,6 +402,9 @@ export interface LocalFileTransferOperation {
   folders: number;
   bytes: number;
   error?: string | null;
+  retryCondition?: string | null;
+  verificationResult?: string | null;
+  cancellationRequested?: boolean;
   startedAt: number;
 }
 

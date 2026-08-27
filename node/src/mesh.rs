@@ -13,7 +13,7 @@
 //! Everything the front-end sees comes through `allmystuff://session`
 //! snapshots emitted after each change.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,6 +54,7 @@ use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, Local
 
 use crate::input_inject::Injector;
 use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
+use crate::operations::{OperationRecord, OperationsStore};
 use crate::ownership::Ownership;
 use crate::service_profiles::{ServiceProfiles, TransferOutcome};
 use crate::shares::Shares;
@@ -69,19 +70,6 @@ use std::time::{Duration, Instant};
 
 type ClipboardReceiptWaiters =
     Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>;
-
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FileOperationStatus {
-    id: String,
-    phase: String,
-    target_label: String,
-    files: u64,
-    folders: u64,
-    bytes: u64,
-    error: Option<String>,
-    started_at: u64,
-}
 
 /// A claimable profile carried over an already-active ordinary mesh when the
 /// LAN claim rendezvous has independently sighted the same peer but its own
@@ -170,7 +158,7 @@ pub struct Mesh {
     /// User-initiated scans/transfers, keyed by UI-minted id. The flag makes
     /// both directory walking and each bounded upload chunk cancellable.
     file_transfer_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    file_operations: Mutex<VecDeque<FileOperationStatus>>,
+    operations: OperationsStore,
     /// Durable identities and local native bindings for Files pages that have
     /// actually been visited. This is bounded page adoption, not disk indexing.
     namespace: NamespaceCatalog,
@@ -1798,7 +1786,7 @@ impl Mesh {
             term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
             file_transfer_jobs: Mutex::new(HashMap::new()),
-            file_operations: Mutex::new(VecDeque::new()),
+            operations: OperationsStore::load(),
             namespace: NamespaceCatalog::load(),
             service_profiles: ServiceProfiles::load(),
             storage_plan: StoragePlanStore::load(),
@@ -14262,40 +14250,61 @@ impl Mesh {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
-    fn publish_file_operations(&self, snapshot: Vec<FileOperationStatus>) {
+    fn publish_file_operations(&self, snapshot: Vec<OperationRecord>) {
         self.sink.emit(
             "allmystuff://file-operations",
             json!({ "operations": snapshot }),
         );
     }
 
-    fn set_file_operation(&self, status: FileOperationStatus) {
-        let snapshot = {
-            let mut operations = self.file_operations.lock();
-            operations.retain(|operation| operation.id != status.id);
-            operations.push_front(status);
-            operations.truncate(50);
-            operations.iter().cloned().collect::<Vec<_>>()
-        };
-        self.publish_file_operations(snapshot);
+    fn operation_snapshot(&self) -> Vec<OperationRecord> {
+        match self.operations.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!("read operation history: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn set_file_operation(&self, status: OperationRecord) -> Result<(), String> {
+        self.operations.insert(&status)?;
+        self.publish_file_operations(self.operation_snapshot());
+        Ok(())
     }
 
     fn update_file_operation(&self, id: &str, phase: &str, error: Option<String>) {
-        let snapshot = {
-            let mut operations = self.file_operations.lock();
-            let Some(operation) = operations.iter_mut().find(|operation| operation.id == id) else {
-                return;
-            };
-            operation.phase = phase.into();
-            operation.error = error;
-            operations.iter().cloned().collect::<Vec<_>>()
-        };
-        self.publish_file_operations(snapshot);
+        let cancellation_requested = phase == "cancelling";
+        match self
+            .operations
+            .update_transfer(id, phase, error.as_deref(), cancellation_requested)
+        {
+            Ok(true) => self.publish_file_operations(self.operation_snapshot()),
+            Ok(false) => tracing::warn!("operation {id} disappeared before phase {phase}"),
+            Err(update_error) => {
+                tracing::error!("persist operation {id} phase {phase}: {update_error}")
+            }
+        }
+    }
+
+    pub fn file_operation_dismiss(&self, id: &str) -> bool {
+        match self.operations.dismiss(id) {
+            Ok(changed) => {
+                if changed {
+                    self.publish_file_operations(self.operation_snapshot());
+                }
+                changed
+            }
+            Err(error) => {
+                tracing::error!("dismiss operation {id}: {error}");
+                false
+            }
+        }
     }
 
     pub fn file_transfer_operations(&self) -> Value {
         json!({
-            "operations": self.file_operations.lock().iter().cloned().collect::<Vec<_>>()
+            "operations": self.operation_snapshot()
         })
     }
 
@@ -14510,16 +14519,17 @@ impl Mesh {
         let cancel = self.begin_file_transfer_job(&id)?;
         let peer = self.file_route_peer(&route_id);
         let started = Instant::now();
-        self.set_file_operation(FileOperationStatus {
-            id: id.clone(),
-            phase: "transferring".into(),
+        if let Err(error) = self.set_file_operation(OperationRecord::file_transfer(
+            id.clone(),
             target_label,
-            files: expected_files,
-            folders: expected_folders,
-            bytes: expected_bytes,
-            error: None,
-            started_at: unix_now_ms(),
-        });
+            expected_files,
+            expected_folders,
+            expected_bytes,
+            unix_now_ms(),
+        )) {
+            self.finish_file_transfer_job(&id, &cancel);
+            return Err(error);
+        }
         let result = async {
             let top_level = paths.iter().map(|raw| {
                 Path::new(raw).file_name()

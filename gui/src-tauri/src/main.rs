@@ -2165,6 +2165,19 @@ async fn local_file_transfer_operations(state: State<'_, AppState>) -> Result<Va
 }
 
 #[tauri::command]
+async fn local_file_operation_dismiss(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request("file_operation_dismiss", json!({ "id": id }))
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn fleetfiles_local_desktop(state: State<'_, AppState>) -> Result<Value, String> {
     state
         .node
@@ -4656,6 +4669,7 @@ fn main() {
             local_file_transfer_start,
             local_file_transfer_cancel,
             local_file_transfer_operations,
+            local_file_operation_dismiss,
             fleetfiles_local_desktop,
             file_watch,
             file_poll,

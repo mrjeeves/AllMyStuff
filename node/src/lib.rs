@@ -126,6 +126,7 @@ pub mod nvdec;
 /// `ALLMYSTUFF_NVENC=1` until soaked.
 #[cfg(all(windows, feature = "host"))]
 pub mod nvenc;
+pub mod operations;
 /// OS performance levers for the media-plane threads (timer resolution +
 /// thread priority) — Windows-real, no-op elsewhere.
 pub(crate) mod os_perf;

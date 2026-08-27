@@ -22,6 +22,7 @@
     onFileOperations,
     localFileTransferStart,
     localFileTransferCancel,
+    localFileOperationDismiss,
     openFilesWorkspaceWindow,
     localFileMkdir,
     localFileOpen,
@@ -224,6 +225,7 @@
     targetLabel: string;
     impact: LocalFileTransferImpact;
     error: string;
+    retryCondition?: string;
     startedAt: number;
   };
   let transferOperations = $state<TransferOperation[]>([]);
@@ -250,6 +252,7 @@
         requires_confirmation: false,
       },
       error: operation.error ?? "",
+      retryCondition: operation.retryCondition ?? undefined,
       startedAt: operation.startedAt,
     })), (operation) => operation.id);
   }
@@ -2355,6 +2358,23 @@ function newTransferId(): string {
     void localFileTransferCancel(id);
   }
 
+  async function dismissTransferOperation(id: string) {
+    try {
+      if (await localFileOperationDismiss(id)) {
+        transferOperations = transferOperations.filter((operation) => operation.id !== id);
+      }
+    } catch (error) {
+      app.toast("warn", "Could not dismiss the operation: " + String(error));
+    }
+  }
+
+  async function clearFinishedTransferOperations() {
+    const ids = transferOperations
+      .filter((operation) => !["transferring", "cancelling"].includes(operation.phase))
+      .map((operation) => operation.id);
+    await Promise.all(ids.map((id) => dismissTransferOperation(id)));
+  }
+
   async function prepareLocalTransfer(target: WorkspaceEntry, dragged: WorkspaceEntry[]) {
     if (transferDialog || target.binding.kind !== "remote" || target.computerOnline === false) return;
     if (!dragged.every((entry) => entry.binding.kind === "local" && !entry.computerNode)) {
@@ -3276,19 +3296,20 @@ function newTransferId(): string {
                 <span>{operation.targetLabel}</span>
                 <small>{operation.impact.files.toLocaleString()} files · {operation.impact.folders.toLocaleString()} folders · {humanBytes(operation.impact.bytes)}</small>
                 {#if operation.error}<small class="operation-error">{operation.error}</small>{/if}
+                {#if operation.retryCondition}<small>{operation.retryCondition}</small>{/if}
               </div>
               {#if operation.phase === "transferring"}
                 <button onclick={() => cancelTransferOperation(operation.id)}>Cancel</button>
               {:else if operation.phase === "cancelling"}
                 <button disabled>Stopping…</button>
               {:else}
-                <button aria-label="Dismiss operation" title="Dismiss" onclick={() => { transferOperations = transferOperations.filter((item) => item.id !== operation.id); }}>×</button>
+                <button aria-label="Dismiss operation" title="Dismiss" onclick={() => void dismissTransferOperation(operation.id)}>×</button>
               {/if}
             </article>
           {/each}
         </div>
         {#if transferOperations.some((operation) => !["transferring", "cancelling"].includes(operation.phase))}
-          <button class="clear-operations" onclick={() => { transferOperations = transferOperations.filter((operation) => ["transferring", "cancelling"].includes(operation.phase)); }}>Clear finished</button>
+          <button class="clear-operations" onclick={() => void clearFinishedTransferOperations()}>Clear finished</button>
         {/if}
       {:else}
         <p>No file operations yet.</p>

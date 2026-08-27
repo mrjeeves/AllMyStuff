@@ -437,15 +437,7 @@ Required before claiming a unified filesystem:
 
 ## Delivery slices
 
-1. **Bounded identity surface:** extend file listing with optional opaque native IDs, pagination, cancellation, capability negotiation, and compatibility tests.
-2. **Fleet namespace root:** persist fleet object/native binding records and expose a paged unified root. Origin device is metadata, not hierarchy.
-3. **Real mutations:** route create, rename, move, and delete through idempotent namespace operations and materialize them through adapters.
-4. **Content/version plane:** immutable manifests, chunk transfer, verification, and truthful placement state.
-5. **Canvas sharding:** sparse spatial shards, nested frames, deterministic virtual placement, and fleet-wide background.
-6. **Sharing lens:** grants on the same object IDs; drag-to-share/revoke with committed-state feedback.
-7. **Derived navigation:** Recent, search, offline, and device filters as bounded queries.
-
-Each slice must work end to end before its controls appear. Controls that only store intent without an executing and observing engine are not product features.
+Active implementation order, status, dependencies, and proof gates are maintained in the [Fleetfiles PR completion plan](FLEETFILES-COMPLETION-PLAN.md). That plan is the execution tracker for the current pull request; this document remains the architecture contract.
 
 ## Tradeoffs and revisit points
 

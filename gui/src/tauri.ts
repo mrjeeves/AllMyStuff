@@ -467,8 +467,7 @@ export function fleetStorageLocalVolumes(): Promise<FleetStorageVolume[]> {
 
 
 export interface FleetStoragePolicy {
-  ordinaryReplicas: number;
-  criticalReplicas: number;
+  replicas: number;
   reservePercent: number;
   versionRetentionDays: number;
   rebalanceGibPerDay: number;

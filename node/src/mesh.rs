@@ -14669,7 +14669,7 @@ impl Mesh {
             .iter()
             .filter(|allocation| allocation.enabled)
             .collect::<Vec<_>>();
-        let replica_count = snapshot.policy.value.ordinary_replicas.max(1);
+        let replica_count = snapshot.policy.value.replicas.max(1);
         let failure_domains = enabled
             .iter()
             .map(|allocation| allocation.device.as_str())
@@ -17678,7 +17678,7 @@ impl Mesh {
             .allocations
             .iter()
             .any(|allocation| allocation.enabled && same_node(&allocation.device, &local));
-        let needed = usize::from(plan.policy.value.ordinary_replicas.max(1))
+        let needed = usize::from(plan.policy.value.replicas.max(1))
             .saturating_sub(usize::from(local_is_replica));
         let evidence = self
             .service_profiles

@@ -68,7 +68,7 @@ The person can:
 - allocate an entire volume or a bounded quota on a volume;
 - withdraw or reduce an allocation with an impact preview;
 - identify removable, metered, battery-sensitive, slow, or always-on resources;
-- set ordinary and critical-file durability;
+- set the number of verified copies maintained for managed files;
 - set minimum free-space/headroom rules;
 - control offline availability, version retention, bandwidth windows, and energy preferences;
 - view usable capacity after replication policy, not an inflated sum of raw disks;
@@ -314,7 +314,7 @@ The Files settings area contains one Storage section that answers, without requi
 2. How much is used, free, reserved, degraded, and pending repair?
 3. Which devices/volumes have I allocated, and what is each contributing?
 4. What durability and offline-availability policy is active?
-5. Is my critical data currently protected?
+5. Is any managed data currently under-protected?
 6. What is AllMyStuff doing now, and why?
 7. What will happen if I change or remove this allocation?
 

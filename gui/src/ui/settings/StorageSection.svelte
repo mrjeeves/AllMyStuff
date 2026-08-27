@@ -43,7 +43,7 @@
   const policy = $derived(status?.plan.policy.value);
   const allocations = $derived(status?.plan.allocations ?? []);
   const rawAllocated = $derived(allocations.filter((item) => item.enabled).reduce((sum, item) => sum + item.quotaBytes, 0));
-  const protectedCapacity = $derived(policy ? Math.floor(rawAllocated * (1 - policy.reservePercent / 100) / policy.ordinaryReplicas) : 0);
+  const protectedCapacity = $derived(policy ? Math.floor(rawAllocated * (1 - policy.reservePercent / 100) / policy.replicas) : 0);
   const activeResources = $derived(allocations.filter((item) => item.enabled && resourceFor(item.device, item.volume)?.available_bytes).length);
 
   onMount(() => {
@@ -143,27 +143,16 @@
     <p class="muted">Reading fleet storage…</p>
   {:else if status && policy}
     <div class="capacity">
-      <div><span>Protected capacity</span><strong>{humanBytes(protectedCapacity)}</strong><small>after {policy.ordinaryReplicas} copies and {policy.reservePercent}% reserve</small></div>
+      <div><span>Protected capacity</span><strong>{humanBytes(protectedCapacity)}</strong><small>after {policy.replicas} copies and {policy.reservePercent}% reserve</small></div>
       <div><span>Allocated physical</span><strong>{humanBytes(rawAllocated)}</strong><small>{activeResources} active resource{activeResources === 1 ? "" : "s"}</small></div>
-      <div><span>Protection</span><strong>{activeResources >= policy.ordinaryReplicas ? "Ready" : "Needs capacity"}</strong><small>{activeResources}/{policy.ordinaryReplicas} ordinary targets</small></div>
+      <div><span>Protection</span><strong>{activeResources >= policy.replicas ? "Ready" : "Needs capacity"}</strong><small>{activeResources}/{policy.replicas} targets</small></div>
     </div>
 
     <div class="policy">
       <label>
-        <span>Ordinary copies</span>
-        <select value={policy.ordinaryReplicas} disabled={saving === "policy"} onchange={(event) => {
-          const ordinaryReplicas = Number(event.currentTarget.value);
-          void updatePolicy({ ordinaryReplicas, criticalReplicas: Math.max(ordinaryReplicas, policy.criticalReplicas) });
-        }}>
+        <span>Copies</span>
+        <select value={policy.replicas} disabled={saving === "policy"} onchange={(event) => void updatePolicy({ replicas: Number(event.currentTarget.value) })}>
           {#each [1, 2, 3, 4, 5] as count}<option value={count}>{count}</option>{/each}
-        </select>
-      </label>
-      <label>
-        <span>Critical copies</span>
-        <select value={policy.criticalReplicas} disabled={saving === "policy"} onchange={(event) => void updatePolicy({ criticalReplicas: Number(event.currentTarget.value) })}>
-          {#each [policy.ordinaryReplicas, 3, 4, 5, 6].filter((value, index, values) => value >= policy.ordinaryReplicas && values.indexOf(value) === index) as count}
-            <option value={count}>{count}</option>
-          {/each}
         </select>
       </label>
       <label>
@@ -224,7 +213,7 @@
   .capacity { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .45rem; }
   .capacity > div { display: grid; gap: .12rem; padding: .65rem; border-radius: 8px; background: var(--bg); }
   .capacity span, .capacity small { color: var(--ink-faint); font-size: .68rem; } .capacity strong { font-size: 1rem; }
-  .policy { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem; }
+  .policy { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
   .policy label { display: grid; gap: .25rem; color: var(--ink-soft); font-size: .72rem; }
   .policy select { width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); padding: .35rem; }
   .policy .metered { grid-column: 1 / -1; display: flex; align-items: center; }

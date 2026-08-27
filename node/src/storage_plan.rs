@@ -22,8 +22,8 @@ pub struct PlanStamp {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct StoragePolicy {
-    pub ordinary_replicas: u8,
-    pub critical_replicas: u8,
+    #[serde(alias = "ordinaryReplicas")]
+    pub replicas: u8,
     pub reserve_percent: u8,
     pub version_retention_days: u16,
     pub rebalance_gib_per_day: u32,
@@ -33,8 +33,7 @@ pub struct StoragePolicy {
 impl Default for StoragePolicy {
     fn default() -> Self {
         Self {
-            ordinary_replicas: 2,
-            critical_replicas: 3,
+            replicas: 2,
             reserve_percent: 10,
             version_retention_days: 30,
             rebalance_gib_per_day: 50,
@@ -313,9 +312,7 @@ fn valid_policy_record(policy: &PolicyRecord) -> bool {
 }
 
 fn validate_policy(policy: &StoragePolicy) -> Result<(), String> {
-    if !(1..=8).contains(&policy.ordinary_replicas)
-        || !(1..=8).contains(&policy.critical_replicas)
-        || policy.critical_replicas < policy.ordinary_replicas
+    if !(1..=8).contains(&policy.replicas)
         || !(5..=50).contains(&policy.reserve_percent)
         || policy.version_retention_days > 3650
         || policy.rebalance_gib_per_day > 10_000
@@ -347,8 +344,7 @@ mod tests {
             .set_policy(
                 "owner",
                 StoragePolicy {
-                    ordinary_replicas: 3,
-                    critical_replicas: 4,
+                    replicas: 3,
                     ..StoragePolicy::default()
                 },
             )
@@ -421,11 +417,31 @@ mod tests {
     fn replica_and_reserve_bounds_prevent_nonsensical_policy() {
         let store = StoragePlanStore::memory();
         let bad = StoragePolicy {
-            ordinary_replicas: 0,
+            replicas: 0,
             reserve_percent: 0,
             ..StoragePolicy::default()
         };
         assert!(store.set_policy("owner", bad).is_err());
+    }
+
+    #[test]
+    fn legacy_replica_policy_migrates_to_one_copy_count() {
+        let legacy = serde_json::json!({
+            "ordinaryReplicas": 4,
+            "criticalReplicas": 6,
+            "reservePercent": 10,
+            "versionRetentionDays": 30,
+            "rebalanceGibPerDay": 50,
+            "pauseOnMetered": true
+        });
+
+        let policy: StoragePolicy = serde_json::from_value(legacy).unwrap();
+        assert_eq!(policy.replicas, 4);
+
+        let current = serde_json::to_value(policy).unwrap();
+        assert_eq!(current["replicas"], 4);
+        assert!(current.get("ordinaryReplicas").is_none());
+        assert!(current.get("criticalReplicas").is_none());
     }
 
     #[test]

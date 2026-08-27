@@ -1668,6 +1668,11 @@ mod tests {
         loop {
             match changes.try_recv() {
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                // macOS may report an FSEvents change while the native watcher is
+                // being armed. Change notifications during the lease are valid;
+                // this test is specifically responsible for proving that an
+                // abandoned subscription releases its sender and native watcher.
+                Ok(FileEvent::DirectoryChanged { req: 51, .. }) => {}
                 Ok(event) => panic!("abandoned watch emitted an unexpected event: {event:?}"),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));

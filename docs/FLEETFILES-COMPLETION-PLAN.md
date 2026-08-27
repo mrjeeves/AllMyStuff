@@ -37,8 +37,8 @@ This order prevents collisions: adapters share operation IDs; placement targets 
 
 | ID | Status | Outcome | Proof gate |
 | --- | --- | --- | --- |
-| F0 | ACTIVE | Durable operation ledger and coordinator | Restart and duplicate-ID tests cannot lose state or publish twice |
-| F1 | WAITING | Paged authoritative namespace with stable object and entry IDs | UI and mount preserve one identity through mutation and restart |
+| F0 | DONE | Durable operation ledger and coordinator | Restart and duplicate-ID tests cannot lose state or publish twice |
+| F1 | ACTIVE | Paged authoritative namespace with stable object and entry IDs | UI and mount preserve one identity through mutation and restart |
 | F2 | WAITING | Immutable versions, bounded manifests/chunks, verified atomic commits | Crash and corruption cannot replace the last committed version |
 | F3 | WAITING | UI and mount use the same preconditioned mutations | Finder/Explorer and canvas converge without watcher races |
 | F4 | WAITING | Allocations enforce quota, reserve, and failure domains | Uneven capacity, exhaustion, reduction, and withdrawal tests pass |
@@ -52,12 +52,12 @@ This order prevents collisions: adapters share operation IDs; placement targets 
 ## F0 — durable operations
 
 - [x] Persist operation ID, idempotency scope, intent, object IDs, preconditions, phase, progress, policy, retry condition, cancellation, verification, and residue.
-- [ ] Separate requested operations from worker attempts.
-- [ ] Model scan, staging, transfer, verification, namespace commit, materialization, compensation, completion, and failure.
+- [x] Separate requested operations from worker attempts.
+- [x] Model scan, staging, transfer, verification, namespace commit, materialization, compensation, completion, and failure.
 - [x] Recover nonterminal work after restart and compact successful history without dropping unresolved failures.
 - [x] Replace the in-memory transfer deque and feed the current Operations panel from the durable store.
 - [x] Publish quiet summaries, not polling or per-chunk UI chatter.
-- [ ] Test idempotency, restart, cancellation, compaction, and duplicate workers.
+- [x] Test idempotency, restart, cancellation, compaction, and duplicate workers.
 
 Exit: an interrupted operation resumes or fails actionably after restart, and Operations shows the durable record.
 
@@ -147,4 +147,4 @@ Exit: every Operation Promise gate has automated evidence or a reproducible capt
 
 ## Immediate next action
 
-Implement F0 in the existing node SQLite infrastructure, migrate the transfer-operation publisher to it, and keep the Files Operations panel reading that durable source. F1 begins after F0 restart and idempotency tests pass.
+Implement F1 namespace mutation records and stable object/entry identity in the existing SQLite catalog, then route the current create, rename, move, copy, and delete paths through those preconditioned operations.

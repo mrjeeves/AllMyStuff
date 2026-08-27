@@ -394,13 +394,28 @@ export function localFileTransferCancel(id: string): Promise<boolean> {
 export function localFileOperationDismiss(id: string): Promise<boolean> {
   return requiredInvoke("local_file_operation_dismiss", { id });
 }
+export type LocalFileOperationPhase =
+  | "scanning"
+  | "awaiting-approval"
+  | "staging"
+  | "transferring"
+  | "verifying"
+  | "committing"
+  | "materializing"
+  | "cancelling"
+  | "compensating"
+  | "complete"
+  | "failed"
+  | "cancelled";
+
 export interface LocalFileTransferOperation {
   id: string;
-  phase: "transferring" | "cancelling" | "complete" | "failed" | "cancelled";
+  phase: LocalFileOperationPhase;
   targetLabel: string;
   files: number;
   folders: number;
   bytes: number;
+  progressBytes: number;
   error?: string | null;
   retryCondition?: string | null;
   verificationResult?: string | null;

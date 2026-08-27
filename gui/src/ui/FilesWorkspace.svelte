@@ -221,9 +221,10 @@
   let transferDropTargetId = $state<string | null>(null);
   type TransferOperation = {
     id: string;
-    phase: "transferring" | "cancelling" | "complete" | "failed" | "cancelled";
+    phase: LocalFileTransferOperation["phase"];
     targetLabel: string;
     impact: LocalFileTransferImpact;
+    progressBytes: number;
     error: string;
     retryCondition?: string;
     startedAt: number;
@@ -232,9 +233,24 @@
   let operationsOpen = $state(false);
   const activeOperationCount = $derived(
     transferOperations.filter((operation) =>
-      operation.phase === "transferring" || operation.phase === "cancelling"
+      !["complete", "failed", "cancelled"].includes(operation.phase)
     ).length,
   );
+
+  function operationPhaseLabel(phase: TransferOperation["phase"]): string {
+    if (phase === "complete") return "Sent";
+    if (phase === "failed") return "Needs attention";
+    if (phase === "cancelled") return "Cancelled";
+    if (phase === "cancelling") return "Cancelling safely…";
+    if (phase === "committing") return "Committing…";
+    if (phase === "verifying") return "Verifying…";
+    if (phase === "staging") return "Preparing…";
+    return "Sending transactionally…";
+  }
+
+  function operationCanCancel(phase: TransferOperation["phase"]): boolean {
+    return ["staging", "transferring", "verifying"].includes(phase);
+  }
 
   function absorbTransferOperations(operations: LocalFileTransferOperation[]) {
     transferOperations = coalesceLatestBy(operations.map((operation) => ({
@@ -251,6 +267,7 @@
         top_level: [],
         requires_confirmation: false,
       },
+      progressBytes: operation.progressBytes,
       error: operation.error ?? "",
       retryCondition: operation.retryCondition ?? undefined,
       startedAt: operation.startedAt,
@@ -2318,9 +2335,10 @@ function newTransferId(): string {
     if (!dialog.impact || dialog.impact.symlinks > 0 || dialog.impact.unreadable > 0) return;
     const operation: TransferOperation = {
       id: dialog.id,
-      phase: "transferring",
+      phase: "staging",
       targetLabel: dialog.targetLabel,
       impact: dialog.impact,
+      progressBytes: 0,
       error: "",
       startedAt: Date.now(),
     };
@@ -2353,7 +2371,7 @@ function newTransferId(): string {
 
   function cancelTransferOperation(id: string) {
     const operation = transferOperations.find((item) => item.id === id);
-    if (!operation || operation.phase !== "transferring") return;
+    if (!operation || !operationCanCancel(operation.phase)) return;
     updateTransferOperation(id, { phase: "cancelling" });
     void localFileTransferCancel(id);
   }
@@ -3292,16 +3310,19 @@ function newTransferId(): string {
           {#each transferOperations as operation (operation.id)}
             <article class:failed={operation.phase === "failed"}>
               <div class="operation-copy">
-                <b>{operation.phase === "complete" ? "Sent" : operation.phase === "failed" ? "Needs attention" : operation.phase === "cancelled" ? "Cancelled" : operation.phase === "cancelling" ? "Cancelling safely…" : "Sending transactionally…"}</b>
+                <b>{operationPhaseLabel(operation.phase)}</b>
                 <span>{operation.targetLabel}</span>
                 <small>{operation.impact.files.toLocaleString()} files · {operation.impact.folders.toLocaleString()} folders · {humanBytes(operation.impact.bytes)}</small>
+                {#if operation.impact.bytes > 0 && !["complete", "failed", "cancelled"].includes(operation.phase)}
+                  <small>{humanBytes(operation.progressBytes)} of {humanBytes(operation.impact.bytes)}</small>
+                {/if}
                 {#if operation.error}<small class="operation-error">{operation.error}</small>{/if}
                 {#if operation.retryCondition}<small>{operation.retryCondition}</small>{/if}
               </div>
-              {#if operation.phase === "transferring"}
+              {#if operationCanCancel(operation.phase)}
                 <button onclick={() => cancelTransferOperation(operation.id)}>Cancel</button>
-              {:else if operation.phase === "cancelling"}
-                <button disabled>Stopping…</button>
+              {:else if !["complete", "failed", "cancelled"].includes(operation.phase)}
+                <button disabled>{operation.phase === "cancelling" ? "Stopping…" : "Finishing…"}</button>
               {:else}
                 <button aria-label="Dismiss operation" title="Dismiss" onclick={() => void dismissTransferOperation(operation.id)}>×</button>
               {/if}

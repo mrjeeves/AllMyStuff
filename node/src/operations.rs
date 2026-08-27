@@ -8,11 +8,105 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, ErrorCode};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 const VISIBLE_OPERATIONS: i64 = 200;
 const RETAIN_SUCCESSES: i64 = 50;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationPhase {
+    Scanning,
+    AwaitingApproval,
+    Staging,
+    Transferring,
+    Verifying,
+    Committing,
+    Materializing,
+    Cancelling,
+    Compensating,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl OperationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scanning => "scanning",
+            Self::AwaitingApproval => "awaiting-approval",
+            Self::Staging => "staging",
+            Self::Transferring => "transferring",
+            Self::Verifying => "verifying",
+            Self::Committing => "committing",
+            Self::Materializing => "materializing",
+            Self::Cancelling => "cancelling",
+            Self::Compensating => "compensating",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "scanning" => Self::Scanning,
+            "awaiting-approval" => Self::AwaitingApproval,
+            "staging" => Self::Staging,
+            "transferring" => Self::Transferring,
+            "verifying" => Self::Verifying,
+            "committing" => Self::Committing,
+            "materializing" => Self::Materializing,
+            "cancelling" => Self::Cancelling,
+            "compensating" => Self::Compensating,
+            "complete" => Self::Complete,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
+    fn permits(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Scanning => matches!(
+                next,
+                Self::AwaitingApproval | Self::Cancelled | Self::Failed
+            ),
+            Self::AwaitingApproval => {
+                matches!(next, Self::Staging | Self::Cancelled | Self::Failed)
+            }
+            Self::Staging => {
+                matches!(next, Self::Transferring | Self::Cancelling | Self::Failed)
+            }
+            Self::Transferring => matches!(
+                next,
+                Self::Verifying | Self::Committing | Self::Cancelling | Self::Failed
+            ),
+            Self::Verifying => {
+                matches!(next, Self::Committing | Self::Cancelling | Self::Failed)
+            }
+            Self::Committing => matches!(
+                next,
+                Self::Materializing | Self::Compensating | Self::Complete | Self::Failed
+            ),
+            Self::Materializing => {
+                matches!(next, Self::Complete | Self::Compensating | Self::Failed)
+            }
+            Self::Cancelling => {
+                matches!(next, Self::Cancelled | Self::Compensating | Self::Failed)
+            }
+            Self::Compensating => matches!(next, Self::Cancelled | Self::Failed),
+            Self::Complete | Self::Failed | Self::Cancelled => false,
+        }
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +147,7 @@ impl OperationRecord {
             intent: format!("Send selected files to {target_label}"),
             id,
             operation_type: "file-transfer".into(),
-            phase: "transferring".into(),
+            phase: OperationPhase::Staging.as_str().into(),
             target_label,
             object_ids: Vec::new(),
             preconditions: serde_json::json!({
@@ -111,7 +205,8 @@ impl OperationsStore {
             .map_err(|error| format!("configure operation database: {error}"))?;
         connection
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
                  CREATE TABLE IF NOT EXISTS operations (
                    id TEXT PRIMARY KEY,
@@ -139,7 +234,21 @@ impl OperationsStore {
                  CREATE INDEX IF NOT EXISTS operations_visible
                    ON operations(dismissed, updated_at DESC);
                  CREATE INDEX IF NOT EXISTS operations_phase
-                   ON operations(phase, updated_at DESC);",
+                   ON operations(phase, updated_at DESC);
+                 CREATE TABLE IF NOT EXISTS operation_attempts (
+                   operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+                   attempt INTEGER NOT NULL,
+                   worker TEXT NOT NULL,
+                   phase TEXT NOT NULL,
+                   started_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL,
+                   finished_at INTEGER,
+                   error TEXT,
+                   PRIMARY KEY(operation_id, attempt)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS operation_attempts_active
+                   ON operation_attempts(operation_id)
+                   WHERE finished_at IS NULL;",
             )
             .map_err(|error| format!("initialize operation database: {error}"))?;
 
@@ -159,6 +268,17 @@ impl OperationsStore {
                 params![as_i64(now)],
             )
             .map_err(|error| format!("recover interrupted operations: {error}"))?;
+        connection
+            .execute(
+                "UPDATE operation_attempts
+                    SET phase = 'failed',
+                        error = COALESCE(error, 'AllMyStuff restarted during this worker attempt'),
+                        updated_at = ?1,
+                        finished_at = ?1
+                  WHERE finished_at IS NULL",
+                params![as_i64(now)],
+            )
+            .map_err(|error| format!("recover interrupted worker attempts: {error}"))?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -224,18 +344,137 @@ impl OperationsStore {
         Ok(())
     }
 
+    pub fn begin_attempt(&self, id: &str, worker: &str) -> Result<u64, String> {
+        if worker.is_empty() || worker.len() > 512 {
+            return Err("invalid operation worker".into());
+        }
+        let now = now_ms();
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin worker-attempt transaction: {error}"))?;
+        let operation_phase: Option<String> = transaction
+            .query_row(
+                "SELECT phase FROM operations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("find operation for worker attempt: {error}"))?;
+        let Some(operation_phase) = operation_phase else {
+            return Err("operation does not exist".into());
+        };
+        if OperationPhase::parse(&operation_phase).is_some_and(OperationPhase::terminal) {
+            return Err("terminal operation cannot start another worker attempt".into());
+        }
+        let active: Option<i64> = transaction
+            .query_row(
+                "SELECT attempt FROM operation_attempts
+                  WHERE operation_id = ?1 AND finished_at IS NULL",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("find active worker attempt: {error}"))?;
+        if active.is_some() {
+            return Err("operation already has an active worker attempt".into());
+        }
+        let attempt: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(attempt), 0) + 1
+                   FROM operation_attempts WHERE operation_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("allocate worker attempt: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO operation_attempts (
+                   operation_id, attempt, worker, phase, started_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'running', ?4, ?4)",
+                params![id, attempt, worker, as_i64(now)],
+            )
+            .map_err(|error| format!("persist worker attempt: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit worker attempt: {error}"))?;
+        Ok(from_i64(attempt))
+    }
+
+    pub fn finish_attempt(
+        &self,
+        id: &str,
+        attempt: u64,
+        phase: &str,
+        error: Option<&str>,
+    ) -> Result<bool, String> {
+        if !matches!(phase, "succeeded" | "failed" | "cancelled") {
+            return Err("invalid terminal worker-attempt phase".into());
+        }
+        let now = now_ms();
+        let connection = self.connection.lock();
+        let changed = connection
+            .execute(
+                "UPDATE operation_attempts
+                    SET phase = ?3, error = ?4, updated_at = ?5, finished_at = ?5
+                  WHERE operation_id = ?1 AND attempt = ?2 AND finished_at IS NULL",
+                params![id, as_i64(attempt), phase, error, as_i64(now)],
+            )
+            .map_err(|error| format!("finish worker attempt: {error}"))?;
+        Ok(changed > 0)
+    }
+
+    pub fn update_progress(&self, id: &str, progress_bytes: u64) -> Result<bool, String> {
+        let now = now_ms();
+        let connection = self.connection.lock();
+        let changed = connection
+            .execute(
+                "UPDATE operations
+                    SET progress_bytes = MAX(progress_bytes, ?2), updated_at = ?3
+                  WHERE id = ?1 AND phase NOT IN ('complete', 'failed', 'cancelled')",
+                params![id, as_i64(progress_bytes), as_i64(now)],
+            )
+            .map_err(|error| format!("update operation progress: {error}"))?;
+        Ok(changed > 0)
+    }
+
     pub fn update_transfer(
         &self,
         id: &str,
-        phase: &str,
+        phase: OperationPhase,
         error: Option<&str>,
         cancellation_requested: bool,
     ) -> Result<bool, String> {
         let now = now_ms();
-        let retry_condition = (phase == "failed").then_some("Review the operation and retry it");
-        let verification_result = (phase == "complete").then_some("Destination commit completed");
-        let connection = self.connection.lock();
-        let changed = connection
+        let retry_condition =
+            (phase == OperationPhase::Failed).then_some("Review the operation and retry it");
+        let verification_result =
+            (phase == OperationPhase::Complete).then_some("Destination commit completed");
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin operation update: {error}"))?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT phase FROM operations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("read current operation phase: {error}"))?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current = OperationPhase::parse(&current)
+            .ok_or_else(|| "operation has an unknown persisted phase".to_string())?;
+        if !current.permits(phase) {
+            return Err(format!(
+                "invalid operation transition from {} to {}",
+                current.as_str(),
+                phase.as_str()
+            ));
+        }
+        let changed = transaction
             .execute(
                 "UPDATE operations
                     SET phase = ?2,
@@ -247,7 +486,7 @@ impl OperationsStore {
                   WHERE id = ?1",
                 params![
                     id,
-                    phase,
+                    phase.as_str(),
                     error,
                     retry_condition,
                     cancellation_requested,
@@ -256,9 +495,12 @@ impl OperationsStore {
                 ],
             )
             .map_err(|error| format!("update operation: {error}"))?;
-        if matches!(phase, "complete" | "cancelled") {
-            compact_successes(&connection)?;
+        if phase.terminal() {
+            compact_successes(&transaction)?;
         }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit operation update: {error}"))?;
         Ok(changed > 0)
     }
 
@@ -357,7 +599,7 @@ fn validate(operation: &OperationRecord) -> Result<(), String> {
     if operation.operation_type.is_empty() || operation.operation_type.len() > 80 {
         return Err("invalid operation type".into());
     }
-    if operation.phase.is_empty() || operation.phase.len() > 80 {
+    if OperationPhase::parse(&operation.phase).is_none() {
         return Err("invalid operation phase".into());
     }
     Ok(())
@@ -429,13 +671,39 @@ mod tests {
         let store = OperationsStore::open(None).unwrap();
         store.insert(&transfer("cancel-id", "peer")).unwrap();
         store
-            .update_transfer("cancel-id", "cancelling", None, true)
+            .update_transfer("cancel-id", OperationPhase::Cancelling, None, true)
             .unwrap();
         store
-            .update_transfer("cancel-id", "cancelled", None, false)
+            .update_transfer("cancel-id", OperationPhase::Cancelled, None, false)
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         assert!(snapshot[0].cancellation_requested);
+    }
+
+    #[test]
+    fn worker_attempts_are_distinct_and_never_overlap() {
+        let store = OperationsStore::open(None).unwrap();
+        store.insert(&transfer("attempt-id", "peer")).unwrap();
+        let first = store.begin_attempt("attempt-id", "worker-a").unwrap();
+        assert!(store.begin_attempt("attempt-id", "worker-b").is_err());
+        assert!(store
+            .finish_attempt("attempt-id", first, "failed", Some("route lost"))
+            .unwrap());
+        let second = store.begin_attempt("attempt-id", "worker-b").unwrap();
+        assert_eq!(second, first + 1);
+        assert!(store
+            .finish_attempt("attempt-id", second, "succeeded", None)
+            .unwrap());
+    }
+
+    #[test]
+    fn invalid_phase_transition_is_rejected() {
+        let store = OperationsStore::open(None).unwrap();
+        store.insert(&transfer("phase-id", "peer")).unwrap();
+        assert!(store
+            .update_transfer("phase-id", OperationPhase::Complete, None, false)
+            .is_err());
+        assert_eq!(store.snapshot().unwrap()[0].phase, "staging");
     }
 
     #[test]
@@ -444,11 +712,18 @@ mod tests {
         for index in 0..60 {
             let id = format!("complete-{index}");
             store.insert(&transfer(&id, "peer")).unwrap();
-            store.update_transfer(&id, "complete", None, false).unwrap();
+            for phase in [
+                OperationPhase::Transferring,
+                OperationPhase::Verifying,
+                OperationPhase::Committing,
+                OperationPhase::Complete,
+            ] {
+                store.update_transfer(&id, phase, None, false).unwrap();
+            }
         }
         store.insert(&transfer("failed-one", "peer")).unwrap();
         store
-            .update_transfer("failed-one", "failed", Some("boom"), false)
+            .update_transfer("failed-one", OperationPhase::Failed, Some("boom"), false)
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.len(), RETAIN_SUCCESSES as usize + 1);

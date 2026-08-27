@@ -54,7 +54,7 @@ use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, Local
 
 use crate::input_inject::Injector;
 use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
-use crate::operations::{OperationRecord, OperationsStore};
+use crate::operations::{OperationPhase, OperationRecord, OperationsStore};
 use crate::ownership::Ownership;
 use crate::service_profiles::{ServiceProfiles, TransferOutcome};
 use crate::shares::Shares;
@@ -14273,17 +14273,55 @@ impl Mesh {
         Ok(())
     }
 
-    fn update_file_operation(&self, id: &str, phase: &str, error: Option<String>) {
-        let cancellation_requested = phase == "cancelling";
+    fn update_file_operation(
+        &self,
+        id: &str,
+        phase: OperationPhase,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let cancellation_requested = phase == OperationPhase::Cancelling;
         match self
             .operations
             .update_transfer(id, phase, error.as_deref(), cancellation_requested)
         {
-            Ok(true) => self.publish_file_operations(self.operation_snapshot()),
-            Ok(false) => tracing::warn!("operation {id} disappeared before phase {phase}"),
-            Err(update_error) => {
-                tracing::error!("persist operation {id} phase {phase}: {update_error}")
+            Ok(true) => {
+                self.publish_file_operations(self.operation_snapshot());
+                Ok(())
             }
+            Ok(false) => Err(format!(
+                "operation {id} disappeared before phase {}",
+                phase.as_str()
+            )),
+            Err(update_error) => Err(format!(
+                "persist operation {id} phase {}: {update_error}",
+                phase.as_str()
+            )),
+        }
+    }
+
+    fn update_file_operation_progress(&self, id: &str, bytes: u64) -> Result<(), String> {
+        match self.operations.update_progress(id, bytes) {
+            Ok(true) => {
+                self.publish_file_operations(self.operation_snapshot());
+                Ok(())
+            }
+            Ok(false) => Err(format!("operation {id} cannot accept progress")),
+            Err(error) => Err(format!("persist operation {id} progress: {error}")),
+        }
+    }
+
+    fn advance_file_operation(
+        &self,
+        id: &str,
+        phase: OperationPhase,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        match self.update_file_operation(id, phase, None) {
+            Err(_) if cancel.load(Ordering::Relaxed) => Err("cancelled".into()),
+            result => result,
         }
     }
 
@@ -14344,7 +14382,9 @@ impl Mesh {
             return false;
         };
         cancel.store(true, Ordering::Relaxed);
-        self.update_file_operation(id, "cancelling", None);
+        if let Err(error) = self.update_file_operation(id, OperationPhase::Cancelling, None) {
+            tracing::error!("{error}");
+        }
         true
     }
 
@@ -14530,6 +14570,18 @@ impl Mesh {
             self.finish_file_transfer_job(&id, &cancel);
             return Err(error);
         }
+        let worker = self
+            .local_node_id()
+            .unwrap_or_else(|| "local-unidentified".into());
+        let attempt = match self.operations.begin_attempt(&id, &worker) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let _ =
+                    self.update_file_operation(&id, OperationPhase::Failed, Some(error.clone()));
+                self.finish_file_transfer_job(&id, &cancel);
+                return Err(error);
+            }
+        };
         let result = async {
             let top_level = paths.iter().map(|raw| {
                 Path::new(raw).file_name()
@@ -14549,12 +14601,15 @@ impl Mesh {
                 &route_id,
                 FileEvent::Mkdir { req: self.next_file_request_id(), path: staging.clone() },
             ).await?;
+            self.advance_file_operation(&id, OperationPhase::Transferring, &cancel)?;
 
             let transfer = async {
                 let mut walker = crate::files::start_transfer_walk(paths, cancel.clone())?;
                 let mut files = 0_u64;
                 let mut folders = 0_u64;
                 let mut bytes = 0_u64;
+                let mut reported_bytes = 0_u64;
+                let mut reported_at = Instant::now();
                 while let Some(entry) = walker.recv().await {
                     let entry = entry?;
                     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
@@ -14570,8 +14625,18 @@ impl Mesh {
                             self.transfer_upload_file(&route_id, &entry.source, target, &cancel).await?
                         );
                         files = files.saturating_add(1);
+                        if bytes.saturating_sub(reported_bytes) >= 1_048_576
+                            || reported_at.elapsed() >= Duration::from_millis(500)
+                        {
+                            self.update_file_operation_progress(&id, bytes)?;
+                            reported_bytes = bytes;
+                            reported_at = Instant::now();
+                        }
                     }
                 }
+                if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+                self.update_file_operation_progress(&id, bytes)?;
+                self.advance_file_operation(&id, OperationPhase::Verifying, &cancel)?;
                 if (files, folders, bytes) != (expected_files, expected_folders, expected_bytes) {
                     return Err("the selected files changed after the impact review; review the transfer again".into());
                 }
@@ -14582,6 +14647,8 @@ impl Mesh {
                         return Err(format!("“{name}” appeared at the destination before commit"));
                     }
                 }
+                if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+                self.advance_file_operation(&id, OperationPhase::Committing, &cancel)?;
                 let mut committed: Vec<String> = Vec::new();
                 for name in &top_level {
                     let from = Self::transfer_join(&staging, name);
@@ -14621,6 +14688,17 @@ impl Mesh {
             transfer
         }.await;
         self.finish_file_transfer_job(&id, &cancel);
+        let (attempt_phase, attempt_error) = match &result {
+            Ok(_) => ("succeeded", None),
+            Err(error) if error.eq_ignore_ascii_case("cancelled") => ("cancelled", None),
+            Err(error) => ("failed", Some(error.as_str())),
+        };
+        if let Err(error) =
+            self.operations
+                .finish_attempt(&id, attempt, attempt_phase, attempt_error)
+        {
+            tracing::error!("persist worker attempt for operation {id}: {error}");
+        }
         if let Some(peer) = peer {
             let outcome = match &result {
                 Ok(_) => TransferOutcome::Succeeded,
@@ -14636,14 +14714,21 @@ impl Mesh {
             self.service_profiles
                 .note_transfer(&peer, bytes, started.elapsed(), outcome);
         }
-        match &result {
-            Ok(_) => self.update_file_operation(&id, "complete", None),
+        let persisted = match &result {
+            Ok(_) => self.update_file_operation(&id, OperationPhase::Complete, None),
             Err(error) if error.eq_ignore_ascii_case("cancelled") => {
-                self.update_file_operation(&id, "cancelled", None)
+                self.update_file_operation(&id, OperationPhase::Cancelled, None)
             }
-            Err(error) => self.update_file_operation(&id, "failed", Some(error.clone())),
+            Err(error) => {
+                self.update_file_operation(&id, OperationPhase::Failed, Some(error.clone()))
+            }
+        };
+        match (result, persisted) {
+            (Ok(_), Err(error)) => Err(format!(
+                "the transfer committed but its operation record could not finish: {error}"
+            )),
+            (result, _) => result,
         }
-        result
     }
 
     /// Bounded local scheduling evidence for fleet storage and worker choice.

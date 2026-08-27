@@ -638,6 +638,23 @@ fn fleetfiles_root() -> Result<PathBuf, String> {
         .map(|state| state.join("Fleetfiles").join("Desktop"))
 }
 
+#[cfg(not(test))]
+fn fleetfiles_replica() -> FleetfilesReplica {
+    FleetfilesReplica::load(
+        fleetfiles_root().expect("Fleetfiles state directory must be available"),
+    )
+}
+
+#[cfg(test)]
+fn fleetfiles_replica() -> FleetfilesReplica {
+    let root = std::env::temp_dir().join(format!(
+        "allmystuff-fleetfiles-mesh-test-{}-{}",
+        std::process::id(),
+        fresh_boot_id()
+    ));
+    FleetfilesReplica::memory(root)
+}
+
 fn drive_reconnect_store_path() -> Option<PathBuf> {
     Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-drives.json"))
 }
@@ -1791,9 +1808,7 @@ impl Mesh {
             drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
             drive_reconnect_path,
-            fleetfiles: Arc::new(FleetfilesReplica::load(
-                fleetfiles_root().expect("Fleetfiles state directory must be available"),
-            )),
+            fleetfiles: Arc::new(fleetfiles_replica()),
             fleetfiles_transfer_gate: Arc::new(Semaphore::new(2)),
             fleetfiles_waiters: Mutex::new(HashMap::new()),
             fleetfiles_draining: Mutex::new(HashSet::new()),

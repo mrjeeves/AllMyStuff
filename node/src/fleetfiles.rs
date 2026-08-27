@@ -139,7 +139,7 @@ impl FleetfilesReplica {
     }
 
     #[cfg(test)]
-    fn memory(root: PathBuf) -> Self {
+    pub(crate) fn memory(root: PathBuf) -> Self {
         Self::with_connection(root, Connection::open_in_memory().unwrap())
     }
 

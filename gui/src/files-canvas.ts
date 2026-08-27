@@ -175,6 +175,16 @@ export function mergeCanvasRecords(
   return { records: [...byId.values()], changed };
 }
 
+/** Combine the launch snapshot with events that arrived while the Files view
+ * was hydrating. The per-record stamps make the result independent of whether
+ * the snapshot or the listener observed a fleet edit first. */
+export function hydrateCanvasRecords(
+  snapshot: readonly CanvasRecord[],
+  live: readonly CanvasRecord[],
+): CanvasRecord[] {
+  return mergeCanvasRecords(snapshot, live).records;
+}
+
 export function contains(outer: Rect, inner: Rect, padding = 0): boolean {
   return (
     inner.x >= outer.x + padding &&

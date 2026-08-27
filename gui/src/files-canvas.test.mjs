@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("overlapping snapshots keep stable order and the latest value per domain key", () => {
   const rows = [
@@ -30,6 +30,13 @@ test("a tombstone beats an older layout record", () => {
   const live = { id: "frame:a", kind: "frame", value: {}, stamp: { counter: 2, actor: "a" } };
   const gone = { ...live, value: null, deleted: true, stamp: { counter: 3, actor: "b" } };
   assert.deepEqual(mergeCanvasRecords([live], [gone]).records[0], gone);
+});
+
+test("a live fleet edit received during hydration cannot be overwritten by the launch snapshot", () => {
+  const stale = { id: "item:a", kind: "item", value: { x: 10, parentId: null }, stamp: { counter: 4, actor: "pc" } };
+  const live = { ...stale, value: { x: 220, parentId: "frame:work" }, stamp: { counter: 5, actor: "mac" } };
+  const unrelated = { id: "frame:work", kind: "frame", value: { title: "Work" }, stamp: { counter: 3, actor: "pc" } };
+  assert.deepEqual(hydrateCanvasRecords([stale, unrelated], [live]), [live, unrelated]);
 });
 
 test("nesting chooses the smallest frame and never chooses a descendant", () => {

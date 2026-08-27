@@ -28,6 +28,7 @@
     localFilePreview,
     localFileRename,
     localFileTrash,
+    onBackendReady,
     onFileSaved,
     onFilesCanvas,
     type LocalFileEntry,
@@ -52,6 +53,7 @@
     resolveDesktopTileCollisions,
     translateCanvasPoint,
     descendantsOf,
+    hydrateCanvasRecords,
     mergeCanvasRecords,
     normalizeFrameNesting,
     sharedFilesystemObject,
@@ -1202,8 +1204,28 @@
   onMount(() => {
     let mounted = true;
     let stop = () => {};
+    let stopBackendReady = () => {};
     let stopOperations = () => {};
     let stopSaved = () => {};
+    let canvasHydrated = false;
+    let backendRefreshPending = false;
+    let canvasEventRevision = 0;
+    let canvasSnapshotRequest = 0;
+
+    async function refreshCanvasAfterBackendReconnect() {
+      const request = ++canvasSnapshotRequest;
+      const eventRevision = canvasEventRevision;
+      try {
+        const saved = await filesCanvasSnapshot();
+        if (!mounted || request !== canvasSnapshotRequest) return;
+        // A full canvas event received while this request was in flight is at
+        // least as current and must not be replaced by the earlier pull.
+        if (eventRevision === canvasEventRevision) records = saved;
+        backendRefreshPending = false;
+      } catch (error) {
+        if (mounted) console.warn("Could not resync Files canvas after backend reconnect:", error);
+      }
+    }
     document.addEventListener("visibilitychange", remoteDirectoryVisibilityChanged);
     try {
       placesOpen = localStorage.getItem("allmystuff.files.placesOpen") !== "false";
@@ -1218,10 +1240,43 @@
       });
     } catch { /* private mode keeps these device-local for this session */ }
     void (async () => {
+      // Subscribe before taking the launch snapshot. Otherwise a fleet patch
+      // can be persisted after the pull but before the listener exists, leaving
+      // this open window stale even though every machine has converged on disk.
+      try {
+        const unlisten = await onFilesCanvas((next) => {
+          if (!mounted) return;
+          canvasEventRevision += 1;
+          records = canvasHydrated ? next : hydrateCanvasRecords(records, next);
+        });
+        if (!mounted) {
+          unlisten();
+          return;
+        }
+        stop = unlisten;
+      } catch (error) {
+        console.warn("Could not watch Files canvas:", error);
+      }
+      try {
+        const unlisten = await onBackendReady(() => {
+          if (!mounted) return;
+          backendRefreshPending = true;
+          if (canvasHydrated) void refreshCanvasAfterBackendReconnect();
+        });
+        if (!mounted) {
+          unlisten();
+          return;
+        }
+        stopBackendReady = unlisten;
+      } catch (error) {
+        console.warn("Could not watch Files backend connection:", error);
+      }
       const [places, saved] = await Promise.all([localFileLocations(), filesCanvasSnapshot()]);
       if (!mounted) return;
       locations = places;
-      records = saved;
+      records = hydrateCanvasRecords(saved, records);
+      canvasHydrated = true;
+      if (backendRefreshPending) await refreshCanvasAfterBackendReconnect();
       if (initialLocation) await navigateInitialWorkspaceLocation(initialLocation);
       else await navigateFleetHome();
     })().catch((error) => {
@@ -1229,7 +1284,6 @@
       loading = false;
       app.toast("warn", `Couldn't start Files: ${String(error)}`);
     });
-    void onFilesCanvas((next) => { records = next; }).then((unlisten) => { stop = unlisten; });
     void localFileTransferOperations()
       .then(({ operations }) => absorbTransferOperations(operations))
       .catch((error) => console.warn("Could not restore file operations:", error));
@@ -1262,6 +1316,7 @@
       }
       stopOperations();
       closeRemoteSessions();
+      stopBackendReady();
       stop();
     };
   });

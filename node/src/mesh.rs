@@ -14645,7 +14645,21 @@ impl Mesh {
         let desktop = fleetfiles_root()?;
         std::fs::create_dir_all(&desktop)
             .map_err(|error| format!("create the virtual Fleetfiles Desktop: {error}"))?;
-        Ok(json!({ "path": desktop.to_string_lossy() }))
+        // A Fleetfiles path is one logical directory entry whose materialized
+        // inode/file-id differs on every replica. Give every fleet member the
+        // same non-secret namespace instead of keying layout to a replica.
+        let namespace = self
+            .ownership
+            .fleet_network_id()
+            .map(|network| format!("fleetfiles:{network}"))
+            .unwrap_or_else(|| {
+                let local = self.local_node_id().unwrap_or_else(|| "unowned".into());
+                format!("fleetfiles:local:{}", pubkey_part(&local))
+            });
+        Ok(json!({
+            "path": desktop.to_string_lossy(),
+            "namespace": namespace,
+        }))
     }
 
     fn fleetfiles_capacity(&self) -> u64 {

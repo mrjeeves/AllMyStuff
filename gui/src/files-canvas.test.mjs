@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("overlapping snapshots keep stable order and the latest value per domain key", () => {
   const rows = [
@@ -37,6 +37,66 @@ test("a live fleet edit received during hydration cannot be overwritten by the l
   const live = { ...stale, value: { x: 220, parentId: "frame:work" }, stamp: { counter: 5, actor: "mac" } };
   const unrelated = { id: "frame:work", kind: "frame", value: { title: "Work" }, stamp: { counter: 3, actor: "pc" } };
   assert.deepEqual(hydrateCanvasRecords([stale, unrelated], [live]), [live, unrelated]);
+});
+
+test("Fleetfiles replicas resolve physical OS paths to one logical identity surface", () => {
+  assert.equal(
+    fleetfilesLogicalPath(
+      "C:\\Users\\Chris\\.myownmesh\\Fleetfiles\\Desktop",
+      "c:/users/chris/.myownmesh/Fleetfiles/Desktop/Photos/Caf\u00e9.jpg",
+      "windows",
+    ),
+    "Photos/Caf\u00e9.jpg",
+  );
+  assert.equal(
+    fleetfilesLogicalPath(
+      "/Users/chris/.myownmesh/Fleetfiles/Desktop",
+      "/Users/chris/.myownmesh/Fleetfiles/Desktop/Photos/Cafe\u0301.jpg",
+      "macos",
+    ),
+    "Photos/Caf\u00e9.jpg",
+  );
+  assert.equal(fleetfilesLogicalPath("/fleet/root", "/somewhere/else/file", "linux"), null);
+});
+
+test("physical replica placement migrates once without overwriting logical edits", () => {
+  const old = {
+    id: "item:files:fleet:home:entry:mac-inode",
+    kind: "item",
+    value: { id: "entry:mac-inode", x: 20, y: 30, parentId: "frame:a" },
+    stamp: { counter: 7, actor: "mac" },
+  };
+  assert.deepEqual(
+    planFleetfilesPlacementMigration([old], "fleet:home", "entry:mac-inode", "entry:fleet-object"),
+    [
+      {
+        id: "item:files:fleet:home:entry:fleet-object",
+        kind: "item",
+        value: { id: "entry:fleet-object", x: 20, y: 30, parentId: "frame:a" },
+      },
+      {
+        id: "item:files:fleet:home:entry:mac-inode",
+        kind: "item",
+        value: null,
+        deleted: true,
+      },
+    ],
+  );
+  const current = {
+    id: "item:files:fleet:home:entry:fleet-object",
+    kind: "item",
+    value: { id: "entry:fleet-object", x: 400, y: 500, parentId: null },
+    stamp: { counter: 9, actor: "pc" },
+  };
+  assert.deepEqual(
+    planFleetfilesPlacementMigration([old, current], "fleet:home", "entry:mac-inode", "entry:fleet-object"),
+    [{
+      id: "item:files:fleet:home:entry:mac-inode",
+      kind: "item",
+      value: null,
+      deleted: true,
+    }],
+  );
 });
 
 test("nesting chooses the smallest frame and never chooses a descendant", () => {

@@ -203,7 +203,7 @@ export function localFileLocations(): Promise<LocalFileLocation[]> {
         { id: "downloads", label: "Downloads", path: "/Users/you/Downloads", kind: "favorite" },
       ]);
 }
-export function fleetfilesLocalDesktop(): Promise<{ path: string }> {
+export function fleetfilesLocalDesktop(): Promise<{ path: string; namespace?: string }> {
   return requiredInvoke("fleetfiles_local_desktop");
 }
 

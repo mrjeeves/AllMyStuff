@@ -185,6 +185,67 @@ export function hydrateCanvasRecords(
   return mergeCanvasRecords(snapshot, live).records;
 }
 
+/** Convert a materialized Fleetfiles replica path into its fleet-logical path.
+ * Physical roots, separators, casing rules, and Unicode normalization may
+ * differ across operating systems; the returned path is the identity surface
+ * shared by every replica. */
+export function fleetfilesLogicalPath(
+  root: string,
+  path: string,
+  platform = "",
+): string | null {
+  const normalize = (value: string) => {
+    const slashed = value.replaceAll("\\", "/").normalize("NFC");
+    return slashed.length > 1 ? slashed.replace(/\/+$/, "") : slashed;
+  };
+  const normalizedRoot = normalize(root);
+  const normalizedPath = normalize(path);
+  const windows = platform.toLocaleLowerCase().startsWith("win")
+    || /^[A-Za-z]:\//.test(normalizedRoot);
+  const compareRoot = windows ? normalizedRoot.toLocaleLowerCase("en-US") : normalizedRoot;
+  const comparePath = windows ? normalizedPath.toLocaleLowerCase("en-US") : normalizedPath;
+  if (comparePath === compareRoot) return "";
+  const prefix = compareRoot + "/";
+  if (!comparePath.startsWith(prefix)) return null;
+  return normalizedPath.slice(normalizedRoot.length + 1);
+}
+
+export type CanvasMutationLike = Omit<CanvasRecord, "stamp">;
+
+/** Move a pre-logical physical-replica placement onto its Fleetfiles entry.
+ * An existing logical record (including a tombstone) always wins, so migration
+ * cannot collide with a post-upgrade user edit. */
+export function planFleetfilesPlacementMigration(
+  records: readonly CanvasRecord[],
+  scope: string,
+  legacyEntryId: string,
+  logicalEntryId: string,
+): CanvasMutationLike[] {
+  if (!legacyEntryId || legacyEntryId === logicalEntryId) return [];
+  const prefix = `item:files:${scope}:`;
+  const legacyId = prefix + legacyEntryId;
+  const logicalId = prefix + logicalEntryId;
+  const legacy = records.find((record) =>
+    record.id === legacyId && record.kind === "item" && !record.deleted && record.value
+  );
+  if (!legacy) return [];
+  const tombstone: CanvasMutationLike = {
+    id: legacyId,
+    kind: "item",
+    value: null,
+    deleted: true,
+  };
+  if (records.some((record) => record.id === logicalId)) return [tombstone];
+  return [
+    {
+      id: logicalId,
+      kind: "item",
+      value: { ...(legacy.value as CanvasPlacement), id: logicalEntryId },
+    },
+    tombstone,
+  ];
+}
+
 export function contains(outer: Rect, inner: Rect, padding = 0): boolean {
   return (
     inner.x >= outer.x + padding &&

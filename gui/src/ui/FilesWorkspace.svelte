@@ -53,9 +53,11 @@
     resolveDesktopTileCollisions,
     translateCanvasPoint,
     descendantsOf,
+    fleetfilesLogicalPath,
     hydrateCanvasRecords,
     mergeCanvasRecords,
     normalizeFrameNesting,
+    planFleetfilesPlacementMigration,
     sharedFilesystemObject,
     type CanvasFrame,
     type CanvasPlacement,
@@ -74,6 +76,12 @@
   type WorkspaceEntry = LocalFileEntry & {
     binding: WorkspaceBinding;
     objectId?: string;
+    legacyEntryId?: string;
+    namespaceIdentity?: {
+      sourceDevice: string;
+      nativeId: string;
+      nativePath: string;
+    };
     computerNode?: boolean;
     computerOnline?: boolean;
   };
@@ -129,6 +137,8 @@
   let computerHome = $state(false);
   let currentComputer = $state<{ deviceId: string; deviceLabel: string; routeId?: string } | null>(null);
   let localRootPath = "";
+  let fleetfilesRootPath = "";
+  let fleetfilesNamespace = "";
   const remoteSessions = new Map<string, RemoteSession>();
   let routeSnapshotRefresh: Promise<void> | null = null;
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
@@ -536,30 +546,72 @@
   ): Promise<WorkspaceEntry[]> {
     if (candidates.length === 0) return candidates;
     const adopted = new Map<string, { entryId: string; objectId: string }>();
+    const legacy = new Map<string, string>();
     try {
       for (let offset = 0; offset < candidates.length; offset += 256) {
-        const page = candidates.slice(offset, offset + 256);
+        const page = candidates.slice(offset, offset + 256).map((item) => {
+          if (parentId !== "fleet:home" || !fleetfilesNamespace || !fleetfilesRootPath) return item;
+          const logicalPath = fleetfilesLogicalPath(fleetfilesRootPath, item.path, platform);
+          if (logicalPath === null || logicalPath === "") return item;
+          return {
+            ...item,
+            namespaceIdentity: {
+              sourceDevice: fleetfilesNamespace,
+              nativeId: "path:" + logicalPath,
+              nativePath: logicalPath,
+            },
+          };
+        });
+        const observations = (
+          rows: WorkspaceEntry[],
+          logical: boolean,
+        ) => rows.map((item) => ({
+          provisionalId: item.id,
+          priorEntryId: page.length === 1 ? priorEntryId : undefined,
+          sourceDevice: logical
+            ? item.namespaceIdentity?.sourceDevice ?? canonicalDeviceId(item.binding.deviceId)
+            : canonicalDeviceId(item.binding.deviceId),
+          nativeId: logical
+            ? item.namespaceIdentity?.nativeId ?? item.binding.nativeId
+            : item.binding.nativeId,
+          name: item.name,
+          nativePath: logical
+            ? item.namespaceIdentity?.nativePath ?? item.path
+            : item.path,
+          dir: item.dir,
+          hidden: item.hidden,
+          size: item.size,
+          modified: item.modified ?? 0,
+        }));
+        const physical = page.filter((item) => item.namespaceIdentity);
+        if (physical.length > 0) {
+          const legacyRows = await filesNamespaceAdopt(parentId, observations(physical, false));
+          for (const row of legacyRows) legacy.set(row.provisionalId, row.entryId);
+        }
         const rows = await filesNamespaceAdopt(
           parentId,
-          page.map((item) => ({
-            provisionalId: item.id,
-            priorEntryId: page.length === 1 ? priorEntryId : undefined,
-            sourceDevice: canonicalDeviceId(item.binding.deviceId),
-            nativeId: item.binding.nativeId,
-            name: item.name,
-            nativePath: item.path,
-            dir: item.dir,
-            hidden: item.hidden,
-            size: item.size,
-            modified: item.modified ?? 0,
-          })),
+          observations(page, true),
         );
         for (const row of rows) adopted.set(row.provisionalId, row);
       }
-      return coalesceLatestBy(candidates.map((item) => {
+      const resolved = coalesceLatestBy(candidates.map((item) => {
         const identity = adopted.get(item.id);
-        return identity ? { ...item, id: identity.entryId, objectId: identity.objectId } : item;
+        return identity ? {
+          ...item,
+          id: identity.entryId,
+          objectId: identity.objectId,
+          legacyEntryId: legacy.get(item.id),
+        } : item;
       }), (item) => item.id);
+      const migrations = resolved.flatMap((item) =>
+        item.legacyEntryId
+          ? planFleetfilesPlacementMigration(records, "fleet:home", item.legacyEntryId, item.id)
+          : []
+      );
+      for (let offset = 0; offset < migrations.length; offset += 128) {
+        absorb(await filesCanvasApply(migrations.slice(offset, offset + 128)));
+      }
+      return resolved;
     } catch (error) {
       console.warn("Files namespace adoption unavailable:", error);
       return coalesceLatestBy(candidates, (item) => item.id);
@@ -1000,6 +1052,9 @@
       const listing = await localFileList(desktop.path);
       if (generation !== navigationGeneration) return;
       localRootPath = listing.path;
+      fleetfilesRootPath = listing.path;
+      fleetfilesNamespace = desktop.namespace
+        || "fleetfiles:" + (app.fleetNetworkId || "local:" + canonicalDeviceId(app.localId));
       directoryId = "fleet:home";
       fleetHome = true;
       map = "files";

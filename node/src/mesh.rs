@@ -14477,6 +14477,10 @@ impl Mesh {
         self.files.cancel_rpc(route_id, req);
         result
     }
+
+    // This is the typed boundary of the serialized transfer-start command;
+    // keeping its fields explicit avoids a second payload shape inside Mesh.
+    #[allow(clippy::too_many_arguments)]
     pub async fn file_transfer_start(
         self: &Arc<Self>,
         id: String,
@@ -17839,7 +17843,7 @@ impl Mesh {
                 }
 
                 let mut reader = ChunkReader::open(source)?;
-                while let Some((offset, data)) = reader.next()? {
+                while let Some((offset, data)) = reader.next_chunk()? {
                     self.send_fleetfiles_message(
                         peer,
                         FleetfilesMessage::FileChunk {

@@ -43,20 +43,11 @@ impl Default for StoragePolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRecord {
     pub value: StoragePolicy,
     pub stamp: PlanStamp,
-}
-
-impl Default for PolicyRecord {
-    fn default() -> Self {
-        Self {
-            value: StoragePolicy::default(),
-            stamp: PlanStamp::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

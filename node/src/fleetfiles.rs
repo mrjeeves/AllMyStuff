@@ -840,7 +840,7 @@ fn replace_file(staging: &Path, target: &Path) -> Result<(), String> {
                 std::io::Error::last_os_error()
             ));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -861,7 +861,7 @@ impl ChunkReader {
         })
     }
 
-    pub fn next(&mut self) -> Result<Option<(u64, Vec<u8>)>, String> {
+    pub fn next_chunk(&mut self) -> Result<Option<(u64, Vec<u8>)>, String> {
         let mut data = vec![0_u8; TRANSFER_CHUNK];
         let read = self
             .file

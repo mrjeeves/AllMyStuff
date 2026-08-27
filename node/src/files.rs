@@ -860,8 +860,8 @@ fn native_hidden(name: &str, meta: &std::fs::Metadata) -> bool {
         use std::os::windows::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-        return name.starts_with('.')
-            || meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+        name.starts_with('.')
+            || meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
     }
     #[cfg(not(windows))]
     {

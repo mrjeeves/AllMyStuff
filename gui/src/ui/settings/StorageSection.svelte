@@ -6,9 +6,11 @@
   import {
     fleetStorageLocalVolumes,
     fleetStorageSetAllocation,
+    fleetStorageSetDeviceRole,
     fleetStorageSetPolicy,
     onFleetStorage,
     fleetStorageStatus,
+    type FleetDeviceRole,
     type FleetStoragePolicy,
     type FleetStorageStatus,
     type FleetStorageVolume,
@@ -95,6 +97,36 @@
     return allocations.find((allocation) => nodeFor(allocation.device)?.id === node.id && allocation.volume === volume.id);
   }
 
+  function roleFor(node: MeshNode): FleetDeviceRole {
+    return status?.plan.deviceIntents.find(
+      (intent) => nodeFor(intent.device)?.id === node.id,
+    )?.role ?? "automatic";
+  }
+
+  function roleDescription(role: FleetDeviceRole): string {
+    if (role === "alwaysOn") {
+      return "Fleetfiles may rely on this device for coordination and background maintenance.";
+    }
+    if (role === "personal") {
+      return "This device may sleep or travel and is never required to keep Fleetfiles available.";
+    }
+    return "AllMyStuff decides from this device's observed availability.";
+  }
+
+  async function setRole(node: MeshNode, role: FleetDeviceRole) {
+    const key = "role:" + node.id;
+    saving = key;
+    error = "";
+    try {
+      await fleetStorageSetDeviceRole(node.id, role);
+      status = await fleetStorageStatus();
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      saving = null;
+    }
+  }
+
   async function setAllocation(node: MeshNode, volume: StorageSummary, enabled: boolean, quotaBytes?: number) {
     const key = node.id + ":" + volume.id;
     saving = key;
@@ -125,9 +157,6 @@
     }
   }
 
-  function profileFor(node: MeshNode) {
-    return status?.profiles.find((profile) => nodeFor(profile.peer)?.id === node.id);
-  }
 </script>
 
 <section class="storage">
@@ -165,15 +194,23 @@
     </div>
 
     <div class="resources">
-      <div class="resources-head"><b>Storage resources</b><span>Native paths remain private.</span></div>
+      <div class="resources-head"><b>Devices and storage</b><span>Native paths remain private.</span></div>
       {#each nodes as node (node.id)}
         {@const volumes = volumesFor(node)}
-        {@const profile = profileFor(node)}
+        {@const role = roleFor(node)}
         <article class="device">
           <header>
             <div><b>{node.label}</b><small>{app.isMe(node.id) ? "This device" : node.online ? "Online" : "Offline"}</small></div>
-            {#if profile}<span class="candidate" title={Math.round(profile.confidence * 100) + "% scheduling confidence"}>{Math.round(profile.serviceScore * 100)} candidate</span>{/if}
+            <label class="device-role">
+              <span>Use as</span>
+              <select value={role} disabled={saving === "role:" + node.id} onchange={(event) => void setRole(node, event.currentTarget.value as FleetDeviceRole)}>
+                <option value="automatic">Automatic</option>
+                <option value="alwaysOn">Always available</option>
+                <option value="personal">Personal device</option>
+              </select>
+            </label>
           </header>
+          <p class="role-note">{roleDescription(role)}</p>
           {#if volumes.length === 0}
             <p class="muted">Capacity has not been advertised by this device yet.</p>
           {:else}
@@ -201,7 +238,7 @@
   {/if}
 
   {#if error}<p class="error">{error}</p>{/if}
-  <p class="footnote">Candidate ratings use bounded observations from real fleet operations. Unknown history lowers confidence; it is not treated as perfect uptime.</p>
+  <p class="footnote">Automatic learns from bounded observations of real fleet use. Adding a device never makes it an availability dependency by itself.</p>
 </section>
 
 <style>
@@ -220,7 +257,11 @@
   .resources { display: grid; gap: .5rem; } .resources-head span { color: var(--ink-faint); font-size: .68rem; }
   .device { display: grid; gap: .45rem; padding: .65rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
   .device header > div, .enable span { display: grid; gap: .08rem; } .device small { color: var(--ink-faint); font-size: .66rem; }
-  .candidate { padding: .2rem .4rem; border-radius: 99px; background: var(--accent-soft); color: var(--accent-ink); font-size: .65rem; }
+  .device header { flex-wrap: wrap; }
+  .device-role { display: flex; align-items: center; gap: .4rem; color: var(--ink-faint); font-size: .66rem; }
+  .device-role select { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink); padding: .3rem .45rem; }
+  .role-note { color: var(--ink-soft); font-size: .7rem; line-height: 1.4; }
+
   .volume { align-items: start; padding-top: .45rem; border-top: 1px solid var(--line); flex-wrap: wrap; }
   .enable { display: flex; align-items: start; gap: .45rem; min-width: 11rem; } .space { display: grid; gap: .2rem; min-width: 11rem; color: var(--ink-soft); font-size: .68rem; }
   progress { width: 100%; height: .38rem; } .quota { display: grid; gap: .25rem; flex-basis: 100%; color: var(--ink-soft); font-size: .68rem; padding-left: 1.45rem; } .quota input { width: 100%; }

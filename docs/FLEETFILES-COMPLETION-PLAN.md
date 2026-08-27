@@ -65,6 +65,13 @@ Exit: an interrupted operation resumes or fails actionably after restart, and Op
 
 - [ ] Promote page adoption into versioned namespace shards with separate object, entry, binding, version, replica, grant, and authority records.
 - [ ] Add cursor paging and stable page versions; replace the 500,000-entry correctness ceiling with bounded caches over sharded growth.
+- [ ] Separate human governance from the namespace data plane: owners govern eligibility and recovery but never become per-write voters merely by being owners.
+- [ ] Persist a versioned metadata service set selected from eligible, sufficiently available fleet nodes; sleeping clients and storage-only nodes remain outside it.
+- [ ] Rank candidates from hard capability/allocation constraints first and bounded service profiles second; persist the decision so observers cannot elect from different local metric views.
+- [ ] Implement a durable term, vote, ordered log, commit index, and leader lease for each namespace shard.
+- [ ] Acknowledge mutations only after quorum durability; minority partitions serve cached reads and retain edits explicitly as uncommitted.
+- [ ] Reconfigure through joint old/new quorum, including governance revocation and failed-node replacement without split authority.
+- [ ] Use a lightweight third metadata witness where a two-storage-node fleet has another eligible member; otherwise expose the honest single-node or two-node availability limit without blocking on unrelated laptops.
 - [ ] Define cross-platform case, Unicode, names, links, packages, and special entries.
 - [ ] Store immutable versions in bounded manifests and verified chunks.
 - [ ] Stage, stream, hash, verify, satisfy durability, reserve the name, and publish atomically.
@@ -147,4 +154,4 @@ Exit: every Operation Promise gate has automated evidence or a reproducible capt
 
 ## Immediate next action
 
-Implement F1 namespace mutation records and stable object/entry identity in the existing SQLite catalog, then route the current create, rename, move, copy, and delete paths through those preconditioned operations.
+Finish F1 by adding the persisted metadata service-set term and quorum log around the tested mutation engine. Derive candidates from governed eligibility, storage allocations, and bounded service profiles; prove that an offline owner laptop outside the service set does not affect commits before routing the UI or mount through the coordinator.

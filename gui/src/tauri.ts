@@ -504,6 +504,14 @@ export interface FleetStorageAllocation {
   enabled: boolean;
   stamp: { counter: number; actor: string };
 }
+export type FleetDeviceRole = "automatic" | "alwaysOn" | "personal";
+
+export interface FleetDeviceIntent {
+  device: string;
+  role: FleetDeviceRole;
+  stamp: { counter: number; actor: string };
+}
+
 
 export interface FleetStorageStatus {
   plan: {
@@ -512,6 +520,7 @@ export interface FleetStorageStatus {
       stamp: { counter: number; actor: string };
     };
     allocations: FleetStorageAllocation[];
+    deviceIntents: FleetDeviceIntent[];
   };
   profiles: FleetServiceProfile[];
 }
@@ -537,6 +546,13 @@ export function fleetStorageSetAllocation(
     enabled,
   });
 }
+export function fleetStorageSetDeviceRole(
+  device: string,
+  role: FleetDeviceRole,
+): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_device_role", { device, role });
+}
+
 
 export async function onFleetStorage(
   cb: (plan: FleetStorageStatus["plan"]) => void,
@@ -567,6 +583,7 @@ export interface NamespaceAdoption {
   provisionalId: string;
   entryId: string;
   objectId: string;
+  version: number;
 }
 
 export function filesNamespaceAdopt(
@@ -579,6 +596,7 @@ export function filesNamespaceAdopt(
         provisionalId: observation.provisionalId,
         entryId: observation.provisionalId,
         objectId: observation.nativeId,
+        version: 1,
       })),
     );
   }
@@ -586,6 +604,101 @@ export function filesNamespaceAdopt(
     parent,
     observations,
   });
+}
+
+export type NamespaceMutationRequest = {
+  operationId: string;
+} & (
+  | {
+      action: "create";
+      parentId: string;
+      displayName: string;
+      kind: "file" | "directory";
+      expectedParentVersion?: number;
+    }
+  | {
+      action: "rename";
+      entryId: string;
+      expectedVersion: number;
+      displayName: string;
+    }
+  | {
+      action: "move";
+      entryId: string;
+      expectedVersion: number;
+      parentId: string;
+      expectedParentVersion?: number;
+    }
+  | {
+      action: "delete";
+      entryId: string;
+      expectedVersion: number;
+    }
+);
+
+export interface NamespaceEntry {
+  entryId: string;
+  objectId: string;
+  parentId: string;
+  displayName: string;
+  kind: "file" | "directory";
+  hidden: boolean;
+  size: number;
+  modified: number;
+  version: number;
+  tombstone: boolean;
+  conflictGroup?: string;
+}
+
+export interface NamespaceDirectoryVersion {
+  parentId: string;
+  version: number;
+}
+
+export interface NamespaceMutationResult {
+  operationId: string;
+  sequence: number;
+  entry: NamespaceEntry;
+  directoryVersions: NamespaceDirectoryVersion[];
+}
+
+export interface NamespacePage {
+  parentId: string;
+  directoryVersion: number;
+  entries: NamespaceEntry[];
+  nextCursor?: string;
+}
+
+export function filesNamespaceMutate(
+  request: NamespaceMutationRequest,
+): Promise<NamespaceMutationResult> {
+  if (!isTauri()) return Promise.reject(new Error("Fleetfiles namespace requires the desktop app"));
+  return requiredInvoke<NamespaceMutationResult>("files_namespace_mutate", { request });
+}
+
+export function filesNamespaceList(
+  parent: string,
+  cursor?: string,
+  limit = 128,
+  expectedDirectoryVersion?: number,
+): Promise<NamespacePage> {
+  if (!isTauri()) return Promise.reject(new Error("Fleetfiles namespace requires the desktop app"));
+  return requiredInvoke<NamespacePage>("files_namespace_list", {
+    parent,
+    cursor,
+    limit,
+    expectedDirectoryVersion,
+  });
+}
+
+export async function onFilesNamespace(
+  cb: (result: NamespaceMutationResult) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<NamespaceMutationResult>("allmystuff://files-namespace", (event) =>
+    cb(event.payload),
+  );
 }
 
 export interface CanvasMutation {

@@ -1013,6 +1013,41 @@ async fn files_namespace_adopt(
 }
 
 #[tauri::command]
+async fn files_namespace_mutate(
+    state: State<'_, AppState>,
+    request: Value,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("files_namespace_mutate", json!({ "request": request }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_namespace_list(
+    state: State<'_, AppState>,
+    parent: String,
+    cursor: Option<String>,
+    limit: usize,
+    expected_directory_version: Option<i64>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "files_namespace_list",
+            json!({
+                "parent": parent,
+                "cursor": cursor,
+                "limit": limit,
+                "expected_directory_version": expected_directory_version,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn files_canvas_snapshot(state: State<'_, AppState>) -> Result<Value, String> {
     state
         .node
@@ -2224,6 +2259,24 @@ async fn fleet_storage_set_allocation(
                 "volume": volume,
                 "quota_bytes": quota_bytes,
                 "enabled": enabled,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn fleet_storage_set_device_role(
+    state: State<'_, AppState>,
+    device: String,
+    role: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleet_storage_set_device_role",
+            json!({
+                "device": device,
+                "role": role,
             }),
         )
         .await
@@ -4640,6 +4693,7 @@ fn main() {
             fleet_storage_status,
             fleet_storage_set_policy,
             fleet_storage_set_allocation,
+            fleet_storage_set_device_role,
             share_revoke,
             share_stop,
             send_input,
@@ -4679,6 +4733,8 @@ fn main() {
             open_files_window,
             open_files_workspace_window,
             files_namespace_adopt,
+            files_namespace_mutate,
+            files_namespace_list,
             files_canvas_snapshot,
             files_canvas_status,
             files_canvas_apply,

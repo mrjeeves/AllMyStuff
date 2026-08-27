@@ -77,6 +77,7 @@
   type WorkspaceEntry = LocalFileEntry & {
     binding: WorkspaceBinding;
     objectId?: string;
+    namespaceVersion?: number;
     legacyEntryId?: string;
     namespaceIdentity?: {
       sourceDevice: string;
@@ -565,7 +566,7 @@
     priorEntryId?: string,
   ): Promise<WorkspaceEntry[]> {
     if (candidates.length === 0) return candidates;
-    const adopted = new Map<string, { entryId: string; objectId: string }>();
+    const adopted = new Map<string, { entryId: string; objectId: string; version: number }>();
     const legacy = new Map<string, string>();
     try {
       for (let offset = 0; offset < candidates.length; offset += 256) {
@@ -620,6 +621,7 @@
           ...item,
           id: identity.entryId,
           objectId: identity.objectId,
+          namespaceVersion: identity.version,
           legacyEntryId: legacy.get(item.id),
         } : item;
       }), (item) => item.id);

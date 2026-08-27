@@ -53,15 +53,18 @@ use crate::files::FilesPlane;
 use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, LocalMutation};
 
 use crate::input_inject::Injector;
-use crate::namespace::{NamespaceAdoption, NamespaceCatalog, NamespaceObservation};
+use crate::namespace::{
+    NamespaceAdoption, NamespaceCatalog, NamespaceMutationRequest, NamespaceMutationResult,
+    NamespaceObservation, NamespacePage,
+};
 use crate::operations::{OperationPhase, OperationRecord, OperationsStore};
 use crate::ownership::Ownership;
 use crate::service_profiles::{ServiceProfiles, TransferOutcome};
 use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
 use crate::storage_plan::{
-    PolicyRecord, StorageAllocation, StoragePlanMessage, StoragePlanStore, StoragePolicy,
-    PLAN_CHUNK,
+    DeviceServiceIntent, DeviceServiceRole, PolicyRecord, StorageAllocation, StoragePlanMessage,
+    StoragePlanStore, StoragePolicy, PLAN_CHUNK,
 };
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
@@ -4740,13 +4743,17 @@ impl Mesh {
                     StoragePlanMessage::Patch {
                         policy,
                         allocations,
+                        device_intents,
                     } => {
                         let sender = pubkey_part(&from).to_string();
                         let may_manage = self.fleet_peer_may_manage(&network, &from).await;
-                        if self
-                            .storage_plan
-                            .merge(&sender, may_manage, policy, allocations)
-                        {
+                        if self.storage_plan.merge(
+                            &sender,
+                            may_manage,
+                            policy,
+                            allocations,
+                            device_intents,
+                        ) {
                             self.reconcile_local_storage_allocations();
                             self.sink.emit(
                                 "allmystuff://fleet-storage",
@@ -14892,7 +14899,7 @@ impl Mesh {
             .map(|node| pubkey_part(node.as_str()).to_string())
             .ok_or("this device identity is not ready")?;
         let record = self.storage_plan.set_policy(&actor, policy)?;
-        self.broadcast_storage_patch(Some(record.clone()), Vec::new())
+        self.broadcast_storage_patch(Some(record.clone()), Vec::new(), Vec::new())
             .await;
         self.sink.emit(
             "allmystuff://fleet-storage",
@@ -14933,13 +14940,36 @@ impl Mesh {
             quota_bytes,
             enabled,
         )?;
-        self.broadcast_storage_patch(None, vec![allocation.clone()])
+        self.broadcast_storage_patch(None, vec![allocation.clone()], Vec::new())
             .await;
         self.sink.emit(
             "allmystuff://fleet-storage",
             json!({ "plan": self.storage_plan.snapshot() }),
         );
         Ok(serde_json::to_value(allocation).unwrap_or(Value::Null))
+    }
+    pub async fn fleet_storage_set_device_role(
+        self: &Arc<Self>,
+        device: String,
+        role: DeviceServiceRole,
+    ) -> Result<Value, String> {
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let device = pubkey_part(&device).to_string();
+        let local = same_node(&actor, &device);
+        if !local && !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can set another device's role".into());
+        }
+        let intent = self.storage_plan.set_device_intent(&actor, device, role)?;
+        self.broadcast_storage_patch(None, Vec::new(), vec![intent.clone()])
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(intent).unwrap_or(Value::Null))
     }
 
     // ---- sites (the reverse proxy) --------------------------------------
@@ -17535,6 +17565,36 @@ impl Mesh {
         self.namespace.adopt_page(&parent_id, observations)
     }
 
+    /// Apply one authoritative Fleetfiles namespace mutation. Operation IDs
+    /// make retries safe; entry and directory versions reject stale writers.
+    pub fn files_namespace_mutate(
+        &self,
+        request: NamespaceMutationRequest,
+    ) -> Result<NamespaceMutationResult, String> {
+        let result = self.namespace.apply_mutation(request)?;
+        self.sink.emit(
+            "allmystuff://files-namespace",
+            serde_json::to_value(&result).unwrap_or_default(),
+        );
+        Ok(result)
+    }
+
+    /// Read one bounded, version-pinned directory page from Fleetfiles.
+    pub fn files_namespace_list(
+        &self,
+        parent_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        expected_directory_version: Option<i64>,
+    ) -> Result<NamespacePage, String> {
+        self.namespace.list_page(
+            &parent_id,
+            cursor.as_deref(),
+            limit,
+            expected_directory_version,
+        )
+    }
+
     /// Current fleet-wide Files canvas document for a newly opened GUI.
     pub fn files_canvas_snapshot(&self) -> Vec<CanvasRecord> {
         self.canvas.snapshot()
@@ -18078,6 +18138,7 @@ impl Mesh {
             | FleetfilesMessage::Ready { operation, .. }
             | FleetfilesMessage::Committed { operation, .. } => operation.clone(),
         };
+
         if matches!(
             message,
             FleetfilesMessage::Ready { .. } | FleetfilesMessage::Committed { .. }
@@ -18214,17 +18275,26 @@ impl Mesh {
         &self,
         policy: Option<PolicyRecord>,
         allocations: Vec<StorageAllocation>,
+        device_intents: Vec<DeviceServiceIntent>,
     ) {
         let Some(network) = self.ownership.fleet_network_id() else {
             return;
         };
-        let chunk_count = allocations.len().max(1).div_ceil(PLAN_CHUNK);
+        let chunk_count = allocations
+            .len()
+            .max(device_intents.len())
+            .max(1)
+            .div_ceil(PLAN_CHUNK);
         for index in 0..chunk_count {
             let start = index * PLAN_CHUNK;
-            let end = (start + PLAN_CHUNK).min(allocations.len());
+            let allocation_start = start.min(allocations.len());
+            let allocation_end = (start + PLAN_CHUNK).min(allocations.len());
+            let intent_start = start.min(device_intents.len());
+            let intent_end = (start + PLAN_CHUNK).min(device_intents.len());
             let message = StoragePlanMessage::Patch {
                 policy: (index == 0).then(|| policy.clone()).flatten(),
-                allocations: allocations[start..end].to_vec(),
+                allocations: allocations[allocation_start..allocation_end].to_vec(),
+                device_intents: device_intents[intent_start..intent_end].to_vec(),
             };
             let Ok(payload) = serde_json::to_value(message) else {
                 continue;
@@ -18265,17 +18335,35 @@ impl Mesh {
                 .filter(|allocation| allocation.device == local && allocation.stamp.actor == local)
                 .collect()
         };
+        let device_intents = if may_manage {
+            snapshot.device_intents
+        } else {
+            snapshot
+                .device_intents
+                .into_iter()
+                .filter(|intent| intent.device == local && intent.stamp.actor == local)
+                .collect()
+        };
+
         let policy = may_manage.then_some(snapshot.policy);
-        if policy.is_none() && allocations.is_empty() {
+        if policy.is_none() && allocations.is_empty() && device_intents.is_empty() {
             return;
         }
-        let chunk_count = allocations.len().max(1).div_ceil(PLAN_CHUNK);
+        let chunk_count = allocations
+            .len()
+            .max(device_intents.len())
+            .max(1)
+            .div_ceil(PLAN_CHUNK);
         for index in 0..chunk_count {
             let start = index * PLAN_CHUNK;
-            let end = (start + PLAN_CHUNK).min(allocations.len());
+            let allocation_start = start.min(allocations.len());
+            let allocation_end = (start + PLAN_CHUNK).min(allocations.len());
+            let intent_start = start.min(device_intents.len());
+            let intent_end = (start + PLAN_CHUNK).min(device_intents.len());
             let message = StoragePlanMessage::Patch {
                 policy: (index == 0).then(|| policy.clone()).flatten(),
-                allocations: allocations[start..end].to_vec(),
+                allocations: allocations[allocation_start..allocation_end].to_vec(),
+                device_intents: device_intents[intent_start..intent_end].to_vec(),
             };
             let Ok(payload) = serde_json::to_value(message) else {
                 continue;

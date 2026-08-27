@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 const MAX_ALLOCATIONS: usize = 512;
+const MAX_DEVICE_INTENTS: usize = 512;
 pub const PLAN_CHUNK: usize = 16;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -59,12 +60,29 @@ pub struct StorageAllocation {
     pub enabled: bool,
     pub stamp: PlanStamp,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceServiceRole {
+    #[default]
+    Automatic,
+    AlwaysOn,
+    Personal,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceServiceIntent {
+    pub device: String,
+    pub role: DeviceServiceRole,
+    pub stamp: PlanStamp,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePlanSnapshot {
     pub policy: PolicyRecord,
     pub allocations: Vec<StorageAllocation>,
+    pub device_intents: Vec<DeviceServiceIntent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +91,8 @@ pub enum StoragePlanMessage {
     Patch {
         policy: Option<PolicyRecord>,
         allocations: Vec<StorageAllocation>,
+        #[serde(default)]
+        device_intents: Vec<DeviceServiceIntent>,
     },
     Digest {
         digest: String,
@@ -81,9 +101,11 @@ pub enum StoragePlanMessage {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Persisted {
     policy: PolicyRecord,
     allocations: BTreeMap<String, StorageAllocation>,
+    device_intents: BTreeMap<String, DeviceServiceIntent>,
     counters: BTreeMap<String, u64>,
 }
 
@@ -111,11 +133,21 @@ impl StoragePlanStore {
         inner
             .allocations
             .retain(|id, allocation| id == &allocation.id && valid_allocation(allocation));
+        inner
+            .device_intents
+            .retain(|device, intent| device == &intent.device && valid_device_intent(intent));
         if inner.allocations.len() > MAX_ALLOCATIONS {
             inner.allocations = inner
                 .allocations
                 .into_iter()
                 .take(MAX_ALLOCATIONS)
+                .collect();
+        }
+        if inner.device_intents.len() > MAX_DEVICE_INTENTS {
+            inner.device_intents = inner
+                .device_intents
+                .into_iter()
+                .take(MAX_DEVICE_INTENTS)
                 .collect();
         }
         Self {
@@ -129,6 +161,7 @@ impl StoragePlanStore {
         StoragePlanSnapshot {
             policy: inner.policy.clone(),
             allocations: inner.allocations.values().cloned().collect(),
+            device_intents: inner.device_intents.values().cloned().collect(),
         }
     }
 
@@ -195,6 +228,39 @@ impl StoragePlanStore {
         }
         Ok(allocation)
     }
+    pub fn set_device_intent(
+        &self,
+        actor: &str,
+        device: String,
+        role: DeviceServiceRole,
+    ) -> Result<DeviceServiceIntent, String> {
+        valid_device(&device)?;
+        let mut inner = self.inner.lock();
+        if !inner.device_intents.contains_key(&device)
+            && inner.device_intents.len() >= MAX_DEVICE_INTENTS
+        {
+            return Err("the fleet storage plan has too many device roles".into());
+        }
+        let stamp = next_stamp(&mut inner, actor)?;
+        let intent = DeviceServiceIntent {
+            device: device.clone(),
+            role,
+            stamp,
+        };
+        let previous = inner.device_intents.insert(device.clone(), intent.clone());
+        if let Err(error) = persist(&self.path, &inner) {
+            match previous {
+                Some(previous) => {
+                    inner.device_intents.insert(device, previous);
+                }
+                None => {
+                    inner.device_intents.remove(&device);
+                }
+            }
+            return Err(error);
+        }
+        Ok(intent)
+    }
 
     /// Merge an authenticated peer patch. A manager may author fleet policy or
     /// any allocation; an ordinary member may author only its own device.
@@ -204,8 +270,12 @@ impl StoragePlanStore {
         sender_may_manage: bool,
         policy: Option<PolicyRecord>,
         allocations: Vec<StorageAllocation>,
+        device_intents: Vec<DeviceServiceIntent>,
     ) -> bool {
-        if sender.is_empty() || allocations.len() > MAX_ALLOCATIONS {
+        if sender.is_empty()
+            || allocations.len() > MAX_ALLOCATIONS
+            || device_intents.len() > MAX_DEVICE_INTENTS
+        {
             return false;
         }
         let mut inner = self.inner.lock();
@@ -243,6 +313,29 @@ impl StoragePlanStore {
                 changed = true;
             }
         }
+        for intent in device_intents {
+            let authorized =
+                sender_may_manage || (intent.device == sender && intent.stamp.actor == sender);
+            if !authorized || !valid_device_intent(&intent) {
+                continue;
+            }
+            let newer = inner
+                .device_intents
+                .get(&intent.device)
+                .is_none_or(|current| intent.stamp > current.stamp);
+            if newer
+                && (inner.device_intents.contains_key(&intent.device)
+                    || inner.device_intents.len() < MAX_DEVICE_INTENTS)
+            {
+                inner
+                    .counters
+                    .entry(intent.stamp.actor.clone())
+                    .and_modify(|counter| *counter = (*counter).max(intent.stamp.counter))
+                    .or_insert(intent.stamp.counter);
+                inner.device_intents.insert(intent.device.clone(), intent);
+                changed = true;
+            }
+        }
         if changed && persist(&self.path, &inner).is_err() {
             *inner = previous;
             return false;
@@ -264,6 +357,12 @@ fn next_stamp(inner: &mut Persisted, actor: &str) -> Result<PlanStamp, String> {
         .allocations
         .values()
         .map(|allocation| allocation.stamp.counter)
+        .chain(
+            inner
+                .device_intents
+                .values()
+                .map(|intent| intent.stamp.counter),
+        )
         .chain(std::iter::once(inner.policy.stamp.counter))
         .max()
         .unwrap_or_default();
@@ -293,6 +392,20 @@ fn allocation_id(device: &str, volume: &str) -> Result<String, String> {
         return Err("invalid storage resource identity".into());
     }
     Ok(format!("{}:{device}{volume}", device.len()))
+}
+
+fn valid_device(device: &str) -> Result<(), String> {
+    if device.is_empty() || device.len() > 512 || device.contains('\0') {
+        return Err("invalid device identity".into());
+    }
+    Ok(())
+}
+
+fn valid_device_intent(intent: &DeviceServiceIntent) -> bool {
+    valid_device(&intent.device).is_ok()
+        && intent.stamp.counter > 0
+        && !intent.stamp.actor.is_empty()
+        && intent.stamp.actor.len() <= 512
 }
 
 fn valid_allocation(allocation: &StorageAllocation) -> bool {
@@ -356,6 +469,26 @@ mod tests {
         assert_eq!(snapshot.policy, policy);
         assert_eq!(snapshot.allocations, vec![allocation]);
     }
+    #[test]
+    fn device_role_is_durable_cleanly_serialized_and_backward_compatible() {
+        let store = StoragePlanStore::memory();
+        let intent = store
+            .set_device_intent("owner", "server".into(), DeviceServiceRole::AlwaysOn)
+            .unwrap();
+        assert_eq!(store.snapshot().device_intents, vec![intent.clone()]);
+        assert_eq!(
+            serde_json::to_value(intent.role).unwrap(),
+            serde_json::json!("alwaysOn")
+        );
+
+        let legacy = serde_json::json!({
+            "policy": PolicyRecord::default(),
+            "allocations": {},
+            "counters": {}
+        });
+        let persisted: Persisted = serde_json::from_value(legacy).unwrap();
+        assert!(persisted.device_intents.is_empty());
+    }
 
     #[test]
     fn member_cannot_edit_another_device_or_policy() {
@@ -389,7 +522,13 @@ mod tests {
                 actor: "owner".into(),
             },
         };
-        assert!(!store.merge("member", false, Some(forged_policy), vec![forged, relayed]));
+        assert!(!store.merge(
+            "member",
+            false,
+            Some(forged_policy),
+            vec![forged, relayed],
+            Vec::new()
+        ));
         assert!(store.snapshot().allocations.is_empty());
         assert_eq!(store.snapshot().policy, PolicyRecord::default());
     }
@@ -403,14 +542,25 @@ mod tests {
         let allocation = source
             .set_allocation("owner", "laptop".into(), "ssd".into(), 500, true)
             .unwrap();
+        let intent = source
+            .set_device_intent("owner", "laptop".into(), DeviceServiceRole::Personal)
+            .unwrap();
         let target = StoragePlanStore::memory();
         assert!(target.merge(
             "controller",
             true,
             Some(policy.clone()),
-            vec![allocation.clone()]
+            vec![allocation.clone()],
+            vec![intent.clone()]
         ));
-        assert!(!target.merge("controller", true, Some(policy), vec![allocation]));
+        assert!(!target.merge(
+            "controller",
+            true,
+            Some(policy),
+            vec![allocation],
+            vec![intent.clone()]
+        ));
+        assert_eq!(target.snapshot().device_intents, vec![intent]);
     }
 
     #[test]

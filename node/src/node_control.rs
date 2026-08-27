@@ -1384,6 +1384,11 @@ pub async fn dispatch(
                     .await,
             )
         }
+        "fleet_storage_set_device_role" => {
+            let device: String = try_arg!(arg(a, "device"));
+            let role: crate::storage_plan::DeviceServiceRole = try_arg!(arg(a, "role"));
+            json_result(mesh.fleet_storage_set_device_role(device, role).await)
+        }
 
         "file_watch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
@@ -1473,6 +1478,23 @@ pub async fn dispatch(
             let observations: Vec<crate::namespace::NamespaceObservation> =
                 try_arg!(arg(a, "observations"));
             json_result(mesh.files_namespace_adopt(parent, observations).await)
+        }
+        "files_namespace_mutate" => {
+            let request: crate::namespace::NamespaceMutationRequest = try_arg!(arg(a, "request"));
+            json_result(mesh.files_namespace_mutate(request))
+        }
+        "files_namespace_list" => {
+            let parent: String = try_arg!(arg(a, "parent"));
+            let cursor: Option<String> = try_arg!(opt(a, "cursor"));
+            let limit: usize = try_arg!(arg(a, "limit"));
+            let expected_directory_version: Option<i64> =
+                try_arg!(opt(a, "expected_directory_version"));
+            json_result(mesh.files_namespace_list(
+                parent,
+                cursor,
+                limit,
+                expected_directory_version,
+            ))
         }
         "files_canvas_snapshot" => DispatchOut::Json(
             serde_json::to_value(mesh.files_canvas_snapshot()).unwrap_or_default(),

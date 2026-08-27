@@ -122,6 +122,25 @@ Interactive work takes priority over maintenance. Background work yields to devi
 
 No device is permanently designated as the computer. Coordination and authority are replicated roles with explicit availability limits. A small fleet may co-locate every role; larger fleets may distribute metadata, content, indexing, and worker roles.
 
+### Governance is not the write path
+
+Fleet ownership names the people/devices allowed to change policy, membership, and recovery authority. It does not make every owner's current device a metadata voter, and an ordinary file operation never waits for every owner to be online.
+
+The namespace data plane uses a small, persisted metadata service set selected from eligible fleet nodes:
+
+- eligibility is governed, while routine placement inside that boundary is automatic;
+- candidates are ranked using hard capability constraints and bounded service profiles;
+- intermittently connected clients, including owner laptops, are clients/caches unless deliberately eligible and selected;
+- storage-only members and encrypted chunk holders need not have namespace authority;
+- the configured service set and its term are durable namespace state, not a fresh interpretation of whichever peers happen to be visible;
+- a leader may acknowledge a namespace mutation only after the ordered log entry is durable on a quorum of the configured service set;
+- service-set replacement uses joint quorum across the old and new configurations, so a partition cannot create two valid authorities;
+- governance changes invalidate unauthorized future terms but do not put owners into the per-operation acknowledgement path.
+
+One suitable service node may operate without partition-safe automatic failover and must say so. Two service nodes cannot provide both write availability during either-node loss and split-brain safety; the system should automatically use a third lightweight metadata witness when an eligible fleet node exists. Three or more service members use majority quorum. A sleeping laptop that is not in the current service set has no effect on write availability.
+
+Owners remain able to change eligibility, approve exceptional recovery, and audit why the scheduler selected each service member. Those are control-plane operations, not dependencies of opening, renaming, or saving a file.
+
 ## Bounded fleet service profiles
 
 Each member records a compact, time-decayed service profile for every other eligible member. The record exists to choose storage and workload candidates, not to monitor a person.

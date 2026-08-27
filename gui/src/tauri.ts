@@ -34,6 +34,7 @@ import type {
   VideoFrameMsg,
 } from "./types";
 import type { CanvasRecord } from "./files-canvas";
+import { managedUnlisten } from "./event-lifecycle";
 
 interface ScanResult {
   node_id: string;
@@ -249,12 +250,12 @@ export async function watchLocalDirectory(
   let expiresAt = 0;
   let renewTimer: number | null = null;
   let stopped = false;
-  const unlisten = await listen<LocalDirectoryChanged>(
+  const unlisten = managedUnlisten(await listen<LocalDirectoryChanged>(
     "allmystuff://local-directory-changed",
     ({ payload }) => {
       if (payload.token === token) cb(payload);
     },
-  );
+  ));
 
   const clearRenewal = () => {
     if (renewTimer !== null) window.clearTimeout(renewTimer);
@@ -441,10 +442,10 @@ export async function onFileOperations(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ operations: LocalFileTransferOperation[] }>(
+  return managedUnlisten(await listen<{ operations: LocalFileTransferOperation[] }>(
     "allmystuff://file-operations",
     (event) => cb(event.payload.operations),
-  );
+  ));
 }
 
 
@@ -746,7 +747,9 @@ export async function onFilesCanvas(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ records: CanvasRecord[] }>("allmystuff://files-canvas", (event) => cb(event.payload.records));
+  return managedUnlisten(await listen<{ records: CanvasRecord[] }>(
+    "allmystuff://files-canvas", (event) => cb(event.payload.records),
+  ));
 }
 
 // ---- app metadata -----------------------------------------------------
@@ -1708,12 +1711,13 @@ export async function watchFiles(
   });
   const timer = setInterval(() => void tick(), 100);
   void tick(); // drain whatever buffered before this window subscribed
-  return () => {
+  return managedUnlisten(() => {
     stopped = true;
     clearInterval(timer);
-    unlisten();
+    const result = unlisten();
     void invoke("file_unwatch", { routeId, token }).catch(() => {});
-  };
+    return result;
+  });
 }
 
 /** Route the coming `read` request's chunks straight into this machine's
@@ -1750,12 +1754,12 @@ export async function onFileSaved(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{
+  return managedUnlisten(await listen<{
     route: string;
     req: number;
     path: string | null;
     error: string | null;
-  }>("allmystuff://file-saved", (e) => cb(e.payload));
+  }>("allmystuff://file-saved", (e) => cb(e.payload)));
 }
 
 /** This machine refused an inbound input/clipboard event
@@ -3035,7 +3039,7 @@ export async function onSubscription(
 export async function onBackendReady(cb: () => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<Record<string, never>>("allmystuff://backend-ready", () => cb());
+  return managedUnlisten(await listen<Record<string, never>>("allmystuff://backend-ready", () => cb()));
 }
 
 // ---- networks · identity · roster -------------------------------------

@@ -1390,7 +1390,13 @@
       .then(({ operations }) => absorbTransferOperations(operations))
       .catch((error) => console.warn("Could not restore file operations:", error));
     void onFileOperations(absorbTransferOperations)
-      .then((unlisten) => { stopOperations = unlisten; })
+      .then((unlisten) => {
+        if (!mounted) {
+          unlisten();
+          return;
+        }
+        stopOperations = unlisten;
+      })
       .catch((error) => console.warn("Could not watch file operations:", error));
     void onFileSaved((event) => {
       const key = `${event.route}:${event.req}`;
@@ -1406,7 +1412,13 @@
       }).catch((error) => {
         app.toast("warn", `Couldn't open ${pending.name}: ${String(error)}`);
       });
-    }).then((unlisten) => { stopSaved = unlisten; });
+    }).then((unlisten) => {
+      if (!mounted) {
+        unlisten();
+        return;
+      }
+      stopSaved = unlisten;
+    });
     return () => {
       mounted = false;
       document.removeEventListener("visibilitychange", remoteDirectoryVisibilityChanged);

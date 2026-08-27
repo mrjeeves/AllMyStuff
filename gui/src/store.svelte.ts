@@ -16,7 +16,7 @@ import {
   type GrantRequest,
 } from "./catalog";
 import { reconcileCecOnlyCanons } from "./cec-provenance";
-import { nearestFileTileSize } from "./files-canvas";
+import { coalesceLatestBy, nearestFileTileSize } from "./files-canvas";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -10669,7 +10669,10 @@ class AppStore {
       const hasDirection = durable?.out_grants !== undefined && durable.in_grants !== undefined;
       const holderFor = (grant: Grant) =>
         partner.grants.find((row) => row.grant.id === grant.id)?.node ?? partner.nodes[0];
-      const rows = (grants: Grant[]) => grants.map((grant) => ({ node: holderFor(grant), grant }));
+      const rows = (grants: Grant[]) => coalesceLatestBy(
+        grants.map((grant) => ({ node: holderFor(grant), grant })),
+        (row) => row.grant.id,
+      );
       if (hasDirection && durable) {
         partner.sharedByYou = rows(durable.out_grants ?? []);
         partner.sharedWithYou = rows(durable.in_grants ?? []);

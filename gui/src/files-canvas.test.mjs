@@ -1,7 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+
+test("overlapping snapshots keep stable order and the latest value per domain key", () => {
+  const rows = [
+    { id: "entry:a", revision: 1 },
+    { id: "entry:b", revision: 1 },
+    { id: "entry:a", revision: 2 },
+  ];
+  assert.deepEqual(coalesceLatestBy(rows, (row) => row.id), [
+    { id: "entry:a", revision: 2 },
+    { id: "entry:b", revision: 1 },
+  ]);
+  assert.equal(coalesceLatestBy([
+    { id: "same", domain: "entry" },
+    { id: "same", domain: "operation" },
+  ], (row) => row.domain + ":" + row.id).length, 2);
+});
 
 test("fleet records converge per entity regardless of merge order", () => {
   const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };

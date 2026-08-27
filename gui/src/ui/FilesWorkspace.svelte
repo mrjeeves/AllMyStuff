@@ -37,6 +37,7 @@
     type LocalFileTransferImpact,
   } from "../tauri";
   import {
+    coalesceLatestBy,
     contains,
     containingFrame,
     desktopColumnPosition,
@@ -222,7 +223,7 @@
   );
 
   function absorbTransferOperations(operations: LocalFileTransferOperation[]) {
-    transferOperations = operations.map((operation) => ({
+    transferOperations = coalesceLatestBy(operations.map((operation) => ({
       id: operation.id,
       phase: operation.phase,
       targetLabel: operation.targetLabel,
@@ -238,7 +239,7 @@
       },
       error: operation.error ?? "",
       startedAt: operation.startedAt,
-    }));
+    })), (operation) => operation.id);
   }
 
   type FrameGeometry = Pick<CanvasFrame, "x" | "y" | "width" | "height">;
@@ -296,11 +297,12 @@
   });
 
   const selected = $derived(entries.find((entry) => entry.id === selectedId) ?? null);
-  const navigatorTrail = $derived(
+  const navigatorTrail = $derived(coalesceLatestBy(
     fleetHome || computerHome
       ? []
       : nativeLocationTrail(currentRemoteDirectory?.path ?? path, currentRemoteDirectory ? "" : platform),
-  );
+    (crumb) => crumb.path,
+  ));
   const scope = $derived(
     fleetHome
       ? "fleet:home"
@@ -533,13 +535,13 @@
         );
         for (const row of rows) adopted.set(row.provisionalId, row);
       }
-      return candidates.map((item) => {
+      return coalesceLatestBy(candidates.map((item) => {
         const identity = adopted.get(item.id);
         return identity ? { ...item, id: identity.entryId, objectId: identity.objectId } : item;
-      });
+      }), (item) => item.id);
     } catch (error) {
       console.warn("Files namespace adoption unavailable:", error);
-      return candidates;
+      return coalesceLatestBy(candidates, (item) => item.id);
     }
   }
 
@@ -706,7 +708,7 @@
   ): WorkspaceEntry[] {
     if (completeListing) {
       const kept = prior.filter((entry) => !matchesSource(entry));
-      return [...kept, ...additions];
+      return coalesceLatestBy([...kept, ...additions], (entry) => entry.id);
     }
     const updates = new Map(additions.map((entry) => [entry.id, entry]));
     const merged = prior.map((entry) => {
@@ -716,7 +718,7 @@
       updates.delete(entry.id);
       return update;
     });
-    return [...merged, ...updates.values()];
+    return coalesceLatestBy([...merged, ...updates.values()], (entry) => entry.id);
   }
 
   async function refreshRemoteDirectory(subscription: RemoteDirectorySubscription) {
@@ -1050,7 +1052,7 @@
       map = "files";
       path = "computer://" + encodeURIComponent(canonical);
       address = "Devices / " + deviceLabel;
-      entries = nextEntries;
+      entries = coalesceLatestBy(nextEntries, (entry) => entry.id);
       nextCursor = null;
       complete = true;
       thumbnails = {};
@@ -2190,7 +2192,10 @@ function newTransferId(): string {
       error: "",
       startedAt: Date.now(),
     };
-    transferOperations = [operation, ...transferOperations].slice(0, 50);
+    transferOperations = coalesceLatestBy(
+      [operation, ...transferOperations],
+      (candidate) => candidate.id,
+    ).slice(0, 50);
     operationsOpen = true;
     transferDialog = null;
     try {

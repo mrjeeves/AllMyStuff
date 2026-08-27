@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import { coalesceLatestBy } from "../../files-canvas";
   import { humanBytes, type MeshNode, type StorageSummary } from "../../types";
   import {
     fleetStorageLocalVolumes,
@@ -19,7 +20,26 @@
   let error = $state("");
   let saving = $state<string | null>(null);
 
-  const nodes = $derived(app.catalog.nodes.filter((node) => app.isMe(node.id) || app.isFleetMember(node.id)));
+  const nodes = $derived.by(() => {
+    const distinct: MeshNode[] = [];
+    for (const node of app.catalog.nodes) {
+      if (!app.isMe(node.id) && !app.isFleetMember(node.id)) continue;
+      const index = distinct.findIndex((candidate) => app.isSameMachine(candidate.id, node.id));
+      if (index < 0) {
+        distinct.push(node);
+        continue;
+      }
+      const current = distinct[index]!;
+      const score = Number(app.isMe(node.id)) * 8
+        + Number(node.online) * 4
+        + Number(Boolean(node.summary)) * 2;
+      const currentScore = Number(app.isMe(current.id)) * 8
+        + Number(current.online) * 4
+        + Number(Boolean(current.summary)) * 2;
+      if (score >= currentScore) distinct[index] = node;
+    }
+    return distinct;
+  });
   const policy = $derived(status?.plan.policy.value);
   const allocations = $derived(status?.plan.allocations ?? []);
   const rawAllocated = $derived(allocations.filter((item) => item.enabled).reduce((sum, item) => sum + item.quotaBytes, 0));
@@ -50,16 +70,16 @@
 
   function volumesFor(node: MeshNode): StorageSummary[] {
     if (app.isMe(node.id) && localVolumes.length) {
-      return localVolumes.map((volume) => ({
+      return coalesceLatestBy(localVolumes.map((volume) => ({
         id: volume.id,
         name: volume.name,
         total_bytes: volume.totalBytes,
         available_bytes: volume.availableBytes,
         removable: volume.removable,
         kind: volume.kind,
-      }));
+      })), (volume) => volume.id);
     }
-    return node.summary?.storage ?? [];
+    return coalesceLatestBy(node.summary?.storage ?? [], (volume) => volume.id);
   }
 
   function nodeFor(device: string): MeshNode | undefined {

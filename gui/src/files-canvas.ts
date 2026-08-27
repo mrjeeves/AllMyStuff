@@ -1,6 +1,24 @@
 export type FilesView = "canvas" | "details";
 export type FilesMap = "files" | "sharing";
 
+/**
+ * Collapse repeated observations of the same logical entity without changing
+ * its first-seen position. Event snapshots and paged refreshes can overlap;
+ * the most recent observation owns the value while the stable order prevents
+ * the UI from jumping around. Callers must use an identity from their own
+ * domain (namespace entry, operation, device, volume), never a display name.
+ */
+export function coalesceLatestBy<T>(items: readonly T[], keyOf: (item: T) => string): T[] {
+  const order: string[] = [];
+  const latest = new Map<string, T>();
+  for (const item of items) {
+    const key = keyOf(item);
+    if (!latest.has(key)) order.push(key);
+    latest.set(key, item);
+  }
+  return order.map((key) => latest.get(key)!);
+}
+
 export interface Point { x: number; y: number }
 export interface Rect extends Point { width: number; height: number }
 export interface NativeLocationCrumb {

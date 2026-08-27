@@ -531,9 +531,9 @@
       status = "offline";
       note = "Live file browsing needs the desktop app.";
     }
-    // Route state hangs off session snapshots; poll as the truth (the
-    // same doctrine as the terminal).
-    const sessionPoll = setInterval(() => void app.refreshSession(), 1000);
+    // Session events are live truth; one pull closes the missed-event window.
+    // There is deliberately no recurring IPC/network poll for route state.
+    void app.refreshSession();
     void onFileSaved((ev) => {
       if (ev.route !== routeId) return;
       const t = transfers.find((x) => x.req === ev.req && x.kind === "down");
@@ -561,7 +561,6 @@
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
     return () => {
-      clearInterval(sessionPoll);
       stopWatch?.();
       unlistenSaved?.();
       unlistenProgress?.();

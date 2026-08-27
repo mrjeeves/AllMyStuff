@@ -16,7 +16,7 @@ import {
   type GrantRequest,
 } from "./catalog";
 import { reconcileCecOnlyCanons } from "./cec-provenance";
-import { coalesceLatestBy, nearestFileTileSize } from "./files-canvas";
+import { coalesceLatestBy, nearestFileTileSize, routeActivationOutcome } from "./files-canvas";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -447,6 +447,11 @@ const PRESENCE_GRACE_MS = 45_000;
  *  moment its details change); this is the fallback for a node that's gone or
  *  simply never answers, so the ring doesn't spin forever. */
 const REFRESH_TIMEOUT_MS = 12_000;
+
+/** One queued route survives two complete MyOwnMesh ICE cycles (75 s total)
+ * plus route-accept margin. This is only a ceiling: session events wake the
+ * waiter immediately, so an already-live peer still opens instantly. */
+const ROUTE_ACTIVATION_TIMEOUT_MS = 90_000;
 
 /** The app features the running binary always supports — the GUI's mirror of
  *  the node's `build_profile` feature list (node/src/mesh.rs). A peer learns
@@ -993,6 +998,13 @@ class AppStore {
    *  snapshot. A terminal tab watches its own route here to tell
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
+  /** Event-driven route activation waiters. The session listener is the fast
+   * path; each wait performs one snapshot pull to cover a window that opened
+   * after the last event. There is deliberately no interval/poll loop here. */
+  private routeActivationWaiters = new Map<
+    string,
+    Set<(state: RouteLiveState | undefined) => void>
+  >();
   driveMounts = $state<Record<string, { label: string; mount: string }>>({});
   /** Durable one-way mapping relationships mirrored by both affected nodes. */
   driveRelationships = $state<DriveMappingState[]>([]);
@@ -2709,6 +2721,10 @@ class AppStore {
     }
     this.routeStates = states;
     this.routeSessions = sessions;
+    for (const [routeId, waiters] of this.routeActivationWaiters) {
+      const state = states[routeId];
+      for (const waiter of Array.from(waiters)) waiter(state);
+    }
     for (const routeId of Object.keys(this.driveMounts)) {
       if (!states[routeId] || states[routeId].state !== "active") {
         delete this.driveMounts[routeId];
@@ -4929,6 +4945,58 @@ class AppStore {
     const to = `${this.localId}:files-view:${Date.now().toString(36)}-${n}`;
     void connectRoute(from, to, "generic");
     return `route:${from}→${to}`;
+  }
+
+
+  /** Confirm that the local daemon accepted the route command before exposing
+   * its id. Workspace sessions use this stricter surface so a failed invoke
+   * cannot masquerade as a route that is merely still negotiating. */
+  async filesConnectConfirmed(hostNodeId: string): Promise<string | null> {
+    if (!this.backendConnected) return null;
+    const from = `${hostNodeId}:files`;
+    const n = ++this.filesViewSeq;
+    const to = `${this.localId}:files-view:${Date.now().toString(36)}-${n}`;
+    await connectRoute(from, to, "generic");
+    return `route:${from}→${to}`;
+  }
+  /** Wait for one route to become active without polling the daemon. Multiple
+   * callers may wait on the same route; a session event settles all of them.
+   * One pull after registration closes the missed-event race for new windows. */
+  waitForRouteActive(
+    routeId: string,
+    timeoutMs = ROUTE_ACTIVATION_TIMEOUT_MS,
+  ): Promise<void> {
+    const initial = routeActivationOutcome(this.routeStates[routeId]);
+    if (initial.kind === "active") return Promise.resolve();
+    if (initial.kind === "failed") return Promise.reject(new Error(initial.reason));
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        const waiters = this.routeActivationWaiters.get(routeId);
+        waiters?.delete(onState);
+        if (waiters?.size === 0) this.routeActivationWaiters.delete(routeId);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onState = (state: RouteLiveState | undefined) => {
+        const outcome = routeActivationOutcome(state);
+        if (outcome.kind === "active") finish();
+        else if (outcome.kind === "failed") finish(new Error(outcome.reason));
+      };
+      const timer = window.setTimeout(() => {
+        finish(new Error("Files connection timed out before the peer transport became ready"));
+      }, timeoutMs);
+      const waiters = this.routeActivationWaiters.get(routeId)
+        ?? new Set<(state: RouteLiveState | undefined) => void>();
+      waiters.add(onState);
+      this.routeActivationWaiters.set(routeId, waiters);
+      // One bounded local IPC truth pull, never a recurring connection poll.
+      void this.refreshSession().catch(() => {});
+    });
   }
 
   /** Tear one files session down (window closing). The returned promise

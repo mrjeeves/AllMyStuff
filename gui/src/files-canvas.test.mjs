@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("overlapping snapshots keep stable order and the latest value per domain key", () => {
   const rows = [
@@ -272,4 +272,19 @@ test("the sharing map cannot collide with broad or non-filesystem shares", () =>
     { media: "storage", capability: null, label: "Generic storage" },
   ];
   for (const grant of rejected) assert.equal(sharedFilesystemObject(grant), null);
+});
+
+test("route activation waits through negotiation and stops on terminal states", () => {
+  assert.deepEqual(routeActivationOutcome(undefined), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "offered" }), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "connecting" }), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "active" }), { kind: "active" });
+  assert.deepEqual(routeActivationOutcome({ state: "rejected", reason: "not shared" }), {
+    kind: "failed",
+    reason: "not shared",
+  });
+  assert.deepEqual(routeActivationOutcome({ state: "torn_down" }), {
+    kind: "failed",
+    reason: "The remote device refused the connection",
+  });
 });

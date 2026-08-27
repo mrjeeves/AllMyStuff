@@ -288,6 +288,31 @@ export function nearestFileTileSize(input: number): number {
   );
 }
 
+export type RouteActivationOutcome =
+  | { kind: "waiting" }
+  | { kind: "active" }
+  | { kind: "failed"; reason: string };
+
+/** Classify a route snapshot for an event-driven activation waiter.
+ *
+ * A missing route and every negotiation state remain pending: the route offer
+ * can be queued while its peer's transport wakes. Only the two terminal states
+ * fail the wait. Keeping this policy in one pure helper makes Files, Terminal,
+ * and future route-backed surfaces agree about what "still connecting" means.
+ */
+export function routeActivationOutcome(
+  state: { state: string; reason?: string } | undefined,
+): RouteActivationOutcome {
+  if (state?.state === "active") return { kind: "active" };
+  if (state?.state === "rejected" || state?.state === "torn_down") {
+    return {
+      kind: "failed",
+      reason: state.reason || "The remote device refused the connection",
+    };
+  }
+  return { kind: "waiting" };
+}
+
 export interface NativeFileGridMetrics {
   iconSize: number;
   tileWidth: number;

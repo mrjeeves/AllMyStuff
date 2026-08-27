@@ -817,7 +817,11 @@ const MAX_TERM_DATA_BYTES: usize = 16 * 1024;
 /// expire the offer while the link it's waiting for is still legitimately
 /// being built — the exact race that made a share "fail" when it was merely
 /// slow.
-const ROUTE_OFFER_TTL: Duration = Duration::from_secs(30);
+/// Keep the one reliable queued offer alive through two complete ICE cycles
+/// plus signaling margin. The daemon retransmits it across the rebuild, so
+/// this extends one bounded intent instead of generating duplicate offers.
+/// An unreachable peer still expires deterministically.
+const ROUTE_OFFER_TTL: Duration = Duration::from_secs(75);
 
 /// Room windows refresh their membership lease every 10 seconds. Missing
 /// three beats expires the scope and tears down every route that used it.
@@ -20853,8 +20857,9 @@ mod tests {
     fn a_reliable_sends_ttl_is_the_whole_budget_however_many_meshes_are_shared() {
         // The TTL a route offer carries is a promise about how long the
         // *offer* may wait for a link — not how long each mesh may. Sharing
-        // three networks with a peer must not turn a 30s budget into 90s of
-        // a console sitting on "connecting".
+        // three networks with a peer must not turn one bounded 75s recovery
+        // budget into 225s of a console sitting on "connecting".
+        assert_eq!(ROUTE_OFFER_TTL, Duration::from_secs(75));
         assert_eq!(
             per_attempt_ttl(ROUTE_OFFER_TTL, 3) * 3,
             ROUTE_OFFER_TTL,

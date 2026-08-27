@@ -92,6 +92,9 @@
     deviceId: string;
     deviceLabel: string;
     routeId: string;
+    ready: Promise<void>;
+    closed: boolean;
+    disconnectStarted: boolean;
     nextReq: number;
     stop: (() => void) | null;
     pending: Map<number, {
@@ -142,7 +145,6 @@
   let fleetfilesRootPath = "";
   let fleetfilesNamespace = "";
   const remoteSessions = new Map<string, RemoteSession>();
-  let routeSnapshotRefresh: Promise<void> | null = null;
   type FleetDesktopCursor = { deviceId: string; deviceLabel: string; path: string; cursor: string };
   const fleetDesktopCursors = new Map<string, FleetDesktopCursor>();
   type RemoteDirectorySubscription = {
@@ -650,36 +652,6 @@
     preview = null;
   }
 
-  function refreshRouteSnapshot(): Promise<void> {
-    if (routeSnapshotRefresh) return routeSnapshotRefresh;
-    const pending = app.refreshSession().catch(() => {});
-    routeSnapshotRefresh = pending;
-    void pending.finally(() => {
-      if (routeSnapshotRefresh === pending) routeSnapshotRefresh = null;
-    });
-    return pending;
-  }
-
-  async function waitForRoute(routeId: string): Promise<void> {
-    const deadline = Date.now() + 10_000;
-    let nextSnapshotAt = 0;
-    while (Date.now() < deadline) {
-      const state = app.routeStates[routeId]?.state;
-      if (state === "active") return;
-      if (state === "rejected" || state === "torn_down") {
-        throw new Error(app.routeStates[routeId]?.reason || "Files access was refused");
-      }
-      const now = Date.now();
-      if (now >= nextSnapshotAt) {
-        nextSnapshotAt = now + 500;
-        await refreshRouteSnapshot();
-      } else {
-        await new Promise((resolve) => window.setTimeout(resolve, 50));
-      }
-    }
-    throw new Error("Files connection timed out");
-  }
-
   function receiveRemote(session: RemoteSession, event: FileEvent) {
     if (event.kind === "directory_changed") {
       session.directoryChanges.get(event.req)?.(event);
@@ -695,29 +667,80 @@
   }
 
   async function ensureRemoteSession(deviceId: string, deviceLabel: string): Promise<RemoteSession> {
-    const existing = remoteSessions.get(deviceId);
-    if (existing) return existing;
-    const routeId = app.filesConnect(deviceId);
-    if (!routeId) throw new Error("Files transport is unavailable");
+    const key = canonicalDeviceId(deviceId);
+    const existing = remoteSessions.get(key);
+    if (existing) {
+      const state = app.routeStates[existing.routeId]?.state;
+      const terminal = state === "rejected" || state === "torn_down";
+      if (!existing.closed && !terminal) {
+        await existing.ready;
+        if (existing.closed) throw new Error("Files workspace closed");
+        return existing;
+      }
+      if (remoteSessions.get(key) === existing) remoteSessions.delete(key);
+      existing.closed = true;
+      existing.stop?.();
+      existing.stop = null;
+      for (const pending of existing.pending.values()) {
+        window.clearTimeout(pending.timer);
+        pending.reject(new Error("The remote Files connection ended"));
+      }
+      existing.pending.clear();
+      existing.directoryChanges.clear();
+      void disconnectRemoteRoute(existing);
+    }
     const session: RemoteSession = {
       deviceId,
       deviceLabel,
-      routeId,
+      routeId: "",
+      ready: Promise.resolve(),
+      closed: false,
+      disconnectStarted: false,
       nextReq: 1,
       stop: null,
       pending: new Map(),
       directoryChanges: new Map(),
     };
-    remoteSessions.set(deviceId, session);
-    try {
-      await waitForRoute(routeId);
+    remoteSessions.set(key, session);
+    session.ready = (async () => {
+      const routeId = await app.filesConnectConfirmed(deviceId);
+      if (!routeId) throw new Error("Files transport is unavailable");
+      session.routeId = routeId;
+      if (session.closed) {
+        await disconnectRemoteRoute(session);
+        throw new Error("Files workspace closed");
+      }
+      await app.waitForRouteActive(routeId);
+      if (session.closed) {
+        await disconnectRemoteRoute(session);
+        throw new Error("Files workspace closed");
+      }
       session.stop = await watchFiles(routeId, (event) => receiveRemote(session, event));
+    })();
+    try {
+      await session.ready;
       return session;
     } catch (error) {
-      remoteSessions.delete(deviceId);
-      void app.filesDisconnect(routeId);
+      if (remoteSessions.get(key) === session) remoteSessions.delete(key);
+      session.closed = true;
+      session.stop?.();
+      session.stop = null;
+      void disconnectRemoteRoute(session);
       throw error;
     }
+  }
+
+  function disconnectRemoteRoute(session: RemoteSession): Promise<unknown> {
+    if (!session.routeId || session.disconnectStarted) return Promise.resolve();
+    session.disconnectStarted = true;
+    return app.filesDisconnect(session.routeId);
+  }
+
+  function remoteSession(deviceId: string): RemoteSession | undefined {
+    const session = remoteSessions.get(canonicalDeviceId(deviceId));
+    if (!session || session.closed) return undefined;
+    const state = app.routeStates[session.routeId]?.state;
+    return state === "rejected" || state === "torn_down" ? undefined : session;
   }
 
   function remoteRequest(
@@ -1267,13 +1290,15 @@
   function closeRemoteSessions() {
     stopDirectorySubscriptions();
     for (const session of remoteSessions.values()) {
+      session.closed = true;
       session.stop?.();
+      session.stop = null;
       for (const pending of session.pending.values()) {
         window.clearTimeout(pending.timer);
         pending.reject(new Error("Files workspace closed"));
       }
       session.directoryChanges.clear();
-      void app.filesDisconnect(session.routeId);
+      void disconnectRemoteRoute(session);
     }
     remoteSessions.clear();
   }
@@ -1490,7 +1515,7 @@
 
   async function navigateRemoteItem(item: WorkspaceEntry) {
     if (item.binding.kind !== "remote") return;
-    const session = remoteSessions.get(item.binding.deviceId);
+    const session = remoteSession(item.binding.deviceId);
     if (!session) {
       app.toast("warn", "That device's Files connection is no longer active");
       return;
@@ -1526,7 +1551,7 @@
   async function navigateRemoteParent() {
     const current = currentRemoteDirectory;
     if (!current) return;
-    const session = remoteSessions.get(current.deviceId);
+    const session = remoteSession(current.deviceId);
     if (!session) return;
     const parent = parentPath(current.path);
     if (parent === current.path) {
@@ -1545,7 +1570,7 @@
     try {
       let additions: WorkspaceEntry[] = [];
       if (currentRemoteDirectory) {
-        const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+        const session = remoteSession(currentRemoteDirectory.deviceId);
         if (!session) throw new Error("That device's Files connection is no longer active");
         const listing = await remoteList(session, currentRemoteDirectory.path, cursor);
         if (generation !== navigationGeneration) return;
@@ -1562,7 +1587,7 @@
           complete = true;
           return;
         }
-        const session = remoteSessions.get(source.deviceId);
+        const session = remoteSession(source.deviceId);
         if (!session) {
           fleetDesktopCursors.delete(source.deviceId);
           nextCursor = fleetDesktopCursors.size > 0 ? FLEET_DESKTOP_CURSOR : null;
@@ -1637,7 +1662,7 @@
       return;
     }
     if (currentRemoteDirectory) {
-      const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+      const session = remoteSession(currentRemoteDirectory.deviceId);
       if (!session) return;
       const prefix = currentRemoteDirectory.deviceLabel + " / ";
       const requested = next.startsWith(prefix) ? next.slice(prefix.length) : next;
@@ -1776,7 +1801,7 @@
       return;
     }
     if (currentRemoteDirectory) {
-      const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+      const session = remoteSession(currentRemoteDirectory.deviceId);
       if (session) {
         void navigateRemoteDirectory(session, currentRemoteDirectory.path, "Current folder", currentRemoteDirectory.nativeId);
       }
@@ -1969,7 +1994,7 @@
     }
     recent = [item, ...recent.filter((entry) => entry.id !== item.id)].slice(0, 8);
     if (item.binding.kind === "remote") {
-      const session = remoteSessions.get(item.binding.deviceId);
+      const session = remoteSession(item.binding.deviceId);
       if (!session) {
         app.toast("warn", "That device's Files connection is no longer active");
         return;
@@ -2049,7 +2074,7 @@
       void navigate(nativePath);
       return;
     }
-    const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+    const session = remoteSession(currentRemoteDirectory.deviceId);
     if (!session) return;
     void navigateRemotePath(session, nativePath, label)
       .catch((error) => app.toast("warn", "Couldn't open that fleet folder: " + String(error)));
@@ -2253,7 +2278,7 @@
     try {
       let renamed: WorkspaceEntry;
       if (item.binding.kind === "remote") {
-        const session = remoteSessions.get(item.binding.deviceId);
+        const session = remoteSession(item.binding.deviceId);
         if (!session) throw new Error("That device's Files connection is no longer active");
         const destination = remoteChildPath(parentPath(item.path), name);
         await remoteRequest(session, { kind: "rename", from: item.path, to: destination } as Omit<FileEvent, "req">);
@@ -2837,7 +2862,7 @@ function newTransferId(): string {
     try {
       let created: WorkspaceEntry;
       if (currentRemoteDirectory) {
-        const session = remoteSessions.get(currentRemoteDirectory.deviceId);
+        const session = remoteSession(currentRemoteDirectory.deviceId);
         if (!session) throw new Error("That device's Files connection is no longer active");
         const taken = new Set(entries.map((entry) => entry.name.toLocaleLowerCase()));
         let name = "New Folder";
@@ -2882,7 +2907,7 @@ function newTransferId(): string {
     if (!window.confirm(`${action[0]!.toUpperCase() + action.slice(1)} “${displayName(item)}”?`)) return;
     try {
       if (remote) {
-        const session = remoteSessions.get(item.binding.deviceId);
+        const session = remoteSession(item.binding.deviceId);
         if (!session) throw new Error("That device's Files connection is no longer active");
         await remoteRequest(session, { kind: "delete", path: item.path } as Omit<FileEvent, "req">);
         entries = entries.filter((entry) => entry.id !== item.id);

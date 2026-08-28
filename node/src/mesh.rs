@@ -25,12 +25,13 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::UiSink;
 
-use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
+use allmystuff_graph::{Capability, Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
-    DriveRouteOffer, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
-    RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
+    DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
+    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl,
+    SiteService,
     TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_FLEETFILES,
     CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID,
     PROTOCOL_VERSION,
@@ -3278,7 +3279,13 @@ impl Mesh {
     /// without an app restart. The scan is cheap by design ("cheap enough
     /// to call on a button press"), and steady state broadcasts nothing.
     fn spawn_inventory_watch(self: &Arc<Self>) {
-        const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(10);
+        // A full cross-platform inventory scan reaches WMI/system_profiler,
+        // audio/video enumerators, volumes, and network listeners. Ten-second
+        // polling made that a permanent background workload on device-heavy
+        // machines. Changes still self-heal without a restart, but the full
+        // fallback sweep is deliberately bounded; user-triggered refreshes
+        // remain immediate.
+        const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(60);
         let mesh = Arc::downgrade(self);
         crate::spawn(async move {
             loop {
@@ -18961,11 +18968,31 @@ pub(crate) const VIDEO_IPC_HEADER_LEN: usize = 28;
 /// summary + capability list, serialized. The inventory watcher diffs it
 /// across rescans — JSON equality is exactly "would peers see something
 /// different", since this *is* what presence carries.
-fn profile_fingerprint(
-    summary: &impl serde::Serialize,
-    capabilities: &impl serde::Serialize,
-) -> String {
-    serde_json::to_string(&(summary, capabilities)).unwrap_or_default()
+fn profile_fingerprint(summary: &InventorySummary, capabilities: &[Capability]) -> String {
+    const MIN_FREE_SPACE_STEP: u64 = 256 * 1024 * 1024;
+    const FREE_SPACE_STEPS_PER_VOLUME: u64 = 1_000;
+
+    // Free space is useful placement information, but it is not stable device
+    // identity. Serialising its exact byte count created a feedback loop:
+    // writing a log changed free space, the next scan called that a new device
+    // picture and broadcast presence, and that broadcast wrote another log.
+    // Keep bounded capacity freshness by advertising changes at 0.1% of a
+    // volume (never finer than 256 MiB), while ignoring byte-level churn.
+    let mut stable_summary = summary.clone();
+    stable_summary.storage.sort_by(|a, b| a.id.cmp(&b.id));
+    for volume in &mut stable_summary.storage {
+        let step = (volume.total_bytes / FREE_SPACE_STEPS_PER_VOLUME)
+            .max(MIN_FREE_SPACE_STEP)
+            .max(1);
+        volume.available_bytes = (volume.available_bytes / step) * step;
+    }
+
+    // Platform probes do not promise enumeration order. Presence is a set of
+    // endpoints, so order-only changes must not trigger a fleet-wide advert.
+    let mut stable_capabilities = capabilities.to_vec();
+    stable_capabilities.sort_by(|a, b| a.id.cmp(&b.id));
+
+    serde_json::to_string(&(stable_summary, stable_capabilities)).unwrap_or_default()
 }
 
 pub(crate) fn video_ipc_header(
@@ -20142,6 +20169,96 @@ mod tests {
     }
 
     use super::*;
+
+    fn inventory_summary_with_free(id: &str, available_bytes: u64) -> InventorySummary {
+        InventorySummary {
+            storage: vec![allmystuff_protocol::StorageSummary {
+                id: id.into(),
+                name: id.into(),
+                total_bytes: 100 * 1024 * 1024 * 1024,
+                available_bytes,
+                removable: false,
+                kind: "ssd".into(),
+            }],
+            ..InventorySummary::default()
+        }
+    }
+
+    #[test]
+    fn inventory_fingerprint_ignores_small_free_space_churn() {
+        const STEP: u64 = 256 * 1024 * 1024;
+        let before = inventory_summary_with_free("disk-a", 40 * STEP + 1024);
+        let after = inventory_summary_with_free("disk-a", 40 * STEP + 8 * 1024 * 1024);
+
+        assert_eq!(
+            profile_fingerprint(&before, &[]),
+            profile_fingerprint(&after, &[]),
+            "log writes and other byte-level disk churn must not rebroadcast presence"
+        );
+    }
+
+    #[test]
+    fn inventory_fingerprint_reports_meaningful_free_space_change() {
+        const STEP: u64 = 256 * 1024 * 1024;
+        let before = inventory_summary_with_free("disk-a", 40 * STEP + 1024);
+        let after = inventory_summary_with_free("disk-a", 41 * STEP + 1024);
+
+        assert_ne!(
+            profile_fingerprint(&before, &[]),
+            profile_fingerprint(&after, &[]),
+            "bounded capacity updates must still reach the fleet"
+        );
+    }
+
+    #[test]
+    fn inventory_fingerprint_treats_probe_order_as_a_set() {
+        let mut first = inventory_summary_with_free("disk-a", 10 * 256 * 1024 * 1024);
+        first.storage.push(allmystuff_protocol::StorageSummary {
+            id: "disk-b".into(),
+            name: "disk-b".into(),
+            total_bytes: 200 * 1024 * 1024 * 1024,
+            available_bytes: 20 * 256 * 1024 * 1024,
+            removable: false,
+            kind: "hdd".into(),
+        });
+        let mut second = first.clone();
+        second.storage.reverse();
+
+        let node = NodeId::from("node");
+        let mut first_caps = vec![
+            Capability::new(
+                node.clone(),
+                "node:z",
+                "Z",
+                MediaKind::Storage,
+                allmystuff_graph::Flow::Duplex,
+                "storage",
+            ),
+            Capability::new(
+                node,
+                "node:a",
+                "A",
+                MediaKind::Storage,
+                allmystuff_graph::Flow::Duplex,
+                "storage",
+            ),
+        ];
+        let mut second_caps = first_caps.clone();
+        second_caps.reverse();
+
+        assert_eq!(
+            profile_fingerprint(&first, &first_caps),
+            profile_fingerprint(&second, &second_caps),
+            "enumeration order alone must not rebroadcast presence"
+        );
+
+        first_caps[0].label = "changed".into();
+        assert_ne!(
+            profile_fingerprint(&first, &first_caps),
+            profile_fingerprint(&second, &second_caps),
+            "a real advertised capability change must remain visible"
+        );
+    }
 
     #[test]
     fn claimability_is_the_union_of_network_scoped_presence() {

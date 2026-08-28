@@ -184,20 +184,25 @@ mod imp {
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-        SecurityImpersonation, SetTokenInformation, TokenElevation, TokenIntegrityLevel,
-        TokenPrimary, TokenSessionId, TokenUIAccess, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
+        TokenElevation, TokenIntegrityLevel, TokenPrimary, TokenSessionId, TokenUIAccess,
+        TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
     use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcess, OpenProcessToken, TerminateProcess,
         WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTUPINFOW,
+        PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
     };
 
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetShellWindow, GetWindowThreadProcessId,
+    };
     use super::{Integrity, Posture};
 
     /// `UOI_NAME` — ask `GetUserObjectInformationW` for an object's name.
@@ -338,6 +343,69 @@ mod imp {
     pub fn active_console_session() -> u32 {
         // SAFETY: no arguments, no preconditions.
         unsafe { WTSGetActiveConsoleSessionId() }
+    }
+
+    /// Drive letters visible to the signed-in user's Explorer token.
+    ///
+    /// UAC gives elevated and ordinary processes separate DOS-device maps.
+    /// The service has the same split because it retains its SYSTEM token even
+    /// after moving into the console session. Looking only at our own
+    /// `GetLogicalDrives` result can therefore select a letter already used on
+    /// the actual desktop. Impersonate Explorer only for this read and return
+    /// its bitmask; no process is launched and no mapping is contacted.
+    pub fn interactive_user_logical_drive_mask() -> Result<u32, String> {
+        // Token impersonation is thread-local. Isolate it on a short-lived OS
+        // thread so even a pathological RevertToSelf failure cannot leak the
+        // desktop user's token onto a long-lived async executor worker.
+        std::thread::Builder::new()
+            .name("ams-drive-namespace".into())
+            .spawn(read_interactive_user_logical_drive_mask)
+            .map_err(|error| format!("couldn't start the drive namespace check: {error}"))?
+            .join()
+            .map_err(|_| "the drive namespace check stopped unexpectedly".to_string())?
+    }
+
+    fn read_interactive_user_logical_drive_mask() -> Result<u32, String> {
+        let shell = unsafe { GetShellWindow() };
+        if shell.is_null() {
+            // No interactive shell means there is no second desktop device map
+            // to collide with. The caller still unions its own drive mask.
+            return Ok(0);
+        }
+        let mut process_id = 0;
+        if unsafe { GetWindowThreadProcessId(shell, &mut process_id) } == 0 || process_id == 0 {
+            return Err("couldn't identify the signed-in user's Explorer process".into());
+        }
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
+        if process.is_null() {
+            return Err("couldn't inspect the signed-in user's Explorer process".into());
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let opened = unsafe {
+            OpenProcessToken(
+                process,
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+                &mut token,
+            )
+        };
+        unsafe { CloseHandle(process) };
+        if opened == 0 {
+            return Err("couldn't inspect the signed-in user's Explorer token".into());
+        }
+        if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+            unsafe { CloseHandle(token) };
+            return Err("couldn't enter the signed-in user's drive namespace".into());
+        }
+        let mask = unsafe { GetLogicalDrives() };
+        let reverted = unsafe { RevertToSelf() };
+        unsafe { CloseHandle(token) };
+        if reverted == 0 {
+            return Err("couldn't leave the signed-in user's drive namespace".into());
+        }
+        if mask == 0 {
+            return Err("couldn't inspect the signed-in user's drive letters".into());
+        }
+        Ok(mask)
     }
 
     /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
@@ -680,6 +748,10 @@ mod imp {
         0
     }
 
+    pub fn interactive_user_logical_drive_mask() -> Result<u32, String> {
+        Ok(0)
+    }
+
     /// No session-0 split to escape: a Unix daemon that needs a display gets it
     /// from the display server's own rules, not from token surgery.
     pub struct ConsoleAgent;
@@ -717,7 +789,10 @@ mod imp {
     }
 }
 
-pub use imp::{active_console_session, current_posture, ConsoleAgent, DesktopFollower};
+pub use imp::{
+    active_console_session, current_posture, interactive_user_logical_drive_mask, ConsoleAgent,
+    DesktopFollower,
+};
 
 /// Whether this build targets Windows at all, hoisted here so callers don't
 /// sprinkle `cfg!`.
@@ -810,6 +885,12 @@ mod tests {
     fn no_arguments_is_just_the_quoted_exe() {
         let cmd = quote_command(std::path::Path::new("agent.exe"), &[]);
         assert_eq!(cmd, r#""agent.exe""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_interactive_drive_namespace_can_be_inspected_without_mutation() {
+        interactive_user_logical_drive_mask().unwrap();
     }
 
     #[test]

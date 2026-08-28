@@ -406,7 +406,8 @@ async fn choose_mount(
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
-        let logical_drives = windows_logical_drive_mask()?;
+        let logical_drives = windows_logical_drive_mask()?
+            | crate::win_privilege::interactive_user_logical_drive_mask()?;
         select_windows_mount(normalize_requested_mount(requested)?, |mount| {
             mount_available(mount, active, &remembered, logical_drives)
         })
@@ -618,9 +619,13 @@ fn drive_letter_bit(mount: &str) -> Option<u32> {
 async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>, String> {
     // One snapshot is both faster and more reliable than `net use X:` per
     // candidate: querying a disconnected remembered letter can make Windows
-    // attempt a reconnect before it answers. The listing includes connected,
-    // disconnected, and reconnecting entries; drive-letter tokens themselves
+    // attempt a reconnect before it answers. Drive-letter tokens themselves
     // are stable even when the surrounding output is localized.
+    //
+    // `net use` is scoped to the caller's logon token. In particular, a node
+    // launched elevated (or by the service) can see a different mapping table
+    // than Explorer. Union it with the signed-in user's persistent Network
+    // keys so an offline or disconnected desktop mapping is still occupied.
     let output = crate::child_process::command("net.exe")
         .arg("use")
         .output()
@@ -629,7 +634,7 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
     if !output.status.success() {
         return Err("Windows couldn't list its existing drive mappings".into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let mut mounts = String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .filter(|token| {
             token.len() == 2
@@ -637,7 +642,54 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
                 && token.as_bytes()[1] == b':'
         })
         .map(str::to_ascii_uppercase)
-        .collect())
+        .collect::<std::collections::HashSet<_>>();
+    mounts.extend(remembered_network_registry_mounts().await?);
+    Ok(mounts)
+}
+
+#[cfg(any(windows, test))]
+fn parse_network_registry_mounts(bytes: &[u8]) -> std::collections::HashSet<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().rsplit('\\');
+            let letter = parts.next()?;
+            let parent = parts.next()?;
+            (parent.eq_ignore_ascii_case("Network")
+                && letter.len() == 1
+                && letter.as_bytes()[0].is_ascii_alphabetic())
+            .then(|| format!("{}:", letter.to_ascii_uppercase()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+async fn remembered_network_registry_mounts(
+) -> Result<std::collections::HashSet<String>, String> {
+    let root = drive_registry_root()?;
+    let base = format!(r"{root}\Network");
+    let output = crate::child_process::command("reg.exe")
+        .args(["query", &base])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect remembered Windows drive mappings: {error}"))?;
+    if output.status.success() {
+        return Ok(parse_network_registry_mounts(&output.stdout));
+    }
+
+    // A missing Network key is the ordinary no-persistent-mappings case.
+    // Prove the selected user hive itself is readable before treating it as
+    // empty; otherwise fail closed instead of risking somebody else's letter.
+    let root_query = crate::child_process::command("reg.exe")
+        .args(["query", &root])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect the signed-in user's registry: {error}"))?;
+    if root_query.status.success() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        Err("Windows couldn't inspect the signed-in user's remembered drive mappings".into())
+    }
 }
 #[cfg(any(windows, test))]
 fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
@@ -1752,9 +1804,11 @@ mod registry_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::{
-        drive_letter_reserved, normalize_requested_mount, parse_registry_dword,
-        select_windows_mount, windows_mapping_output_matches_port,
+        drive_letter_reserved, mount_available, normalize_requested_mount,
+        parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
+        windows_mapping_output_matches_port, NativeDriveInfo,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn parses_allmystuff_drive_marker_port() {
@@ -1779,6 +1833,37 @@ mod windows_tests {
         assert!(drive_letter_reserved("Z:", z));
         assert!(drive_letter_reserved("z:", z));
         assert!(!drive_letter_reserved("Y:", z));
+    }
+
+    #[test]
+    fn disconnected_user_mappings_are_parsed_without_localized_status_text() {
+        let output = br#"
+HKEY_CURRENT_USER\Network\Y
+HKEY_USERS\S-1-5-21-1000\Network\p
+HKEY_CURRENT_USER\Software\Unrelated\Q
+HKEY_CURRENT_USER\Network\TooLong
+"#;
+        assert_eq!(
+            parse_network_registry_mounts(output),
+            HashSet::from(["P:".to_string(), "Y:".to_string()])
+        );
+    }
+
+    #[test]
+    fn every_windows_assignment_surface_reserves_its_letter() {
+        let logical = 1_u32 << u32::from(b'X' - b'A');
+        let remembered = HashSet::from(["Y:".to_string()]);
+        let active = vec![NativeDriveInfo {
+            route: "route".into(),
+            label: "label".into(),
+            mount: "W:".into(),
+            port: 1,
+        }];
+
+        assert!(!mount_available("X:", &active, &remembered, logical));
+        assert!(!mount_available("Y:", &active, &remembered, logical));
+        assert!(!mount_available("W:", &active, &remembered, logical));
+        assert!(mount_available("V:", &active, &remembered, logical));
     }
 
     #[test]

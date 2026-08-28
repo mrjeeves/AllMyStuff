@@ -15,6 +15,7 @@
     localFileContextMenu,
     localFileIcon,
     localFileList,
+    nativeDriveMounts,
     localFileLocations,
     watchLocalDirectory,
     localFileTransferScan,
@@ -1157,7 +1158,13 @@
       let nextEntries: WorkspaceEntry[];
       let routeId: string | undefined;
       if (local) {
-        nextEntries = locations.filter((location) => location.kind === "volume").map(computerLocationEntry);
+        const adapterMounts = await nativeDriveMounts().catch(() => []);
+        nextEntries = locations
+          .filter((location) =>
+            location.kind === "volume"
+            && !adapterMounts.some((adapter) => sameNativePath(location.path, adapter.mount))
+          )
+          .map(computerLocationEntry);
       } else {
         const session = await ensureRemoteSession(deviceId, deviceLabel);
         routeId = session.routeId;

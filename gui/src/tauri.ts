@@ -966,6 +966,19 @@ export async function mapNativeDriveFrom(
   await invoke("drive_map_from", { source, root, label, mount });
 }
 
+export interface NativeDriveInfo {
+  route: string;
+  label: string;
+  mount: string;
+  port: number;
+}
+
+export async function nativeDriveMounts(): Promise<NativeDriveInfo[]> {
+  if (!isTauri()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<NativeDriveInfo[]>("native_drives");
+}
+
 export interface DriveMappingState {
   mapping: string;
   source: string;

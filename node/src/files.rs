@@ -132,6 +132,20 @@ impl FilesPlane {
         event: FileEvent,
         root: Option<PathBuf>,
     ) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        self.handle_in_root_excluding(route_id, event, root, Vec::new())
+    }
+
+    /// Whole-machine volume listings may exclude mounts that are adapters
+    /// into AllMyStuff itself. They remain real OS mounts, but advertising
+    /// them back through Files would recursively present infrastructure as
+    /// user storage.
+    pub fn handle_in_root_excluding(
+        &self,
+        route_id: &str,
+        event: FileEvent,
+        root: Option<PathBuf>,
+        excluded_volume_mounts: Vec<String>,
+    ) -> tokio::sync::mpsc::Receiver<FileEvent> {
         let (tx, rx) = tokio::sync::mpsc::channel::<FileEvent>(OP_QUEUE);
         if let FileEvent::WatchDirectory { req, path } = &event {
             return self.watch_directory(route_id, *req, path, root.as_deref());
@@ -147,7 +161,15 @@ impl FilesPlane {
             .name(format!("amst-files-op {rid}"))
             .spawn(move || {
                 if let Some(reply) =
-                    run_op(event, &tx, &cancel, root.as_deref(), &rid, &list_cursors)
+                    run_op(
+                        event,
+                        &tx,
+                        &cancel,
+                        root.as_deref(),
+                        &rid,
+                        &list_cursors,
+                        &excluded_volume_mounts,
+                    )
                 {
                     let _ = tx.blocking_send(reply);
                 }
@@ -403,9 +425,21 @@ impl FilesPlane {
     }
 }
 
+fn same_native_mount_path(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(left) == Path::new(right)
+    }
+}
+
 /// Run one request, sending streamed events through `tx`; the returned
-/// event (if any) is the final reply. Pure fs + channel work — runs on
-/// the op thread.
+/// event (if any) is the final reply. Pure fs + channel work runs on the
+/// operation thread.
 fn run_op(
     event: FileEvent,
     tx: &tokio::sync::mpsc::Sender<FileEvent>,
@@ -413,6 +447,7 @@ fn run_op(
     root: Option<&Path>,
     route_id: &str,
     list_cursors: &Mutex<HashMap<(String, String), RemoteListCursor>>,
+    excluded_volume_mounts: &[String],
 ) -> Option<FileEvent> {
     match event {
         FileEvent::Quota { req } => Some(match root {
@@ -433,14 +468,20 @@ fn run_op(
                     .storage
                     .into_iter()
                     .filter_map(|volume| {
-                        volume
-                            .mount_point
-                            .map(|path| allmystuff_session::FileVolume {
+                        volume.mount_point.and_then(|path| {
+                            if excluded_volume_mounts
+                                .iter()
+                                .any(|excluded| same_native_mount_path(&path, excluded))
+                            {
+                                return None;
+                            }
+                            Some(allmystuff_session::FileVolume {
                                 name: volume.name,
                                 path,
                                 size: volume.total_bytes,
                                 removable: volume.removable,
                             })
+                        })
                     })
                     .collect(),
             })
@@ -1333,6 +1374,14 @@ pub fn start_transfer_walk(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn infrastructure_mount_matching_normalizes_windows_roots() {
+        assert!(same_native_mount_path("X:", "x:\\"));
+        assert!(same_native_mount_path("X:/", "x:\\"));
+        assert!(!same_native_mount_path("X:", "Y:\\"));
+    }
 
     fn drain(mut rx: tokio::sync::mpsc::Receiver<FileEvent>) -> Vec<FileEvent> {
         let mut out = Vec::new();

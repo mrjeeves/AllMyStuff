@@ -14091,7 +14091,16 @@ impl Mesh {
         event: FileEvent,
         root: Option<std::path::PathBuf>,
     ) {
-        let mut rx = self.files.handle_in_root(route_id, event, root);
+        let excluded_volume_mounts = if matches!(&event, FileEvent::Volumes { .. }) {
+            self.drive_mounts
+                .list()
+                .into_iter()
+                .map(|mount| mount.mount)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut rx = self.files.handle_in_root_excluding(route_id, event, root, excluded_volume_mounts);
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();

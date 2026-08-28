@@ -262,7 +262,7 @@ fn main() -> ExitCode {
     run_blocking(
         session_agent,
         session_agent || supervised,
-        wait_for_shutdown_signal(),
+        wait_for_shutdown(),
     )
 }
 
@@ -668,6 +668,46 @@ async fn supervise_daemon(
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM (service stop), mirroring the daemon.
+async fn wait_for_shutdown() {
+    #[cfg(target_os = "macos")]
+    if let Some(supervisor_pid) = std::env::var("ALLMYSTUFF_SUPERVISOR_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 1)
+    {
+        tokio::select! {
+            _ = wait_for_shutdown_signal() => {}
+            _ = wait_for_macos_supervisor_exit(supervisor_pid) => {
+                tracing::info!(
+                    supervisor_pid,
+                    "desktop supervisor exited — stopping GUI-owned node"
+                );
+            }
+        }
+        return;
+    }
+    wait_for_shutdown_signal().await;
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_supervisor_exit(supervisor_pid: u32) {
+    loop {
+        // SAFETY: getppid has no preconditions and does not mutate process
+        // state. Once this direct child is reparented, the relationship never
+        // becomes true again even if the old numeric pid is reused.
+        let current_parent = unsafe { libc::getppid() } as u32;
+        if supervisor_parent_changed(supervisor_pid, current_parent) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn supervisor_parent_changed(expected_parent: u32, current_parent: u32) -> bool {
+    current_parent != expected_parent
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1156,5 +1196,17 @@ mod service_environment_tests {
         assert_eq!(mesh, profile.join(".myownmesh"));
         assert_eq!(app, profile.join(".allmystuff"));
         assert_eq!(user, profile);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_identity_is_the_parent_relationship_not_pid_liveness() {
+        assert!(!supervisor_parent_changed(42, 42));
+        assert!(supervisor_parent_changed(42, 1));
+        assert!(supervisor_parent_changed(42, 99));
     }
 }

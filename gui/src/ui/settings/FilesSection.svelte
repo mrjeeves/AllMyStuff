@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { filesCanvasStatus, type FilesCanvasStatus } from "../../tauri";
-  import { FILE_TILE_SIZES } from "../../files-canvas";
+  import { FILE_TILE_SIZES, fileTileSizeLabel } from "../../files-canvas";
   import StorageSection from "./StorageSection.svelte";
 
   let status = $state<FilesCanvasStatus | null>(null);
@@ -31,7 +31,7 @@
     <div class="preference">
       <b>Icon size</b>
       <div class="segmented" role="group" aria-label="Default icon size">
-        {#each FILE_TILE_SIZES as size}<button class:active={app.filesSettings.thumbnailSize === size} onclick={() => app.updateFilesSettings({ thumbnailSize: size })}>{size === 32 ? "Small" : size === 48 ? "Medium" : "Large"}</button>{/each}
+        {#each FILE_TILE_SIZES as size}<button class:active={app.filesSettings.thumbnailSize === size} onclick={() => app.updateFilesSettings({ thumbnailSize: size })}>{fileTileSizeLabel(size)}</button>{/each}
       </div>
     </div>
 
@@ -65,7 +65,7 @@
   .lead, p { margin: 0; color: var(--ink-soft); font-size: .82rem; line-height: 1.5; }
   .block { display: flex; flex-direction: column; gap: .8rem; padding: .9rem; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
   .title { font-size: .82rem; font-weight: 750; color: var(--ink); }
-  .segmented { display: inline-flex; align-self: flex-start; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }
+  .segmented { display: inline-flex; flex-wrap: wrap; align-self: flex-start; padding: 2px; border: 1px solid var(--line); border-radius: 8px; }
   .segmented button { border: 0; border-radius: 6px; padding: .38rem .8rem; background: transparent; color: var(--ink-soft); }
   .segmented button.active { background: var(--accent-soft); color: var(--accent-ink); }
   .preference { display: grid; gap: .45rem; font-size: .8rem; }

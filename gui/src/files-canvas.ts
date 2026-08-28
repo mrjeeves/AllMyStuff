@@ -277,9 +277,18 @@ export function fileReferenceId(origin: string, path: string, platform: string):
   return `${origin}:${windows ? normalized.toLocaleLowerCase("en-US") : normalized}`;
 }
 
-/** Explorer's three desktop icon sizes. The icon and its grid cell are
- * deliberately separate: Windows reserves room for a two-line label. */
-export const FILE_TILE_SIZES = [32, 48, 96] as const;
+/** Six stable canvas notches. The former Large value remains the third notch,
+ * while the upper three preserve enough cell space for a two-line label. */
+export const FILE_TILE_SIZES = [32, 48, 96, 128, 192, 256] as const;
+
+export function fileTileSizeLabel(size: number): string {
+  if (size === 32) return "Small";
+  if (size === 48) return "Medium";
+  if (size === 96) return "Large";
+  if (size === 128) return "Extra large";
+  if (size === 192) return "Huge";
+  return "Giant";
+}
 
 export function nearestFileTileSize(input: number): number {
   const value = Number.isFinite(input) ? input : 48;
@@ -327,10 +336,14 @@ export function nativeFileGridMetrics(input: number, platform: string): NativeFi
   if (windows) {
     if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 82, columnWidth: 88, rowHeight: 90 };
     if (iconSize === 96) return { iconSize, tileWidth: 124, tileHeight: 158, columnWidth: 136, rowHeight: 166 };
+    if (iconSize > 96) {
+      return { iconSize, tileWidth: iconSize + 28, tileHeight: iconSize + 62, columnWidth: iconSize + 40, rowHeight: iconSize + 70 };
+    }
     return { iconSize, tileWidth: 88, tileHeight: 104, columnWidth: 100, rowHeight: 112 };
   }
   if (iconSize === 32) return { iconSize, tileWidth: 76, tileHeight: 82, columnWidth: 88, rowHeight: 90 };
   if (iconSize === 96) return { iconSize, tileWidth: 128, tileHeight: 160, columnWidth: 140, rowHeight: 168 };
+  if (iconSize > 96) return { iconSize, tileWidth: iconSize + 32, tileHeight: iconSize + 64, columnWidth: iconSize + 44, rowHeight: iconSize + 72 };
   return { iconSize, tileWidth: 92, tileHeight: 106, columnWidth: 104, rowHeight: 114 };
 }
 

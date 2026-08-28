@@ -182,20 +182,21 @@ mod imp {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_BAD_DEVICE, ERROR_FILE_NOT_FOUND,
+        CloseHandle, GetLastError, LocalFree, ERROR_BAD_DEVICE, ERROR_FILE_NOT_FOUND,
         ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_PATH_NOT_FOUND,
         FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::NetworkManagement::WNet::{
-        NETRESOURCEW, RESOURCETYPE_DISK, WNetAddConnection2W, WNetCancelConnection2W,
-        WNetGetConnectionW,
+        WNetAddConnection2W, WNetCancelConnection2W, WNetGetConnectionW, NETRESOURCEW,
+        RESOURCETYPE_DISK,
     };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
         ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
         TokenElevation, TokenIntegrityLevel, TokenPrimary, TokenSessionId, TokenUIAccess,
-        TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
-        TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TokenUser, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
     use windows_sys::Win32::System::RemoteDesktop::{
@@ -206,15 +207,14 @@ mod imp {
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcess, OpenProcessToken, TerminateProcess,
-        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+        OpenThreadToken, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        STARTUPINFOW,
     };
 
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetShellWindow, GetWindowThreadProcessId,
-    };
     use super::{Integrity, Posture};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
     /// `UOI_NAME` — ask `GetUserObjectInformationW` for an object's name.
     const UOI_NAME: u32 = 2;
@@ -626,6 +626,81 @@ mod imp {
         result.map(Some)
     }
 
+    /// Execute a short operation in the signed-in Explorer user's identity.
+    ///
+    /// The disposable thread is part of the safety boundary: even if Windows
+    /// fails to revert impersonation, no async worker can retain that token.
+    pub(crate) fn interactive_user_call<T: Send + 'static>(
+        thread_name: &str,
+        action: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let thread_name = thread_name.to_string();
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || with_interactive_user(action))
+            .map_err(|error| format!("couldn't start the interactive-user operation: {error}"))?
+            .join()
+            .map_err(|_| "the interactive-user operation stopped unexpectedly".to_string())?
+            .and_then(|value| {
+                value.ok_or_else(|| {
+                    "there is no signed-in Explorer session for Fleetfiles".to_string()
+                })
+            })
+    }
+
+    /// Return the SID of the effective thread token. Fleetfiles calls this
+    /// while impersonating Explorer, so a LocalSystem service registers the
+    /// sync root in the desktop user's namespace with the required stable ID.
+    pub(crate) fn effective_user_sid() -> Result<String, String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &mut token) } == 0 {
+            return Err("couldn't inspect the signed-in user's token".into());
+        }
+
+        let result = (|| {
+            let mut required = 0_u32;
+            unsafe {
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required)
+            };
+            if required < std::mem::size_of::<TOKEN_USER>() as u32 {
+                return Err("Windows returned an invalid user-token identity".into());
+            }
+            let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            if unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    required,
+                    &mut required,
+                )
+            } == 0
+            {
+                return Err("couldn't read the signed-in user's identity".into());
+            }
+            let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+            let mut sid_text = std::ptr::null_mut();
+            if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0
+                || sid_text.is_null()
+            {
+                return Err("couldn't format the signed-in user's identity".into());
+            }
+            let mut length = 0_usize;
+            while length < 256 && unsafe { *sid_text.add(length) } != 0 {
+                length += 1;
+            }
+            let sid =
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, length) });
+            unsafe { LocalFree(sid_text.cast()) };
+            if length == 0 || length == 256 {
+                return Err("Windows returned an invalid user SID".into());
+            }
+            Ok(sid)
+        })();
+        unsafe { CloseHandle(token) };
+        result
+    }
 
     /// Find Explorer in the physical console session even when the caller is a
     /// service or scheduled task in a different Windows session. GetShellWindow
@@ -639,20 +714,13 @@ mod imp {
         let mut processes: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
         let mut count = 0_u32;
         let enumerated = unsafe {
-            WTSEnumerateProcessesW(
-                WTS_CURRENT_SERVER_HANDLE,
-                0,
-                1,
-                &mut processes,
-                &mut count,
-            )
+            WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut processes, &mut count)
         };
         if enumerated != 0 {
             let process_id = if processes.is_null() || count == 0 {
                 None
             } else {
-                let entries =
-                    unsafe { std::slice::from_raw_parts(processes, count as usize) };
+                let entries = unsafe { std::slice::from_raw_parts(processes, count as usize) };
                 entries
                     .iter()
                     .find(|entry| {
@@ -1104,6 +1172,8 @@ pub use imp::{
     interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
     interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
 };
+#[cfg(windows)]
+pub(crate) use imp::{effective_user_sid, interactive_user_call};
 
 /// Whether this build targets Windows at all, hoisted here so callers don't
 /// sprinkle `cfg!`.

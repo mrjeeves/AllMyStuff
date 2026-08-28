@@ -45,6 +45,7 @@ pub enum LocalClip {
 
 enum Cmd {
     Read(SyncSender<Result<Option<LocalClip>, String>>),
+    ReadFilePaths(SyncSender<Result<Vec<String>, String>>),
     SetText(String, SyncSender<Result<(), String>>),
     SetImage(Vec<u8>, SyncSender<Result<(), String>>), // PNG bytes
     SetFiles(Vec<String>, SyncSender<Result<(), String>>),
@@ -135,6 +136,9 @@ impl ClipboardService {
                             Cmd::Read(resp) => {
                                 let _ = resp.send(Err("OS clipboard is unavailable".into()));
                             }
+                            Cmd::ReadFilePaths(resp) => {
+                                let _ = resp.send(Err("OS clipboard is unavailable".into()));
+                            }
                             Cmd::SetText(_, resp)
                             | Cmd::SetImage(_, resp)
                             | Cmd::SetFiles(_, resp) => {
@@ -146,6 +150,20 @@ impl ClipboardService {
                     match cmd {
                         Cmd::Read(resp) => {
                             let _ = resp.send(read_clipboard(ctx));
+                        }
+                        Cmd::ReadFilePaths(resp) => {
+                            let result = ctx
+                                .get_files()
+                                .map(|paths| {
+                                    paths
+                                        .iter()
+                                        .map(|path| {
+                                            normalize_clip_path(path).to_string_lossy().into_owned()
+                                        })
+                                        .collect()
+                                })
+                                .map_err(|error| error.to_string());
+                            let _ = resp.send(result);
                         }
                         Cmd::SetText(t, resp) => {
                             let result = ctx.set_text(t).map_err(|e| e.to_string());
@@ -208,6 +226,19 @@ impl ClipboardService {
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
         self.tx
             .send(Cmd::Read(resp_tx))
+            .map_err(|_| "clipboard service stopped".to_string())?;
+        resp_rx
+            .recv()
+            .map_err(|_| "clipboard service stopped".to_string())?
+    }
+
+    /// Return the OS-native file list without opening file contents. Unlike
+    /// remote clipboard streaming, this deliberately retains directories so a
+    /// local Finder/Explorer copy can paste a whole tree into Fleetfiles.
+    pub fn file_paths(&self) -> Result<Vec<String>, String> {
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(Cmd::ReadFilePaths(resp_tx))
             .map_err(|_| "clipboard service stopped".to_string())?;
         resp_rx
             .recv()

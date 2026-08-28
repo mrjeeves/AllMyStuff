@@ -116,6 +116,7 @@ core-foundation = "0.10"
 # kill-on-close — daemon_spawn::tie_daemon_lifetime), same story: the
 # version the tree already resolves.
 [target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

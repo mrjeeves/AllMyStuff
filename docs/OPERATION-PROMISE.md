@@ -12,7 +12,7 @@ AllMyStuff presents one personal computer whose storage and useful processing ar
 
 The person does not administer a collection of synchronized computers. They allocate resources to AllMyStuff and choose policy. AllMyStuff decides where managed data and work should live, keeps the requested availability, repairs failures, and explains what it is doing.
 
-Every member computer exposes exactly one real operating-system mount named Fleetfiles. That mount and the AllMyStuff Files UI address the same canonical namespace. The namespace contains one virtual Desktop. It is not a merged view of several native desktops and it is not grouped by source computer.
+Every member computer exposes exactly one real operating-system mount named Fleetfiles. That mount and the AllMyStuff Files UI address the same canonical namespace. On macOS, the canonical `~/Fleetfiles` materialization is also presented as a loopback-only Finder volume under Locations; its data is not relocated into hidden application state. The namespace contains one virtual Desktop. It is not a merged view of several native desktops and it is not grouped by source computer.
 
 A device, disk, or native folder is a resource, import/export surface, failure domain, or interoperability adapter. It is not the organizing model presented to the person.
 
@@ -50,12 +50,14 @@ Each capable fleet member must expose one mount for the complete Fleet Filesyste
 
 | Platform | User-visible result | Implementation requirement |
 | --- | --- | --- |
-| Windows | One stable drive or shell location named Fleetfiles | Reconnects without accumulating drive letters; Explorer operations map to fleet namespace transactions. |
-| macOS | One stable Finder volume named Fleetfiles | Reconnects at a predictable mount point and retains Finder semantics where representable. |
-| Linux | One stable filesystem mount named Fleetfiles | Uses a supported userspace filesystem adapter with explicit cache and offline behavior. |
+| Windows | One stable Cloud Files shell location at `~/Fleetfiles` | Uses the built-in Windows sync-root surface, with AllMyStuff branding and no localhost WebDAV drive or third-party filesystem driver. |
+| macOS | One stable Finder-visible sync root at `~/Fleetfiles` | Uses the local materialization directly and retains Finder semantics where representable. |
+| Linux | One stable filesystem sync root at `~/Fleetfiles` | Uses the local materialization directly with explicit cache and offline behavior. |
 | Mobile/constrained viewer | The same namespace in the app, without pretending an unavailable OS mount exists | Bounded metadata and content cache only. |
 
-The mount is an adapter, not the authority. Restarting or remounting must not change object identity, create a second Desktop, or duplicate data.
+The root contains the fleet-wide `Desktop` as `~/Fleetfiles/Desktop`. Internal metadata remains in the private application state directory or in hidden, bounded working files; it must not replace the user-visible sync root.
+
+The mount is an adapter, not the authority. Restarting or remounting must not change object identity, create a second Desktop, duplicate data, or flap the operating-system namespace.
 
 Native file operations issued through the mount must use the same operation IDs, preconditions, conflict rules, policy checks, and Operations history as actions issued in the AllMyStuff UI. Explorer/Finder and the canvas must never race as two independent sources of truth.
 

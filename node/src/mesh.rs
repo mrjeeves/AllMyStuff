@@ -624,15 +624,131 @@ fn new_drive_mapping_id() -> Result<String, String> {
 }
 
 fn fleetfiles_root() -> Result<PathBuf, String> {
-    allmystuff_protocol::myownmesh_state_dir()
-        .ok_or_else(|| "the Fleetfiles state directory is unavailable".to_string())
-        .map(|state| state.join("Fleetfiles").join("Desktop"))
+    std::env::var_os("ALLMYSTUFF_USER_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "this user's home folder is unavailable".to_string())
+        .map(|home| home.join("Fleetfiles"))
+}
+
+fn legacy_fleetfiles_desktop() -> Option<PathBuf> {
+    allmystuff_protocol::myownmesh_state_dir().map(|state| state.join("Fleetfiles").join("Desktop"))
+}
+
+fn remove_empty_legacy_fleetfiles_container(legacy_desktop: &std::path::Path) {
+    let Some(container) = legacy_desktop.parent() else {
+        return;
+    };
+    if container.file_name().and_then(|name| name.to_str()) != Some("Fleetfiles") {
+        return;
+    }
+    // Finder creates this metadata beside the old Desktop directory. It is
+    // regenerated automatically and must not strand an otherwise-empty
+    // implementation-detail container in the user's state directory.
+    for name in [".DS_Store", "._.DS_Store"] {
+        let metadata = container.join(name);
+        if metadata.is_file() {
+            if let Err(error) = std::fs::remove_file(&metadata) {
+                tracing::warn!(path = %metadata.display(), %error, "couldn't remove legacy Finder metadata");
+            }
+        }
+    }
+    let is_empty = std::fs::read_dir(container)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if is_empty {
+        if let Err(error) = std::fs::remove_dir(container) {
+            tracing::warn!(path = %container.display(), %error, "couldn't remove the empty legacy Fleetfiles container");
+        }
+    }
+}
+
+fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
+    const ROOT_MARKER: &str = ".allmystuff-fleetfiles-root";
+
+    let root = fleetfiles_root()?;
+    let desktop = root.join("Desktop");
+    let marker = root.join(ROOT_MARKER);
+    let legacy = legacy_fleetfiles_desktop();
+
+    if root.exists() && !marker.exists() {
+        let occupied = std::fs::read_dir(&root)
+            .map_err(|error| format!("inspect {}: {error}", root.display()))?
+            .next()
+            .is_some();
+        if occupied {
+            return Err(format!(
+                "{} already exists and was not created by AllMyStuff",
+                root.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("create {}: {error}", root.display()))?;
+    if !marker.exists() {
+        std::fs::write(&marker, b"Fleetfiles root v1\n")
+            .map_err(|error| format!("mark {} as Fleetfiles: {error}", root.display()))?;
+        let _ = crate::files::mark_internal_staging_hidden(&marker);
+    }
+
+    if let Some(legacy) = legacy.as_ref().filter(|path| path.exists()) {
+        if !desktop.exists() {
+            std::fs::rename(&legacy, &desktop).map_err(|error| {
+                format!(
+                    "move the previous Fleetfiles Desktop from {} to {}: {error}",
+                    legacy.display(),
+                    desktop.display()
+                )
+            })?;
+            tracing::info!(
+                from = %legacy.display(),
+                to = %desktop.display(),
+                "migrated Fleetfiles into the user's home folder"
+            );
+        } else if std::fs::read_dir(&legacy)
+            .map_err(|error| format!("inspect {}: {error}", legacy.display()))?
+            .next()
+            .is_none()
+        {
+            std::fs::remove_dir(&legacy)
+                .map_err(|error| format!("remove empty {}: {error}", legacy.display()))?;
+        } else {
+            return Err(format!(
+                "both {} and {} contain Fleetfiles data; preserved both instead of merging them",
+                legacy.display(),
+                desktop.display()
+            ));
+        }
+    }
+    if let Some(legacy) = legacy.as_deref() {
+        remove_empty_legacy_fleetfiles_container(legacy);
+    }
+
+    let nested_staging = desktop.join(".allmystuff-staging");
+    let root_staging = root.join(".allmystuff-staging");
+    if nested_staging.exists() && !root_staging.exists() {
+        std::fs::rename(&nested_staging, &root_staging).map_err(|error| {
+            format!("move Fleetfiles staging out of the Desktop folder: {error}")
+        })?;
+    } else if nested_staging.is_dir()
+        && std::fs::read_dir(&nested_staging)
+            .map_err(|error| format!("inspect {}: {error}", nested_staging.display()))?
+            .next()
+            .is_none()
+    {
+        std::fs::remove_dir(&nested_staging)
+            .map_err(|error| format!("remove empty {}: {error}", nested_staging.display()))?;
+    }
+
+    std::fs::create_dir_all(&desktop)
+        .map_err(|error| format!("create the Fleetfiles Desktop: {error}"))?;
+    Ok(root)
 }
 
 #[cfg(not(test))]
 fn fleetfiles_replica() -> FleetfilesReplica {
     FleetfilesReplica::load(
-        fleetfiles_root().expect("Fleetfiles state directory must be available"),
+        prepare_fleetfiles_root().expect("the user's Fleetfiles root must be available"),
     )
 }
 
@@ -2599,7 +2715,7 @@ impl Mesh {
         // Native mount recovery can take Windows tens of seconds while its
         // redirector releases a stale WebDAV drive, so serialize that work in
         // the background instead of holding the node control socket hostage.
-        let fleetfiles = match fleetfiles_root() {
+        let fleetfiles = match prepare_fleetfiles_root() {
             Ok(root) => {
                 self.files
                     .map_root(crate::drive_mount::FLEETFILES_ROUTE, root.clone());
@@ -14121,7 +14237,9 @@ impl Mesh {
         } else {
             Vec::new()
         };
-        let mut rx = self.files.handle_in_root_excluding(route_id, event, root, excluded_volume_mounts);
+        let mut rx =
+            self.files
+                .handle_in_root_excluding(route_id, event, root, excluded_volume_mounts);
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();
@@ -14778,7 +14896,7 @@ impl Mesh {
     }
 
     pub fn fleetfiles_local_desktop(&self) -> Result<Value, String> {
-        let desktop = fleetfiles_root()?;
+        let desktop = prepare_fleetfiles_root()?.join("Desktop");
         std::fs::create_dir_all(&desktop)
             .map_err(|error| format!("create the virtual Fleetfiles Desktop: {error}"))?;
         // A Fleetfiles path is one logical directory entry whose materialized
@@ -16871,6 +16989,33 @@ impl Mesh {
         let ev = InputEvent::new(route_id, seq, action);
         let payload = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
         self.send_media_value(&peer, payload).await
+    }
+
+    /// Put file and folder references on this machine's real OS clipboard.
+    /// The clipboard service owns its platform context for the process lifetime,
+    /// which keeps X11 selections alive and lets the existing watcher sync the
+    /// same selection to any active clipboard routes.
+    pub async fn local_file_clipboard_set(&self, paths: Vec<String>) -> Result<(), String> {
+        if paths.is_empty() {
+            return Err("select at least one file or folder".into());
+        }
+        for path in &paths {
+            if !std::path::Path::new(path).exists() {
+                return Err(format!("{path} no longer exists"));
+            }
+        }
+        let clipboard = self.clipboard.clone();
+        tokio::task::spawn_blocking(move || clipboard.set_files(paths))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    /// Read native file/folder references without opening their contents.
+    pub async fn local_file_clipboard_get(&self) -> Result<Vec<String>, String> {
+        let clipboard = self.clipboard.clone();
+        tokio::task::spawn_blocking(move || clipboard.file_paths())
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     /// Front-end command: read this machine's clipboard and push it down an
@@ -21509,7 +21654,6 @@ mod tests {
         // With live CEC consent there is no CEC denial in either case.
         assert!(!cec_screen_consent_blocks(false, false));
         assert!(!cec_screen_consent_blocks(true, false));
-
     }
     #[test]
     fn cec_sweep_ignores_completed_route_history() {
@@ -21529,11 +21673,7 @@ mod tests {
             term_route("me-A3285:camera", "peer:video", MediaKind::Video),
             term_route("me-A3285:terminal", "peer:term-view:1", MediaKind::Generic),
             term_route("me-A3285:files", "peer:files-view:1", MediaKind::Generic),
-            term_route(
-                "me-A3285:disk:C:\\",
-                "peer:storage-in",
-                MediaKind::Storage,
-            ),
+            term_route("me-A3285:disk:C:\\", "peer:storage-in", MediaKind::Storage),
             term_route("me-A3285:site", "peer:site-view:1", MediaKind::Generic),
         ];
         for route in source_hosted {
@@ -21551,11 +21691,7 @@ mod tests {
 
         let sink_hosted = [
             term_route("peer:input", "me-A3285:control", MediaKind::Input),
-            term_route(
-                "peer:clipboard",
-                "me-A3285:clipboard",
-                MediaKind::Clipboard,
-            ),
+            term_route("peer:clipboard", "me-A3285:clipboard", MediaKind::Clipboard),
         ];
         for route in sink_hosted {
             assert!(

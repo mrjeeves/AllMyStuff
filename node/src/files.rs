@@ -160,17 +160,15 @@ impl FilesPlane {
         let _ = std::thread::Builder::new()
             .name(format!("amst-files-op {rid}"))
             .spawn(move || {
-                if let Some(reply) =
-                    run_op(
-                        event,
-                        &tx,
-                        &cancel,
-                        root.as_deref(),
-                        &rid,
-                        &list_cursors,
-                        &excluded_volume_mounts,
-                    )
-                {
+                if let Some(reply) = run_op(
+                    event,
+                    &tx,
+                    &cancel,
+                    root.as_deref(),
+                    &rid,
+                    &list_cursors,
+                    &excluded_volume_mounts,
+                ) {
                     let _ = tx.blocking_send(reply);
                 }
             });

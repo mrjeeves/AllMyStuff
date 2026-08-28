@@ -20,6 +20,12 @@
     watchLocalDirectory,
     localFileTransferScan,
     localFileTransferOperations,
+    localFileClipboardGet,
+    localFileClipboardSet,
+    localFileOperationApply,
+    localFileOperationRedo,
+    localFileOperationState,
+    localFileOperationUndo,
     onFileOperations,
     localFileTransferStart,
     localFileTransferCancel,
@@ -45,6 +51,7 @@
     containingFrame,
     desktopColumnPosition,
     FILE_TILE_SIZES,
+    fileTileSizeLabel,
     isLegacyAutoRowPlacement,
     isWorkspaceFileReplyKind,
     nativeFileGridMetrics,
@@ -130,9 +137,12 @@
   let viewportElement = $state<HTMLElement | null>(null);
   let records = $state<CanvasRecord[]>([]);
   let context = $state<{ x: number; y: number; item: WorkspaceEntry } | null>(null);
+  let workspaceContext = $state<{ x: number; y: number; anchorX: number | null; anchorY: number | null } | null>(null);
+  let clipboardIntent: { paths: string[]; kind: "copy" | "move" } | null = null;
+  let canUndoFileOperation = $state(false);
+  let canRedoFileOperation = $state(false);
+  let fileOperationBusy = $state(false);
   let recent = $state<WorkspaceEntry[]>([]);
-  let frameTool = $state(false);
-  let draftFrame = $state<CanvasFrame | null>(null);
   let thumbnails = $state<Record<string, string>>({});
   let nativeIcons = $state<Record<string, string>>({});
   let history = $state<string[]>([]);
@@ -142,7 +152,7 @@
   let fleetHome = $state(true);
   let computerHome = $state(false);
   let currentComputer = $state<{ deviceId: string; deviceLabel: string; routeId?: string } | null>(null);
-  let localRootPath = "";
+  let localRootPath = $state("");
   let fleetfilesRootPath = "";
   let fleetfilesNamespace = "";
   const remoteSessions = new Map<string, RemoteSession>();
@@ -445,6 +455,53 @@
 
   function computerEntryId(deviceId: string): string {
     return "entry:" + canonicalDeviceId(deviceId) + ":computer-root";
+  }
+
+  function navigatorDirectoryEntryId(deviceId: string, nativePath: string): string {
+    return `navigator:${canonicalDeviceId(deviceId)}:${stableTextId(nativePath)}`;
+  }
+
+  function navigatorDirectoryTarget(
+    deviceId: string,
+    deviceLabel: string,
+    nativePath: string,
+    label: string,
+    id = navigatorDirectoryEntryId(deviceId, nativePath),
+  ): WorkspaceEntry | null {
+    if (!nativePath) return null;
+    const nativeId = `navigator-path:${stableTextId(nativePath)}`;
+    let binding: WorkspaceBinding;
+    if (canonicalDeviceId(deviceId) === canonicalDeviceId(app.localId)) {
+      binding = {
+        kind: "local",
+        deviceId: app.localId,
+        deviceLabel: app.localNode?.label || "This device",
+        nativeId,
+      };
+    } else {
+      const session = remoteSession(deviceId);
+      if (!session || session.closed) return null;
+      binding = {
+        kind: "remote",
+        deviceId,
+        deviceLabel,
+        nativeId,
+        routeId: session.routeId,
+      };
+    }
+    return {
+      id,
+      name: label,
+      path: nativePath,
+      dir: true,
+      size: 0,
+      modified: null,
+      hidden: false,
+      symlink: false,
+      virtualItem: true,
+      shellIcon: null,
+      binding,
+    };
   }
 
   function localWorkspaceEntry(item: LocalFileEntry): WorkspaceEntry {
@@ -1105,7 +1162,7 @@
       fleetHome = true;
       map = "files";
       path = "fleet://home";
-      address = "Fleetfiles";
+      address = listing.path;
       platform = listing.platform;
       const desktopEntries = await adoptWorkspaceEntries(
         "fleet:home",
@@ -1179,7 +1236,7 @@
       currentComputer = { deviceId, deviceLabel, routeId };
       map = "files";
       path = "computer://" + encodeURIComponent(canonical);
-      address = "Devices / " + deviceLabel;
+      address = "";
       entries = coalesceLatestBy(nextEntries, (entry) => entry.id);
       nextCursor = null;
       complete = true;
@@ -1206,8 +1263,8 @@
     | { kind: "local-directory"; path: string }
     | { kind: "remote-directory"; deviceId: string; deviceLabel: string; path: string; nativeId: string };
 
-  function currentWorkspaceWindowLocation(): WorkspaceWindowLocation {
-    const item = selected?.dir ? selected : null;
+  function currentWorkspaceWindowLocation(includeSelection = true): WorkspaceWindowLocation {
+    const item = includeSelection && selected?.dir ? selected : null;
     if (item?.computerNode) {
       return {
         kind: "computer",
@@ -1245,10 +1302,11 @@
     return { kind: "local-directory", path };
   }
 
-  function openWorkspaceInNewWindow() {
-    const location = currentWorkspaceWindowLocation();
-    const title = selected?.dir
-      ? displayName(selected)
+  function openWorkspaceInNewWindow(includeSelection = true) {
+    const location = currentWorkspaceWindowLocation(includeSelection);
+    const item = includeSelection && selected?.dir ? selected : null;
+    const title = item
+      ? displayName(item)
       : fleetHome
         ? "Fleetfiles"
         : currentComputer?.deviceLabel || currentRemoteDirectory?.deviceLabel || address;
@@ -1311,6 +1369,8 @@
   }
 
   onMount(() => {
+    window.addEventListener("keydown", fileCommandKeydown);
+    window.addEventListener("contextmenu", showWorkspaceContextMenu);
     let mounted = true;
     let stop = () => {};
     let stopBackendReady = () => {};
@@ -1393,6 +1453,10 @@
       loading = false;
       app.toast("warn", `Couldn't start Files: ${String(error)}`);
     });
+    void localFileOperationState().then((state) => {
+      canUndoFileOperation = state.canUndo;
+      canRedoFileOperation = state.canRedo;
+    }).catch((error) => console.warn("Could not restore local file history:", error));
     void localFileTransferOperations()
       .then(({ operations }) => absorbTransferOperations(operations))
       .catch((error) => console.warn("Could not restore file operations:", error));
@@ -1427,6 +1491,8 @@
       stopSaved = unlisten;
     });
     return () => {
+      window.removeEventListener("keydown", fileCommandKeydown);
+      window.removeEventListener("contextmenu", showWorkspaceContextMenu);
       mounted = false;
       document.removeEventListener("visibilitychange", remoteDirectoryVisibilityChanged);
       cancelPendingItemRename();
@@ -1513,7 +1579,7 @@
       directoryId = `remote:${session.deviceId}:${nativeId}`;
       map = "files";
       path = `fleet://directory/${encodeURIComponent(session.deviceId)}/${encodeURIComponent(nativeId)}`;
-      address = `Devices / ${session.deviceLabel} / ${listing.path}`;
+      address = listing.path;
       entries = await adoptWorkspaceEntries(
         directoryId,
         listing.entries.map((item) => remoteWorkspaceEntry(session, listing.path, item)),
@@ -1663,13 +1729,10 @@
     if (event.key !== "Enter") return;
     const next = address.trim();
     if (!next) return;
-    if (["fleet home", "fleetfiles", "fleetfiles / desktop"].includes(next.toLocaleLowerCase())
+    if ((fleetHome && sameNativePath(next, localRootPath))
+      || ["fleet home", "fleetfiles", "fleetfiles / desktop"].includes(next.toLocaleLowerCase())
       || next === "fleet://home") {
       void navigateFleetHome();
-      return;
-    }
-    if (computerHome && currentComputer && next === address) {
-      void navigateComputer(currentComputer.deviceId, currentComputer.deviceLabel, false);
       return;
     }
     if (next.startsWith("computer://")) {
@@ -1680,12 +1743,24 @@
       void navigateComputer();
       return;
     }
+    if (computerHome && currentComputer) {
+      if (canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(app.localId)) {
+        void navigate(next);
+        return;
+      }
+      const session = remoteSession(currentComputer.deviceId);
+      if (!session) {
+        app.toast("warn", "That device's Files connection is no longer active");
+        return;
+      }
+      void navigateRemotePath(session, next, next.split(/[\\/]/).filter(Boolean).at(-1) || "Home")
+        .catch((error) => app.toast("warn", "Couldn't open that fleet folder: " + String(error)));
+      return;
+    }
     if (currentRemoteDirectory) {
       const session = remoteSession(currentRemoteDirectory.deviceId);
       if (!session) return;
-      const prefix = currentRemoteDirectory.deviceLabel + " / ";
-      const requested = next.startsWith(prefix) ? next.slice(prefix.length) : next;
-      void navigateRemotePath(session, requested, requested.split(/[\\/]/).filter(Boolean).at(-1) || "Home")
+      void navigateRemotePath(session, next, next.split(/[\\/]/).filter(Boolean).at(-1) || "Home")
         .catch((error) => app.toast("warn", "Couldn't open that fleet folder: " + String(error)));
       return;
     }
@@ -2133,9 +2208,194 @@
     return extension || "File";
   }
 
+  // local operation commands
+  function selectedFileItems(seed?: WorkspaceEntry): WorkspaceEntry[] {
+    const ids = seed && !selectedIds.has(seed.id) ? new Set([seed.id]) : selectedIds;
+    return entries.filter((entry) => ids.has(entry.id) && !entry.computerNode && !entry.virtualItem);
+  }
+
+  function sameClipboardPaths(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((path) =>
+      right.some((candidate) => sameNativePath(path, candidate))
+    );
+  }
+
+  function localOperationDestination(target?: WorkspaceEntry): string | null {
+    if (target) {
+      return target.dir && target.binding.kind === "local" && !target.computerNode ? target.path : null;
+    }
+    if (currentRemoteDirectory || computerHome) return null;
+    return fleetHome ? localRootPath : path;
+  }
+
+  async function applyLocalFileOperation(paths: string[], destination: string, kind: "copy" | "move"): Promise<boolean> {
+    if (fileOperationBusy) return false;
+    fileOperationBusy = true;
+    try {
+      const result = await localFileOperationApply(paths, destination, kind);
+      canUndoFileOperation = result.canUndo;
+      canRedoFileOperation = result.canRedo;
+      if (kind === "move") clearWorkspaceSelection();
+      refreshWorkspace();
+      app.toast("ok", `${result.operation} ${result.affected} item${result.affected === 1 ? "" : "s"}`);
+      return true;
+    } catch (error) {
+      app.toast("warn", String(error));
+      return false;
+    } finally {
+      fileOperationBusy = false;
+    }
+  }
+
+  async function copyOrCutSelection(kind: "copy" | "move", seed?: WorkspaceEntry) {
+    const items = selectedFileItems(seed);
+    if (!items.length) return;
+    if (!items.every((item) => item.binding.kind === "local")) {
+      app.toast("warn", "Copy and cut currently require files materialized on this computer");
+      return;
+    }
+    const paths = items.map((item) => item.path);
+    try {
+      await localFileClipboardSet(paths);
+      clipboardIntent = { paths, kind };
+      context = null;
+      workspaceContext = null;
+      app.toast("ok", `${kind === "move" ? "Cut" : "Copied"} ${items.length} item${items.length === 1 ? "" : "s"} to the system clipboard`);
+    } catch (error) {
+      app.toast("warn", "Couldn't update the system clipboard: " + String(error));
+    }
+  }
+
+  async function pasteFiles(target?: WorkspaceEntry) {
+    const destination = localOperationDestination(target);
+    if (!destination) {
+      app.toast("warn", "Paste needs a local Fleetfiles folder on this computer");
+      return;
+    }
+    try {
+      const clipboard = await localFileClipboardGet();
+      if (!clipboard.paths.length) throw new Error("the system clipboard does not contain files or folders");
+      const internalMove = clipboardIntent?.kind === "move"
+        && sameClipboardPaths(clipboardIntent.paths, clipboard.paths);
+      const kind = clipboard.prefersMove || internalMove ? "move" : "copy";
+      const completed = await applyLocalFileOperation(clipboard.paths, destination, kind);
+      if (completed && kind === "move") clipboardIntent = null;
+    } catch (error) {
+      app.toast("warn", "Couldn't paste: " + String(error));
+    } finally {
+      workspaceContext = null;
+      context = null;
+    }
+  }
+
+  async function undoFileOperation() {
+    if (fileOperationBusy || !canUndoFileOperation) return;
+    fileOperationBusy = true;
+    try {
+      const result = await localFileOperationUndo();
+      canUndoFileOperation = result.canUndo;
+      canRedoFileOperation = result.canRedo;
+      refreshWorkspace();
+      app.toast("ok", result.operation);
+    } catch (error) {
+      app.toast("warn", "Couldn't undo: " + String(error));
+    } finally {
+      fileOperationBusy = false;
+      workspaceContext = null;
+      context = null;
+    }
+  }
+
+  async function redoFileOperation() {
+    if (fileOperationBusy || !canRedoFileOperation) return;
+    fileOperationBusy = true;
+    try {
+      const result = await localFileOperationRedo();
+      canUndoFileOperation = result.canUndo;
+      canRedoFileOperation = result.canRedo;
+      refreshWorkspace();
+      app.toast("ok", result.operation);
+    } catch (error) {
+      app.toast("warn", "Couldn't redo: " + String(error));
+    } finally {
+      fileOperationBusy = false;
+      workspaceContext = null;
+      context = null;
+    }
+  }
+
+  function fileCommandKeydown(event: KeyboardEvent) {
+    const target = event.target;
+    if (target instanceof HTMLElement && (target.matches("input, textarea, select") || target.isContentEditable)) return;
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.repeat) return;
+    const key = event.key.toLowerCase();
+    if (key === "c" && selectedIds.size) {
+      event.preventDefault();
+      void copyOrCutSelection("copy");
+    } else if (key === "x" && selectedIds.size) {
+      event.preventDefault();
+      void copyOrCutSelection("move");
+    } else if (key === "v") {
+      event.preventDefault();
+      void pasteFiles();
+    } else if (key === "z" && event.shiftKey) {
+      event.preventDefault();
+      void redoFileOperation();
+    } else if (key === "z") {
+      event.preventDefault();
+      void undoFileOperation();
+    } else if (key === "y") {
+      event.preventDefault();
+      void redoFileOperation();
+    }
+  }
+
+  function workspaceMenuPosition(x: number, y: number) {
+    return {
+      x: Math.max(8, Math.min(window.innerWidth - 224, x)),
+      y: Math.max(8, Math.min(window.innerHeight - 332, y)),
+    };
+  }
+
+  function showWorkspaceContextMenu(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest(".browser")) return;
+    if (map !== "files") return;
+    event.preventDefault();
+    event.stopPropagation();
+    context = null;
+    workspaceContext = {
+      ...workspaceMenuPosition(event.clientX, event.clientY),
+      anchorX: event.clientX,
+      anchorY: event.clientY,
+    };
+  }
+
+  function showWorkspaceMenuFromToolbar(event: MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    context = null;
+    if (workspaceContext?.anchorX === null) {
+      workspaceContext = null;
+      return;
+    }
+    const button = event.currentTarget as HTMLElement;
+    const rect = button.getBoundingClientRect();
+    workspaceContext = {
+      ...workspaceMenuPosition(rect.right - 208, rect.bottom + 4),
+      anchorX: null,
+      anchorY: null,
+    };
+  }
+
   function showContextMenu(event: MouseEvent, item: WorkspaceEntry) {
     event.preventDefault();
     event.stopPropagation();
+    workspaceContext = null;
+    if (selectedIds.has(item.id) && selectedIds.size > 1) {
+      context = { x: event.clientX, y: event.clientY, item };
+      return;
+    }
     const menuPosition = { x: event.clientX, y: event.clientY };
     // The Shell menu below is bound to this one item. Keep the visible
     // selection honest instead of implying that an action targets a group.
@@ -2182,8 +2442,9 @@
   function dismissTransientMenus(event?: PointerEvent) {
     acceptInlineRenames(event);
     const target = event?.target;
-    if (!(target instanceof Element) || !target.closest(".context-menu")) {
+    if (!(target instanceof Element) || !target.closest(".context-menu, .workspace-menu-button")) {
       context = null;
+      workspaceContext = null;
     }
     if (!(target instanceof Element) || !target.closest(".zoom-control")) zoomMenu = false;
   }
@@ -2440,6 +2701,14 @@ function newTransferId(): string {
   }
 
   async function prepareLocalTransfer(target: WorkspaceEntry, dragged: WorkspaceEntry[]) {
+    if (target.binding.kind === "local") {
+      if (!dragged.every((entry) => entry.binding.kind === "local" && !entry.computerNode)) {
+        app.toast("warn", "Move between devices requires a materialized local source");
+        return;
+      }
+      await applyLocalFileOperation(dragged.map((entry) => entry.path), target.path, "move");
+      return;
+    }
     if (transferDialog || target.binding.kind !== "remote" || target.computerOnline === false) return;
     if (!dragged.every((entry) => entry.binding.kind === "local" && !entry.computerNode)) {
       app.toast("warn", "Send currently starts from files stored on this computer");
@@ -2495,11 +2764,33 @@ function newTransferId(): string {
       const id = tile?.dataset.filesEntryId;
       if (id && !dragged.has(id)) {
         const target = entries.find((entry) => entry.id === id);
+        if (target?.dir && target.binding.kind === "local") return target;
         if (target?.dir && target.binding.kind === "remote" && target.computerOnline !== false) return target;
+      }
+      const navigator = element.closest<HTMLElement>("[data-files-navigator-path]");
+      const navigatorPath = navigator?.dataset.filesNavigatorPath;
+      const navigatorDeviceId = navigator?.dataset.filesNavigatorDeviceId;
+      if (navigatorPath && navigatorDeviceId) {
+        const target = navigatorDirectoryTarget(
+          navigatorDeviceId,
+          navigator.dataset.filesNavigatorDeviceLabel || "Device",
+          navigatorPath,
+          navigator.dataset.filesNavigatorLabel || navigatorPath,
+        );
+        if (target && !dragged.has(target.id)) return target;
       }
       const device = element.closest<HTMLElement>("[data-files-device-id]");
       const deviceId = device?.dataset.filesDeviceId;
       if (!deviceId) continue;
+      if (canonicalDeviceId(deviceId) === canonicalDeviceId(app.localId) && localRootPath) {
+        return navigatorDirectoryTarget(
+          app.localId,
+          app.localNode?.label || "This device",
+          localRootPath,
+          "Desktop",
+          computerEntryId(app.localId),
+        );
+      }
       const node = fleetFileNodes.find((candidate) =>
         canonicalDeviceId(candidate.id) === canonicalDeviceId(deviceId)
       );
@@ -2509,9 +2800,56 @@ function newTransferId(): string {
     }
     return null;
   }
-  function newFrame() {
-    if (map === "files") changeView("canvas");
-    frameTool = !frameTool;
+  function persistNewFrame(frame: CanvasFrame) {
+    frame.parentId = containingFrame(frame, frames);
+    const enclosed = frames.filter((candidate) => contains(frame, candidate));
+    const enclosedIds = new Set(enclosed.map((candidate) => candidate.id));
+    const capturedFrames = enclosed.filter(
+      (candidate) => !candidate.parentId || !enclosedIds.has(candidate.parentId),
+    );
+    for (const candidate of capturedFrames) candidate.parentId = frame.id;
+    const capturedItems = visible.flatMap((item) => {
+      const placement = itemPosition(item);
+      if (
+        !contains(frame, { ...placement, width: grid.tileWidth, height: grid.tileHeight }) ||
+        (placement.parentId && enclosedIds.has(placement.parentId))
+      ) return [];
+      const value = { ...placement, id: item.id, parentId: frame.id };
+      return [{ id: `item:${map}:${scope}:${item.id}`, kind: "item" as const, value }];
+    });
+    editingFrameId = frame.id;
+    void save([frameRecord(frame), ...capturedFrames.map(frameRecord), ...capturedItems]);
+  }
+
+  function createFrame() {
+    if (map !== "files") return;
+    const menu = workspaceContext;
+    const point = menu?.anchorX != null && menu.anchorY != null
+      ? { x: menu.anchorX, y: menu.anchorY }
+      : null;
+    workspaceContext = null;
+    if (view !== "canvas") changeView("canvas");
+    const surface = document.querySelector<HTMLElement>(".browser");
+    if (!surface) return;
+    const rect = surface.getBoundingClientRect();
+    const fromBackdrop = Boolean(point
+      && point.x >= rect.left && point.x <= rect.right
+      && point.y >= rect.top && point.y <= rect.bottom);
+    const clientX = fromBackdrop && point ? point.x : rect.left + rect.width / 2;
+    const clientY = fromBackdrop && point ? point.y : rect.top + rect.height / 2;
+    const width = 240;
+    const height = 160;
+    const frame: CanvasFrame = {
+      id: `${framePrefix}${crypto.randomUUID()}`,
+      title: "New Frame",
+      color: "violet",
+      parentId: null,
+      x: Math.round((clientX - rect.left - pan.x) / zoom - width / 2),
+      y: Math.round((clientY - rect.top - pan.y) / zoom - height / 2),
+      width,
+      height,
+    };
+    persistNewFrame(frame);
   }
 
   function dragItem(event: PointerEvent, item: WorkspaceEntry) {
@@ -2519,7 +2857,7 @@ function newTransferId(): string {
     event.stopPropagation();
     cancelPendingItemRename();
     const eventTarget = event.target;
-    const titleClick = eventTarget instanceof Element && Boolean(eventTarget.closest(".file-label"));
+    const titleClick = eventTarget instanceof Element && Boolean(eventTarget.closest(".file-label, .detail-label"));
     const preserveSelection = selectedIds.has(item.id) && !event.ctrlKey && !event.metaKey && !event.shiftKey;
     const renameOnRelease = titleClick && preserveSelection && selectedIds.size === 1;
     if (!preserveSelection) void select(item, event);
@@ -2539,11 +2877,13 @@ function newTransferId(): string {
       const clientDy = next.clientY - origin.y;
       if (!moved && Math.hypot(clientDx, clientDy) < 4) return;
       moved = true;
-      liveItemPositions = Object.fromEntries(dragged.map((entry) => {
-        const start = starts.get(entry.id)!;
-        const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
-        return [entry.id, { ...start, ...point }];
-      }));
+      if (view === "canvas") {
+        liveItemPositions = Object.fromEntries(dragged.map((entry) => {
+          const start = starts.get(entry.id)!;
+          const point = translateCanvasPoint(start, origin, { x: next.clientX, y: next.clientY }, zoom);
+          return [entry.id, { ...start, ...point }];
+        }));
+      }
       const target = transferTargetAt(next.clientX, next.clientY, draggedIds);
       transferDropTargetId = target?.id ?? null;
     };
@@ -2564,6 +2904,10 @@ function newTransferId(): string {
       if (transferTarget) {
         clearGeometryPreview(previewGeneration);
         void prepareLocalTransfer(transferTarget, dragged).catch((error) => app.toast("warn", String(error)));
+        return;
+      }
+      if (view === "details") {
+        clearGeometryPreview(previewGeneration);
         return;
       }
       const mutations = dragged.map((entry) => {
@@ -2591,7 +2935,6 @@ function newTransferId(): string {
 
   function dragFrame(event: PointerEvent, frame: CanvasFrame) {
     if (event.button !== 0) return;
-    if (frameTool) return;
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY };
     const children = descendantsOf(frame.id, frames);
@@ -2700,62 +3043,6 @@ function newTransferId(): string {
 
   function panCanvas(event: PointerEvent) {
     const target = event.target as Element;
-    if (frameTool) {
-      if (event.button !== 0 || target.closest(".file-tile, button, input, .share-frame")) return;
-      const viewport = event.currentTarget as HTMLElement;
-      const rect = viewport.getBoundingClientRect();
-      const canvasPan = map === "files" ? pan : { x: 0, y: 0 };
-      const canvasScroll = map === "sharing" ? { x: viewport.scrollLeft, y: viewport.scrollTop } : { x: 0, y: 0 };
-      const canvasZoom = map === "files" ? zoom : 1;
-      const start = { x: (event.clientX - rect.left - canvasPan.x + canvasScroll.x) / canvasZoom, y: (event.clientY - rect.top - canvasPan.y + canvasScroll.y) / canvasZoom };
-      const frame: CanvasFrame = {
-        id: `${framePrefix}${crypto.randomUUID()}`,
-        title: "New frame",
-        color: "violet",
-        parentId: null,
-        x: start.x,
-        y: start.y,
-        width: 1,
-        height: 1,
-      };
-      draftFrame = frame;
-      const move = (next: PointerEvent) => {
-        const x = (next.clientX - rect.left - canvasPan.x + canvasScroll.x) / canvasZoom;
-        const y = (next.clientY - rect.top - canvasPan.y + canvasScroll.y) / canvasZoom;
-        frame.x = Math.min(start.x, x);
-        frame.y = Math.min(start.y, y);
-        frame.width = Math.abs(x - start.x);
-        frame.height = Math.abs(y - start.y);
-        draftFrame = { ...frame };
-      };
-      const up = () => {
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
-        frameTool = false;
-        draftFrame = null;
-        if (frame.width < 48 || frame.height < 48) return;
-        frame.parentId = containingFrame(frame, frames);
-        const enclosed = frames.filter((candidate) => contains(frame, candidate));
-        const enclosedIds = new Set(enclosed.map((candidate) => candidate.id));
-        const capturedFrames = enclosed.filter(
-          (candidate) => !candidate.parentId || !enclosedIds.has(candidate.parentId),
-        );
-        for (const candidate of capturedFrames) candidate.parentId = frame.id;
-        const capturedItems = (map === "files" ? visible : []).flatMap((item) => {
-          const placement = itemPosition(item);
-          if (
-            !contains(frame, { ...placement, width: grid.tileWidth, height: grid.tileHeight }) ||
-            (placement.parentId && enclosedIds.has(placement.parentId))
-          ) return [];
-          const value = { ...placement, id: item.id, parentId: frame.id };
-          return [{ id: `item:${map}:${scope}:${item.id}`, kind: "item" as const, value }];
-        });
-        void save([frameRecord(frame), ...capturedFrames.map(frameRecord), ...capturedItems]);
-      };
-      window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up, { once: true });
-      return;
-    }
     if (map !== "files" || target.closest(".file-tile, .frame-titlebar, .resize-handle, .load-more, .zoom-control, .share-frame")) return;
     if (event.button === 2) {
       event.preventDefault();
@@ -2820,17 +3107,11 @@ function newTransferId(): string {
 
   function changeMap(next: FilesMap) {
     map = next;
-    frameTool = false;
-    draftFrame = null;
   }
 
   function changeView(next: FilesView) {
     view = next;
     app.updateFilesSettings({ defaultView: next });
-    if (next !== "canvas") {
-      frameTool = false;
-      draftFrame = null;
-    }
   }
 
   function toggleHidden() {
@@ -3030,11 +3311,9 @@ function newTransferId(): string {
     <button title="Forward" disabled={currentRemoteDirectory !== null || historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
     <button title="Up one folder" disabled={fleetHome} onclick={goUp}>↑</button>
     <button onclick={refreshWorkspace} title="Refresh">↻</button>
-    <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Location" spellcheck="false" />
+    <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Filesystem location" placeholder={computerHome ? "Device roots (not a filesystem directory)" : "Filesystem path"} spellcheck="false" />
     <input class="search" bind:value={query} disabled={map !== "files"} placeholder={fleetHome ? "Search Fleetfiles" : computerHome ? "Search device" : "Search this folder"} aria-label="Search files" />
-    <button onclick={createFolder} disabled={map !== "files" || computerHome} title="New folder">＋ Folder</button>
-    <button class:active={frameTool} aria-pressed={frameTool} onclick={newFrame} title={frameTool ? "Cancel frame drawing" : "Draw a nestable canvas frame"}>▱ Frame</button>
-    <button onclick={openWorkspaceInNewWindow} disabled={map !== "files"} title={selected?.dir ? `Open ${displayName(selected)} in a new AllMyStuff window` : "Open this location in a new AllMyStuff window"}>↗ Window</button>
+    <button onclick={() => openWorkspaceInNewWindow(true)} disabled={map !== "files"} aria-label="Open in a new AllMyStuff window" title={selected?.dir ? `Open ${displayName(selected)} in a new AllMyStuff window` : "Open this location in a new AllMyStuff window"}>↗</button>
     <button class:active={operationsOpen} onclick={() => { operationsOpen = !operationsOpen; }} title="Show file operations">⇅{activeOperationCount ? " " + activeOperationCount : ""}</button>
     {#if map === "files"}
       <div class="switch" role="group" aria-label="View">
@@ -3043,10 +3322,10 @@ function newTransferId(): string {
       </div>
       {#if view === "canvas"}
         <select class="icon-size" value={tileSize} onchange={(event) => { tileSize = Number(event.currentTarget.value); app.updateFilesSettings({ thumbnailSize: tileSize }); }} aria-label="Icon size">
-          {#each FILE_TILE_SIZES as size}<option value={size}>{size === 32 ? "Small" : size === 48 ? "Medium" : "Large"} icons</option>{/each}
+          {#each FILE_TILE_SIZES as size}<option value={size}>{fileTileSizeLabel(size)} icons</option>{/each}
         </select>
       {/if}
-      <button class:active={showHidden} aria-pressed={showHidden} onclick={toggleHidden} title={showHidden ? "Hide hidden files" : "Show hidden files"}>&#183;&#183;&#183;</button>
+      <button class="workspace-menu-button" class:active={workspaceContext !== null} aria-haspopup="menu" aria-expanded={workspaceContext !== null} onclick={showWorkspaceMenuFromToolbar} title="More file commands">···</button>
     {/if}
   </nav>
 
@@ -3058,22 +3337,49 @@ function newTransferId(): string {
     </div>
     {#if placesOpen}
       <div class="sidebar-body">
-        <button class="tree-root" class:current={fleetHome && map === "files"} aria-current={fleetHome && map === "files" ? "location" : undefined} onclick={navigateFleetHome}><span aria-hidden="true">▱</span>Fleetfiles</button>
+        <button
+          class="tree-root"
+          class:current={fleetHome && map === "files"}
+          class:transfer-target={transferDropTargetId === navigatorDirectoryEntryId(app.localId, localRootPath)}
+          data-files-navigator-path={localRootPath}
+          data-files-navigator-device-id={app.localId}
+          data-files-navigator-device-label={app.localNode?.label || "This device"}
+          data-files-navigator-label="Fleetfiles"
+          aria-current={fleetHome && map === "files" ? "location" : undefined}
+          onclick={navigateFleetHome}
+        ><span aria-hidden="true">▱</span>Fleetfiles</button>
         <button class="tree-section-toggle" aria-expanded={devicesOpen || computerHome || Boolean(currentRemoteDirectory)} onclick={toggleDevices} title="Browse files on a device">
           <span aria-hidden="true">{devicesOpen || computerHome || currentRemoteDirectory ? "⌄" : "›"}</span>Devices
         </button>
         {#if devicesOpen || computerHome || currentRemoteDirectory}<div class="computer-tree" aria-label="Device file sources">
-          <button class:active={computerBranchActive(app.localId)} onclick={() => { void navigateComputer(); }} title={app.localNode?.label || nativeComputerName()}><span class="tree-expander" aria-hidden="true">{computerBranchActive(app.localId) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
+          <button
+            data-files-device-id={app.localId}
+            class:active={computerBranchActive(app.localId)}
+            class:transfer-target={transferDropTargetId === computerEntryId(app.localId)}
+            onclick={() => { void navigateComputer(); }}
+            title={app.localNode?.label || nativeComputerName()}
+          ><span class="tree-expander" aria-hidden="true">{computerBranchActive(app.localId) ? "⌄" : "›"}</span><span aria-hidden="true">&#9635;</span>{nativeComputerName()}</button>
           {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(app.localId)}
             <div class="location-branch" aria-label="Drives on this computer">
               {#each entries as drive (drive.id)}
-                <button title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
+                <button data-files-entry-id={drive.id} class:transfer-target={transferDropTargetId === drive.id} title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
               {/each}
             </div>
           {:else if !fleetHome && !computerHome && !currentRemoteDirectory}
             <div class="location-branch local" aria-label="Current location">
               {#each navigatorTrail as crumb, index (crumb.path)}
-                <button style={`--tree-depth:${index}`} class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                <button
+                  data-files-navigator-path={crumb.path}
+                  data-files-navigator-device-id={app.localId}
+                  data-files-navigator-device-label={app.localNode?.label || "This device"}
+                  data-files-navigator-label={navigatorCrumbLabel(crumb.label, crumb.path)}
+                  style={`--tree-depth:${index}`}
+                  class:current={index === navigatorTrail.length - 1}
+                  class:transfer-target={transferDropTargetId === navigatorDirectoryEntryId(app.localId, crumb.path)}
+                  aria-current={index === navigatorTrail.length - 1 ? "location" : undefined}
+                  title={crumb.path}
+                  onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}
+                >
                   {navigatorCrumbLabel(crumb.label, crumb.path)}
                 </button>
               {/each}
@@ -3093,13 +3399,24 @@ function newTransferId(): string {
             {#if computerHome && currentComputer && canonicalDeviceId(currentComputer.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Drives on " + node.label}>
                 {#each entries as drive (drive.id)}
-                  <button title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
+                  <button data-files-entry-id={drive.id} class:transfer-target={transferDropTargetId === drive.id} title={drive.path} onclick={() => { void open(drive); }}>{displayName(drive)}</button>
                 {/each}
               </div>
             {:else if currentRemoteDirectory && canonicalDeviceId(currentRemoteDirectory.deviceId) === canonicalDeviceId(node.id)}
               <div class="location-branch" aria-label={"Current location on " + node.label}>
                 {#each navigatorTrail as crumb, index (crumb.path)}
-                  <button style={`--tree-depth:${index}`} class:current={index === navigatorTrail.length - 1} aria-current={index === navigatorTrail.length - 1 ? "location" : undefined} title={crumb.path} onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}>
+                  <button
+                    data-files-navigator-path={crumb.path}
+                    data-files-navigator-device-id={node.id}
+                    data-files-navigator-device-label={node.label}
+                    data-files-navigator-label={navigatorCrumbLabel(crumb.label, crumb.path)}
+                    style={`--tree-depth:${index}`}
+                    class:current={index === navigatorTrail.length - 1}
+                    class:transfer-target={transferDropTargetId === navigatorDirectoryEntryId(node.id, crumb.path)}
+                    aria-current={index === navigatorTrail.length - 1 ? "location" : undefined}
+                    title={crumb.path}
+                    onclick={() => openNavigatorCrumb(crumb.path, crumb.label)}
+                  >
                     {navigatorCrumbLabel(crumb.label, crumb.path)}
                   </button>
                 {/each}
@@ -3129,7 +3446,7 @@ function newTransferId(): string {
 
   <main class="browser" use:measureCanvas style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
     {#if map === "sharing"}
-      <div class="sharing-canvas" class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
+      <div class="sharing-canvas" role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
         <p class="share-map-help">Drag files into a person’s frame to share. Drag them out to stop sharing.</p>
         {#each filesystemPartners as relation (relation.partner.person.id)}
           <section class="share-frame partner" role="group" aria-label={`Files shared with ${relation.partner.person.name}`} ondragover={(event) => event.preventDefault()} ondrop={(event) => shareDrop(event, relation.partner)}>
@@ -3169,8 +3486,6 @@ function newTransferId(): string {
             <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
           </article>
         {/each}
-        {#if draftFrame}<article class="canvas-frame draft user" style={`left:${draftFrame.x}px;top:${draftFrame.y}px;width:${draftFrame.width}px;height:${draftFrame.height}px`}>New frame</article>{/if}
-        {#if frameTool}<div class="frame-hint">Drag on empty canvas to draw a frame</div>{/if}
       </div>
     {:else if view === "details"}
       <div class="details">
@@ -3181,13 +3496,11 @@ function newTransferId(): string {
             class:selected={selectedIds.has(item.id)}
             class:offline={item.computerNode && item.computerOnline === false}
             role="button"
+            class:transfer-target={transferDropTargetId === item.id}
+            data-files-entry-id={item.id}
+            onpointerdown={(event) => dragItem(event, item)}
+            ondragstart={(event) => event.preventDefault()}
             tabindex="0"
-            onclick={(event) => {
-              const target = event.target;
-              const titleClick = target instanceof Element && Boolean(target.closest(".detail-label"));
-              if (titleClick && selectedIds.size === 1 && selectedIds.has(item.id)) scheduleItemRename(item);
-              else void select(item, event);
-            }}
             ondblclick={() => { cancelPendingItemRename(); if (editingItemId !== item.id) void open(item); }}
             onkeydown={(event) => {
               if (event.key === "F2") { event.preventDefault(); beginItemRename(item); }
@@ -3226,7 +3539,7 @@ function newTransferId(): string {
         {#if !complete}<button class="details-load" onclick={loadMore} disabled={loadingPage}><span>{loadingPage ? "Reading…" : `Load 256 more (${entries.length} shown)`}</span></button>{/if}
       </div>
     {:else}
-      <div class="viewport" bind:this={viewportElement} class:frame-active={frameTool} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
+      <div class="viewport" bind:this={viewportElement} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
           {#each frames as frame}
             {@const geometry = frameGeometry(frame)}
@@ -3242,9 +3555,6 @@ function newTransferId(): string {
               <button class="resize-handle" aria-label="Resize frame" title="Resize frame" onpointerdown={(event) => resizeFrame(event, frame)}></button>
             </article>
           {/each}
-          {#if draftFrame}
-            <article class="canvas-frame draft" style={`left:${draftFrame.x}px;top:${draftFrame.y}px;width:${draftFrame.width}px;height:${draftFrame.height}px`}>New frame</article>
-          {/if}
           {#if marquee}<div class="selection-marquee" style={`left:${marquee.x}px;top:${marquee.y}px;width:${marquee.width}px;height:${marquee.height}px`}></div>{/if}
           {#each visible as item (item.id)}
             {@const position = itemPosition(item)}
@@ -3330,7 +3640,7 @@ function newTransferId(): string {
           <p>{selected.dir ? fileType(selected) : humanBytes(selected.size)}</p>
           {#if preview?.kind === "text"}<pre>{preview.text}</pre>{/if}
           <dl>
-            <dt>Fleet location</dt><dd>{address}</dd>
+            <dt>Location</dt><dd>{address}</dd>
             <dt>Available through</dt><dd>{selected.binding.deviceLabel}</dd>
             <dt>Modified</dt><dd>{selected.modified ? new Date(selected.modified * 1000).toLocaleString() : "Unknown"}</dd>
             {#if isWindowsShellLink(selected)}<dt>Kind</dt><dd>Shortcut</dd>{:else if selected.symlink}<dt>Kind</dt><dd>Symbolic link</dd>{/if}
@@ -3429,6 +3739,20 @@ function newTransferId(): string {
   {/if}
   </aside>
 
+  {#if workspaceContext}
+    <div class="context-menu" style={`left:${workspaceContext.x}px;top:${workspaceContext.y}px`} role="menu">
+      <button disabled={map !== "files" || computerHome} onclick={() => { workspaceContext = null; void createFolder(); }}>New folder</button>
+      <button disabled={map !== "files"} onclick={createFrame}>New frame</button>
+      <button disabled={map !== "files"} onclick={() => { workspaceContext = null; openWorkspaceInNewWindow(false); }}>Open in new window</button>
+      <hr />
+      <button disabled={fileOperationBusy} onclick={() => { workspaceContext = null; void pasteFiles(); }}>Paste</button>
+      <button disabled={!canUndoFileOperation || fileOperationBusy} onclick={() => { workspaceContext = null; void undoFileOperation(); }}>Undo</button>
+      <button disabled={!canRedoFileOperation || fileOperationBusy} onclick={() => { workspaceContext = null; void redoFileOperation(); }}>Redo</button>
+      <hr />
+      <button onclick={() => { workspaceContext = null; toggleHidden(); }}>{showHidden ? "Hide hidden files" : "Show hidden files"}</button>
+    </div>
+  {/if}
+
   {#if context}
     <div class="context-menu" style={`left:${context.x}px;top:${context.y}px`} role="menu">
       <button onclick={() => { void open(context!.item); context = null; }}>Open</button>
@@ -3440,6 +3764,14 @@ function newTransferId(): string {
       <hr />
       {#if !context.item.virtualItem}
         <button onclick={() => { beginItemRename(context!.item); context = null; }}>Rename</button>
+        <button onclick={() => { void copyOrCutSelection("move", context!.item); }}>Cut</button>
+        <button onclick={() => { void copyOrCutSelection("copy", context!.item); }}>Copy</button>
+        {#if context.item.dir && context.item.binding.kind === "local"}
+          <button onclick={() => { void pasteFiles(context!.item); }}>Paste into folder</button>
+        {/if}
+        <button disabled={!canUndoFileOperation || fileOperationBusy} onclick={() => { void undoFileOperation(); }}>Undo</button>
+        <button disabled={!canRedoFileOperation || fileOperationBusy} onclick={() => { void redoFileOperation(); }}>Redo</button>
+        <hr />
         <button onclick={() => { void navigator.clipboard.writeText(context!.item.path); context = null; }}>Copy path</button>
         <hr />
         <button class="danger" onclick={() => { void moveToTrash(context!.item); context = null; }}>{context.item.binding.kind === "remote" ? "Delete from device" : `Move to ${platform === "windows" ? "Recycle Bin" : "Trash"}`}</button>
@@ -3494,7 +3826,7 @@ function newTransferId(): string {
   .location-branch button:hover, .location-branch button.current { background: var(--surface-2); color: var(--ink); }
   .location-branch button.current { color: var(--ink); font-weight: 600; }
   .computer-tree > button.active { color: var(--accent-ink); }
-  .computer-tree > button.transfer-target { color: var(--accent-ink); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+  .places button.transfer-target { color: var(--accent-ink); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
   .computer-tree > button.offline, .file-tile.offline, .detail-row.offline { opacity: .52; }
   .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
@@ -3502,7 +3834,6 @@ function newTransferId(): string {
   .tree-section-toggle { margin-top: .45rem; color: var(--ink-faint) !important; font-size: .66rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .tree-section-toggle span { flex: 0 0 .72rem; text-align: center; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }
-  .viewport.frame-active, .sharing-canvas.frame-active { cursor: crosshair; }
   .world { position: absolute; inset: 0; transform-origin: 0 0; }
   .canvas-frame { position: absolute; z-index: 0; border: 1px solid oklch(0.62 .2 292 / .55); border-radius: 15px; background: oklch(0.62 .2 292 / .08); box-shadow: inset 0 0 0 1px oklch(1 0 0 / .025); padding: .55rem; }
   .frame-titlebar { position: relative; z-index: 3; display: flex; align-items: center; gap: .35rem; min-height: 1.45rem; cursor: grab; touch-action: none; }
@@ -3510,11 +3841,10 @@ function newTransferId(): string {
   .frame-title-label { flex: 0 1 auto; width: max-content; max-width: calc(100% - 2rem); overflow: hidden; padding: 0; border: 0; background: transparent; color: var(--c-share-ink); font-weight: 750; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
   .frame-title-input { flex: 1; min-width: 0; width: auto; padding: .1rem .2rem; border: 1px solid var(--accent); border-radius: 4px; background: var(--surface); color: var(--c-share-ink); font-weight: 750; }
   .frame-delete { flex: 0 0 auto; margin-left: auto; padding: 0 .2rem; border: 0; background: transparent; color: var(--ink-faint); }
-  .canvas-frame.draft { border-style: dashed; pointer-events: none; color: var(--c-share-ink); font-size: .75rem; }
   .canvas-frame .resize-handle { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border: 0; border-right: 2px solid var(--c-share-ink); border-bottom: 2px solid var(--c-share-ink); opacity: .65; }
   .file-tile { position: absolute; z-index: 2; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: .3rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); padding: .24rem .35rem; touch-action: none; }
   .file-tile:hover { background: oklch(1 0 0 / .05); }.file-tile.selected { z-index: 4; background: var(--accent-soft); border-color: var(--accent); }.file-icon { flex: 0 0 auto; display: grid; place-items: center; filter: drop-shadow(0 3px 4px oklch(0 0 0 / .28)); overflow: visible; border-radius: 5px; }.file-icon img { width: 100%; height: 100%; object-fit: contain; }.file-label { width: 100%; min-height: 2.35em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; text-align: center; font-size: .78rem; font-weight: 500; line-height: 1.18; overflow-wrap: anywhere; text-shadow: 0 1px 3px var(--bg); }.file-tile.selected .file-label { display: block; min-height: 0; overflow: visible; -webkit-line-clamp: unset; line-clamp: unset; padding: .08rem .15rem; border-radius: 3px; background: var(--accent-soft); }.file-rename-input { position: relative; z-index: 4; box-sizing: border-box; width: 100%; min-height: 1.55rem; padding: .12rem .2rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; text-align: center; font-size: .78rem; line-height: 1.2; user-select: text; }
-  .file-tile { user-select: none; }
+  .file-tile { -webkit-user-select: none; user-select: none; }
   .file-icon img { pointer-events: none; -webkit-user-drag: none; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-faint); pointer-events: none; }
   .selection-marquee { position: absolute; z-index: 5; border: 1px solid var(--accent); background: var(--accent-soft); pointer-events: none; }
@@ -3526,10 +3856,11 @@ function newTransferId(): string {
   .zoom-menu hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .load-more { position: absolute; left: 50%; bottom: .7rem; translate: -50% 0; z-index: 6; padding: .45rem .8rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }.load-more:disabled { opacity: .55; }
   .details { position: absolute; inset: 0; overflow: auto; background: var(--surface); }.detail-head, .detail-row { box-sizing: border-box; display: grid; grid-template-columns: minmax(12rem, 1fr) 12rem 7rem 6rem; align-items: center; width: 100%; min-height: 2.25rem; padding: 0 .8rem; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink-soft); text-align: left; font-size: .76rem; }.detail-head { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--ink-faint); font-weight: 700; }.detail-row:hover, .detail-row.selected { background: var(--accent-soft); color: var(--ink); }.detail-name { display: flex; align-items: center; gap: .6rem; min-width: 0; }.detail-name i { flex: 0 0 auto; display: grid; place-items: center; width: 1.4rem; height: 1.4rem; font-style: normal; font-size: 1.2rem; }.detail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.detail-row.selected .detail-label { overflow: visible; white-space: normal; overflow-wrap: anywhere; }.detail-rename-input { min-width: 0; flex: 1; padding: .18rem .3rem; border: 1px solid var(--accent); border-radius: 2px; background: white; color: #111; user-select: text; }.shell-icon { width: 100%; height: 100%; object-fit: contain; }
+  .detail-row { -webkit-user-select: none; user-select: none; touch-action: none; }
   .details > .details-load { display: block; padding: .7rem; text-align: center; color: var(--accent-ink); }
   .preview h2 { font-size: .9rem; overflow-wrap: anywhere; }.preview .sidebar-body > p { color: var(--ink-faint); font-size: .75rem; }.preview-art { aspect-ratio: 4/3; border-radius: 10px; background: var(--bg); display: grid; place-items: center; overflow: hidden; }.preview-art span { font-size: 4rem; }.preview-art img { width: 100%; height: 100%; object-fit: contain; }.preview pre { max-height: 16rem; overflow: auto; white-space: pre-wrap; font: .7rem/1.45 var(--mono); background: var(--bg); padding: .7rem; border-radius: 8px; }.preview dl { display: grid; grid-template-columns: 4rem 1fr; gap: .45rem; font-size: .7rem; }.preview dt { color: var(--ink-faint); }.preview dd { margin: 0; overflow-wrap: anywhere; }.native-open { width: 100%; margin-top: .7rem; }.preview-empty { height: 100%; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--ink-faint); }.preview-empty span { font-size: 2.5rem; }.preview-empty p { max-width: 12rem; font-size: .75rem; }
-  .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover { background: var(--accent-soft); }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }
-  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1.2rem; align-items: start; touch-action: none; }.share-map-help { grid-column: 1 / -1; margin: 0; color: var(--ink-faint); font-size: .74rem; }.share-frame { position: relative; z-index: 2; min-width: 0; min-height: 12rem; overflow: hidden; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; overflow-wrap: anywhere; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); overflow-wrap: anywhere; font-size: .75rem; line-height: 1.45; }.canvas-frame.user { pointer-events: auto; z-index: 1; }.frame-hint { position: fixed; left: 50%; bottom: 1rem; z-index: 8; translate: -50% 0; padding: .45rem .7rem; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: .72rem; pointer-events: none; }
+  .context-menu { position: fixed; z-index: 102; min-width: 13rem; padding: .35rem; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); box-shadow: var(--shadow-lg); }.context-menu button { display: block; width: 100%; padding: .48rem .6rem; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; }.context-menu button:hover:not(:disabled) { background: var(--accent-soft); }.context-menu button:disabled { opacity: .4; }.context-menu .danger { color: var(--danger); }.context-menu hr { border: 0; border-top: 1px solid var(--line); }
+  .sharing-canvas { position: absolute; inset: 0; overflow: auto; padding: 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1.2rem; align-items: start; touch-action: none; }.share-map-help { grid-column: 1 / -1; margin: 0; color: var(--ink-faint); font-size: .74rem; }.share-frame { position: relative; z-index: 2; min-width: 0; min-height: 12rem; overflow: hidden; padding: 1rem; border: 1px solid var(--line-strong); border-radius: 16px; background: oklch(0.18 .025 285 / .92); }.share-frame h2 { margin: 0 0 .35rem; overflow-wrap: anywhere; font-size: 1rem; }.share-frame > p { color: var(--ink-faint); overflow-wrap: anywhere; font-size: .75rem; line-height: 1.45; }.canvas-frame.user { pointer-events: auto; z-index: 1; }
   @media (max-width: 1050px) { .search { display: none; } }
   @media (max-width: 760px) { .filebar { overflow-x: auto; }.sharing-canvas { grid-template-columns: 1fr; }.switch:first-of-type { display: none; } }
   .share-frame.partner { border-color: var(--c-share); }.share-frame h3 { margin: 1rem 0 .45rem; color: var(--ink-faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }.share-items { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(5.2rem, 1fr)); gap: .5rem; }.share-file { min-width: 0; min-height: 5.75rem; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .25rem; padding: .45rem; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--ink); text-align: center; }.share-file:hover { border-color: var(--line-strong); background: var(--surface-2); }.share-file i { font-style: normal; font-size: 2rem; }.share-file span { max-width: 100%; min-height: 2.4em; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font-size: .68rem; line-height: 1.2; }

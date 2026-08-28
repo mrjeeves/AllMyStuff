@@ -23,69 +23,19 @@ use dav_server::fs::{
     OpenOptions, ReadDirMeta,
 };
 use futures_util::{future, FutureExt, StreamExt};
-use http_body_util::{BodyExt, Full};
-use hyper::{server::conn::http1, service::service_fn, Request};
+use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+#[cfg(target_os = "macos")]
+use dav_server::localfs::LocalFs;
 use dav_server::{fakels::FakeLs, DavHandler};
 
 pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
 
 use crate::mesh::Mesh;
-
-// `dav-server` deliberately leaves the quota properties out of its special
-// empty-body PROPFIND response for Microsoft clients. Windows WebClient uses
-// exactly that request for Explorer's capacity query, so `get_quota` is never
-// reached even though the mesh source reports the correct used/total values.
-// Turn that one shorthand request into an explicit property request before
-// handing it to the library. Explicit client bodies remain untouched.
-const EMPTY_PROPFIND_WITH_QUOTA: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
-<D:propfind xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">
-  <D:prop>
-    <D:creationdate/><D:displayname/><D:getcontentlanguage/>
-    <D:getcontentlength/><D:getcontenttype/><D:getetag/>
-    <D:getlastmodified/><D:lockdiscovery/><D:resourcetype/>
-    <D:supportedlock/><D:quota-available-bytes/><D:quota-used-bytes/>
-    <Z:Win32CreationTime/><Z:Win32FileAttributes/>
-    <Z:Win32LastAccessTime/><Z:Win32LastModifiedTime/>
-  </D:prop>
-</D:propfind>"#;
-
-fn add_quota_to_empty_propfind<B>(
-    request: Request<B>,
-) -> Request<http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>
-where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
-    let should_expand = request.method().as_str() == "PROPFIND" && request.body().is_end_stream();
-    let (mut parts, body) = request.into_parts();
-    if should_expand {
-        use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-
-        parts.headers.remove(TRANSFER_ENCODING);
-        parts.headers.insert(
-            CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/xml; charset=utf-8"),
-        );
-        parts.headers.insert(
-            CONTENT_LENGTH,
-            hyper::header::HeaderValue::from_str(&EMPTY_PROPFIND_WITH_QUOTA.len().to_string())
-                .expect("static PROPFIND length is a valid header"),
-        );
-        Request::from_parts(
-            parts,
-            Full::new(Bytes::from_static(EMPTY_PROPFIND_WITH_QUOTA))
-                .map_err(|error: Infallible| match error {})
-                .boxed_unsync(),
-        )
-    } else {
-        Request::from_parts(parts, body.map_err(std::io::Error::other).boxed_unsync())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
@@ -98,6 +48,79 @@ pub struct NativeDriveInfo {
 struct ActiveMount {
     info: NativeDriveInfo,
     server: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "macos")]
+async fn mount_macos_fleetfiles_location(
+    root: PathBuf,
+    active: &[NativeDriveInfo],
+) -> Result<(NativeDriveInfo, tokio::task::JoinHandle<()>), String> {
+    let label = "Fleetfiles".to_string();
+    let mountpoint = dirs::home_dir()
+        .ok_or_else(|| "couldn't find this user's home folder".to_string())?
+        .join("Library")
+        .join("Application Support")
+        .join("AllMyStuff")
+        .join("Mounts")
+        .join(&label);
+    let mount = choose_mount(&mountpoint.to_string_lossy(), &label, active).await?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let server = DavHandler::builder()
+        .filesystem(LocalFs::new(root, false, false, true))
+        .locksystem(FakeLs::new())
+        .build_handler();
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = server.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                if let Err(error) = http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            let handler = handler.clone();
+                            async move { Ok::<_, Infallible>(handler.handle(request).await) }
+                        }),
+                    )
+                    .await
+                {
+                    tracing::debug!("Fleetfiles Finder connection ended: {error}");
+                }
+            });
+        }
+    });
+    let info = NativeDriveInfo {
+        route: FLEETFILES_ROUTE.into(),
+        label: label.clone(),
+        mount: mount.clone(),
+        port,
+    };
+    if let Err(error) = remember_native_mount(&info) {
+        server_task.abort();
+        return Err(format!(
+            "couldn't record the Fleetfiles Finder mount: {error}"
+        ));
+    }
+    let url = format!("http://127.0.0.1:{port}/");
+    if let Err(error) = mount_native(&mount, &url, &label).await {
+        server_task.abort();
+        if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
+            tracing::warn!(
+                "couldn't clean failed Fleetfiles Finder mount {mount}: {cleanup_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok((info, server_task))
 }
 
 #[derive(Clone, Default)]
@@ -129,14 +152,14 @@ impl DriveMounts {
         self.lifecycle.clone().lock_owned().await
     }
 
-    /// Expose the local materialization of the canonical Fleetfiles namespace
-    /// as this machine's one operating-system mount. The mount is an adapter:
-    /// the supplied root remains the authority used by the Files UI and the
-    /// replication engine. Its deterministic route key makes repeated calls
-    /// idempotent and lets the ordinary mount lifecycle clean it up safely.
+    /// Expose the canonical Fleetfiles namespace to the host OS. The supplied
+    /// root remains the authority used by the Files UI and replication engine.
+    /// Windows registers that directory as its sync root; macOS keeps it at
+    /// ~/Fleetfiles and adds a loopback-only volume named Fleetfiles so Finder
+    /// presents the same data under Locations.
     pub async fn mount_fleetfiles(
         &self,
-        mesh: Arc<Mesh>,
+        _mesh: Arc<Mesh>,
         root: PathBuf,
     ) -> Result<NativeDriveInfo, String> {
         if let Some(existing) = self.active.lock().get(FLEETFILES_ROUTE) {
@@ -145,84 +168,50 @@ impl DriveMounts {
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("couldn't create the Fleetfiles namespace: {error}"))?;
 
-        let active = self.list();
-        let label = "Fleetfiles".to_string();
-        let mount = choose_mount("", &label, &active).await?;
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| error.to_string())?
-            .port();
-        let server = DavHandler::builder()
-            .filesystem(Box::new(RemoteDavFs::new(mesh, FLEETFILES_ROUTE)))
-            .locksystem(FakeLs::new())
-            .build_handler();
-        let server_task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let handler = server.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    if let Err(error) = http1::Builder::new()
-                        .serve_connection(
-                            io,
-                            service_fn(move |request| {
-                                let handler = handler.clone();
-                                async move {
-                                    let request = add_quota_to_empty_propfind(request);
-                                    Ok::<_, Infallible>(handler.handle(request).await)
-                                }
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::debug!("Fleetfiles WebDAV connection ended: {error}");
-                    }
-                });
-            }
-        });
         #[cfg(windows)]
-        let url = format!("http://localhost:{port}/");
-        #[cfg(not(windows))]
-        let url = format!("http://127.0.0.1:{port}/");
-        let info = NativeDriveInfo {
-            route: FLEETFILES_ROUTE.into(),
-            label: label.clone(),
-            mount: mount.clone(),
-            port,
+        let (info, server) = {
+            let mount =
+                tokio::task::spawn_blocking(move || crate::windows_fleetfiles::register(root))
+                    .await
+                    .map_err(|error| {
+                        format!("Fleetfiles registration stopped unexpectedly: {error}")
+                    })??;
+            (
+                NativeDriveInfo {
+                    route: FLEETFILES_ROUTE.into(),
+                    label: "Fleetfiles".into(),
+                    mount,
+                    port: 0,
+                },
+                tokio::spawn(std::future::pending()),
+            )
         };
+        #[cfg(target_os = "macos")]
+        let (info, server) = mount_macos_fleetfiles_location(root, &self.list()).await?;
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let (info, server) = (
+            NativeDriveInfo {
+                route: FLEETFILES_ROUTE.into(),
+                label: "Fleetfiles".into(),
+                mount: root.to_string_lossy().into_owned(),
+                port: 0,
+            },
+            tokio::spawn(std::future::pending()),
+        );
 
-        if let Err(error) = remember_native_mount(&info) {
-            server_task.abort();
-            return Err(format!("couldn't record the Fleetfiles mount: {error}"));
-        }
-        if let Err(error) = label_native(&mount, &label, FLEETFILES_ROUTE, port).await {
-            tracing::warn!("couldn't label native Fleetfiles mount {mount}: {error}");
-        }
-        if let Err(error) = mount_native(&mount, &url, &label).await {
-            server_task.abort();
-            if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
-                tracing::warn!("couldn't clean failed Fleetfiles mount {mount}: {cleanup_error}");
-            }
-            return Err(error);
-        }
         self.active.lock().insert(
             FLEETFILES_ROUTE.into(),
             ActiveMount {
                 info: info.clone(),
-                server: server_task,
+                server,
             },
         );
-        if let Err(error) = label_native(&mount, &label, FLEETFILES_ROUTE, port).await {
-            tracing::warn!("couldn't refresh native Fleetfiles label {mount}: {error}");
-        }
         #[cfg(windows)]
-        warm_native_mount(&mount).await;
-        tracing::info!("Fleetfiles mounted at {mount}");
+        tracing::info!(path = %info.mount, "Fleetfiles registered with Windows Explorer");
+        #[cfg(target_os = "macos")]
+        tracing::info!(path = %info.mount, "Fleetfiles registered under Finder Locations");
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        tracing::info!(path = %info.mount, "Fleetfiles available in the user's home folder");
         Ok(info)
     }
 
@@ -303,10 +292,7 @@ impl DriveMounts {
                             io,
                             service_fn(move |request| {
                                 let handler = handler.clone();
-                                async move {
-                                    let request = add_quota_to_empty_propfind(request);
-                                    Ok::<_, Infallible>(handler.handle(request).await)
-                                }
+                                async move { Ok::<_, Infallible>(handler.handle(request).await) }
                             }),
                         )
                         .await
@@ -375,6 +361,14 @@ impl DriveMounts {
         let Some(active) = self.active.lock().remove(route) else {
             return;
         };
+        #[cfg(windows)]
+        if route == FLEETFILES_ROUTE {
+            // Fleetfiles is a durable local sync root, not a per-process
+            // network connection. Retain it across normal app
+            // restarts so Explorer never sees the user's filesystem flap.
+            active.server.abort();
+            return;
+        }
         crate::spawn(async move {
             // Keep the loopback endpoint alive while Windows verifies and
             // disconnects this exact mapping. Aborting it first can turn the
@@ -535,7 +529,6 @@ fn default_unix_mount_root() -> Result<PathBuf, String> {
     }
 }
 
-
 #[cfg(any(windows, test))]
 fn select_windows_mount(
     requested: Option<String>,
@@ -670,8 +663,7 @@ fn parse_network_registry_mounts(bytes: &[u8]) -> std::collections::HashSet<Stri
 }
 
 #[cfg(windows)]
-async fn remembered_network_registry_mounts(
-) -> Result<std::collections::HashSet<String>, String> {
+async fn remembered_network_registry_mounts() -> Result<std::collections::HashSet<String>, String> {
     let root = drive_registry_root()?;
     let base = format!(r"{root}\Network");
     let output = crate::child_process::command("reg.exe")
@@ -702,7 +694,6 @@ fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
     drive_letter_bit(mount).is_some_and(|bit| logical_drives & bit != 0)
 }
 
-
 #[cfg(windows)]
 async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
@@ -718,12 +709,15 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     if !marker_query.status.success() {
         return Ok(()); // not ours: ordinary availability checks decide
     }
-    let Some(port) = parse_registry_dword(&marker_query.stdout).and_then(|p| u16::try_from(p).ok()) else {
+    let Some(port) = parse_registry_dword(&marker_query.stdout).and_then(|p| u16::try_from(p).ok())
+    else {
         clear_unowned_native_metadata(mount, None).await?;
         return Ok(());
     };
     if !wait_for_stale_mount_identity(mount, port).await? {
-        tracing::warn!("preserving {mount}: its stale AllMyStuff marker does not match the current mapping");
+        tracing::warn!(
+            "preserving {mount}: its stale AllMyStuff marker does not match the current mapping"
+        );
         clear_unowned_native_metadata(mount, Some(port)).await?;
         return Ok(());
     }
@@ -767,8 +761,8 @@ async fn wait_for_stale_mount_identity(mount: &str, port: u16) -> Result<bool, S
 
 #[cfg(windows)]
 async fn windows_mount_is_assigned(mount: &str) -> Result<bool, String> {
-    let bit = drive_letter_bit(mount)
-        .ok_or_else(|| format!("{mount} is not a Windows drive letter"))?;
+    let bit =
+        drive_letter_bit(mount).ok_or_else(|| format!("{mount} is not a Windows drive letter"))?;
     let logical = windows_logical_drive_mask()?
         | crate::win_privilege::interactive_user_logical_drive_mask()?;
     Ok(logical & bit != 0
@@ -961,6 +955,7 @@ async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, S
     // it is much safer than consuming another drive letter on every restart.
     for attempt in 0..30 {
         if !windows_mount_is_assigned(mount).await? {
+            clear_owned_native_mount_history(port).await;
             clear_native_lease_marker(mount, Some(port)).await?;
             forget_native_mount(mount)?;
             return Ok(true);
@@ -1120,10 +1115,13 @@ async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
     let Some(lease) = load_native_mount_leases()
         .iter()
         .find(|lease| lease.mount == mount)
-        .cloned() else {
+        .cloned()
+    else {
         return Ok(());
     };
-    release_native_mount_if_owned(mount, lease.port).await.map(|_| ())
+    release_native_mount_if_owned(mount, lease.port)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -1137,31 +1135,8 @@ fn windows_webdav_remote(url: &str) -> Result<String, String> {
         .strip_prefix("http://localhost:")
         .and_then(|rest| rest.strip_suffix('/'))
         .and_then(|port| port.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid local Fleetfiles WebDAV address: {url}"))?;
+        .ok_or_else(|| format!("invalid local AllMyStuff WebDAV address: {url}"))?;
     Ok(format!(r"\\localhost@{port}\DavWWWRoot"))
-}
-
-#[cfg(windows)]
-async fn warm_native_mount(mount: &str) {
-    // Windows starts the WebClient redirector lazily. Make its one initial
-    // root enumeration immediately after mapping, instead of charging that
-    // cold-start cost to the user's first Explorer click. This is a single
-    // bounded startup read, never a poll or recursive prefetch.
-    let root = format!("{mount}\\");
-    let started = Instant::now();
-    let warm = tokio::task::spawn_blocking(move || std::fs::read_dir(root).map(|_| ()));
-    match tokio::time::timeout(Duration::from_secs(5), warm).await {
-        Ok(Ok(Ok(()))) => {
-            tracing::debug!("warmed Fleetfiles native mount in {:?}", started.elapsed());
-        }
-        Ok(Ok(Err(error))) => {
-            tracing::debug!("Fleetfiles native mount warm-up was unavailable: {error}");
-        }
-        Ok(Err(error)) => {
-            tracing::debug!("Fleetfiles native mount warm-up worker stopped: {error}");
-        }
-        Err(_) => tracing::debug!("Fleetfiles native mount warm-up exceeded 5 seconds"),
-    }
 }
 
 #[cfg(windows)]
@@ -1356,6 +1331,23 @@ async fn clear_native_lease_marker(mount: &str, port: Option<u16>) -> Result<(),
     Ok(())
 }
 
+#[cfg(windows)]
+async fn clear_owned_native_mount_history(port: u16) {
+    let Ok(root) = drive_registry_root() else {
+        return;
+    };
+    let mount_point_key = format!(
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+    );
+    // This endpoint was proven to be ours and both Windows mapping namespaces
+    // are now free. Remove its shell history too; retaining it makes Explorer
+    // accumulate bare DavWWWRoot (\\localhost@port) network locations.
+    let _ = crate::child_process::command("reg.exe")
+        .args(["delete", &mount_point_key, "/f"])
+        .output()
+        .await;
+}
+
 #[cfg(not(windows))]
 async fn clear_native_lease_marker(_mount: &str, _port: Option<u16>) -> Result<(), String> {
     Ok(())
@@ -1484,9 +1476,7 @@ async fn cleanup_stale_native_mounts() {
             None => clear_unowned_native_metadata(&mount, None).await,
         };
         if let Err(error) = result {
-            tracing::warn!(
-                "couldn't clean stale AllMyStuff drive mapping {mount}: {error}"
-            );
+            tracing::warn!("couldn't clean stale AllMyStuff drive mapping {mount}: {error}");
         }
     }
 }
@@ -1572,10 +1562,7 @@ impl RemoteDavFs {
     async fn request(&self, make: impl FnOnce(u64) -> FileEvent) -> FsResult<Vec<FileEvent>> {
         let req = self.mesh.next_file_request_id();
         let started = Instant::now();
-        let result = self
-            .mesh
-            .drive_file_request(&self.route, make(req))
-            .await;
+        let result = self.mesh.drive_file_request(&self.route, make(req)).await;
         if started.elapsed() >= Duration::from_millis(250) {
             tracing::debug!(
                 "native drive request {req} on {} took {:?}",
@@ -1609,7 +1596,16 @@ impl DavFileSystem for RemoteDavFs {
         async move {
             let events = self.request(|req| FileEvent::Quota { req }).await?;
             match events.into_iter().next() {
-                Some(FileEvent::QuotaInfo { used, total, .. }) => Ok((used, Some(total))),
+                Some(FileEvent::QuotaInfo { used, total, .. }) => {
+                    tracing::debug!(
+                        route = %self.route,
+                        used_bytes = used,
+                        total_bytes = total,
+                        available_bytes = total.saturating_sub(used),
+                        "native filesystem capacity response"
+                    );
+                    Ok((used, Some(total)))
+                }
                 Some(FileEvent::Err { reason, .. }) => Err(map_remote_error(&reason)),
                 _ => Err(FsError::GeneralFailure),
             }
@@ -1891,10 +1887,7 @@ fn map_remote_error(reason: &str) -> FsError {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{add_quota_to_empty_propfind, registry_root_for_client};
-    use bytes::Bytes;
-    use http_body_util::{BodyExt, Empty, Full};
-    use hyper::Request;
+    use super::registry_root_for_client;
 
     #[test]
     fn service_drive_state_targets_the_interactive_user_hive() {
@@ -1909,32 +1902,6 @@ mod registry_tests {
     fn service_client_sid_cannot_inject_a_registry_path() {
         assert!(registry_root_for_client(Some(r"S-1-5-21\Software")).is_err());
         assert!(registry_root_for_client(Some("not-a-sid")).is_err());
-    }
-
-    #[tokio::test]
-    async fn empty_propfind_explicitly_requests_drive_capacity() {
-        let request = Request::builder()
-            .method("PROPFIND")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let request = add_quota_to_empty_propfind(request);
-
-        let body = request.into_body().collect().await.unwrap().to_bytes();
-        let xml = String::from_utf8_lossy(&body);
-        assert!(xml.contains("quota-available-bytes"));
-        assert!(xml.contains("quota-used-bytes"));
-    }
-
-    #[tokio::test]
-    async fn explicit_propfind_body_is_preserved() {
-        let request = Request::builder()
-            .method("PROPFIND")
-            .body(Full::new(Bytes::from_static(b"<explicit/>")))
-            .unwrap();
-        let request = add_quota_to_empty_propfind(request);
-
-        let body = request.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"<explicit/>");
     }
 }
 
@@ -1957,15 +1924,14 @@ mod windows_tests {
     #[test]
     fn dos_device_identity_recovers_a_disconnected_webdav_mapping() {
         let targets = vec![
-            r"\Device\WebDavRedirector\;R:0000000000001234\localhost@63229\DavWWWRoot"
-                .to_string(),
+            r"\Device\WebDavRedirector\;R:0000000000001234\localhost@63229\DavWWWRoot".to_string(),
         ];
         assert!(windows_dos_device_targets_match_port(&targets, 63_229));
         assert!(!windows_dos_device_targets_match_port(&targets, 63_230));
     }
 
     #[test]
-    fn fleetfiles_webdav_url_becomes_the_windows_redirector_endpoint() {
+    fn local_webdav_url_becomes_the_windows_redirector_endpoint() {
         assert_eq!(
             windows_webdav_remote("http://localhost:64895/").unwrap(),
             r"\\localhost@64895\DavWWWRoot"

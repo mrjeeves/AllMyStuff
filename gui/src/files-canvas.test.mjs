@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fileTileSizeLabel, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("overlapping snapshots keep stable order and the latest value per domain key", () => {
   const rows = [
@@ -158,14 +158,20 @@ test("Windows shell-link presentation hides only final native suffixes", () => {
   assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "linux"), "AllMyAgents.lnk");
 });
 
-test("file icon sizes use the native Explorer notches and separate grid cells", () => {
-  assert.deepEqual(FILE_TILE_SIZES, [32, 48, 96]);
+test("file icon sizes use six stable notches and separate grid cells", () => {
+  assert.deepEqual(FILE_TILE_SIZES, [32, 48, 96, 128, 192, 256]);
+  assert.deepEqual(FILE_TILE_SIZES.map(fileTileSizeLabel), [
+    "Small", "Medium", "Large", "Extra large", "Huge", "Giant",
+  ]);
   assert.equal(nearestFileTileSize(31), 32);
   assert.equal(nearestFileTileSize(63), 48);
   assert.equal(nearestFileTileSize(95), 96);
   assert.equal(nearestFileTileSize(Number.NaN), 48);
   assert.deepEqual(nativeFileGridMetrics(48, "windows"), {
     iconSize: 48, tileWidth: 88, tileHeight: 104, columnWidth: 100, rowHeight: 112,
+  });
+  assert.deepEqual(nativeFileGridMetrics(256, "windows"), {
+    iconSize: 256, tileWidth: 284, tileHeight: 318, columnWidth: 296, rowHeight: 326,
   });
 });
 

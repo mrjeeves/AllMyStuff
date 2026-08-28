@@ -172,7 +172,24 @@ impl FleetfilesReplica {
                    PRIMARY KEY(target, path)
                  );
                  CREATE INDEX IF NOT EXISTS replication_queue_target
-                   ON replication_queue(target, queued_at, path);",
+                   ON replication_queue(target, queued_at, path);
+                 CREATE TABLE IF NOT EXISTS fleetfiles_meta (
+                   key TEXT PRIMARY KEY,
+                   value TEXT NOT NULL
+                 );
+                 BEGIN IMMEDIATE;
+                 INSERT OR IGNORE INTO fleetfiles_meta(key, value)
+                   VALUES('root_layout', 'desktop_v1');
+                 UPDATE path_versions SET path = char(31) || path
+                   WHERE (SELECT value FROM fleetfiles_meta WHERE key='root_layout') = 'desktop_v1';
+                 UPDATE path_versions SET path = 'Desktop/' || substr(path, 2)
+                   WHERE unicode(substr(path, 1, 1)) = 31;
+                 UPDATE replication_queue SET path = char(31) || path
+                   WHERE (SELECT value FROM fleetfiles_meta WHERE key='root_layout') = 'desktop_v1';
+                 UPDATE replication_queue SET path = 'Desktop/' || substr(path, 2)
+                   WHERE unicode(substr(path, 1, 1)) = 31;
+                 UPDATE fleetfiles_meta SET value='fleet_root_v2' WHERE key='root_layout';
+                 COMMIT;",
             )
             .expect("Fleetfiles metadata schema must initialize");
         let staging = root.join(".allmystuff-staging");
@@ -808,6 +825,7 @@ fn is_internal(root: &Path, path: &Path) -> bool {
     relative.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
         name == ".allmystuff-staging"
+            || name == ".allmystuff-fleetfiles-root"
             || name == ".DS_Store"
             || name == ".Spotlight-V100"
             || name == ".Trashes"
@@ -907,14 +925,79 @@ mod tests {
     }
 
     #[test]
-    fn ignores_replication_staging_and_macos_bookkeeping_only() {
+    fn ignores_replication_internals_and_macos_bookkeeping() {
         let root = PathBuf::from("fleetfiles-root");
         assert!(is_internal(&root, &root.join(".allmystuff-staging/chunk")));
+        assert!(is_internal(
+            &root,
+            &root.join(".allmystuff-fleetfiles-root")
+        ));
         assert!(is_internal(&root, &root.join("photos/.DS_Store")));
         assert!(is_internal(&root, &root.join("photos/._image.png")));
         assert!(is_internal(&root, &root.join(".Spotlight-V100/index")));
         assert!(!is_internal(&root, &root.join(".env")));
         assert!(!is_internal(&root, &root.join("photos/image.png")));
+    }
+
+    #[test]
+    fn legacy_desktop_metadata_moves_under_the_visible_desktop_folder_once() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE path_versions (
+                   path TEXT PRIMARY KEY, counter INTEGER NOT NULL, actor TEXT NOT NULL,
+                   kind TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT,
+                   tombstone INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE replication_queue (
+                   target TEXT NOT NULL, path TEXT NOT NULL, counter INTEGER NOT NULL,
+                   actor TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
+                   sha256 TEXT, queued_at INTEGER NOT NULL, PRIMARY KEY(target, path)
+                 );
+                 INSERT INTO path_versions VALUES
+                   ('report.txt', 1, 'a', 'file', 1, 'hash', 0, 1),
+                   ('Desktop/already.txt', 2, 'a', 'file', 1, 'hash', 0, 1);
+                 INSERT INTO replication_queue VALUES
+                   ('peer', 'queued.txt', 1, 'a', 'file', 1, 'hash', 1);",
+            )
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "allmystuff-fleetfiles-layout-test-{}",
+            std::process::id()
+        ));
+        let replica = FleetfilesReplica::with_connection(root.clone(), connection);
+        let db = replica.connection.lock();
+        let mut statement = db
+            .prepare("SELECT path FROM path_versions ORDER BY path")
+            .unwrap();
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "Desktop/Desktop/already.txt".to_string(),
+                "Desktop/report.txt".to_string()
+            ]
+        );
+        let queued: String = db
+            .query_row("SELECT path FROM replication_queue", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, "Desktop/queued.txt");
+        let layout: String = db
+            .query_row(
+                "SELECT value FROM fleetfiles_meta WHERE key='root_layout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(layout, "fleet_root_v2");
+        drop(statement);
+        drop(db);
+        drop(replica);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

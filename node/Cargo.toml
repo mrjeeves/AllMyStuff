@@ -125,7 +125,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 futures-util = "0.3"
 fs2 = "0.4"
 tokio-tungstenite = "0.30"
-dav-server = { version = "0.11", default-features = false }
+dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -223,6 +223,10 @@ plist = "1"
 # absolute mouse move, and the job-object daemon lifetime tie.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
+    "Foundation",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
     "Win32_Foundation",
     # PDH — the vendor-neutral WDDM counters behind the telemetry line
     # (per-engine GPU utilization + VRAM: same counters on NVIDIA/AMD/
@@ -255,6 +259,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Media",
     "Win32_NetworkManagement_WNet",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Power",

@@ -1188,6 +1188,11 @@ pub async fn dispatch(
             let action: InputAction = try_arg!(arg(a, "action"));
             json_result(mesh.send_input(route_id, action).await)
         }
+        "local_file_clipboard_set" => {
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            json_result(mesh.local_file_clipboard_set(paths).await)
+        }
+        "local_file_clipboard_get" => json_result(mesh.local_file_clipboard_get().await),
         "clipboard_paste" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.clipboard_paste(route_id).await)
@@ -2896,6 +2901,14 @@ async fn ensure_node_running_impl(
     tracing::info!(?bin, "spawning allmystuff node");
 
     let mut cmd = Command::new(&bin);
+    // macOS has no PR_SET_PDEATHSIG and no Windows-style kill-on-close job
+    // object. Give a GUI-spawned node the direct parent's pid so the node can
+    // notice reparenting to launchd after a crash or Tauri hot-reload and run
+    // its normal graceful shutdown. getppid() checks the relationship, not
+    // merely pid existence, so pid reuse cannot keep an orphan alive.
+    #[cfg(target_os = "macos")]
+    cmd.env("ALLMYSTUFF_SUPERVISOR_PID", std::process::id().to_string());
+
     if require_interactive_windows_node {
         cmd.env(RUNTIME_OWNER_ENV, RuntimeOwner::CecSupportBundled.as_str());
     }

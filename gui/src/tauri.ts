@@ -353,6 +353,49 @@ export function localFileRename(path: string, name: string): Promise<LocalFileEn
 export function localFileTrash(paths: string[]): Promise<void> {
   return requiredInvoke("local_file_trash", { paths });
 }
+export type LocalFileOperationKind = "copy" | "move";
+
+export interface LocalFileOperationResult {
+  operation: string;
+  paths: string[];
+  affected: number;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+
+export function localFileOperationApply(
+  paths: string[],
+  destination: string,
+  kind: LocalFileOperationKind,
+): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_apply", { paths, destination, kind });
+}
+
+export function localFileOperationUndo(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_undo");
+}
+
+export function localFileOperationRedo(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_redo");
+}
+
+export function localFileOperationState(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_state");
+}
+
+export function localFileClipboardSet(paths: string[]): Promise<void> {
+  return requiredInvoke("local_file_clipboard_set", { paths });
+}
+
+export interface LocalFileClipboardData {
+  paths: string[];
+  prefersMove: boolean;
+}
+
+export function localFileClipboardGet(): Promise<LocalFileClipboardData> {
+  return requiredInvoke("local_file_clipboard_get");
+}
+
 export interface LocalFileTransferImpact {
   files: number;
   folders: number;

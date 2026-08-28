@@ -14,6 +14,7 @@
     chatWindowTarget,
     consoleWindowTarget,
     filesWindowTarget,
+    filesWorkspaceWindowTarget,
     isCecWindow,
     roomWindowTarget,
     setWindowTitle,
@@ -37,6 +38,7 @@
   import CecChatWindow from "./CecChatWindow.svelte";
   import Files from "./Files.svelte";
   import FilesHost from "./FilesHost.svelte";
+  import FilesWorkspace from "./FilesWorkspace.svelte";
   import Terminal from "./Terminal.svelte";
   import TerminalHost from "./TerminalHost.svelte";
   import VideoPopoutHost from "./VideoPopoutHost.svelte";
@@ -53,6 +55,7 @@
   const consoleTarget = consoleWindowTarget();
   const terminalTarget = terminalWindowTarget();
   const filesTarget = filesWindowTarget();
+  const filesWorkspaceTarget = filesWorkspaceWindowTarget();
   const roomTarget = roomWindowTarget();
   const videoTarget = videoWindowTarget();
   const cecTarget = isCecWindow();
@@ -124,6 +127,8 @@
   <VideoPopoutHost target={videoTarget} />
 {:else if terminalTarget}
   <TerminalHost target={terminalTarget} />
+{:else if filesWorkspaceTarget}
+  <FilesWorkspace initialLocation={filesWorkspaceTarget} />
 {:else if filesTarget}
   <FilesHost target={filesTarget} />
 {:else if consoleTarget}
@@ -184,17 +189,20 @@
       {#if app.netMenuOpen}<NetworkMenu />{/if}
     </span>
 
-    <button
-      class="experience-toggle"
-      class:advanced={app.uiMode === "advanced"}
-      onclick={() => app.setUiMode(app.uiMode === "normal" ? "advanced" : "normal")}
-      aria-label={`Switch to ${app.uiMode === "normal" ? "Advanced" : "Normal"} mode`}
-      title="Normal keeps the graph simple; Advanced restores every tool and panel"
-    >
-      <span class:lit={app.uiMode === "normal"}>Normal</span>
-      <i aria-hidden="true"></i>
-      <span class:lit={app.uiMode === "advanced"}>Advanced</span>
-    </button>
+    <div class="experience-toggle" role="group" aria-label="Workspace mode">
+      {#each [
+        ["normal", "Normal", "A quiet view of your devices"],
+        ["files", "Files", "Organize files and sharing on a fleet-wide canvas"],
+        ["advanced", "Advanced", "Every connection tool and device panel"],
+      ] as choice}
+        <button
+          class:lit={app.uiMode === choice[0]}
+          aria-pressed={app.uiMode === choice[0]}
+          title={choice[2]}
+          onclick={() => app.setUiMode(choice[0] as "normal" | "files" | "advanced")}
+        >{choice[1]}</button>
+      {/each}
+    </div>
 
     <div class="actions">
       <!-- The clock-skew warning: this machine's clock is well out of line
@@ -234,10 +242,14 @@
   </header>
 
   <main class="stage">
-    <Sidebar />
-    <Graph />
-    {#if app.uiMode === "advanced"}<NodeDrawer />{/if}
-    <RoomPanel />
+    {#if app.uiMode === "files"}
+      <FilesWorkspace />
+    {:else}
+      <Sidebar />
+      <Graph />
+      {#if app.uiMode === "advanced"}<NodeDrawer />{/if}
+      <RoomPanel />
+    {/if}
   </main>
 
   {#if app.settingsOpen}
@@ -352,60 +364,39 @@
     font-size: 0.72rem;
     color: var(--ink-faint);
   }
-  /* One unmistakable two-position control replaces the secondary summary
-     chips. Meshes remains beside it as a key interaction surface. The selected half sits physically lower, like a pressed
-     rocker, while the inactive half dims hard enough to read at a glance. */
+  /* Files is the middle workspace between the quiet graph and workbench. */
   .experience-toggle {
     margin-left: auto;
     display: inline-grid;
-    grid-template-columns: 1fr auto 1fr;
+    grid-template-columns: repeat(3, 1fr);
     align-items: center;
-    gap: 0.45rem;
-    padding: 0.28rem 0.38rem 0.42rem;
+    gap: 0.2rem;
+    padding: 0.25rem;
     border: 1px solid var(--line-strong);
     border-radius: var(--r-md);
     background: linear-gradient(180deg, var(--surface-2), var(--surface));
     color: var(--ink);
-    box-shadow:
-      0 5px 0 oklch(0.08 0.02 285 / 0.9),
-      0 8px 18px oklch(0 0 0 / 0.28);
-    perspective: 220px;
-    cursor: pointer;
-    transform-origin: center;
+    box-shadow: var(--shadow-sm);
   }
-  .experience-toggle:active {
-    transform: translateY(3px) rotateX(-5deg);
-    box-shadow: 0 2px 0 oklch(0.08 0.02 285 / 0.9);
-  }
-  .experience-toggle.advanced {
-    animation: mode-flip 0.34s cubic-bezier(0.2, 0.8, 0.25, 1);
-  }
-  .experience-toggle:not(.advanced) {
-    animation: mode-flip-back 0.34s cubic-bezier(0.2, 0.8, 0.25, 1);
-  }
-  .experience-toggle span {
-    min-width: 4.4rem;
+  .experience-toggle button {
+    min-width: 4.2rem;
     padding: 0.32rem 0.5rem;
     border-radius: var(--r-sm);
+    border: 0;
+    background: transparent;
+    color: var(--ink);
     font-size: 0.78rem;
     font-weight: 800;
     letter-spacing: 0.02em;
-    opacity: 0.28;
-    transform: translateY(-1px);
-    transition: opacity 0.18s ease, transform 0.18s ease, background 0.18s ease,
-      box-shadow 0.18s ease;
+    opacity: 0.42;
+    transition: opacity 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
   }
-  .experience-toggle span.lit {
+  .experience-toggle button:hover { opacity: 0.8; }
+  .experience-toggle button.lit {
     opacity: 1;
-    transform: translateY(2px);
     color: var(--accent-ink);
     background: var(--accent-soft);
-    box-shadow: inset 0 2px 5px oklch(0 0 0 / 0.28);
-  }
-  .experience-toggle i {
-    width: 1px;
-    height: 1.2rem;
-    background: var(--line-strong);
+    box-shadow: inset 0 1px 4px oklch(0 0 0 / 0.28);
   }
   .net-anchor {
     position: relative;
@@ -457,12 +448,6 @@
   }
   .net-chevron.open {
     transform: rotate(180deg);
-  }
-  @keyframes mode-flip {
-    45% { transform: rotateX(18deg) scale(0.98); }
-  }
-  @keyframes mode-flip-back {
-    45% { transform: rotateX(-18deg) scale(0.98); }
   }
   .actions {
     display: flex;

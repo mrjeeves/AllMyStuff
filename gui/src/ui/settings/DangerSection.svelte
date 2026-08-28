@@ -1,10 +1,21 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import {
+    filesCanvasPurgeTombstones,
+    filesCanvasStatus,
+    type FilesCanvasStatus,
+  } from "../../tauri";
 
-  type ResetKind = "leave" | "network" | "factory";
+  type ResetKind = "tombstones" | "leave" | "network" | "factory";
   let armed = $state<ResetKind | null>(null);
   let resetting = $state<ResetKind | null>(null);
   let resetError = $state<string | null>(null);
+  let filesStatus = $state<FilesCanvasStatus | null>(null);
+
+  onMount(() => {
+    void filesCanvasStatus().then((value) => (filesStatus = value)).catch(() => {});
+  });
 
   async function runReset(kind: ResetKind) {
     if (armed !== kind) {
@@ -15,7 +26,12 @@
     resetting = kind;
     resetError = null;
     try {
-      if (kind === "leave") await app.dangerLeaveFleet();
+      if (kind === "tombstones") {
+        const result = await filesCanvasPurgeTombstones();
+        filesStatus = result;
+        resetting = null;
+        app.toast("ok", result.purged ? `Purged ${result.purged} Files tombstones` : "No Files tombstones to purge");
+      } else if (kind === "leave") await app.dangerLeaveFleet();
       else if (kind === "network") await app.dangerResetNetworking();
       else await app.dangerFactoryReset();
     } catch (e) {
@@ -29,6 +45,30 @@
   <h3>Danger Zone</h3>
 
   <section class="danger">
+    <div class="danger-row">
+      <div>
+        <div class="danger-title">Purge Files tombstones</div>
+        <div class="danger-desc">
+          Permanently remove {filesStatus?.tombstones ?? "saved"} deleted canvas records and advance the fleet epoch.
+          Offline edits made before this purge will be discarded when those devices reconnect; update older devices first.
+        </div>
+        {#if filesStatus && !filesStatus.canPurge}<div class="permission">Only a fleet owner or manager can purge.</div>{/if}
+      </div>
+      <button
+        class:armed={armed === "tombstones"}
+        disabled={resetting !== null || !filesStatus?.canPurge || filesStatus.tombstones === 0}
+        onclick={() => runReset("tombstones")}
+      >
+        {resetting === "tombstones"
+          ? "Purging…"
+          : armed === "tombstones"
+            ? "Confirm permanent purge"
+            : filesStatus
+              ? `Purge ${filesStatus.tombstones}`
+              : "Reading…"}
+      </button>
+    </div>
+
     <div class="danger-row">
       <div>
         <div class="danger-title">Leave the fleet</div>
@@ -60,7 +100,7 @@
     </div>
 
     {#if armed}<button class="cancel" onclick={() => (armed = null)}>Cancel</button>{/if}
-    {#if resetError}<p class="error">Reset failed: {resetError}</p>{/if}
+    {#if resetError}<p class="error">Action failed: {resetError}</p>{/if}
   </section>
 </div>
 
@@ -71,6 +111,7 @@
   .danger-row:first-child { padding-top: 0; border-top: 0; }
   .danger-title { font-size: 0.88rem; font-weight: 650; }
   .danger-desc { color: var(--ink-soft); font-size: 0.77rem; line-height: 1.4; margin-top: 0.15rem; }
+  .permission { color: var(--danger); font-size: .72rem; margin-top: .25rem; }
   button { flex: 0 0 auto; white-space: nowrap; background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger); border-radius: var(--r-sm); padding: 0.42rem 0.7rem; font-size: 0.8rem; cursor: pointer; }
   button.armed { background: var(--danger); color: #fff; font-weight: 650; }
   button:disabled { opacity: 0.6; cursor: default; }

@@ -1188,6 +1188,11 @@ pub async fn dispatch(
             let action: InputAction = try_arg!(arg(a, "action"));
             json_result(mesh.send_input(route_id, action).await)
         }
+        "local_file_clipboard_set" => {
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            json_result(mesh.local_file_clipboard_set(paths).await)
+        }
+        "local_file_clipboard_get" => json_result(mesh.local_file_clipboard_get().await),
         "clipboard_paste" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.clipboard_paste(route_id).await)
@@ -1326,6 +1331,70 @@ pub async fn dispatch(
             let event: FileEvent = try_arg!(arg(a, "event"));
             json_result(mesh.file_send(route_id, event).await)
         }
+        "file_transfer_scan" => {
+            let id: String = try_arg!(arg(a, "id"));
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            json_result(mesh.file_transfer_scan(id, paths).await)
+        }
+        "file_transfer_start" => {
+            let id: String = try_arg!(arg(a, "id"));
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let paths: Vec<String> = try_arg!(arg(a, "paths"));
+            let destination: String = try_arg!(arg(a, "destination"));
+            let target_label = a
+                .get("target_label")
+                .and_then(Value::as_str)
+                .unwrap_or(&destination)
+                .to_string();
+            let expected_files: u64 = try_arg!(arg(a, "expected_files"));
+            let expected_folders: u64 = try_arg!(arg(a, "expected_folders"));
+            let expected_bytes: u64 = try_arg!(arg(a, "expected_bytes"));
+            json_result(
+                mesh.file_transfer_start(
+                    id,
+                    route_id,
+                    paths,
+                    destination,
+                    target_label,
+                    expected_files,
+                    expected_folders,
+                    expected_bytes,
+                )
+                .await,
+            )
+        }
+        "file_transfer_cancel" => {
+            let id: String = try_arg!(arg(a, "id"));
+            DispatchOut::Json(Value::Bool(mesh.file_transfer_cancel(&id)))
+        }
+        "file_operation_dismiss" => {
+            let id: String = try_arg!(arg(a, "id"));
+            DispatchOut::Json(Value::Bool(mesh.file_operation_dismiss(&id)))
+        }
+        "fleet_service_profiles" => DispatchOut::Json(mesh.fleet_service_profiles()),
+        "fleet_storage_status" => DispatchOut::Json(mesh.fleet_storage_status()),
+        "file_transfer_operations" => DispatchOut::Json(mesh.file_transfer_operations()),
+        "fleetfiles_local_desktop" => json_result(mesh.fleetfiles_local_desktop()),
+        "fleet_storage_set_policy" => {
+            let policy: crate::storage_plan::StoragePolicy = try_arg!(arg(a, "policy"));
+            json_result(mesh.fleet_storage_set_policy(policy).await)
+        }
+        "fleet_storage_set_allocation" => {
+            let device: String = try_arg!(arg(a, "device"));
+            let volume: String = try_arg!(arg(a, "volume"));
+            let quota_bytes: u64 = try_arg!(arg(a, "quota_bytes"));
+            let enabled: bool = try_arg!(arg(a, "enabled"));
+            json_result(
+                mesh.fleet_storage_set_allocation(device, volume, quota_bytes, enabled)
+                    .await,
+            )
+        }
+        "fleet_storage_set_device_role" => {
+            let device: String = try_arg!(arg(a, "device"));
+            let role: crate::storage_plan::DeviceServiceRole = try_arg!(arg(a, "role"));
+            json_result(mesh.fleet_storage_set_device_role(device, role).await)
+        }
+
         "file_watch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
             DispatchOut::Json(json!(mesh.file_watch(&route_id)))
@@ -1345,6 +1414,11 @@ pub async fn dispatch(
             let req_id: u64 = try_arg!(arg(a, "req"));
             let name: String = try_arg!(arg(a, "name"));
             json_result(mesh.file_download(route_id, req_id, &name))
+        }
+        "file_download_cancel" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let req_id: u64 = try_arg!(arg(a, "req"));
+            DispatchOut::Json(Value::Bool(mesh.file_download_cancel(&route_id, req_id)))
         }
 
         // ---- sites (reverse proxy) ---------------------------------------
@@ -1404,6 +1478,38 @@ pub async fn dispatch(
 
         // ---- session + fleet + rooms -------------------------------------
         "session_snapshot" => DispatchOut::Json(mesh.snapshot()),
+        "files_namespace_adopt" => {
+            let parent: String = try_arg!(arg(a, "parent"));
+            let observations: Vec<crate::namespace::NamespaceObservation> =
+                try_arg!(arg(a, "observations"));
+            json_result(mesh.files_namespace_adopt(parent, observations).await)
+        }
+        "files_namespace_mutate" => {
+            let request: crate::namespace::NamespaceMutationRequest = try_arg!(arg(a, "request"));
+            json_result(mesh.files_namespace_mutate(request))
+        }
+        "files_namespace_list" => {
+            let parent: String = try_arg!(arg(a, "parent"));
+            let cursor: Option<String> = try_arg!(opt(a, "cursor"));
+            let limit: usize = try_arg!(arg(a, "limit"));
+            let expected_directory_version: Option<i64> =
+                try_arg!(opt(a, "expected_directory_version"));
+            json_result(mesh.files_namespace_list(
+                parent,
+                cursor,
+                limit,
+                expected_directory_version,
+            ))
+        }
+        "files_canvas_snapshot" => DispatchOut::Json(
+            serde_json::to_value(mesh.files_canvas_snapshot()).unwrap_or_default(),
+        ),
+        "files_canvas_status" => DispatchOut::Json(mesh.files_canvas_status().await),
+        "files_canvas_apply" => {
+            let mutations: Vec<crate::canvas::CanvasMutation> = try_arg!(arg(a, "mutations"));
+            json_result(mesh.files_canvas_apply(mutations).await)
+        }
+        "files_canvas_purge_tombstones" => json_result(mesh.files_canvas_purge_tombstones().await),
         "room_send" => {
             let members: Vec<String> = try_arg!(arg(a, "members"));
             let message: allmystuff_protocol::RoomMessage = try_arg!(arg(a, "message"));
@@ -2795,6 +2901,14 @@ async fn ensure_node_running_impl(
     tracing::info!(?bin, "spawning allmystuff node");
 
     let mut cmd = Command::new(&bin);
+    // macOS has no PR_SET_PDEATHSIG and no Windows-style kill-on-close job
+    // object. Give a GUI-spawned node the direct parent's pid so the node can
+    // notice reparenting to launchd after a crash or Tauri hot-reload and run
+    // its normal graceful shutdown. getppid() checks the relationship, not
+    // merely pid existence, so pid reuse cannot keep an orphan alive.
+    #[cfg(target_os = "macos")]
+    cmd.env("ALLMYSTUFF_SUPERVISOR_PID", std::process::id().to_string());
+
     if require_interactive_windows_node {
         cmd.env(RUNTIME_OWNER_ENV, RuntimeOwner::CecSupportBundled.as_str());
     }

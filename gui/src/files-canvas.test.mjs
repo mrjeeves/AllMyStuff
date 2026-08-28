@@ -1,0 +1,296 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fileTileSizeLabel, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+
+test("overlapping snapshots keep stable order and the latest value per domain key", () => {
+  const rows = [
+    { id: "entry:a", revision: 1 },
+    { id: "entry:b", revision: 1 },
+    { id: "entry:a", revision: 2 },
+  ];
+  assert.deepEqual(coalesceLatestBy(rows, (row) => row.id), [
+    { id: "entry:a", revision: 2 },
+    { id: "entry:b", revision: 1 },
+  ]);
+  assert.equal(coalesceLatestBy([
+    { id: "same", domain: "entry" },
+    { id: "same", domain: "operation" },
+  ], (row) => row.domain + ":" + row.id).length, 2);
+});
+
+test("fleet records converge per entity regardless of merge order", () => {
+  const a = { id: "frame:a", kind: "frame", value: { title: "A" }, stamp: { counter: 4, actor: "alpha" } };
+  const b = { ...a, value: { title: "B" }, stamp: { counter: 4, actor: "beta" } };
+  assert.deepEqual(mergeCanvasRecords([a], [b]).records, mergeCanvasRecords([b], [a]).records);
+  assert.equal(mergeCanvasRecords([a], [b]).records[0].value.title, "B");
+});
+
+test("a tombstone beats an older layout record", () => {
+  const live = { id: "frame:a", kind: "frame", value: {}, stamp: { counter: 2, actor: "a" } };
+  const gone = { ...live, value: null, deleted: true, stamp: { counter: 3, actor: "b" } };
+  assert.deepEqual(mergeCanvasRecords([live], [gone]).records[0], gone);
+});
+
+test("a live fleet edit received during hydration cannot be overwritten by the launch snapshot", () => {
+  const stale = { id: "item:a", kind: "item", value: { x: 10, parentId: null }, stamp: { counter: 4, actor: "pc" } };
+  const live = { ...stale, value: { x: 220, parentId: "frame:work" }, stamp: { counter: 5, actor: "mac" } };
+  const unrelated = { id: "frame:work", kind: "frame", value: { title: "Work" }, stamp: { counter: 3, actor: "pc" } };
+  assert.deepEqual(hydrateCanvasRecords([stale, unrelated], [live]), [live, unrelated]);
+});
+
+test("Fleetfiles replicas resolve physical OS paths to one logical identity surface", () => {
+  assert.equal(
+    fleetfilesLogicalPath(
+      "C:\\Users\\Chris\\.myownmesh\\Fleetfiles\\Desktop",
+      "c:/users/chris/.myownmesh/Fleetfiles/Desktop/Photos/Caf\u00e9.jpg",
+      "windows",
+    ),
+    "Photos/Caf\u00e9.jpg",
+  );
+  assert.equal(
+    fleetfilesLogicalPath(
+      "/Users/chris/.myownmesh/Fleetfiles/Desktop",
+      "/Users/chris/.myownmesh/Fleetfiles/Desktop/Photos/Cafe\u0301.jpg",
+      "macos",
+    ),
+    "Photos/Caf\u00e9.jpg",
+  );
+  assert.equal(fleetfilesLogicalPath("/fleet/root", "/somewhere/else/file", "linux"), null);
+});
+
+test("physical replica placement migrates once without overwriting logical edits", () => {
+  const old = {
+    id: "item:files:fleet:home:entry:mac-inode",
+    kind: "item",
+    value: { id: "entry:mac-inode", x: 20, y: 30, parentId: "frame:a" },
+    stamp: { counter: 7, actor: "mac" },
+  };
+  assert.deepEqual(
+    planFleetfilesPlacementMigration([old], "fleet:home", "entry:mac-inode", "entry:fleet-object"),
+    [
+      {
+        id: "item:files:fleet:home:entry:fleet-object",
+        kind: "item",
+        value: { id: "entry:fleet-object", x: 20, y: 30, parentId: "frame:a" },
+      },
+      {
+        id: "item:files:fleet:home:entry:mac-inode",
+        kind: "item",
+        value: null,
+        deleted: true,
+      },
+    ],
+  );
+  const current = {
+    id: "item:files:fleet:home:entry:fleet-object",
+    kind: "item",
+    value: { id: "entry:fleet-object", x: 400, y: 500, parentId: null },
+    stamp: { counter: 9, actor: "pc" },
+  };
+  assert.deepEqual(
+    planFleetfilesPlacementMigration([old, current], "fleet:home", "entry:mac-inode", "entry:fleet-object"),
+    [{
+      id: "item:files:fleet:home:entry:mac-inode",
+      kind: "item",
+      value: null,
+      deleted: true,
+    }],
+  );
+});
+
+test("nesting chooses the smallest frame and never chooses a descendant", () => {
+  const frames = [
+    { id: "outer", title: "", color: "", parentId: null, x: 0, y: 0, width: 500, height: 500 },
+    { id: "inner", title: "", color: "", parentId: "outer", x: 50, y: 50, width: 250, height: 250 },
+  ];
+  assert.equal(containingFrame({ x: 80, y: 80, width: 40, height: 40 }, frames), "inner");
+  assert.deepEqual([...descendantsOf("outer", frames)], ["inner"]);
+  assert.equal(containingFrame(frames[0], frames, descendantsOf("outer", frames)), null);
+});
+
+test("fallback file identity folds Windows paths but not POSIX case", () => {
+  assert.equal(fileReferenceId("node:a", "C:\\Users\\Chris\\Doc.txt", "windows"), fileReferenceId("node:a", "c:/users/chris/doc.txt", "windows"));
+  assert.notEqual(fileReferenceId("node:a", "/Users/Chris/Doc.txt", "macos"), fileReferenceId("node:a", "/Users/Chris/doc.txt", "macos"));
+  assert.notEqual(fileReferenceId("node:a", "/tmp/a", "linux"), fileReferenceId("node:b", "/tmp/a", "linux"));
+});
+
+test("workspace RPC accepts a volume inventory as a completed reply", () => {
+  assert.equal(isWorkspaceFileReplyKind("volume_list"), true);
+  assert.equal(isWorkspaceFileReplyKind("entries"), true);
+  assert.equal(isWorkspaceFileReplyKind("watching"), true);
+  assert.equal(isWorkspaceFileReplyKind("directory_changed"), false);
+  assert.equal(isWorkspaceFileReplyKind("exists"), true);
+  assert.equal(isWorkspaceFileReplyKind("chunk"), false);
+  assert.equal(isWorkspaceFileReplyKind("volumes"), false);
+});
+
+test("native location trails preserve host path syntax and every clickable ancestor", () => {
+  assert.deepEqual(nativeLocationTrail("C:\\Users\\Chris\\Documents", "windows"), [
+    { label: "C:", path: "C:\\" },
+    { label: "Users", path: "C:\\Users" },
+    { label: "Chris", path: "C:\\Users\\Chris" },
+    { label: "Documents", path: "C:\\Users\\Chris\\Documents" },
+  ]);
+  assert.deepEqual(nativeLocationTrail("\\\\server\\share\\Projects\\AMS", "windows"), [
+    { label: "\\\\server\\share", path: "\\\\server\\share\\" },
+    { label: "Projects", path: "\\\\server\\share\\Projects" },
+    { label: "AMS", path: "\\\\server\\share\\Projects\\AMS" },
+  ]);
+  const extendedUnc = nativeLocationTrail("\\\\?\\UNC\\server\\share\\Projects\\AMS", "windows");
+  assert.deepEqual(extendedUnc[0], { label: "\\\\server\\share", path: "\\\\?\\UNC\\server\\share\\" });
+  assert.deepEqual(extendedUnc.at(-1), { label: "AMS", path: "\\\\?\\UNC\\server\\share\\Projects\\AMS" });
+  assert.deepEqual(nativeLocationTrail("/Users/Chris/Documents", "macos"), [
+    { label: "/", path: "/" },
+    { label: "Users", path: "/Users" },
+    { label: "Chris", path: "/Users/Chris" },
+    { label: "Documents", path: "/Users/Chris/Documents" },
+  ]);
+  assert.deepEqual(nativeLocationTrail("/tmp/a\\b", "windows").at(-1), { label: "a\\b", path: "/tmp/a\\b" });
+});
+
+test("Windows shell-link presentation hides only final native suffixes", () => {
+  assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "windows"), "AllMyAgents");
+  assert.equal(nativeFileDisplayName("CEC Support.LNK", "Windows_NT"), "CEC Support");
+  assert.equal(nativeFileDisplayName("Erin's Zoom.url", "windows"), "Erin's Zoom");
+  assert.equal(nativeWindowsLinkExtension("Erin's Zoom.URL", "windows"), ".url");
+  assert.equal(nativeFileDisplayName("notes.lnk.txt", "windows"), "notes.lnk.txt");
+  assert.equal(nativeFileDisplayName("AllMyAgents.lnk", "linux"), "AllMyAgents.lnk");
+});
+
+test("file icon sizes use six stable notches and separate grid cells", () => {
+  assert.deepEqual(FILE_TILE_SIZES, [32, 48, 96, 128, 192, 256]);
+  assert.deepEqual(FILE_TILE_SIZES.map(fileTileSizeLabel), [
+    "Small", "Medium", "Large", "Extra large", "Huge", "Giant",
+  ]);
+  assert.equal(nearestFileTileSize(31), 32);
+  assert.equal(nearestFileTileSize(63), 48);
+  assert.equal(nearestFileTileSize(95), 96);
+  assert.equal(nearestFileTileSize(Number.NaN), 48);
+  assert.deepEqual(nativeFileGridMetrics(48, "windows"), {
+    iconSize: 48, tileWidth: 88, tileHeight: 104, columnWidth: 100, rowHeight: 112,
+  });
+  assert.deepEqual(nativeFileGridMetrics(256, "windows"), {
+    iconSize: 256, tileWidth: 284, tileHeight: 318, columnWidth: 296, rowHeight: 326,
+  });
+});
+
+test("native size changes resolve top-level collisions without moving framed items", () => {
+  const metrics = nativeFileGridMetrics(96, "windows");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "a", x: 24, y: 24, parentId: null },
+    { id: "b", x: 24, y: 100, parentId: null },
+    { id: "framed", x: 24, y: 100, parentId: "frame:a" },
+  ], metrics);
+  assert.deepEqual(resolved.map(({ y }) => y), [24, 266, 100]);
+});
+
+test("the newest visible drop owns its persisted point when tiles collide", () => {
+  const metrics = nativeFileGridMetrics(96, "macos");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "older", x: 24, y: 24, parentId: null },
+    { id: "dropped", x: 24, y: 100, parentId: null },
+  ], metrics, new Map([
+    ["older", { tier: 1, stamp: { counter: 4, actor: "a" } }],
+    ["dropped", { tier: 1, stamp: { counter: 5, actor: "a" } }],
+  ]));
+  assert.equal(resolved[1].y, 100);
+  assert.ok(resolved[0].y > resolved[1].y);
+});
+
+test("visible desktop files keep their points ahead of newer hidden metadata", () => {
+  const metrics = nativeFileGridMetrics(96, "macos");
+  const resolved = resolveDesktopTileCollisions([
+    { id: "visible", x: 24, y: 24, parentId: null },
+    { id: "dot-file", x: 24, y: 100, parentId: null },
+  ], metrics, new Map([
+    ["visible", { tier: 1, stamp: { counter: 1, actor: "a" } }],
+    ["dot-file", { tier: 0, stamp: { counter: 999, actor: "z" } }],
+  ]));
+  assert.equal(resolved[0].y, 24);
+  assert.ok(resolved[1].y > resolved[0].y);
+});
+
+test("drag previews and drops share one zoom-aware coordinate conversion", () => {
+  assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 1.5), { x: 60, y: 20 });
+  assert.deepEqual(translateCanvasPoint({ x: 20, y: 40 }, { x: 100, y: 200 }, { x: 160, y: 170 }, 0), { x: 80, y: 10 });
+});
+
+test("desktop fallback stays column-major across compact canvas measurement", () => {
+  const initial = Array.from({ length: 9 }, (_, index) => desktopColumnPosition(index, 48, 720));
+  const measured = Array.from({ length: 9 }, (_, index) => desktopColumnPosition(index, 48, 280));
+  assert.deepEqual(measured, initial);
+  assert.ok(measured[1].y > measured[0].y);
+  assert.ok(measured[8].x > measured[0].x);
+});
+
+test("legacy migration matches only the old generated row", () => {
+  assert.equal(isLegacyAutoRowPlacement({ id: "a", x: 64, y: 72, parentId: null }), true);
+  assert.equal(isLegacyAutoRowPlacement({ id: "b", x: 164, y: 72, parentId: null }), true);
+  assert.equal(isLegacyAutoRowPlacement({ id: "manual", x: 165, y: 72, parentId: null }), false);
+  assert.equal(isLegacyAutoRowPlacement({ id: "framed", x: 164, y: 72, parentId: "frame" }), false);
+});
+
+test("marquee intersection includes partially covered native cells", () => {
+  assert.equal(rectsIntersect({ x: 20, y: 20, width: 20, height: 20 }, { x: 35, y: 35, width: 30, height: 30 }), true);
+  assert.equal(rectsIntersect({ x: 20, y: 20, width: 10, height: 10 }, { x: 35, y: 35, width: 30, height: 30 }), false);
+});
+
+test("concurrent frame reparenting cannot leave a cyclic hierarchy", () => {
+  const frames = [
+    { id: "a", title: "", color: "", parentId: "b", x: 0, y: 0, width: 100, height: 100 },
+    { id: "b", title: "", color: "", parentId: "a", x: 10, y: 10, width: 50, height: 50 },
+  ];
+  const normalized = normalizeFrameNesting(frames);
+  assert.equal(normalized.find((frame) => frame.id === "a").parentId, null);
+  assert.equal(normalized.find((frame) => frame.id === "b").parentId, "a");
+  assert.deepEqual([...descendantsOf("a", normalized)], ["b"]);
+});
+
+test("a missing or tombstoned parent cannot strand a frame", () => {
+  const [frame] = normalizeFrameNesting([
+    { id: "child", title: "", color: "", parentId: "gone", x: 0, y: 0, width: 50, height: 50 },
+  ]);
+  assert.equal(frame.parentId, null);
+});
+
+test("the sharing map accepts only explicit filesystem object grants", () => {
+  assert.deepEqual(
+    sharedFilesystemObject({ media: "storage", capability: "node-a:folder:folder-42", label: "Workstation: share Projects" }),
+    { sourceNode: "node-a", kind: "folder", objectId: "folder-42", label: "Projects" },
+  );
+  assert.deepEqual(
+    sharedFilesystemObject({ media: "storage", capability: "node-a:file:file-7", label: "share Notes.txt" }),
+    { sourceNode: "node-a", kind: "file", objectId: "file-7", label: "Notes.txt" },
+  );
+  assert.equal(sharedFilesystemObject({ media: "storage", capability: "node-a:disk:backup", label: "Backup" }).kind, "drive");
+  assert.equal(sharedFilesystemObject({ media: "storage", capability: "node-a:drive:media", label: "Media" }).kind, "drive");
+});
+
+test("the sharing map cannot collide with broad or non-filesystem shares", () => {
+  const rejected = [
+    { media: "display", capability: "node-a:folder:looks-like-one", label: "Screen" },
+    { media: "storage", capability: "node-a:files", label: "All files" },
+    { media: "storage", capability: "node-a:storage-in", label: "Storage" },
+    { media: "storage", capability: "node-a:folder:", label: "Missing id" },
+    { media: "storage", capability: "node-a:folder:id:extra", label: "Too many segments" },
+    { media: "storage", capability: ":folder:id", label: "Missing source" },
+    { media: "storage", capability: null, label: "Generic storage" },
+  ];
+  for (const grant of rejected) assert.equal(sharedFilesystemObject(grant), null);
+});
+
+test("route activation waits through negotiation and stops on terminal states", () => {
+  assert.deepEqual(routeActivationOutcome(undefined), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "offered" }), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "connecting" }), { kind: "waiting" });
+  assert.deepEqual(routeActivationOutcome({ state: "active" }), { kind: "active" });
+  assert.deepEqual(routeActivationOutcome({ state: "rejected", reason: "not shared" }), {
+    kind: "failed",
+    reason: "not shared",
+  });
+  assert.deepEqual(routeActivationOutcome({ state: "torn_down" }), {
+    kind: "failed",
+    reason: "The remote device refused the connection",
+  });
+});

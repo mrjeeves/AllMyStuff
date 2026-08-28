@@ -54,6 +54,7 @@ pub mod audio;
 pub mod byte_queues;
 #[cfg(feature = "host")]
 pub mod camera_capture;
+pub mod canvas;
 pub mod cec;
 pub mod child_process;
 #[cfg(feature = "host")]
@@ -74,6 +75,7 @@ pub mod daemon_spawn;
 pub mod diagnostics;
 pub mod drive_mount;
 pub mod files;
+pub mod fleetfiles;
 /// Which folders of this machine other people may open, and where they
 /// live. The id→path resolution a folder share turns on: the path never
 /// crosses the wire, so a peer names only the minted id.
@@ -109,6 +111,7 @@ pub mod labs;
 #[cfg(all(windows, feature = "host"))]
 pub mod mediafoundation;
 pub mod mesh;
+pub mod namespace;
 pub mod networks_store;
 pub mod node_control;
 /// NVDEC (nvcuvid) HEVC decode — the receive twin of `nvenc`, feeding the
@@ -123,6 +126,7 @@ pub mod nvdec;
 /// `ALLMYSTUFF_NVENC=1` until soaked.
 #[cfg(all(windows, feature = "host"))]
 pub mod nvenc;
+pub mod operations;
 /// OS performance levers for the media-plane threads (timer resolution +
 /// thread priority) — Windows-real, no-op elsewhere.
 pub(crate) mod os_perf;
@@ -131,8 +135,10 @@ pub(crate) mod persist;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
 /// device" and the fleet's `RestartDevice` command.
 pub mod reboot;
+pub mod service_profiles;
 pub mod shares;
 pub mod sites;
+pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —
 /// the same line on NVIDIA, AMD, and Intel boxes.
@@ -158,6 +164,8 @@ pub mod video_decode;
 pub mod videotoolbox;
 #[cfg(feature = "host")]
 pub mod wake;
+#[cfg(windows)]
+pub(crate) mod windows_fleetfiles;
 // Windows screen capture (in-house DXGI). Declared on every target — the
 // module is internally `cfg`-gated to a stub off Windows, exactly as it was
 // when it lived in the GUI binary.

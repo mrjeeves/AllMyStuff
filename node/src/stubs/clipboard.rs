@@ -81,6 +81,10 @@ impl ClipboardService {
         Err("OS clipboard is unavailable on this build".into())
     }
 
+    pub fn file_paths(&self) -> Result<Vec<String>, String> {
+        Err("OS clipboard is unavailable on this build".into())
+    }
+
     /// A receiver that never fires. Keeping the sender alive on the struct is
     /// what makes that "silent" rather than "closed" — a closed channel would
     /// end the sync loop, and this build should simply have nothing to sync.

@@ -33,6 +33,8 @@ import type {
   UpdateStatus,
   VideoFrameMsg,
 } from "./types";
+import type { CanvasRecord } from "./files-canvas";
+import { managedUnlisten } from "./event-lifecycle";
 
 interface ScanResult {
   node_id: string;
@@ -150,6 +152,647 @@ export function isMobile(): boolean {
     /Android|iPhone|iPad|iPod/i.test(ua) ||
     (/Macintosh/.test(ua) && navigator.maxTouchPoints > 2)
   );
+}
+
+export interface LocalFileLocation {
+  id: string;
+  label: string;
+  path: string;
+  kind: "favorite" | "volume";
+}
+
+export interface LocalFileEntry {
+  id: string;
+  name: string;
+  path: string;
+  dir: boolean;
+  size: number;
+  modified?: number | null;
+  hidden: boolean;
+  symlink: boolean;
+  shellIcon?: string | null;
+  virtualItem?: boolean;
+}
+
+export interface LocalFileListing {
+  id: string;
+  path: string;
+  platform: string;
+  entries: LocalFileEntry[];
+  nextCursor?: string | null;
+  complete: boolean;
+}
+
+export type LocalFilePreview =
+  | { kind: "text"; text: string }
+  | { kind: "image"; mime: string; data: string }
+  | { kind: "unsupported" };
+
+async function requiredInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (!isTauri()) throw new Error("this action needs the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+export function localFileLocations(): Promise<LocalFileLocation[]> {
+  return isTauri()
+    ? requiredInvoke<LocalFileLocation[]>("local_file_locations")
+    : Promise.resolve([
+        { id: "home", label: "Home", path: "/Users/you", kind: "favorite" },
+        { id: "desktop", label: "Desktop", path: "/Users/you/Desktop", kind: "favorite" },
+        { id: "documents", label: "Documents", path: "/Users/you/Documents", kind: "favorite" },
+        { id: "downloads", label: "Downloads", path: "/Users/you/Downloads", kind: "favorite" },
+      ]);
+}
+export function fleetfilesLocalDesktop(): Promise<{ path: string; namespace?: string }> {
+  return requiredInvoke("fleetfiles_local_desktop");
+}
+
+
+export function localFileList(path: string, cursor?: string): Promise<LocalFileListing> {
+  if (!isTauri()) {
+    const now = Math.floor(Date.now() / 1000);
+    return Promise.resolve({
+      id: `demo-directory:${path}`,
+      path,
+      platform: navigator.platform.includes("Win") ? "windows" : "macos",
+      entries: [
+        { id: "demo-projects", name: "Projects", path: `${path}/Projects`, dir: true, size: 0, modified: now - 7200, hidden: false, symlink: false },
+        { id: "demo-photos", name: "Photos", path: `${path}/Photos`, dir: true, size: 0, modified: now - 86400, hidden: false, symlink: false },
+        { id: "demo-plan", name: "Fleet storage plan.md", path: `${path}/Fleet storage plan.md`, dir: false, size: 18432, modified: now - 900, hidden: false, symlink: false },
+        { id: "demo-design", name: "Canvas design.png", path: `${path}/Canvas design.png`, dir: false, size: 2400000, modified: now - 3600, hidden: false, symlink: false },
+        { id: "demo-budget", name: "Storage budget.xlsx", path: `${path}/Storage budget.xlsx`, dir: false, size: 89216, modified: now - 172800, hidden: false, symlink: false },
+      ],
+      nextCursor: null,
+      complete: true,
+    });
+  }
+  return requiredInvoke<LocalFileListing>("local_file_list", { path, cursor });
+}
+
+export interface LocalDirectoryChanged {
+  token: number;
+  seq: number;
+  overflow: boolean;
+}
+
+export async function watchLocalDirectory(
+  path: string,
+  cb: (event: LocalDirectoryChanged) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const [{ listen }, { invoke }] = await Promise.all([
+    import("@tauri-apps/api/event"),
+    import("@tauri-apps/api/core"),
+  ]);
+  type Started = { token: number; leaseMs: number };
+  let token: number | null = null;
+  let expiresAt = 0;
+  let renewTimer: number | null = null;
+  let stopped = false;
+  const unlisten = managedUnlisten(await listen<LocalDirectoryChanged>(
+    "allmystuff://local-directory-changed",
+    ({ payload }) => {
+      if (payload.token === token) cb(payload);
+    },
+  ));
+
+  const clearRenewal = () => {
+    if (renewTimer !== null) window.clearTimeout(renewTimer);
+    renewTimer = null;
+  };
+  const stopToken = (value: number | null) => {
+    if (value !== null) void invoke("local_directory_unwatch", { token: value }).catch(() => {});
+  };
+  const install = async () => {
+    const prior = token;
+    const started = await invoke<Started>("local_directory_watch", { path });
+    if (stopped) {
+      stopToken(started.token);
+      return;
+    }
+    token = started.token;
+    expiresAt = Date.now() + started.leaseMs;
+    stopToken(prior);
+    scheduleRenewal(started.leaseMs * 0.8);
+  };
+  const scheduleRenewal = (delay: number) => {
+    clearRenewal();
+    if (stopped || document.visibilityState !== "visible") return;
+    renewTimer = window.setTimeout(() => {
+      renewTimer = null;
+      void install().catch((error) => {
+        console.info("Local directory watcher lease renewal failed:", error);
+      });
+    }, Math.max(1_000, delay));
+  };
+  const visibilityChanged = () => {
+    if (document.visibilityState !== "visible") {
+      clearRenewal();
+      return;
+    }
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      void install().catch((error) => {
+        console.info("Local directory watcher could not resume:", error);
+      });
+    } else {
+      scheduleRenewal(remaining * 0.8);
+    }
+  };
+  document.addEventListener("visibilitychange", visibilityChanged);
+  try {
+    await install();
+  } catch (error) {
+    stopped = true;
+    document.removeEventListener("visibilitychange", visibilityChanged);
+    unlisten();
+    throw error;
+  }
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearRenewal();
+    document.removeEventListener("visibilitychange", visibilityChanged);
+    unlisten();
+    stopToken(token);
+    token = null;
+  };
+}
+
+export function localFilePreview(path: string): Promise<LocalFilePreview> {
+  return isTauri()
+    ? requiredInvoke<LocalFilePreview>("local_file_preview", { path })
+    : Promise.resolve(path.endsWith(".md")
+        ? { kind: "text", text: "# Fleet storage plan\n\nKeep file placement separate from the shared canvas metadata." }
+        : { kind: "unsupported" });
+}
+
+export function localFileIcon(path: string): Promise<string | null> {
+  return isTauri()
+    ? requiredInvoke<string | null>("local_file_icon", { path })
+    : Promise.resolve(null);
+}
+
+export function localFileOpen(path: string, reveal = false): Promise<void> {
+  return requiredInvoke("local_file_open", { path, reveal });
+}
+
+export function localFileContextMenu(path: string): Promise<void> {
+  return requiredInvoke<void>("local_file_context_menu", { path });
+}
+
+export function localFileMkdir(parent: string, name: string, unique = false): Promise<LocalFileEntry> {
+  return requiredInvoke("local_file_mkdir", { parent, name, unique });
+}
+
+export function localFileRename(path: string, name: string): Promise<LocalFileEntry> {
+  return requiredInvoke("local_file_rename", { path, name });
+}
+
+export function localFileTrash(paths: string[]): Promise<void> {
+  return requiredInvoke("local_file_trash", { paths });
+}
+export type LocalFileOperationKind = "copy" | "move";
+
+export interface LocalFileOperationResult {
+  operation: string;
+  paths: string[];
+  affected: number;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+
+export function localFileOperationApply(
+  paths: string[],
+  destination: string,
+  kind: LocalFileOperationKind,
+): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_apply", { paths, destination, kind });
+}
+
+export function localFileOperationUndo(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_undo");
+}
+
+export function localFileOperationRedo(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_redo");
+}
+
+export function localFileOperationState(): Promise<LocalFileOperationResult> {
+  return requiredInvoke("local_file_operation_state");
+}
+
+export function localFileClipboardSet(paths: string[]): Promise<void> {
+  return requiredInvoke("local_file_clipboard_set", { paths });
+}
+
+export interface LocalFileClipboardData {
+  paths: string[];
+  prefersMove: boolean;
+}
+
+export function localFileClipboardGet(): Promise<LocalFileClipboardData> {
+  return requiredInvoke("local_file_clipboard_get");
+}
+
+export interface LocalFileTransferImpact {
+  files: number;
+  folders: number;
+  bytes: number;
+  symlinks: number;
+  unreadable: number;
+  unreadable_examples: string[];
+  top_level: string[];
+  requires_confirmation: boolean;
+}
+
+export function localFileTransferScan(id: string, paths: string[]): Promise<LocalFileTransferImpact> {
+  return requiredInvoke("local_file_transfer_scan", { id, paths });
+}
+
+export function localFileTransferStart(
+  id: string,
+  routeId: string,
+  paths: string[],
+  destination: string,
+  targetLabel: string,
+  impact: LocalFileTransferImpact,
+): Promise<{ files: number; folders: number; bytes: number }> {
+  return requiredInvoke("local_file_transfer_start", {
+    id,
+    routeId,
+    paths,
+    destination,
+    expectedFiles: impact.files,
+    targetLabel,
+    expectedFolders: impact.folders,
+    expectedBytes: impact.bytes,
+  });
+}
+
+export function localFileTransferCancel(id: string): Promise<boolean> {
+  return requiredInvoke("local_file_transfer_cancel", { id });
+}
+
+export function localFileOperationDismiss(id: string): Promise<boolean> {
+  return requiredInvoke("local_file_operation_dismiss", { id });
+}
+export type LocalFileOperationPhase =
+  | "scanning"
+  | "awaiting-approval"
+  | "staging"
+  | "transferring"
+  | "verifying"
+  | "committing"
+  | "materializing"
+  | "cancelling"
+  | "compensating"
+  | "complete"
+  | "failed"
+  | "cancelled";
+
+export interface LocalFileTransferOperation {
+  id: string;
+  phase: LocalFileOperationPhase;
+  targetLabel: string;
+  files: number;
+  folders: number;
+  bytes: number;
+  progressBytes: number;
+  error?: string | null;
+  retryCondition?: string | null;
+  verificationResult?: string | null;
+  cancellationRequested?: boolean;
+  startedAt: number;
+}
+
+export async function localFileTransferOperations(): Promise<{ operations: LocalFileTransferOperation[] }> {
+  try {
+    return await requiredInvoke("local_file_transfer_operations");
+  } catch (error) {
+    // During `tauri dev`, the frontend can hot-reload before a newly built
+    // node sidecar has replaced the process that is already running. An older
+    // node has no operations ledger to restore, which is equivalent to an
+    // empty ledger; it must not take down the whole Files workspace.
+    if (String(error).includes("unknown node command")) return { operations: [] };
+    throw error;
+  }
+}
+
+export async function onFileOperations(
+  cb: (operations: LocalFileTransferOperation[]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return managedUnlisten(await listen<{ operations: LocalFileTransferOperation[] }>(
+    "allmystuff://file-operations",
+    (event) => cb(event.payload.operations),
+  ));
+}
+
+
+export interface FleetServiceProfile {
+  peer: string;
+  state: "online" | "offline" | "unknown";
+  observedHours: number;
+  availability: number;
+  averageLatencyMs?: number | null;
+  throughputMbps?: number | null;
+  operationReliability: number;
+  confidence: number;
+  serviceScore: number;
+  connections: number;
+  disconnects: number;
+  successes: number;
+  failures: number;
+}
+
+export function fleetServiceProfiles(): Promise<{ profiles: FleetServiceProfile[] }> {
+  return isTauri()
+    ? requiredInvoke("fleet_service_profiles")
+    : Promise.resolve({ profiles: [] });
+}
+
+export interface FleetStorageVolume {
+  id: string;
+  name: string;
+  path?: string | null;
+  filesystem?: string | null;
+  totalBytes: number;
+  availableBytes: number;
+  removable: boolean;
+  kind: "ssd" | "hdd" | "removable" | "unknown";
+}
+
+export function fleetStorageLocalVolumes(): Promise<FleetStorageVolume[]> {
+  return isTauri()
+    ? requiredInvoke("fleet_storage_local_volumes")
+    : Promise.resolve([]);
+}
+
+
+export interface FleetStoragePolicy {
+  replicas: number;
+  reservePercent: number;
+  versionRetentionDays: number;
+  rebalanceGibPerDay: number;
+  pauseOnMetered: boolean;
+}
+
+export interface FleetStorageAllocation {
+  id: string;
+  device: string;
+  volume: string;
+  quotaBytes: number;
+  enabled: boolean;
+  stamp: { counter: number; actor: string };
+}
+export type FleetDeviceRole = "automatic" | "alwaysOn" | "personal";
+
+export interface FleetDeviceIntent {
+  device: string;
+  role: FleetDeviceRole;
+  stamp: { counter: number; actor: string };
+}
+
+
+export interface FleetStorageStatus {
+  plan: {
+    policy: {
+      value: FleetStoragePolicy;
+      stamp: { counter: number; actor: string };
+    };
+    allocations: FleetStorageAllocation[];
+    deviceIntents: FleetDeviceIntent[];
+  };
+  profiles: FleetServiceProfile[];
+}
+
+export function fleetStorageStatus(): Promise<FleetStorageStatus> {
+  return requiredInvoke("fleet_storage_status");
+}
+
+export function fleetStorageSetPolicy(policy: FleetStoragePolicy): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_policy", { policy });
+}
+
+export function fleetStorageSetAllocation(
+  device: string,
+  volume: string,
+  quotaBytes: number,
+  enabled: boolean,
+): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_allocation", {
+    device,
+    volume,
+    quotaBytes,
+    enabled,
+  });
+}
+export function fleetStorageSetDeviceRole(
+  device: string,
+  role: FleetDeviceRole,
+): Promise<unknown> {
+  return requiredInvoke("fleet_storage_set_device_role", { device, role });
+}
+
+
+export async function onFleetStorage(
+  cb: (plan: FleetStorageStatus["plan"]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ plan: FleetStorageStatus["plan"] }>(
+    "allmystuff://fleet-storage",
+    (event) => cb(event.payload.plan),
+  );
+}
+
+
+export interface NamespaceObservation {
+  provisionalId: string;
+  priorEntryId?: string;
+  sourceDevice: string;
+  nativeId: string;
+  name: string;
+  nativePath: string;
+  dir: boolean;
+  hidden: boolean;
+  size: number;
+  modified: number;
+}
+
+export interface NamespaceAdoption {
+  provisionalId: string;
+  entryId: string;
+  objectId: string;
+  version: number;
+}
+
+export function filesNamespaceAdopt(
+  parent: string,
+  observations: NamespaceObservation[],
+): Promise<NamespaceAdoption[]> {
+  if (!isTauri()) {
+    return Promise.resolve(
+      observations.map((observation) => ({
+        provisionalId: observation.provisionalId,
+        entryId: observation.provisionalId,
+        objectId: observation.nativeId,
+        version: 1,
+      })),
+    );
+  }
+  return requiredInvoke<NamespaceAdoption[]>("files_namespace_adopt", {
+    parent,
+    observations,
+  });
+}
+
+export type NamespaceMutationRequest = {
+  operationId: string;
+} & (
+  | {
+      action: "create";
+      parentId: string;
+      displayName: string;
+      kind: "file" | "directory";
+      expectedParentVersion?: number;
+    }
+  | {
+      action: "rename";
+      entryId: string;
+      expectedVersion: number;
+      displayName: string;
+    }
+  | {
+      action: "move";
+      entryId: string;
+      expectedVersion: number;
+      parentId: string;
+      expectedParentVersion?: number;
+    }
+  | {
+      action: "delete";
+      entryId: string;
+      expectedVersion: number;
+    }
+);
+
+export interface NamespaceEntry {
+  entryId: string;
+  objectId: string;
+  parentId: string;
+  displayName: string;
+  kind: "file" | "directory";
+  hidden: boolean;
+  size: number;
+  modified: number;
+  version: number;
+  tombstone: boolean;
+  conflictGroup?: string;
+}
+
+export interface NamespaceDirectoryVersion {
+  parentId: string;
+  version: number;
+}
+
+export interface NamespaceMutationResult {
+  operationId: string;
+  sequence: number;
+  entry: NamespaceEntry;
+  directoryVersions: NamespaceDirectoryVersion[];
+}
+
+export interface NamespacePage {
+  parentId: string;
+  directoryVersion: number;
+  entries: NamespaceEntry[];
+  nextCursor?: string;
+}
+
+export function filesNamespaceMutate(
+  request: NamespaceMutationRequest,
+): Promise<NamespaceMutationResult> {
+  if (!isTauri()) return Promise.reject(new Error("Fleetfiles namespace requires the desktop app"));
+  return requiredInvoke<NamespaceMutationResult>("files_namespace_mutate", { request });
+}
+
+export function filesNamespaceList(
+  parent: string,
+  cursor?: string,
+  limit = 128,
+  expectedDirectoryVersion?: number,
+): Promise<NamespacePage> {
+  if (!isTauri()) return Promise.reject(new Error("Fleetfiles namespace requires the desktop app"));
+  return requiredInvoke<NamespacePage>("files_namespace_list", {
+    parent,
+    cursor,
+    limit,
+    expectedDirectoryVersion,
+  });
+}
+
+export async function onFilesNamespace(
+  cb: (result: NamespaceMutationResult) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<NamespaceMutationResult>("allmystuff://files-namespace", (event) =>
+    cb(event.payload),
+  );
+}
+
+export interface CanvasMutation {
+  id: string;
+  kind: CanvasRecord["kind"];
+  value: unknown | null;
+  deleted?: boolean;
+}
+
+export function filesCanvasSnapshot(): Promise<CanvasRecord[]> {
+  return isTauri() ? requiredInvoke<CanvasRecord[]>("files_canvas_snapshot") : Promise.resolve([]);
+}
+
+export interface FilesCanvasStatus {
+  liveRecords: number;
+  tombstones: number;
+  epoch: number;
+  canPurge: boolean;
+  purged?: number;
+}
+
+export function filesCanvasStatus(): Promise<FilesCanvasStatus> {
+  return isTauri()
+    ? requiredInvoke<FilesCanvasStatus>("files_canvas_status")
+    : Promise.resolve({ liveRecords: 0, tombstones: 0, epoch: 0, canPurge: true });
+}
+
+export function filesCanvasPurgeTombstones(): Promise<FilesCanvasStatus> {
+  return isTauri()
+    ? requiredInvoke<FilesCanvasStatus>("files_canvas_purge_tombstones")
+    : Promise.resolve({ liveRecords: 0, tombstones: 0, epoch: 0, canPurge: true, purged: 0 });
+}
+
+export function filesCanvasApply(mutations: CanvasMutation[]): Promise<CanvasRecord[]> {
+  return isTauri()
+    ? requiredInvoke<CanvasRecord[]>("files_canvas_apply", { mutations })
+    : Promise.resolve(mutations.map((mutation, index) => ({
+        ...mutation,
+        stamp: { counter: Date.now() + index, actor: "web-preview" },
+      })));
+}
+
+export async function onFilesCanvas(
+  cb: (records: CanvasRecord[]) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return managedUnlisten(await listen<{ records: CanvasRecord[] }>(
+    "allmystuff://files-canvas", (event) => cb(event.payload.records),
+  ));
 }
 
 // ---- app metadata -----------------------------------------------------
@@ -364,6 +1007,19 @@ export async function mapNativeDriveFrom(
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("drive_map_from", { source, root, label, mount });
+}
+
+export interface NativeDriveInfo {
+  route: string;
+  label: string;
+  mount: string;
+  port: number;
+}
+
+export async function nativeDriveMounts(): Promise<NativeDriveInfo[]> {
+  if (!isTauri()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<NativeDriveInfo[]>("native_drives");
 }
 
 export interface DriveMappingState {
@@ -1026,6 +1682,29 @@ export function filesWindowTarget(): string | null {
   return new URLSearchParams(window.location.search).get("files");
 }
 
+export async function openFilesWorkspaceWindow(target: string, title: string): Promise<void> {
+  if (!isTauri()) return;
+  const instance = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await requiredInvoke("open_files_workspace_window", { target, title, instance });
+}
+
+export function filesWorkspaceWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  const encoded = new URLSearchParams(window.location.search).get("files-workspace");
+  if (!encoded) return null;
+  try {
+    const standard = encoded.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = standard + "=".repeat((4 - standard.length % 4) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
 /** Send one file request down an active files route (this window is the
  *  viewer; the far end owns the disk). Throws when the backend refuses. */
 export async function fileSend(
@@ -1088,12 +1767,13 @@ export async function watchFiles(
   });
   const timer = setInterval(() => void tick(), 100);
   void tick(); // drain whatever buffered before this window subscribed
-  return () => {
+  return managedUnlisten(() => {
     stopped = true;
     clearInterval(timer);
-    unlisten();
+    const result = unlisten();
     void invoke("file_unwatch", { routeId, token }).catch(() => {});
-  };
+    return result;
+  });
 }
 
 /** Route the coming `read` request's chunks straight into this machine's
@@ -1112,6 +1792,14 @@ export async function fileDownload(
 
 /** A registered download finished (`allmystuff://file-saved`): where it
  *  landed, or the error that stopped it. */
+export async function fileDownloadCancel(
+  routeId: string,
+  req: number,
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  return requiredInvoke<boolean>("file_download_cancel", { routeId, req });
+}
+
 export async function onFileSaved(
   cb: (e: {
     route: string;
@@ -1122,12 +1810,12 @@ export async function onFileSaved(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{
+  return managedUnlisten(await listen<{
     route: string;
     req: number;
     path: string | null;
     error: string | null;
-  }>("allmystuff://file-saved", (e) => cb(e.payload));
+  }>("allmystuff://file-saved", (e) => cb(e.payload)));
 }
 
 /** This machine refused an inbound input/clipboard event
@@ -2407,7 +3095,7 @@ export async function onSubscription(
 export async function onBackendReady(cb: () => void): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<Record<string, never>>("allmystuff://backend-ready", () => cb());
+  return managedUnlisten(await listen<Record<string, never>>("allmystuff://backend-ready", () => cb()));
 }
 
 // ---- networks · identity · roster -------------------------------------

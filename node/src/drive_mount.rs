@@ -10,9 +10,10 @@ use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use allmystuff_session::{FileEntry, FileEvent};
 use bytes::{Buf, Bytes};
@@ -22,67 +23,19 @@ use dav_server::fs::{
     OpenOptions, ReadDirMeta,
 };
 use futures_util::{future, FutureExt, StreamExt};
-use http_body_util::{BodyExt, Full};
-use hyper::{server::conn::http1, service::service_fn, Request};
+use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+#[cfg(target_os = "macos")]
+use dav_server::localfs::LocalFs;
 use dav_server::{fakels::FakeLs, DavHandler};
 
+pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
+
 use crate::mesh::Mesh;
-
-// `dav-server` deliberately leaves the quota properties out of its special
-// empty-body PROPFIND response for Microsoft clients. Windows WebClient uses
-// exactly that request for Explorer's capacity query, so `get_quota` is never
-// reached even though the mesh source reports the correct used/total values.
-// Turn that one shorthand request into an explicit property request before
-// handing it to the library. Explicit client bodies remain untouched.
-const EMPTY_PROPFIND_WITH_QUOTA: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
-<D:propfind xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">
-  <D:prop>
-    <D:creationdate/><D:displayname/><D:getcontentlanguage/>
-    <D:getcontentlength/><D:getcontenttype/><D:getetag/>
-    <D:getlastmodified/><D:lockdiscovery/><D:resourcetype/>
-    <D:supportedlock/><D:quota-available-bytes/><D:quota-used-bytes/>
-    <Z:Win32CreationTime/><Z:Win32FileAttributes/>
-    <Z:Win32LastAccessTime/><Z:Win32LastModifiedTime/>
-  </D:prop>
-</D:propfind>"#;
-
-fn add_quota_to_empty_propfind<B>(
-    request: Request<B>,
-) -> Request<http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>
-where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
-    let should_expand = request.method().as_str() == "PROPFIND" && request.body().is_end_stream();
-    let (mut parts, body) = request.into_parts();
-    if should_expand {
-        use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-
-        parts.headers.remove(TRANSFER_ENCODING);
-        parts.headers.insert(
-            CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/xml; charset=utf-8"),
-        );
-        parts.headers.insert(
-            CONTENT_LENGTH,
-            hyper::header::HeaderValue::from_str(&EMPTY_PROPFIND_WITH_QUOTA.len().to_string())
-                .expect("static PROPFIND length is a valid header"),
-        );
-        Request::from_parts(
-            parts,
-            Full::new(Bytes::from_static(EMPTY_PROPFIND_WITH_QUOTA))
-                .map_err(|error: Infallible| match error {})
-                .boxed_unsync(),
-        )
-    } else {
-        Request::from_parts(parts, body.map_err(std::io::Error::other).boxed_unsync())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
@@ -97,9 +50,83 @@ struct ActiveMount {
     server: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(target_os = "macos")]
+async fn mount_macos_fleetfiles_location(
+    root: PathBuf,
+    active: &[NativeDriveInfo],
+) -> Result<(NativeDriveInfo, tokio::task::JoinHandle<()>), String> {
+    let label = "Fleetfiles".to_string();
+    let mountpoint = dirs::home_dir()
+        .ok_or_else(|| "couldn't find this user's home folder".to_string())?
+        .join("Library")
+        .join("Application Support")
+        .join("AllMyStuff")
+        .join("Mounts")
+        .join(&label);
+    let mount = choose_mount(&mountpoint.to_string_lossy(), &label, active).await?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let server = DavHandler::builder()
+        .filesystem(LocalFs::new(root, false, false, true))
+        .locksystem(FakeLs::new())
+        .build_handler();
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = server.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                if let Err(error) = http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            let handler = handler.clone();
+                            async move { Ok::<_, Infallible>(handler.handle(request).await) }
+                        }),
+                    )
+                    .await
+                {
+                    tracing::debug!("Fleetfiles Finder connection ended: {error}");
+                }
+            });
+        }
+    });
+    let info = NativeDriveInfo {
+        route: FLEETFILES_ROUTE.into(),
+        label: label.clone(),
+        mount: mount.clone(),
+        port,
+    };
+    if let Err(error) = remember_native_mount(&info) {
+        server_task.abort();
+        return Err(format!(
+            "couldn't record the Fleetfiles Finder mount: {error}"
+        ));
+    }
+    let url = format!("http://127.0.0.1:{port}/");
+    if let Err(error) = mount_native(&mount, &url, &label).await {
+        server_task.abort();
+        if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
+            tracing::warn!(
+                "couldn't clean failed Fleetfiles Finder mount {mount}: {cleanup_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok((info, server_task))
+}
+
 #[derive(Clone, Default)]
 pub struct DriveMounts {
     active: Arc<Mutex<HashMap<String, ActiveMount>>>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DriveMounts {
@@ -117,6 +144,75 @@ impl DriveMounts {
 
     pub async fn cleanup_stale(&self) {
         cleanup_stale_native_mounts().await;
+    }
+    /// Hold native-drive startup recovery ahead of any peer-driven mount.
+    /// The owned guard can move into a background task while node control
+    /// becomes available immediately.
+    pub async fn begin_startup(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lifecycle.clone().lock_owned().await
+    }
+
+    /// Expose the canonical Fleetfiles namespace to the host OS. The supplied
+    /// root remains the authority used by the Files UI and replication engine.
+    /// Windows registers that directory as its sync root; macOS keeps it at
+    /// ~/Fleetfiles and adds a loopback-only volume named Fleetfiles so Finder
+    /// presents the same data under Locations.
+    pub async fn mount_fleetfiles(
+        &self,
+        _mesh: Arc<Mesh>,
+        root: PathBuf,
+    ) -> Result<NativeDriveInfo, String> {
+        if let Some(existing) = self.active.lock().get(FLEETFILES_ROUTE) {
+            return Ok(existing.info.clone());
+        }
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("couldn't create the Fleetfiles namespace: {error}"))?;
+
+        #[cfg(windows)]
+        let (info, server) = {
+            let mount =
+                tokio::task::spawn_blocking(move || crate::windows_fleetfiles::register(root))
+                    .await
+                    .map_err(|error| {
+                        format!("Fleetfiles registration stopped unexpectedly: {error}")
+                    })??;
+            (
+                NativeDriveInfo {
+                    route: FLEETFILES_ROUTE.into(),
+                    label: "Fleetfiles".into(),
+                    mount,
+                    port: 0,
+                },
+                tokio::spawn(std::future::pending()),
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let (info, server) = mount_macos_fleetfiles_location(root, &self.list()).await?;
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let (info, server) = (
+            NativeDriveInfo {
+                route: FLEETFILES_ROUTE.into(),
+                label: "Fleetfiles".into(),
+                mount: root.to_string_lossy().into_owned(),
+                port: 0,
+            },
+            tokio::spawn(std::future::pending()),
+        );
+
+        self.active.lock().insert(
+            FLEETFILES_ROUTE.into(),
+            ActiveMount {
+                info: info.clone(),
+                server,
+            },
+        );
+        #[cfg(windows)]
+        tracing::info!(path = %info.mount, "Fleetfiles registered with Windows Explorer");
+        #[cfg(target_os = "macos")]
+        tracing::info!(path = %info.mount, "Fleetfiles registered under Finder Locations");
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        tracing::info!(path = %info.mount, "Fleetfiles available in the user's home folder");
+        Ok(info)
     }
 
     /// Remove a native mount that belongs to AllMyStuff even when its live
@@ -152,6 +248,7 @@ impl DriveMounts {
         label: String,
         requested_mount: String,
     ) -> Result<NativeDriveInfo, String> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(existing) = self.active.lock().get(&route) {
             return Ok(existing.info.clone());
         }
@@ -195,10 +292,7 @@ impl DriveMounts {
                             io,
                             service_fn(move |request| {
                                 let handler = handler.clone();
-                                async move {
-                                    let request = add_quota_to_empty_propfind(request);
-                                    Ok::<_, Infallible>(handler.handle(request).await)
-                                }
+                                async move { Ok::<_, Infallible>(handler.handle(request).await) }
                             }),
                         )
                         .await
@@ -238,18 +332,21 @@ impl DriveMounts {
         }
         if let Err(error) = mount_native(&mount, &url, &label).await {
             server_task.abort();
-            // `net use` can create a reconnecting/remembered entry before it
-            // reports failure. Remove that partial mapping now; otherwise the
-            // next retry sees its own letter as occupied and Explorer keeps a
-            // ghost drive around.
-            if unmount_native(&mount).await.is_ok() {
-                let _ = forget_native_mount(&mount);
+            // A native helper can report failure after creating a partial
+            // mount. Remove it only when the OS still reports our exact
+            // loopback endpoint; another process may have won the mount race.
+            if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
+                tracing::warn!("couldn't clean failed native mount {mount}: {cleanup_error}");
             }
-            // `label_native` may have written only part of its registry state
-            // before failing; cleanup is deliberately unconditional.
-            let _ = clear_native_label(&mount, Some(port)).await;
             return Err(error);
         }
+        self.active.lock().insert(
+            route.clone(),
+            ActiveMount {
+                info: info.clone(),
+                server: server_task,
+            },
+        );
         // Explorer can create or refresh its MountPoints2 entry while
         // `net use` publishes the mapping. Re-apply the friendly label after
         // that race as well as before it so new mappings and reconnects both
@@ -257,13 +354,6 @@ impl DriveMounts {
         if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
         }
-        self.active.lock().insert(
-            route,
-            ActiveMount {
-                info: info.clone(),
-                server: server_task,
-            },
-        );
         Ok(info)
     }
 
@@ -271,31 +361,36 @@ impl DriveMounts {
         let Some(active) = self.active.lock().remove(route) else {
             return;
         };
-        active.server.abort();
+        #[cfg(windows)]
+        if route == FLEETFILES_ROUTE {
+            // Fleetfiles is a durable local sync root, not a per-process
+            // network connection. Retain it across normal app
+            // restarts so Explorer never sees the user's filesystem flap.
+            active.server.abort();
+            return;
+        }
         crate::spawn(async move {
-            let unmounted = match unmount_native(&active.info.mount).await {
-                Ok(()) => true,
+            // Keep the loopback endpoint alive while Windows verifies and
+            // disconnects this exact mapping. Aborting it first can turn the
+            // redirector into a disconnected/ambiguous state between these
+            // two operations and strand a letter with no ownership marker.
+            let released =
+                release_native_mount_if_owned(&active.info.mount, active.info.port).await;
+            active.server.abort();
+            match released {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        "preserved reassigned native drive {} while stopping {}",
+                        active.info.mount,
+                        active.info.route
+                    );
+                }
                 Err(error) => {
                     tracing::warn!(
                         "couldn't remove native drive {} for {}: {error}",
                         active.info.mount,
                         active.info.route
-                    );
-                    false
-                }
-            };
-            if let Err(error) = clear_native_label(&active.info.mount, Some(active.info.port)).await
-            {
-                tracing::warn!(
-                    "couldn't clear native drive label for {}: {error}",
-                    active.info.mount
-                );
-            }
-            if unmounted {
-                if let Err(error) = forget_native_mount(&active.info.mount) {
-                    tracing::warn!(
-                        "couldn't forget native drive lease for {}: {error}",
-                        active.info.mount
                     );
                 }
             }
@@ -311,19 +406,11 @@ async fn choose_mount(
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
-        if let Some(mount) = normalize_requested_mount(requested)? {
-            if !mount_available(&mount, active, &remembered) {
-                return Err(format!("{mount} is already in use"));
-            }
-            return Ok(mount);
-        }
-        for letter in ('D'..='Z').rev() {
-            let mount = format!("{letter}:");
-            if mount_available(&mount, active, &remembered) {
-                return Ok(mount);
-            }
-        }
-        Err("there are no free drive letters".into())
+        let logical_drives = windows_logical_drive_mask()?
+            | crate::win_privilege::interactive_user_logical_drive_mask()?;
+        select_windows_mount(normalize_requested_mount(requested)?, |mount| {
+            mount_available(mount, active, &remembered, logical_drives)
+        })
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -443,6 +530,31 @@ fn default_unix_mount_root() -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
+fn select_windows_mount(
+    requested: Option<String>,
+    mut available: impl FnMut(&str) -> bool,
+) -> Result<String, String> {
+    if let Some(mount) = requested.as_deref() {
+        if available(mount) {
+            return Ok(mount.to_string());
+        }
+        // A persisted reconnect preference is not ownership. If another
+        // volume now owns the letter, relocate once and persist the successful
+        // replacement instead of fighting that owner on every reconnect.
+        tracing::warn!("{mount} is already in use; choosing another drive letter");
+    }
+    for letter in ('D'..='Z').rev() {
+        let mount = format!("{letter}:");
+        if requested.as_deref() == Some(mount.as_str()) {
+            continue;
+        }
+        if available(&mount) {
+            return Ok(mount);
+        }
+    }
+    Err("there are no free drive letters".into())
+}
+#[cfg(windows)]
 fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> {
     let requested = requested.trim().trim_end_matches(['\\', '/']);
     if requested.is_empty() {
@@ -464,12 +576,14 @@ fn mount_available(
     mount: &str,
     active: &[NativeDriveInfo],
     remembered: &std::collections::HashSet<String>,
+    logical_drives: u32,
 ) -> bool {
-    if std::path::Path::new(&format!("{mount}\\")).exists()
+    if drive_letter_reserved(mount, logical_drives)
+        || remembered.contains(&mount.to_ascii_uppercase())
         || active
             .iter()
             .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
-        || remembered.contains(&mount.to_ascii_uppercase())
+        || std::path::Path::new(&format!("{mount}\\")).exists()
     {
         return false;
     }
@@ -477,12 +591,40 @@ fn mount_available(
 }
 
 #[cfg(windows)]
+fn windows_logical_drive_mask() -> Result<u32, String> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mask = unsafe { GetLogicalDrives() };
+    if mask == 0 {
+        Err(format!(
+            "couldn't inspect assigned Windows drive letters: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(mask)
+    }
+}
+
+#[cfg(windows)]
+fn drive_letter_bit(mount: &str) -> Option<u32> {
+    let letter = mount.as_bytes().first()?.to_ascii_uppercase();
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(1_u32 << u32::from(letter - b'A'))
+}
+
+#[cfg(windows)]
 async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>, String> {
     // One snapshot is both faster and more reliable than `net use X:` per
     // candidate: querying a disconnected remembered letter can make Windows
-    // attempt a reconnect before it answers. The listing includes connected,
-    // disconnected, and reconnecting entries; drive-letter tokens themselves
+    // attempt a reconnect before it answers. Drive-letter tokens themselves
     // are stable even when the surrounding output is localized.
+    //
+    // `net use` is scoped to the caller's logon token. In particular, a node
+    // launched elevated (or by the service) can see a different mapping table
+    // than Explorer. Union it with the signed-in user's persistent Network
+    // keys so an offline or disconnected desktop mapping is still occupied.
     let output = crate::child_process::command("net.exe")
         .arg("use")
         .output()
@@ -491,7 +633,7 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
     if !output.status.success() {
         return Err("Windows couldn't list its existing drive mappings".into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let mut mounts = String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .filter(|token| {
             token.len() == 2
@@ -499,7 +641,57 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
                 && token.as_bytes()[1] == b':'
         })
         .map(str::to_ascii_uppercase)
-        .collect())
+        .collect::<std::collections::HashSet<_>>();
+    mounts.extend(remembered_network_registry_mounts().await?);
+    Ok(mounts)
+}
+
+#[cfg(windows)]
+fn parse_network_registry_mounts(bytes: &[u8]) -> std::collections::HashSet<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().rsplit('\\');
+            let letter = parts.next()?;
+            let parent = parts.next()?;
+            (parent.eq_ignore_ascii_case("Network")
+                && letter.len() == 1
+                && letter.as_bytes()[0].is_ascii_alphabetic())
+            .then(|| format!("{}:", letter.to_ascii_uppercase()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+async fn remembered_network_registry_mounts() -> Result<std::collections::HashSet<String>, String> {
+    let root = drive_registry_root()?;
+    let base = format!(r"{root}\Network");
+    let output = crate::child_process::command("reg.exe")
+        .args(["query", &base])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect remembered Windows drive mappings: {error}"))?;
+    if output.status.success() {
+        return Ok(parse_network_registry_mounts(&output.stdout));
+    }
+
+    // A missing Network key is the ordinary no-persistent-mappings case.
+    // Prove the selected user hive itself is readable before treating it as
+    // empty; otherwise fail closed instead of risking somebody else's letter.
+    let root_query = crate::child_process::command("reg.exe")
+        .args(["query", &root])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect the signed-in user's registry: {error}"))?;
+    if root_query.status.success() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        Err("Windows couldn't inspect the signed-in user's remembered drive mappings".into())
+    }
+}
+#[cfg(windows)]
+fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
+    drive_letter_bit(mount).is_some_and(|bit| logical_drives & bit != 0)
 }
 
 #[cfg(windows)]
@@ -517,26 +709,66 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     if !marker_query.status.success() {
         return Ok(()); // not ours: ordinary availability checks decide
     }
-    let port = parse_registry_dword(&marker_query.stdout).and_then(|p| u16::try_from(p).ok());
+    let Some(port) = parse_registry_dword(&marker_query.stdout).and_then(|p| u16::try_from(p).ok())
+    else {
+        clear_unowned_native_metadata(mount, None).await?;
+        return Ok(());
+    };
+    if !wait_for_stale_mount_identity(mount, port).await? {
+        tracing::warn!(
+            "preserving {mount}: its stale AllMyStuff marker does not match the current mapping"
+        );
+        clear_unowned_native_metadata(mount, Some(port)).await?;
+        return Ok(());
+    }
     tracing::info!("reclaiming stale AllMyStuff drive mapping {mount}");
-    let _ = unmount_native(mount).await;
-    clear_native_label(mount, port).await?;
+    release_native_mount_if_owned(mount, port).await?;
 
     // The Windows redirector may release a disconnected mapping slightly
     // after `net use /delete` returns. Wait for the provider's own listing,
     // not a fixed sleep, so reconnects are both fast and deterministic.
     for _ in 0..30 {
-        if !remembered_network_mounts()
-            .await?
-            .contains(&mount.to_ascii_uppercase())
-        {
+        if !windows_mount_is_assigned(mount).await? {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
     Err(format!(
         "Windows is still releasing {mount}; AllMyStuff will retry"
     ))
+}
+#[cfg(windows)]
+async fn wait_for_stale_mount_identity(mount: &str, port: u16) -> Result<bool, String> {
+    // A newly launched process can observe the letter before Windows exposes
+    // the corresponding WebDAV DOS-device target in its logon namespace.
+    // Retry only while recovering a private stale lease; ordinary startup and
+    // drive selection never poll. A different endpoint never passes the exact
+    // port match, and loses only our stale marker after this bounded window.
+    for attempt in 0..20 {
+        if native_mount_matches_port(mount, port).await? {
+            return Ok(true);
+        }
+        if !windows_mount_is_assigned(mount).await? {
+            return Ok(false);
+        }
+        if attempt < 19 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+async fn windows_mount_is_assigned(mount: &str) -> Result<bool, String> {
+    let bit =
+        drive_letter_bit(mount).ok_or_else(|| format!("{mount} is not a Windows drive letter"))?;
+    let logical = windows_logical_drive_mask()?
+        | crate::win_privilege::interactive_user_logical_drive_mask()?;
+    Ok(logical & bit != 0
+        || remembered_network_mounts()
+            .await?
+            .contains(&mount.to_ascii_uppercase()))
 }
 
 #[cfg(windows)]
@@ -556,12 +788,198 @@ async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
         .filter(|output| output.status.success())
         .and_then(|output| parse_registry_dword(&output.stdout))
         .and_then(|port| u16::try_from(port).ok());
-    tracing::info!("removing saved AllMyStuff drive mapping {mount}");
-    // The persisted mapping relationship is itself ownership proof. Do not
-    // require the auxiliary registry lease: a partial/crashed label write can
-    // lose that marker while Windows still retains the WebDAV drive.
-    let _ = unmount_native(&mount).await;
-    clear_native_label(&mount, port).await
+    let Some(port) = port else {
+        clear_unowned_native_metadata(&mount, None).await?;
+        return Ok(());
+    };
+    if release_native_mount_if_owned(&mount, port).await? {
+        tracing::info!("removed saved AllMyStuff drive mapping {mount}");
+    } else {
+        tracing::warn!(
+            "preserved {mount}: the saved AllMyStuff relationship no longer owns its current mapping"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_endpoint_matches_port(remote: &str, port: u16) -> bool {
+    let expected = format!(r"\\localhost@{port}\DavWWWRoot");
+    remote
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(&expected)
+}
+
+#[cfg(windows)]
+fn windows_mapping_output_remote(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .find(|token| token.starts_with(r"\\"))
+        .map(|token| token.trim_end_matches(['\\', '/']).to_string())
+}
+
+#[cfg(windows)]
+fn windows_mapping_output_matches_port(bytes: &[u8], port: u16) -> bool {
+    windows_mapping_output_remote(bytes)
+        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
+}
+
+#[cfg(windows)]
+async fn windows_mount_ownership(mount: &str, port: u16) -> Result<(bool, bool), String> {
+    let output = crate::child_process::command("net.exe")
+        .args(["use", mount])
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect Windows drive mapping {mount}: {error}"))?;
+    let current = (output.status.success()
+        && windows_mapping_output_matches_port(&output.stdout, port))
+        || windows_dos_device_targets_match_port(
+            &crate::win_privilege::dos_device_targets(mount)?,
+            port,
+        );
+    let interactive = crate::win_privilege::interactive_user_network_mapping(mount)?
+        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
+        || windows_dos_device_targets_match_port(
+            &crate::win_privilege::interactive_user_dos_device_targets(mount)?,
+            port,
+        );
+    Ok((current, interactive))
+}
+
+#[cfg(windows)]
+fn windows_dos_device_targets_match_port(targets: &[String], port: u16) -> bool {
+    let endpoint = format!(r"\localhost@{port}\davwwwroot");
+    targets.iter().any(|target| {
+        target
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+            .contains(&endpoint)
+    })
+}
+
+#[cfg(windows)]
+async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
+    let (current, interactive) = windows_mount_ownership(mount, port).await?;
+    Ok(current || interactive)
+}
+
+#[cfg(target_os = "macos")]
+async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
+    let output = crate::child_process::command("/sbin/mount")
+        .output()
+        .await
+        .map_err(|error| format!("couldn't inspect macOS mounts: {error}"))?;
+    if !output.status.success() {
+        return Err("macOS couldn't list its mounted filesystems".into());
+    }
+    let endpoint = format!("http://127.0.0.1:{port}/");
+    let marker = format!(" on {mount} (");
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&endpoint) && line.contains(&marker)))
+}
+
+#[cfg(target_os = "linux")]
+async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
+    let mounted = mount
+        .replace('\\', r"\134")
+        .replace(' ', r"\040")
+        .replace('\t', r"\011")
+        .replace('\n', r"\012");
+    let endpoint = format!("127.0.0.1:{port}");
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("couldn't inspect Linux mounts: {error}"))?;
+    Ok(mounts.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let separator = fields.iter().position(|field| *field == "-");
+        fields.get(4).is_some_and(|field| *field == mounted)
+            && separator
+                .and_then(|index| fields.get(index + 2))
+                .is_some_and(|source| source.contains(&endpoint))
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+async fn native_mount_matches_port(_mount: &str, _port: u16) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, String> {
+    let (current_owned, interactive_seen) = windows_mount_ownership(mount, port).await?;
+    let interactive_owned = if interactive_seen {
+        // Reconfirm immediately before touching letter-scoped Explorer state.
+        // If another process won a remap race, its different endpoint wins.
+        crate::win_privilege::interactive_user_network_mapping(mount)?
+            .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
+    } else {
+        false
+    };
+    if !current_owned && !interactive_owned {
+        // An assigned-but-unresolved letter is ambiguous during Windows
+        // logon/process teardown. Keep the private lease so the next startup
+        // can prove the exact endpoint and recover it; never erase the only
+        // ownership proof while the OS still reports the letter in use.
+        if windows_mount_is_assigned(mount).await? {
+            tracing::debug!("retaining unresolved AllMyStuff drive lease for {mount}");
+            return Ok(false);
+        }
+        clear_unowned_native_metadata(mount, Some(port)).await?;
+        let _ = forget_native_mount(mount);
+        return Ok(false);
+    }
+
+    if interactive_owned {
+        clear_owned_native_display(mount, Some(port)).await?;
+    }
+    if current_owned {
+        unmount_native(mount).await?;
+    }
+    if interactive_owned {
+        // net.exe may have removed the same mapping when both calls see one
+        // logon namespace. The helper rechecks the exact endpoint while
+        // impersonating Explorer and narrows the letter-reuse race around the
+        // cancellation itself.
+        let remote = format!(r"\\localhost@{port}\DavWWWRoot");
+        crate::win_privilege::disconnect_interactive_user_network_mapping_if_matches(
+            mount, &remote,
+        )?;
+    }
+
+    // WNetCancelConnection2 can report success before WebClient removes the
+    // DOS-device letter. Do not discard the private ownership lease until the
+    // union of the service and Explorer namespaces proves the letter is free.
+    // If it stays assigned (including an ambiguous or newly foreign mapping),
+    // preserving the marker lets bounded startup recovery re-prove identity;
+    // it is much safer than consuming another drive letter on every restart.
+    for attempt in 0..30 {
+        if !windows_mount_is_assigned(mount).await? {
+            clear_owned_native_mount_history(port).await;
+            clear_native_lease_marker(mount, Some(port)).await?;
+            forget_native_mount(mount)?;
+            return Ok(true);
+        }
+        if attempt < 29 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    Err(format!(
+        "Windows is still releasing {mount}; its AllMyStuff ownership lease was retained"
+    ))
+}
+
+#[cfg(not(windows))]
+async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, String> {
+    if !native_mount_matches_port(mount, port).await? {
+        clear_unowned_native_metadata(mount, Some(port)).await?;
+        let _ = forget_native_mount(mount);
+        return Ok(false);
+    }
+    unmount_native(mount).await?;
+    clear_native_label(mount, Some(port)).await?;
+    forget_native_mount(mount)?;
+    Ok(true)
 }
 
 async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
@@ -694,14 +1112,16 @@ fn forget_native_mount(_mount: &str) -> Result<(), String> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
-    if !load_native_mount_leases()
+    let Some(lease) = load_native_mount_leases()
         .iter()
-        .any(|lease| lease.mount == mount)
-    {
+        .find(|lease| lease.mount == mount)
+        .cloned()
+    else {
         return Ok(());
-    }
-    unmount_native(mount).await?;
-    forget_native_mount(mount)
+    };
+    release_native_mount_if_owned(mount, lease.port)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -710,23 +1130,19 @@ async fn remove_known_native_mount(_mount: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn windows_webdav_remote(url: &str) -> Result<String, String> {
+    let port = url
+        .strip_prefix("http://localhost:")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .and_then(|port| port.parse::<u16>().ok())
+        .ok_or_else(|| format!("invalid local AllMyStuff WebDAV address: {url}"))?;
+    Ok(format!(r"\\localhost@{port}\DavWWWRoot"))
+}
+
+#[cfg(windows)]
 async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
-    let output = crate::child_process::command("net.exe")
-        .args(["use", mount, url, "/persistent:no"])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't launch Windows drive mapping: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if detail.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        } else {
-            detail
-        };
-        Err(format!("Windows couldn't map {mount}: {detail}"))
-    }
+    let remote = windows_webdav_remote(url)?;
+    crate::win_privilege::connect_interactive_user_network_mapping(mount, &remote)
 }
 
 #[cfg(target_os = "macos")]
@@ -894,32 +1310,15 @@ async fn label_native(_mount: &str, _label: &str, _route: &str, _port: u16) -> R
 }
 
 #[cfg(windows)]
-async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String> {
+async fn clear_native_lease_marker(mount: &str, port: Option<u16>) -> Result<(), String> {
     let letter = mount.trim_end_matches(':');
     let root = drive_registry_root()?;
     let marker = format!(r"{root}\Software\AllMyStuff\MappedDrives\{letter}");
-    let drive_icon_key = format!(
-        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
-    );
-    // `/persistent:no` should avoid this key, but a failed or interrupted
-    // WebDAV redirector can still leave one behind. This function is called
-    // only for a letter carrying our private lease marker.
-    let network_key = format!(r"{root}\Network\{letter}");
-    let _ = crate::child_process::command("reg.exe")
-        .args(["delete", &network_key, "/f"])
-        .output()
-        .await;
-    // A missing key is already the desired state, so deletion is best-effort.
-    let _ = crate::child_process::command("reg.exe")
-        .args(["delete", &drive_icon_key, "/f"])
-        .output()
-        .await;
     if let Some(port) = port {
         let mount_point_key = format!(
             r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
         );
-        // Leave Explorer's mount-history key intact; it owns that history.
-        // Remove only the display value AllMyStuff authored.
+        // Leave Explorer's mount history intact; remove only our label.
         let _ = crate::child_process::command("reg.exe")
             .args(["delete", &mount_point_key, "/v", "_LabelFromReg", "/f"])
             .output()
@@ -929,6 +1328,66 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
         .args(["delete", &marker, "/f"])
         .output()
         .await;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn clear_owned_native_mount_history(port: u16) {
+    let Ok(root) = drive_registry_root() else {
+        return;
+    };
+    let mount_point_key = format!(
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+    );
+    // This endpoint was proven to be ours and both Windows mapping namespaces
+    // are now free. Remove its shell history too; retaining it makes Explorer
+    // accumulate bare DavWWWRoot (\\localhost@port) network locations.
+    let _ = crate::child_process::command("reg.exe")
+        .args(["delete", &mount_point_key, "/f"])
+        .output()
+        .await;
+}
+
+#[cfg(not(windows))]
+async fn clear_native_lease_marker(_mount: &str, _port: Option<u16>) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn clear_owned_native_display(mount: &str, port: Option<u16>) -> Result<(), String> {
+    let letter = mount.trim_end_matches(':');
+    let root = drive_registry_root()?;
+    let drive_icon_key = format!(
+        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
+    );
+    // The current mapping has already been proven to be ours. Remove
+    // letter-scoped display state before unmapping so another process cannot
+    // reuse the letter in the gap and then lose its own registry values.
+    let network_key = format!(r"{root}\Network\{letter}");
+    let _ = crate::child_process::command("reg.exe")
+        .args(["delete", &network_key, "/f"])
+        .output()
+        .await;
+    let _ = crate::child_process::command("reg.exe")
+        .args(["delete", &drive_icon_key, "/f"])
+        .output()
+        .await;
+    if let Some(port) = port {
+        let mount_point_key = format!(
+            r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
+        );
+        let _ = crate::child_process::command("reg.exe")
+            .args(["delete", &mount_point_key, "/v", "_LabelFromReg", "/f"])
+            .output()
+            .await;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String> {
+    clear_owned_native_display(mount, port).await?;
+    clear_native_lease_marker(mount, port).await?;
     refresh_explorer_drive_labels().await;
     Ok(())
 }
@@ -936,6 +1395,36 @@ async fn clear_native_label(mount: &str, port: Option<u16>) -> Result<(), String
 #[cfg(not(windows))]
 async fn clear_native_label(_mount: &str, _port: Option<u16>) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(windows)]
+async fn clear_unowned_native_metadata(mount: &str, port: Option<u16>) -> Result<(), String> {
+    // If the letter is now assigned, only our private marker and endpoint
+    // label are safe to remove. Network and DriveIcons state may belong to
+    // the current owner. A free letter cannot contain live third-party state.
+    let logical_assigned = match windows_logical_drive_mask() {
+        Ok(mask) => drive_letter_bit(mount).is_none_or(|bit| mask & bit != 0),
+        Err(_) => true,
+    };
+    let interactive_assigned = match crate::win_privilege::interactive_user_logical_drive_mask() {
+        Ok(mask) => drive_letter_bit(mount).is_none_or(|bit| mask & bit != 0),
+        Err(_) => true,
+    };
+    let remembered_assigned = remembered_network_mounts()
+        .await
+        .map(|mounts| mounts.contains(&mount.to_ascii_uppercase()))
+        .unwrap_or(true);
+    let assigned = logical_assigned || interactive_assigned || remembered_assigned;
+    if assigned {
+        clear_native_lease_marker(mount, port).await
+    } else {
+        clear_native_label(mount, port).await
+    }
+}
+
+#[cfg(not(windows))]
+async fn clear_unowned_native_metadata(mount: &str, port: Option<u16>) -> Result<(), String> {
+    clear_native_lease_marker(mount, port).await
 }
 
 #[cfg(windows)]
@@ -980,10 +1469,15 @@ async fn cleanup_stale_native_mounts() {
             .await
             .ok()
             .filter(|output| output.status.success())
-            .and_then(|output| parse_registry_dword(&output.stdout));
-        tracing::info!("cleaning stale AllMyStuff drive mapping {mount}");
-        let _ = unmount_native(&mount).await;
-        let _ = clear_native_label(&mount, port.and_then(|p| u16::try_from(p).ok())).await;
+            .and_then(|output| parse_registry_dword(&output.stdout))
+            .and_then(|port| u16::try_from(port).ok());
+        let result = match port {
+            Some(_) => reclaim_stale_owned_mount(&mount).await,
+            None => clear_unowned_native_metadata(&mount, None).await,
+        };
+        if let Err(error) = result {
+            tracing::warn!("couldn't clean stale AllMyStuff drive mapping {mount}: {error}");
+        }
     }
 }
 
@@ -1031,7 +1525,7 @@ async fn cleanup_stale_native_mounts() {
     let mut retained = Vec::new();
     for lease in leases {
         tracing::info!("cleaning stale AllMyStuff drive mount {}", lease.mount);
-        if let Err(error) = unmount_native(&lease.mount).await {
+        if let Err(error) = release_native_mount_if_owned(&lease.mount, lease.port).await {
             tracing::warn!(
                 "couldn't clean stale native drive mount {}: {error}",
                 lease.mount
@@ -1067,10 +1561,16 @@ impl RemoteDavFs {
 
     async fn request(&self, make: impl FnOnce(u64) -> FileEvent) -> FsResult<Vec<FileEvent>> {
         let req = self.mesh.next_file_request_id();
-        self.mesh
-            .drive_file_request(&self.route, make(req))
-            .await
-            .map_err(|reason| map_remote_error(&reason))
+        let started = Instant::now();
+        let result = self.mesh.drive_file_request(&self.route, make(req)).await;
+        if started.elapsed() >= Duration::from_millis(250) {
+            tracing::debug!(
+                "native drive request {req} on {} took {:?}",
+                self.route,
+                started.elapsed()
+            );
+        }
+        result.map_err(|reason| map_remote_error(&reason))
     }
 
     async fn stat(&self, path: String) -> FsResult<RemoteMeta> {
@@ -1096,7 +1596,16 @@ impl DavFileSystem for RemoteDavFs {
         async move {
             let events = self.request(|req| FileEvent::Quota { req }).await?;
             match events.into_iter().next() {
-                Some(FileEvent::QuotaInfo { used, total, .. }) => Ok((used, Some(total))),
+                Some(FileEvent::QuotaInfo { used, total, .. }) => {
+                    tracing::debug!(
+                        route = %self.route,
+                        used_bytes = used,
+                        total_bytes = total,
+                        available_bytes = total.saturating_sub(used),
+                        "native filesystem capacity response"
+                    );
+                    Ok((used, Some(total)))
+                }
                 Some(FileEvent::Err { reason, .. }) => Err(map_remote_error(&reason)),
                 _ => Err(FsError::GeneralFailure),
             }
@@ -1162,7 +1671,14 @@ impl DavFileSystem for RemoteDavFs {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         let path = Self::path(path);
         async move {
-            let events = self.request(|req| FileEvent::List { req, path }).await?;
+            let events = self
+                .request(|req| FileEvent::List {
+                    req,
+                    path,
+                    cursor: None,
+                    limit: None,
+                })
+                .await?;
             match events.into_iter().next() {
                 Some(FileEvent::Entries { entries, .. }) => {
                     let entries: Vec<Box<dyn DavDirEntry>> = entries
@@ -1347,29 +1863,31 @@ impl DavFile for RemoteFile {
 }
 
 fn map_remote_error(reason: &str) -> FsError {
-    tracing::warn!("native drive operation failed: {reason}");
-    let reason = reason.to_ascii_lowercase();
-    if reason.contains("not found") || reason.contains("cannot find") || reason.contains("no such")
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("not found")
+        || normalized.contains("cannot find")
+        || normalized.contains("no such")
     {
+        tracing::debug!("native drive lookup missed: {reason}");
         FsError::NotFound
-    } else if reason.contains("already") || reason.contains("exists") {
+    } else if normalized.contains("already") || normalized.contains("exists") {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::Exists
-    } else if reason.contains("denied")
-        || reason.contains("permission")
-        || reason.contains("leaves the mapped")
+    } else if normalized.contains("denied")
+        || normalized.contains("permission")
+        || normalized.contains("leaves the mapped")
     {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::Forbidden
     } else {
+        tracing::warn!("native drive operation failed: {reason}");
         FsError::GeneralFailure
     }
 }
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{add_quota_to_empty_propfind, registry_root_for_client};
-    use bytes::Bytes;
-    use http_body_util::{BodyExt, Empty, Full};
-    use hyper::Request;
+    use super::registry_root_for_client;
 
     #[test]
     fn service_drive_state_targets_the_interactive_user_hive() {
@@ -1385,37 +1903,17 @@ mod registry_tests {
         assert!(registry_root_for_client(Some(r"S-1-5-21\Software")).is_err());
         assert!(registry_root_for_client(Some("not-a-sid")).is_err());
     }
-
-    #[tokio::test]
-    async fn empty_propfind_explicitly_requests_drive_capacity() {
-        let request = Request::builder()
-            .method("PROPFIND")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let request = add_quota_to_empty_propfind(request);
-
-        let body = request.into_body().collect().await.unwrap().to_bytes();
-        let xml = String::from_utf8_lossy(&body);
-        assert!(xml.contains("quota-available-bytes"));
-        assert!(xml.contains("quota-used-bytes"));
-    }
-
-    #[tokio::test]
-    async fn explicit_propfind_body_is_preserved() {
-        let request = Request::builder()
-            .method("PROPFIND")
-            .body(Full::new(Bytes::from_static(b"<explicit/>")))
-            .unwrap();
-        let request = add_quota_to_empty_propfind(request);
-
-        let body = request.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"<explicit/>");
-    }
 }
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::{normalize_requested_mount, parse_registry_dword};
+    use super::{
+        drive_letter_reserved, mount_available, normalize_requested_mount,
+        parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
+        windows_dos_device_targets_match_port, windows_mapping_output_matches_port,
+        windows_webdav_remote, NativeDriveInfo,
+    };
+    use std::collections::HashSet;
 
     #[test]
     fn parses_allmystuff_drive_marker_port() {
@@ -1424,6 +1922,24 @@ mod windows_tests {
     }
 
     #[test]
+    fn dos_device_identity_recovers_a_disconnected_webdav_mapping() {
+        let targets = vec![
+            r"\Device\WebDavRedirector\;R:0000000000001234\localhost@63229\DavWWWRoot".to_string(),
+        ];
+        assert!(windows_dos_device_targets_match_port(&targets, 63_229));
+        assert!(!windows_dos_device_targets_match_port(&targets, 63_230));
+    }
+
+    #[test]
+    fn local_webdav_url_becomes_the_windows_redirector_endpoint() {
+        assert_eq!(
+            windows_webdav_remote("http://localhost:64895/").unwrap(),
+            r"\\localhost@64895\DavWWWRoot"
+        );
+        assert!(windows_webdav_remote("http://server:64895/").is_err());
+    }
+    #[test]
+
     fn requested_drive_letters_are_canonical_and_strict() {
         assert_eq!(
             normalize_requested_mount(" x:\\").unwrap(),
@@ -1432,5 +1948,73 @@ mod windows_tests {
         assert_eq!(normalize_requested_mount("").unwrap(), None);
         assert!(normalize_requested_mount("XX:").is_err());
         assert!(normalize_requested_mount("1:").is_err());
+    }
+
+    #[test]
+    fn assigned_drive_mask_wins_even_when_the_path_is_inaccessible() {
+        let z = 1_u32 << u32::from(b'Z' - b'A');
+        assert!(drive_letter_reserved("Z:", z));
+        assert!(drive_letter_reserved("z:", z));
+        assert!(!drive_letter_reserved("Y:", z));
+    }
+
+    #[test]
+    fn disconnected_user_mappings_are_parsed_without_localized_status_text() {
+        let output = br#"
+HKEY_CURRENT_USER\Network\Y
+HKEY_USERS\S-1-5-21-1000\Network\p
+HKEY_CURRENT_USER\Software\Unrelated\Q
+HKEY_CURRENT_USER\Network\TooLong
+"#;
+        assert_eq!(
+            parse_network_registry_mounts(output),
+            HashSet::from(["P:".to_string(), "Y:".to_string()])
+        );
+    }
+
+    #[test]
+    fn every_windows_assignment_surface_reserves_its_letter() {
+        let logical = 1_u32 << u32::from(b'X' - b'A');
+        let remembered = HashSet::from(["Y:".to_string()]);
+        let active = vec![NativeDriveInfo {
+            route: "route".into(),
+            label: "label".into(),
+            mount: "W:".into(),
+            port: 1,
+        }];
+
+        assert!(!mount_available("X:", &active, &remembered, logical));
+        assert!(!mount_available("Y:", &active, &remembered, logical));
+        assert!(!mount_available("W:", &active, &remembered, logical));
+        assert!(mount_available("V:", &active, &remembered, logical));
+    }
+
+    #[test]
+    fn occupied_requested_letter_relocates_once_to_a_safe_letter() {
+        let exact = select_windows_mount(Some("Z:".into()), |mount| mount == "Z:").unwrap();
+        assert_eq!(exact, "Z:");
+
+        let mut checked = Vec::new();
+        let relocated = select_windows_mount(Some("Z:".into()), |mount| {
+            checked.push(mount.to_string());
+            mount == "Y:"
+        })
+        .unwrap();
+        assert_eq!(relocated, "Y:");
+        assert_eq!(checked, ["Z:", "Y:"]);
+    }
+
+    #[test]
+    fn ownership_requires_the_recorded_loopback_webdav_endpoint() {
+        let ours = br#"Local name Z:
+Remote name \\localhost@60488\DavWWWRoot
+Status OK"#;
+        let theirs = br#"Local name Z:
+Remote name \\server\existing-share
+Status OK"#;
+        assert!(windows_mapping_output_matches_port(ours, 60_488));
+        assert!(!windows_mapping_output_matches_port(ours, 50_734));
+        assert!(!windows_mapping_output_matches_port(theirs, 60_488));
+        assert!(!windows_mapping_output_matches_port(b"", 60_488));
     }
 }

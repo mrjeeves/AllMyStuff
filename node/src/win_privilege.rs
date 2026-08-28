@@ -181,24 +181,40 @@ mod imp {
     use std::ffi::c_void;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_BAD_DEVICE, ERROR_FILE_NOT_FOUND,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_PATH_NOT_FOUND,
+        FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::NetworkManagement::WNet::{
+        WNetAddConnection2W, WNetCancelConnection2W, WNetGetConnectionW, NETRESOURCEW,
+        RESOURCETYPE_DISK,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-        SecurityImpersonation, SetTokenInformation, TokenElevation, TokenIntegrityLevel,
-        TokenPrimary, TokenSessionId, TokenUIAccess, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
+        TokenElevation, TokenIntegrityLevel, TokenPrimary, TokenSessionId, TokenUIAccess,
+        TokenUser, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
     };
-    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
+    };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
-        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        CreateProcessAsUserW, GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+        OpenThreadToken, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
         STARTUPINFOW,
     };
 
     use super::{Integrity, Posture};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
     /// `UOI_NAME` — ask `GetUserObjectInformationW` for an object's name.
     const UOI_NAME: u32 = 2;
@@ -340,6 +356,410 @@ mod imp {
         unsafe { WTSGetActiveConsoleSessionId() }
     }
 
+    /// Drive letters visible to the signed-in user's Explorer token.
+    ///
+    /// UAC gives elevated and ordinary processes separate DOS-device maps.
+    /// The service has the same split because it retains its SYSTEM token even
+    /// after moving into the console session. Looking only at our own
+    /// `GetLogicalDrives` result can therefore select a letter already used on
+    /// the actual desktop. Impersonate Explorer only for this read and return
+    /// its bitmask; no process is launched and no mapping is contacted.
+    pub fn interactive_user_logical_drive_mask() -> Result<u32, String> {
+        // Token impersonation is thread-local. Isolate it on a short-lived OS
+        // thread so even a pathological RevertToSelf failure cannot leak the
+        // desktop user's token onto a long-lived async executor worker.
+        std::thread::Builder::new()
+            .name("ams-drive-namespace".into())
+            .spawn(read_interactive_user_logical_drive_mask)
+            .map_err(|error| format!("couldn't start the drive namespace check: {error}"))?
+            .join()
+            .map_err(|_| "the drive namespace check stopped unexpectedly".to_string())?
+    }
+
+    fn read_interactive_user_logical_drive_mask() -> Result<u32, String> {
+        with_interactive_user(|| {
+            let mask = unsafe { GetLogicalDrives() };
+            (mask != 0)
+                .then_some(mask)
+                .ok_or_else(|| "couldn't inspect the signed-in user's drive letters".into())
+        })
+        .map(|mask| mask.unwrap_or(0))
+    }
+
+    /// Resolve a drive in the signed-in Explorer user's DOS-device namespace.
+    pub fn interactive_user_network_mapping(mount: &str) -> Result<Option<String>, String> {
+        let mount = mount.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-lookup".into())
+            .spawn(move || {
+                with_interactive_user(|| read_network_mapping(&mount)).map(Option::flatten)
+            })
+            .map_err(|error| format!("couldn't start the drive mapping check: {error}"))?
+            .join()
+            .map_err(|_| "the drive mapping check stopped unexpectedly".to_string())?
+    }
+
+    /// Read the DOS-device targets behind a drive in this process's logon
+    /// namespace. Unlike opening the drive or asking WebDAV to reconnect, this
+    /// is a local object-manager lookup and remains reliable when the old
+    /// localhost bridge died in a crash.
+    pub fn dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        read_dos_device_targets(mount)
+    }
+
+    /// Read the same object-manager identity in the signed-in Explorer user's
+    /// namespace. Elevated/service and desktop mappings can be different.
+    pub fn interactive_user_dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        let mount = mount.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-device-lookup".into())
+            .spawn(move || {
+                with_interactive_user(|| read_dos_device_targets(&mount))
+                    .map(|targets| targets.unwrap_or_default())
+            })
+            .map_err(|error| format!("couldn't start the drive device check: {error}"))?
+            .join()
+            .map_err(|_| "the drive device check stopped unexpectedly".to_string())?
+    }
+
+    fn read_dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        let local = mount
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut targets = vec![0_u16; 1024];
+        loop {
+            let length = unsafe {
+                QueryDosDeviceW(local.as_ptr(), targets.as_mut_ptr(), targets.len() as u32)
+            };
+            if length != 0 {
+                return Ok(targets[..length as usize]
+                    .split(|unit| *unit == 0)
+                    .filter(|target| !target.is_empty())
+                    .map(String::from_utf16_lossy)
+                    .collect());
+            }
+            let error = unsafe { GetLastError() };
+            match error {
+                ERROR_INSUFFICIENT_BUFFER if targets.len() < 32_768 => {
+                    targets.resize((targets.len() * 2).min(32_768), 0);
+                }
+                ERROR_BAD_DEVICE | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                    return Ok(Vec::new());
+                }
+                _ => {
+                    return Err(format!(
+                        "Windows couldn't inspect the DOS-device target for {mount} (error {error})"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Create a temporary drive mapping in the signed-in Explorer user's
+    /// logon namespace. A service or scheduled task has a different DOS-device
+    /// map; running `net use` there produces a drive the user cannot see and
+    /// leaks one private-session mapping on every restart.
+    pub fn connect_interactive_user_network_mapping(
+        mount: &str,
+        remote: &str,
+    ) -> Result<(), String> {
+        let mount = mount.to_string();
+        let remote = remote.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-connect".into())
+            .spawn(move || {
+                with_interactive_user(|| {
+                    let mut local = mount
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let mut remote_wide = remote
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let resource = NETRESOURCEW {
+                        dwType: RESOURCETYPE_DISK,
+                        lpLocalName: local.as_mut_ptr(),
+                        lpRemoteName: remote_wide.as_mut_ptr(),
+                        ..Default::default()
+                    };
+                    let status = unsafe {
+                        WNetAddConnection2W(
+                            &resource,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                        )
+                    };
+                    (status == NO_ERROR).then_some(()).ok_or_else(|| {
+                        format!(
+                            "Windows couldn't connect {mount} to {remote} in the signed-in user's drive namespace (error {status})"
+                        )
+                    })
+                })
+            })
+            .map_err(|error| format!("couldn't start the drive connection: {error}"))?
+            .join()
+            .map_err(|_| "the drive connection stopped unexpectedly".to_string())?
+            .and_then(|connected| {
+                connected.ok_or_else(|| {
+                    "there is no signed-in Explorer session to receive the drive mapping".into()
+                })
+            })
+    }
+    fn read_network_mapping(mount: &str) -> Result<Option<String>, String> {
+        let local = mount
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut remote = vec![0_u16; 512];
+        loop {
+            let mut length = remote.len() as u32;
+            let status =
+                unsafe { WNetGetConnectionW(local.as_ptr(), remote.as_mut_ptr(), &mut length) };
+            match status {
+                NO_ERROR => {
+                    let end = remote
+                        .iter()
+                        .position(|unit| *unit == 0)
+                        .unwrap_or(remote.len());
+                    return Ok(Some(String::from_utf16_lossy(&remote[..end])));
+                }
+                ERROR_MORE_DATA => {
+                    let required = usize::try_from(length)
+                        .map_err(|_| "Windows returned an invalid network path length")?;
+                    if required == 0 || required > 32_768 {
+                        return Err("Windows returned an invalid network path length".into());
+                    }
+                    remote.resize(required.saturating_add(1), 0);
+                }
+                ERROR_BAD_DEVICE | ERROR_NOT_CONNECTED => return Ok(None),
+                error => {
+                    return Err(format!(
+                        "Windows couldn't inspect {mount} in the signed-in user's drive namespace (error {error})"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Disconnect a mapping only while it still resolves to the exact endpoint
+    /// the caller proved belongs to AllMyStuff. Keep the identity check and
+    /// cancellation under one Explorer-token impersonation window so a drive
+    /// letter reused by another application is never cancelled from a stale
+    /// observation made by the service session.
+    pub fn disconnect_interactive_user_network_mapping_if_matches(
+        mount: &str,
+        expected_remote: &str,
+    ) -> Result<bool, String> {
+        let mount = mount.to_string();
+        let expected_remote = expected_remote.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-disconnect".into())
+            .spawn(move || {
+                with_interactive_user(|| {
+                    let Some(remote) = read_network_mapping(&mount)? else {
+                        return Ok(false);
+                    };
+                    if !remote
+                        .trim_end_matches(['\\', '/'])
+                        .eq_ignore_ascii_case(expected_remote.trim_end_matches(['\\', '/']))
+                    {
+                        return Ok(false);
+                    }
+                    let local = mount
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let status = unsafe { WNetCancelConnection2W(local.as_ptr(), 0, TRUE) };
+                    match status {
+                        NO_ERROR => Ok(true),
+                        ERROR_BAD_DEVICE | ERROR_NOT_CONNECTED => Ok(false),
+                        error => Err(format!(
+                            "Windows couldn't disconnect {mount} in the signed-in user's drive namespace (error {error})"
+                        )),
+                    }
+                })
+                .map(|removed| removed.unwrap_or(false))
+            })
+            .map_err(|error| format!("couldn't start the drive disconnect: {error}"))?
+            .join()
+            .map_err(|_| "the drive disconnect stopped unexpectedly".to_string())?
+    }
+
+    /// Run one bounded operation as the signed-in Explorer user. Every public
+    /// caller uses a disposable OS thread so a failed revert cannot leak the
+    /// desktop user's token onto a long-lived async executor worker.
+    fn with_interactive_user<T>(
+        read: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let Some(process_id) = interactive_explorer_process_id()? else {
+            return Ok(None);
+        };
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
+        if process.is_null() {
+            return Err("couldn't inspect the signed-in user's Explorer process".into());
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let opened = unsafe {
+            OpenProcessToken(
+                process,
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+                &mut token,
+            )
+        };
+        unsafe { CloseHandle(process) };
+        if opened == 0 {
+            return Err("couldn't inspect the signed-in user's Explorer token".into());
+        }
+        if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+            unsafe { CloseHandle(token) };
+            return Err("couldn't enter the signed-in user's drive namespace".into());
+        }
+        let result = read();
+        let reverted = unsafe { RevertToSelf() };
+        unsafe { CloseHandle(token) };
+        if reverted == 0 {
+            return Err("couldn't leave the signed-in user's drive namespace".into());
+        }
+        result.map(Some)
+    }
+
+    /// Execute a short operation in the signed-in Explorer user's identity.
+    ///
+    /// The disposable thread is part of the safety boundary: even if Windows
+    /// fails to revert impersonation, no async worker can retain that token.
+    pub(crate) fn interactive_user_call<T: Send + 'static>(
+        thread_name: &str,
+        action: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let thread_name = thread_name.to_string();
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || with_interactive_user(action))
+            .map_err(|error| format!("couldn't start the interactive-user operation: {error}"))?
+            .join()
+            .map_err(|_| "the interactive-user operation stopped unexpectedly".to_string())?
+            .and_then(|value| {
+                value.ok_or_else(|| {
+                    "there is no signed-in Explorer session for Fleetfiles".to_string()
+                })
+            })
+    }
+
+    /// Return the SID of the effective thread token. Fleetfiles calls this
+    /// while impersonating Explorer, so a LocalSystem service registers the
+    /// sync root in the desktop user's namespace with the required stable ID.
+    pub(crate) fn effective_user_sid() -> Result<String, String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &mut token) } == 0 {
+            return Err("couldn't inspect the signed-in user's token".into());
+        }
+
+        let result = (|| {
+            let mut required = 0_u32;
+            unsafe {
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required)
+            };
+            if required < std::mem::size_of::<TOKEN_USER>() as u32 {
+                return Err("Windows returned an invalid user-token identity".into());
+            }
+            let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            if unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    required,
+                    &mut required,
+                )
+            } == 0
+            {
+                return Err("couldn't read the signed-in user's identity".into());
+            }
+            let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+            let mut sid_text = std::ptr::null_mut();
+            if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0
+                || sid_text.is_null()
+            {
+                return Err("couldn't format the signed-in user's identity".into());
+            }
+            let mut length = 0_usize;
+            while length < 256 && unsafe { *sid_text.add(length) } != 0 {
+                length += 1;
+            }
+            let sid =
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, length) });
+            unsafe { LocalFree(sid_text.cast()) };
+            if length == 0 || length == 256 {
+                return Err("Windows returned an invalid user SID".into());
+            }
+            Ok(sid)
+        })();
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    /// Find Explorer in the physical console session even when the caller is a
+    /// service or scheduled task in a different Windows session. GetShellWindow
+    /// only sees the caller's window station and is therefore merely a fallback.
+    fn interactive_explorer_process_id() -> Result<Option<u32>, String> {
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        if session == NO_SESSION {
+            return Ok(None);
+        }
+
+        let mut processes: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
+        let mut count = 0_u32;
+        let enumerated = unsafe {
+            WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut processes, &mut count)
+        };
+        if enumerated != 0 {
+            let process_id = if processes.is_null() || count == 0 {
+                None
+            } else {
+                let entries = unsafe { std::slice::from_raw_parts(processes, count as usize) };
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.SessionId == session
+                            && wide_process_name_is(entry.pProcessName, "explorer.exe")
+                    })
+                    .map(|entry| entry.ProcessId)
+                    .filter(|process_id| *process_id != 0)
+            };
+            if !processes.is_null() {
+                unsafe { WTSFreeMemory(processes.cast()) };
+            }
+            return Ok(process_id);
+        }
+
+        // Restricted desktop builds can deny WTS enumeration while still
+        // allowing a same-session process to inspect its own shell.
+        let shell = unsafe { GetShellWindow() };
+        if shell.is_null() {
+            return Err("couldn't enumerate the signed-in user's Explorer process".into());
+        }
+        let mut process_id = 0;
+        if unsafe { GetWindowThreadProcessId(shell, &mut process_id) } == 0 || process_id == 0 {
+            return Err("couldn't identify the signed-in user's Explorer process".into());
+        }
+        Ok(Some(process_id))
+    }
+
+    fn wide_process_name_is(name: *const u16, expected: &str) -> bool {
+        if name.is_null() {
+            return false;
+        }
+        let mut length = 0;
+        while length < 260 && unsafe { *name.add(length) } != 0 {
+            length += 1;
+        }
+        let name = unsafe { std::slice::from_raw_parts(name, length) };
+        String::from_utf16_lossy(name).eq_ignore_ascii_case(expected)
+    }
     /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
     /// to the console — between a logoff and the next logon, or on a box whose
     /// session is being transferred.
@@ -680,6 +1100,35 @@ mod imp {
         0
     }
 
+    pub fn interactive_user_logical_drive_mask() -> Result<u32, String> {
+        Ok(0)
+    }
+
+    pub fn interactive_user_network_mapping(_mount: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    pub fn connect_interactive_user_network_mapping(
+        _mount: &str,
+        _remote: &str,
+    ) -> Result<(), String> {
+        Err("interactive Windows drive mappings are unavailable".into())
+    }
+
+    pub fn disconnect_interactive_user_network_mapping_if_matches(
+        _mount: &str,
+        _expected_remote: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    pub fn dos_device_targets(_mount: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    pub fn interactive_user_dos_device_targets(_mount: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
     /// No session-0 split to escape: a Unix daemon that needs a display gets it
     /// from the display server's own rules, not from token surgery.
     pub struct ConsoleAgent;
@@ -717,7 +1166,14 @@ mod imp {
     }
 }
 
-pub use imp::{active_console_session, current_posture, ConsoleAgent, DesktopFollower};
+pub use imp::{
+    active_console_session, connect_interactive_user_network_mapping, current_posture,
+    disconnect_interactive_user_network_mapping_if_matches, dos_device_targets,
+    interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
+    interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
+};
+#[cfg(windows)]
+pub(crate) use imp::{effective_user_sid, interactive_user_call};
 
 /// Whether this build targets Windows at all, hoisted here so callers don't
 /// sprinkle `cfg!`.
@@ -810,6 +1266,18 @@ mod tests {
     fn no_arguments_is_just_the_quoted_exe() {
         let cmd = quote_command(std::path::Path::new("agent.exe"), &[]);
         assert_eq!(cmd, r#""agent.exe""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_interactive_drive_namespace_can_be_inspected_without_mutation() {
+        interactive_user_logical_drive_mask().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_interactive_network_namespace_can_be_queried_without_mutation() {
+        interactive_user_network_mapping("X:").unwrap();
     }
 
     #[test]

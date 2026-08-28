@@ -9,6 +9,7 @@
   import NetworksSection from "./settings/NetworksSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
+  import FilesSection from "./settings/FilesSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
   import DevicesSection from "./settings/DevicesSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
@@ -18,6 +19,7 @@
   const tabs = $derived<{ id: SettingsTab; label: string; icon: string }[]>([
     { id: "this_device", label: "This Device", icon: "💻" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
+    ...(!isMobile() ? [{ id: "files" as SettingsTab, label: "Files", icon: "📁" }] : []),
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "devices", label: "Devices", icon: "🖥" },
@@ -79,6 +81,8 @@
         <NetworksSection />
       {:else if app.settingsTab === "fleet"}
         <FleetSection />
+      {:else if app.settingsTab === "files" && !isMobile()}
+        <FilesSection />
       {:else if app.settingsTab === "sharing"}
         <SharingSection />
       {:else if app.settingsTab === "devices"}

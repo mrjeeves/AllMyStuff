@@ -16,6 +16,7 @@ import {
   type GrantRequest,
 } from "./catalog";
 import { reconcileCecOnlyCanons } from "./cec-provenance";
+import { coalesceLatestBy, nearestFileTileSize, routeActivationOutcome } from "./files-canvas";
 import { demoCatalog } from "./mock";
 import {
   exportNetworkSettings,
@@ -307,6 +308,7 @@ export type SettingsTab =
   | "networks"
   | "devices"
   | "fleet"
+  | "files"
   | "sharing"
   | "always_on"
   | "updates"
@@ -445,6 +447,11 @@ const PRESENCE_GRACE_MS = 45_000;
  *  moment its details change); this is the fallback for a node that's gone or
  *  simply never answers, so the ring doesn't spin forever. */
 const REFRESH_TIMEOUT_MS = 12_000;
+
+/** One queued route survives two complete MyOwnMesh ICE cycles (75 s total)
+ * plus route-accept margin. This is only a ceiling: session events wake the
+ * waiter immediately, so an already-live peer still opens instantly. */
+const ROUTE_ACTIVATION_TIMEOUT_MS = 90_000;
 
 /** The app features the running binary always supports — the GUI's mirror of
  *  the node's `build_profile` feature list (node/src/mesh.rs). A peer learns
@@ -643,14 +650,47 @@ function loadRememberedDevices(): string[] {
   }
 }
 
-type UiMode = "normal" | "advanced";
+type UiMode = "normal" | "files" | "advanced";
 const UI_MODE_STORE_KEY = "allmystuff.uiMode.v1";
+const FILES_SETTINGS_STORE_KEY = "allmystuff.filesSettings.v1";
+
+export interface FilesSettings {
+  defaultView: "canvas" | "details";
+  thumbnailSize: number;
+  showHidden: boolean;
+  showPreview: boolean;
+  iconSizeModel: 2;
+}
+
+const DEFAULT_FILES_SETTINGS: FilesSettings = {
+  defaultView: "canvas",
+  thumbnailSize: 48,
+  showHidden: false,
+  showPreview: true,
+  iconSizeModel: 2,
+};
+
+function loadFilesSettings(): FilesSettings {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FILES_SETTINGS_STORE_KEY) ?? "{}");
+    return {
+      defaultView: saved.defaultView === "details" ? "details" : "canvas",
+      thumbnailSize: saved.iconSizeModel === 2 ? nearestFileTileSize(Number(saved.thumbnailSize)) : 48,
+      showHidden: saved.showHidden === true,
+      showPreview: saved.showPreview !== false,
+      iconSizeModel: 2,
+    };
+  } catch {
+    return { ...DEFAULT_FILES_SETTINGS };
+  }
+}
 
 /** The native app opens in the deliberately quiet, graph-first experience.
  *  Once someone opts into Advanced we remember that choice on this machine. */
 function loadUiMode(): UiMode {
   try {
-    return localStorage.getItem(UI_MODE_STORE_KEY) === "advanced" ? "advanced" : "normal";
+    const mode = localStorage.getItem(UI_MODE_STORE_KEY);
+    return mode === "advanced" || mode === "files" ? mode : "normal";
   } catch {
     return "normal";
   }
@@ -668,6 +708,9 @@ class AppStore {
 
   // ---- interaction state ------------------------------------------
   uiMode = $state<UiMode>(loadUiMode());
+  /** Device-local Files presentation preferences. Canvas geometry itself is
+   *  node-owned fleet state and intentionally does not live here. */
+  filesSettings = $state<FilesSettings>(loadFilesSettings());
   selectedNodeId = $state<string | null>(null);
   /** Passive discoveries the user explicitly chose to retain. */
   rememberedDevices = $state<string[]>(loadRememberedDevices());
@@ -955,6 +998,13 @@ class AppStore {
    *  snapshot. A terminal tab watches its own route here to tell
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
+  /** Event-driven route activation waiters. The session listener is the fast
+   * path; each wait performs one snapshot pull to cover a window that opened
+   * after the last event. There is deliberately no interval/poll loop here. */
+  private routeActivationWaiters = new Map<
+    string,
+    Set<(state: RouteLiveState | undefined) => void>
+  >();
   driveMounts = $state<Record<string, { label: string; mount: string }>>({});
   /** Durable one-way mapping relationships mirrored by both affected nodes. */
   driveRelationships = $state<DriveMappingState[]>([]);
@@ -2671,6 +2721,10 @@ class AppStore {
     }
     this.routeStates = states;
     this.routeSessions = sessions;
+    for (const [routeId, waiters] of this.routeActivationWaiters) {
+      const state = states[routeId];
+      for (const waiter of Array.from(waiters)) waiter(state);
+    }
     for (const routeId of Object.keys(this.driveMounts)) {
       if (!states[routeId] || states[routeId].state !== "active") {
         delete this.driveMounts[routeId];
@@ -2752,14 +2806,28 @@ class AppStore {
   // ---- selection ---------------------------------------------------
   setUiMode(mode: UiMode) {
     this.uiMode = mode;
-    if (mode === "normal") {
-      // Normal mode has no details drawer or card drop-outs. Clear their
+    if (mode !== "advanced") {
+      // Normal and Files have no device drawer or card drop-outs. Clear their
       // latent state so switching back never acts on a stale selection.
       this.selectedNodeId = null;
       this.kvmRevealed = null;
     }
     try {
       localStorage.setItem(UI_MODE_STORE_KEY, mode);
+    } catch {
+      /* private mode — keep the choice for this session */
+    }
+  }
+
+  updateFilesSettings(patch: Partial<FilesSettings>) {
+    this.filesSettings = {
+      ...this.filesSettings,
+      ...patch,
+      thumbnailSize: nearestFileTileSize(Number(patch.thumbnailSize ?? this.filesSettings.thumbnailSize)),
+      iconSizeModel: 2,
+    };
+    try {
+      localStorage.setItem(FILES_SETTINGS_STORE_KEY, JSON.stringify(this.filesSettings));
     } catch {
       /* private mode — keep the choice for this session */
     }
@@ -4877,6 +4945,58 @@ class AppStore {
     const to = `${this.localId}:files-view:${Date.now().toString(36)}-${n}`;
     void connectRoute(from, to, "generic");
     return `route:${from}→${to}`;
+  }
+
+
+  /** Confirm that the local daemon accepted the route command before exposing
+   * its id. Workspace sessions use this stricter surface so a failed invoke
+   * cannot masquerade as a route that is merely still negotiating. */
+  async filesConnectConfirmed(hostNodeId: string): Promise<string | null> {
+    if (!this.backendConnected) return null;
+    const from = `${hostNodeId}:files`;
+    const n = ++this.filesViewSeq;
+    const to = `${this.localId}:files-view:${Date.now().toString(36)}-${n}`;
+    await connectRoute(from, to, "generic");
+    return `route:${from}→${to}`;
+  }
+  /** Wait for one route to become active without polling the daemon. Multiple
+   * callers may wait on the same route; a session event settles all of them.
+   * One pull after registration closes the missed-event race for new windows. */
+  waitForRouteActive(
+    routeId: string,
+    timeoutMs = ROUTE_ACTIVATION_TIMEOUT_MS,
+  ): Promise<void> {
+    const initial = routeActivationOutcome(this.routeStates[routeId]);
+    if (initial.kind === "active") return Promise.resolve();
+    if (initial.kind === "failed") return Promise.reject(new Error(initial.reason));
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        const waiters = this.routeActivationWaiters.get(routeId);
+        waiters?.delete(onState);
+        if (waiters?.size === 0) this.routeActivationWaiters.delete(routeId);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onState = (state: RouteLiveState | undefined) => {
+        const outcome = routeActivationOutcome(state);
+        if (outcome.kind === "active") finish();
+        else if (outcome.kind === "failed") finish(new Error(outcome.reason));
+      };
+      const timer = window.setTimeout(() => {
+        finish(new Error("Files connection timed out before the peer transport became ready"));
+      }, timeoutMs);
+      const waiters = this.routeActivationWaiters.get(routeId)
+        ?? new Set<(state: RouteLiveState | undefined) => void>();
+      waiters.add(onState);
+      this.routeActivationWaiters.set(routeId, waiters);
+      // One bounded local IPC truth pull, never a recurring connection poll.
+      void this.refreshSession().catch(() => {});
+    });
   }
 
   /** Tear one files session down (window closing). The returned promise
@@ -10617,7 +10737,10 @@ class AppStore {
       const hasDirection = durable?.out_grants !== undefined && durable.in_grants !== undefined;
       const holderFor = (grant: Grant) =>
         partner.grants.find((row) => row.grant.id === grant.id)?.node ?? partner.nodes[0];
-      const rows = (grants: Grant[]) => grants.map((grant) => ({ node: holderFor(grant), grant }));
+      const rows = (grants: Grant[]) => coalesceLatestBy(
+        grants.map((grant) => ({ node: holderFor(grant), grant })),
+        (row) => row.grant.id,
+      );
       if (hasDirection && durable) {
         partner.sharedByYou = rows(durable.out_grants ?? []);
         partner.sharedWithYou = rows(durable.in_grants ?? []);

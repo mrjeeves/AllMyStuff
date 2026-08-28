@@ -29,7 +29,15 @@ compile_error!(
     "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
 );
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    },
+    time::{Duration, Instant, UNIX_EPOCH},
+};
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
 // client of the per-machine node's control socket (see
@@ -38,6 +46,7 @@ use allmystuff_graph::{Grant, Person};
 #[cfg(all(windows, not(debug_assertions)))]
 use allmystuff_node::node_control::running_node_satisfies;
 use allmystuff_node::node_control::{ensure_node_running, NodeChild, NodeClient, NodeEvent};
+use notify::Watcher as _;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
@@ -46,6 +55,9 @@ use tauri_plugin_autostart::ManagerExt;
 mod backend_recovery;
 #[allow(dead_code)] // parsers for the other desktop OSes are exercised by this module's tests
 mod host_wifi;
+mod local_file_operations;
+#[cfg(windows)]
+mod shell_icon;
 mod window_behavior;
 
 use backend_recovery::{
@@ -86,12 +98,20 @@ impl OwnedNode {
     }
 }
 
+struct LocalDirectoryWatch {
+    _watcher: notify::RecommendedWatcher,
+}
+
 struct AppState {
     node: Arc<NodeClient>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
     /// the app); a reused service node has no child here and keeps running.
     node_child: Mutex<OwnedNode>,
+    local_files: Arc<Mutex<LocalFileBrowser>>,
+    local_directory_watchers: Arc<Mutex<HashMap<u64, LocalDirectoryWatch>>>,
+    next_local_directory_watch: AtomicU64,
+    local_file_operations: Arc<Mutex<local_file_operations::LocalFileOperations>>,
 }
 
 // ---- this machine -----------------------------------------------------
@@ -194,6 +214,15 @@ async fn drive_mappings(state: State<'_, AppState>) -> Result<serde_json::Value,
     state
         .node
         .request("drive_mappings", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn native_drives(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("native_drives", json!({}))
         .await
         .map_err(|error| error.to_string())
 }
@@ -978,6 +1007,1271 @@ async fn open_terminal_window(
 
 // ---- files (the mesh-native file manager) -------------------------------
 
+#[tauri::command]
+async fn files_namespace_adopt(
+    state: State<'_, AppState>,
+    parent: String,
+    observations: Vec<Value>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "files_namespace_adopt",
+            json!({ "parent": parent, "observations": observations }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_namespace_mutate(
+    state: State<'_, AppState>,
+    request: Value,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("files_namespace_mutate", json!({ "request": request }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_namespace_list(
+    state: State<'_, AppState>,
+    parent: String,
+    cursor: Option<String>,
+    limit: usize,
+    expected_directory_version: Option<i64>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "files_namespace_list",
+            json!({
+                "parent": parent,
+                "cursor": cursor,
+                "limit": limit,
+                "expected_directory_version": expected_directory_version,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_snapshot(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_snapshot", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_apply(
+    state: State<'_, AppState>,
+    mutations: Vec<Value>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_apply", json!({ "mutations": mutations }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn files_canvas_purge_tombstones(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("files_canvas_purge_tombstones", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct LocalFileLocation {
+    id: String,
+    label: String,
+    path: String,
+    kind: String,
+}
+
+#[cfg(windows)]
+fn windows_file_is_hidden(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+    attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+fn windows_shell_link_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lnk") || extension.eq_ignore_ascii_case("url")
+        })
+}
+
+#[derive(serde::Serialize)]
+struct LocalFileEntry {
+    id: String,
+    name: String,
+    path: String,
+    dir: bool,
+    size: u64,
+    modified: Option<u64>,
+    hidden: bool,
+    symlink: bool,
+    #[serde(rename = "virtualItem")]
+    virtual_item: bool,
+    #[serde(rename = "shellIcon")]
+    shell_icon: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalFileListing {
+    id: String,
+    path: String,
+    platform: String,
+    entries: Vec<LocalFileEntry>,
+    next_cursor: Option<String>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct LocalFileBrowser {
+    next_cursor: u64,
+    cursors: HashMap<String, LocalFileCursor>,
+}
+
+struct LocalFileCursor {
+    id: String,
+    path: PathBuf,
+    readers: VecDeque<std::fs::ReadDir>,
+    synthetic: VecDeque<LocalFileEntry>,
+    pending: Option<LocalFileEntry>,
+    seen_ids: HashMap<String, usize>,
+    seen_names: HashSet<String>,
+    merge_names: bool,
+    touched: Instant,
+}
+
+fn next_local_dir_entry(current: &mut LocalFileCursor) -> Option<std::fs::DirEntry> {
+    loop {
+        match current.readers.front_mut()?.next() {
+            Some(Ok(item)) => {
+                if current.merge_names {
+                    let key = item.file_name().to_string_lossy().to_lowercase();
+                    if !current.seen_names.insert(key) {
+                        continue;
+                    }
+                }
+                return Some(item);
+            }
+            Some(Err(_)) => continue,
+            None => {
+                current.readers.pop_front();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+const RECYCLE_BIN_PARSE_NAME: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+
+#[cfg(windows)]
+fn recycle_bin_entry() -> LocalFileEntry {
+    LocalFileEntry {
+        id: "windows-shell:recycle-bin".into(),
+        name: "Recycle Bin".into(),
+        path: RECYCLE_BIN_PARSE_NAME.into(),
+        dir: true,
+        size: 0,
+        modified: None,
+        hidden: false,
+        symlink: false,
+        shell_icon: shell_icon::recycle_bin_icon(),
+        virtual_item: true,
+    }
+}
+
+#[cfg(windows)]
+fn windows_desktop_parts(
+    canonical: &Path,
+) -> (Option<std::fs::ReadDir>, VecDeque<LocalFileEntry>, bool) {
+    let is_desktop = dirs::desktop_dir()
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|desktop| desktop == canonical);
+    if !is_desktop {
+        return (None, VecDeque::new(), false);
+    }
+    let public_path = std::env::var_os("PUBLIC")
+        .map(PathBuf::from)
+        .map(|path| path.join("Desktop"))
+        .and_then(|path| path.canonicalize().ok())
+        .filter(|path| path != canonical);
+    let public_reader = public_path.and_then(|path| std::fs::read_dir(path).ok());
+    (public_reader, VecDeque::from([recycle_bin_entry()]), true)
+}
+
+#[cfg(windows)]
+fn windows_desktop_watch_path(canonical: &Path) -> Option<PathBuf> {
+    let is_desktop = dirs::desktop_dir()
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|desktop| desktop == canonical);
+    is_desktop
+        .then(|| {
+            std::env::var_os("PUBLIC")
+                .map(PathBuf::from)
+                .map(|path| path.join("Desktop"))
+                .and_then(|path| path.canonicalize().ok())
+                .filter(|path| path != canonical)
+        })
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn windows_desktop_watch_path(_canonical: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+fn windows_desktop_parts(
+    _canonical: &Path,
+) -> (Option<std::fs::ReadDir>, VecDeque<LocalFileEntry>, bool) {
+    (None, VecDeque::new(), false)
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LocalPreview {
+    Text { text: String },
+    Image { mime: String, data: String },
+    Unsupported,
+}
+
+fn local_path_for_display(path: &Path) -> String {
+    #[cfg(windows)]
+    let shown = shell_icon::shell_compatible_path(path);
+    #[cfg(not(windows))]
+    let shown = path.to_path_buf();
+    shown.to_string_lossy().into_owned()
+}
+
+fn path_fallback_id(kind: &str, path: &Path, meta: &std::fs::Metadata, fold_case: bool) -> String {
+    let shown = path.to_string_lossy();
+    let normalized = if fold_case {
+        shown.to_lowercase()
+    } else {
+        shown.into_owned()
+    };
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+        .map(|at| at.as_nanos())
+        .unwrap_or_default();
+    format!("path:{kind}:{hash:016x}:{created:x}")
+}
+
+fn local_file_id(path: &Path, meta: &std::fs::Metadata, symlink: bool) -> String {
+    #[cfg(not(windows))]
+    let _ = symlink;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        return format!("unix:{}:{}", meta.dev(), meta.ino());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | if symlink {
+                        FILE_FLAG_OPEN_REPARSE_POINT
+                    } else {
+                        0
+                    },
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+            unsafe { CloseHandle(handle) };
+            if ok {
+                let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+                return format!("windows:{:x}:{index:x}", info.dwVolumeSerialNumber);
+            }
+        }
+        if symlink {
+            return path_fallback_id("link", path, meta, true);
+        }
+        if let Ok(real) = path.canonicalize() {
+            return path_fallback_id("canonical", &real, meta, true);
+        }
+        // Last resort for a provider that refuses both a stable handle and
+        // canonicalization. Keep the path out of fleet metadata and include
+        // creation time when the provider exposes it.
+        return path_fallback_id("entry", path, meta, true);
+    }
+    #[allow(unreachable_code)]
+    path_fallback_id("entry", path, meta, false)
+}
+
+fn local_file_entry(path: &Path) -> Result<LocalFileEntry, String> {
+    let name = path
+        .file_name()
+        .ok_or("that item has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let identity_meta = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let symlink = identity_meta.file_type().is_symlink();
+    let target_meta = if symlink {
+        std::fs::metadata(path).ok()
+    } else {
+        Some(identity_meta.clone())
+    };
+    let display_meta = target_meta.as_ref().unwrap_or(&identity_meta);
+    #[cfg(windows)]
+    let hidden = {
+        use std::os::windows::fs::MetadataExt as _;
+        name.starts_with('.') || windows_file_is_hidden(identity_meta.file_attributes())
+    };
+    #[cfg(not(windows))]
+    let hidden = name.starts_with('.');
+    #[cfg(windows)]
+    let shell_icon = windows_shell_link_name(&name)
+        .then(|| shell_icon::shortcut_icon(path))
+        .flatten();
+    #[cfg(not(windows))]
+    let shell_icon = None;
+
+    Ok(LocalFileEntry {
+        id: local_file_id(path, &identity_meta, symlink),
+        name,
+        path: local_path_for_display(path),
+        dir: display_meta.is_dir(),
+        size: if display_meta.is_file() {
+            display_meta.len()
+        } else {
+            0
+        },
+        modified: display_meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        hidden,
+        shell_icon,
+        symlink,
+        virtual_item: false,
+    })
+}
+
+fn location(id: &str, label: &str, path: Option<PathBuf>, kind: &str) -> Option<LocalFileLocation> {
+    let path = path?;
+    if !path.exists() {
+        return None;
+    }
+    Some(LocalFileLocation {
+        id: id.into(),
+        label: label.into(),
+        path: local_path_for_display(&path),
+        kind: kind.into(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_logical_drive_roots() -> Vec<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW;
+    let required = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
+    if required == 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let written = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Vec::new();
+    }
+    let mut roots = Vec::new();
+    let mut start = 0usize;
+    for index in 0..=written as usize {
+        if buffer[index] != 0 {
+            continue;
+        }
+        if index == start {
+            break;
+        }
+        roots.push(String::from_utf16_lossy(&buffer[start..index]));
+        start = index + 1;
+    }
+    roots
+}
+
+fn same_native_mount_path(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(left) == Path::new(right)
+    }
+}
+
+async fn allmystuff_adapter_mounts(state: &AppState) -> Vec<String> {
+    state
+        .node
+        .request("native_drives", json!({}))
+        .await
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mount| mount.get("mount")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Native places for the Files sidebar. Reading these paths is local-only and
+/// side-effect free; no mesh traffic is generated by browsing.
+#[tauri::command]
+async fn local_file_locations(
+    state: State<'_, AppState>,
+) -> Result<Vec<LocalFileLocation>, String> {
+    let adapter_mounts = allmystuff_adapter_mounts(&state).await;
+    let mut out = Vec::new();
+    out.extend(
+        [
+            location("home", "Home", dirs::home_dir(), "favorite"),
+            location("desktop", "Desktop", dirs::desktop_dir(), "favorite"),
+            location("documents", "Documents", dirs::document_dir(), "favorite"),
+            location("downloads", "Downloads", dirs::download_dir(), "favorite"),
+            location("pictures", "Pictures", dirs::picture_dir(), "favorite"),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    for (index, volume) in allmystuff_inventory::scan().storage.into_iter().enumerate() {
+        let Some(path) = volume.mount_point.map(PathBuf::from) else {
+            continue;
+        };
+        if adapter_mounts
+            .iter()
+            .any(|mount| same_native_mount_path(&path.to_string_lossy(), mount))
+        {
+            continue;
+        }
+        let shown = if volume.name.trim().is_empty() {
+            path.to_string_lossy().into_owned()
+        } else {
+            volume.name
+        };
+        if out.iter().any(|item| item.path == path.to_string_lossy()) {
+            continue;
+        }
+        if let Some(item) = location(&format!("volume-{index}"), &shown, Some(path), "volume") {
+            out.push(item);
+        }
+    }
+    #[cfg(windows)]
+    for root in windows_logical_drive_roots() {
+        if adapter_mounts
+            .iter()
+            .any(|mount| same_native_mount_path(&root, mount))
+        {
+            continue;
+        }
+        let normalized = root.trim_end_matches(['\\', '/']);
+        if out.iter().any(|item| {
+            item.path
+                .trim_end_matches(['\\', '/'])
+                .eq_ignore_ascii_case(normalized)
+        }) {
+            continue;
+        }
+        out.push(LocalFileLocation {
+            id: format!(
+                "volume-windows-{}",
+                normalized.replace(':', "").to_ascii_lowercase()
+            ),
+            label: normalized.to_string(),
+            path: root,
+            kind: "volume".into(),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn local_file_list(
+    state: State<'_, AppState>,
+    path: String,
+    cursor: Option<String>,
+) -> Result<LocalFileListing, String> {
+    const PAGE_SIZE: usize = 256;
+    const CURSOR_TTL: Duration = Duration::from_secs(120);
+    const MAX_CURSORS: usize = 8;
+    let browser = state.local_files.clone();
+    tokio::task::spawn_blocking(move || {
+        let now = Instant::now();
+        let mut current = if let Some(token) = cursor {
+            let mut browser = browser.lock();
+            browser
+                .cursors
+                .retain(|_, value| now.duration_since(value.touched) <= CURSOR_TTL);
+            let current = browser
+                .cursors
+                .remove(&token)
+                .ok_or_else(|| "that folder page expired; refresh it".to_string())?;
+            let requested = PathBuf::from(&path)
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            if requested != current.path {
+                return Err("that folder page belongs to another location".into());
+            }
+            current
+        } else {
+            let canonical = PathBuf::from(&path)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            if !canonical.is_dir() {
+                return Err("that location is not a folder".into());
+            }
+            let directory_meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
+            let (public_reader, synthetic, merge_names) = windows_desktop_parts(&canonical);
+            let mut readers = VecDeque::new();
+            readers.push_back(std::fs::read_dir(&canonical).map_err(|e| e.to_string())?);
+            if let Some(reader) = public_reader {
+                readers.push_back(reader);
+            }
+            LocalFileCursor {
+                id: local_file_id(&canonical, &directory_meta, false),
+                path: canonical,
+                readers,
+                synthetic,
+                pending: None,
+                seen_ids: HashMap::new(),
+                seen_names: HashSet::new(),
+                merge_names,
+                touched: now,
+            }
+        };
+
+        let convert = |item: std::fs::DirEntry,
+                       seen_ids: &mut HashMap<String, usize>|
+         -> Option<LocalFileEntry> {
+            let mut entry = local_file_entry(&item.path()).ok()?;
+            let base_id = entry.id.clone();
+            let count = seen_ids.entry(base_id.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                entry.id = format!("{base_id}:entry:{}", entry.name);
+            }
+            Some(entry)
+        };
+
+        let mut entries = Vec::with_capacity(PAGE_SIZE);
+        if let Some(entry) = current.pending.take() {
+            entries.push(entry);
+        }
+        while entries.len() < PAGE_SIZE {
+            if let Some(entry) = current.synthetic.pop_front() {
+                entries.push(entry);
+                continue;
+            }
+            let Some(item) = next_local_dir_entry(&mut current) else {
+                break;
+            };
+            if let Some(entry) = convert(item, &mut current.seen_ids) {
+                entries.push(entry);
+            }
+        }
+        while entries.len() == PAGE_SIZE && current.pending.is_none() {
+            if let Some(entry) = current.synthetic.pop_front() {
+                current.pending = Some(entry);
+                break;
+            }
+            let Some(item) = next_local_dir_entry(&mut current) else {
+                break;
+            };
+            current.pending = convert(item, &mut current.seen_ids);
+        }
+
+        entries.sort_by(|a, b| {
+            b.dir
+                .cmp(&a.dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let listing_id = current.id.clone();
+        let listing_path = local_path_for_display(&current.path);
+        let complete = current.pending.is_none();
+        let next_cursor = if complete {
+            None
+        } else {
+            let mut browser = browser.lock();
+            browser
+                .cursors
+                .retain(|_, value| now.duration_since(value.touched) <= CURSOR_TTL);
+            if browser.cursors.len() >= MAX_CURSORS {
+                let oldest = browser
+                    .cursors
+                    .iter()
+                    .min_by_key(|(_, value)| value.touched)
+                    .map(|(token, _)| token.clone());
+                if let Some(token) = oldest {
+                    browser.cursors.remove(&token);
+                }
+            }
+            browser.next_cursor = browser.next_cursor.wrapping_add(1);
+            let token = format!("files-{:x}", browser.next_cursor);
+            current.touched = Instant::now();
+            browser.cursors.insert(token.clone(), current);
+            Some(token)
+        };
+        Ok(LocalFileListing {
+            id: listing_id,
+            path: listing_path,
+            platform: std::env::consts::OS.into(),
+            entries,
+            next_cursor,
+            complete,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDirectoryChanged {
+    token: u64,
+    seq: u64,
+    overflow: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalDirectoryWatchStarted {
+    token: u64,
+    lease_ms: u64,
+}
+
+#[tauri::command]
+fn local_directory_watch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<LocalDirectoryWatchStarted, String> {
+    const MAX_WATCHES: usize = 32;
+    const DEBOUNCE: Duration = Duration::from_millis(100);
+    const LEASE: Duration = Duration::from_secs(30 * 60);
+    let directory = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !directory.is_dir() {
+        return Err("that watch target is not a directory".into());
+    }
+    if state.local_directory_watchers.lock().len() >= MAX_WATCHES {
+        return Err("too many live local directory subscriptions".into());
+    }
+    let token = state
+        .next_local_directory_watch
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1);
+    let (dirty_tx, dirty_rx) = mpsc::sync_channel::<()>(1);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let callback_overflow = overflow.clone();
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        match result {
+            Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => return,
+            Ok(_) => {}
+            Err(_) => callback_overflow.store(true, Ordering::Relaxed),
+        }
+        let _ = dirty_tx.try_send(());
+    })
+    .map_err(|error| format!("couldn't create directory watcher: {error}"))?;
+    watcher
+        .watch(&directory, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| format!("couldn't watch that directory: {error}"))?;
+    if let Some(public_desktop) = windows_desktop_watch_path(&directory) {
+        watcher
+            .watch(&public_desktop, notify::RecursiveMode::NonRecursive)
+            .map_err(|error| format!("couldn't watch the public Desktop: {error}"))?;
+    }
+    let watchers = state.local_directory_watchers.clone();
+    watchers
+        .lock()
+        .insert(token, LocalDirectoryWatch { _watcher: watcher });
+
+    let expires_at = Instant::now() + LEASE;
+    let worker_watchers = watchers.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("amst-local-files-watch-{token}"))
+        .spawn(move || {
+            let mut seq = 0_u64;
+            loop {
+                let now = Instant::now();
+                if now >= expires_at {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+                match dirty_rx.recv_timeout(expires_at.saturating_duration_since(now)) {
+                    Ok(()) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        worker_watchers.lock().remove(&token);
+                        return;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                std::thread::sleep(DEBOUNCE);
+                if Instant::now() >= expires_at {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+                loop {
+                    match dirty_rx.try_recv() {
+                        Ok(()) => {}
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                seq = seq.saturating_add(1);
+                if app
+                    .emit(
+                        "allmystuff://local-directory-changed",
+                        LocalDirectoryChanged {
+                            token,
+                            seq,
+                            overflow: overflow.swap(false, Ordering::Relaxed),
+                        },
+                    )
+                    .is_err()
+                {
+                    worker_watchers.lock().remove(&token);
+                    return;
+                }
+            }
+        });
+    Ok(LocalDirectoryWatchStarted {
+        token,
+        lease_ms: LEASE.as_millis() as u64,
+    })
+}
+
+#[tauri::command]
+fn local_directory_unwatch(state: State<'_, AppState>, token: u64) {
+    state.local_directory_watchers.lock().remove(&token);
+}
+
+#[tauri::command]
+async fn local_file_icon(path: String) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        return tokio::task::spawn_blocking(move || {
+            Ok(shell_icon::filesystem_icon(Path::new(&path)))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn local_file_preview(path: String) -> Result<LocalPreview, String> {
+    tokio::task::spawn_blocking(move || {
+        use base64::Engine as _;
+        const LIMIT: u64 = 4 * 1024 * 1024;
+        let path = PathBuf::from(path);
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > LIMIT {
+            return Ok(LocalPreview::Unsupported);
+        }
+        let ext = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mime = match ext.as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "svg" => Some("image/svg+xml"),
+            "bmp" => Some("image/bmp"),
+            _ => None,
+        };
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        if let Some(mime) = mime {
+            return Ok(LocalPreview::Image {
+                mime: mime.into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+        }
+        const TEXT: &[&str] = &[
+            "txt", "md", "rs", "ts", "js", "svelte", "json", "toml", "yaml", "yml", "css", "html",
+            "xml", "sh", "ps1", "py", "go", "c", "h", "cpp", "hpp", "java", "log", "ini", "csv",
+            "sql",
+        ];
+        if TEXT.contains(&ext.as_str()) {
+            return Ok(LocalPreview::Text {
+                text: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(LocalPreview::Unsupported)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn launch_native(path: &Path, reveal: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    let status = {
+        let mut command = std::process::Command::new("explorer.exe");
+        if path == Path::new(RECYCLE_BIN_PARSE_NAME) {
+            command.arg("shell:RecycleBinFolder");
+        } else if reveal && path.is_file() {
+            command.arg(format!("/select,{}", path.to_string_lossy()));
+        } else {
+            command.arg(path);
+        }
+        command.status()
+    };
+    #[cfg(target_os = "macos")]
+    let status = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg(path).status()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = {
+        let target = if reveal && path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        std::process::Command::new("xdg-open").arg(target).status()
+    };
+    status.map_err(|e| e.to_string()).and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("native file browser exited with {status}"))
+        }
+    })
+}
+
+#[tauri::command]
+async fn local_file_open(path: String, reveal: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || launch_native(&PathBuf::from(path), reveal))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(windows)]
+unsafe fn windows_shell_context_menu(
+    hwnd: windows::Win32::Foundation::HWND,
+    path: &Path,
+) -> windows::core::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::{
+        core::{w, PCSTR, PCWSTR, PSTR},
+        Win32::{
+            Foundation::{LPARAM, POINT, WPARAM},
+            System::Com::{CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED},
+            UI::{
+                Input::KeyboardAndMouse::{
+                    mouse_event, GetAsyncKeyState, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+                    VK_RBUTTON,
+                },
+                Shell::{
+                    BHID_SFUIObject, IContextMenu, IShellItem, SHCreateItemFromParsingName,
+                    SHObjectProperties, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, GCS_VERBA,
+                    SHOP_FILEPATH,
+                },
+                WindowsAndMessaging::{
+                    CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, GetCursorPos,
+                    MenuItemFromPoint, PostMessageW, SetForegroundWindow, TrackPopupMenu,
+                    SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_NULL,
+                    WS_CHILD,
+                },
+            },
+        },
+    };
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let outcome = (|| -> windows::core::Result<()> {
+        let shell_path = shell_icon::shell_compatible_path(path);
+        let wide: Vec<u16> = shell_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let item: IShellItem =
+            unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)? };
+        let shell_menu: IContextMenu =
+            unsafe { item.BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)? };
+        let menu_owner = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_CHILD,
+                0,
+                0,
+                0,
+                0,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )?
+        };
+        let menu = unsafe { CreatePopupMenu()? };
+        let mut replay_right_click = false;
+        let menu_outcome = (|| -> windows::core::Result<()> {
+            unsafe {
+                shell_menu
+                    .QueryContextMenu(menu, 0, 1, 0x7fff, CMF_NORMAL | CMF_EXPLORE)
+                    .ok()?
+            };
+
+            let mut point = POINT::default();
+            unsafe {
+                GetCursorPos(&mut point)?;
+                let _ = SetForegroundWindow(hwnd);
+            }
+            // Clear the initiating click's transition bit. If the popup later
+            // dismisses on a different right-click, the fresh state below
+            // tells us to hand that click back to the WebView.
+            let _ = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) };
+            let command = unsafe {
+                TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                    point.x,
+                    point.y,
+                    None,
+                    menu_owner,
+                    None,
+                )
+                .0 as u32
+            };
+            let mut dismissal_point = POINT::default();
+            let outside_menu = unsafe { GetCursorPos(&mut dismissal_point) }.is_ok()
+                && unsafe { MenuItemFromPoint(Some(menu_owner), menu, dismissal_point) } == -1;
+            replay_right_click = command == 0 && outside_menu && {
+                let state = unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) } as u16;
+                state & 0x8001 != 0
+            };
+            // Windows documents this nudge for repeated TrackPopupMenu calls.
+            let _ = unsafe { PostMessageW(Some(menu_owner), WM_NULL, WPARAM(0), LPARAM(0)) };
+            if command != 0 {
+                let offset = command - 1;
+                let mut verb_buffer = [0_u8; 64];
+                let canonical_verb = unsafe {
+                    shell_menu.GetCommandString(
+                        offset as usize,
+                        GCS_VERBA,
+                        None,
+                        PSTR(verb_buffer.as_mut_ptr()),
+                        verb_buffer.len() as u32,
+                    )
+                }
+                .ok()
+                .and_then(|_| {
+                    let end = verb_buffer.iter().position(|byte| *byte == 0)?;
+                    std::str::from_utf8(&verb_buffer[..end]).ok()
+                });
+                // The generic numeric dispatch is correct for extension verbs,
+                // but Windows can accept a .lnk Properties offset and then fail
+                // to build its sheet outside Explorer. Use the Shell API whose
+                // contract is specifically to invoke Properties on a file path.
+                let properties_opened = canonical_verb
+                    .is_some_and(|verb| verb.eq_ignore_ascii_case("properties"))
+                    && shell_path.is_absolute()
+                    && unsafe {
+                        SHObjectProperties(
+                            Some(hwnd),
+                            SHOP_FILEPATH,
+                            PCWSTR(wide.as_ptr()),
+                            PCWSTR::null(),
+                        )
+                        .as_bool()
+                    };
+                if !properties_opened {
+                    let invoke = CMINVOKECOMMANDINFO {
+                        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                        hwnd,
+                        // Shell command ids are passed as MAKEINTRESOURCEA offsets.
+                        lpVerb: PCSTR(offset as usize as *const u8),
+                        nShow: SW_SHOWNORMAL.0,
+                        ..Default::default()
+                    };
+                    unsafe { shell_menu.InvokeCommand(&invoke)? };
+                }
+            }
+            Ok(())
+        })();
+        let _ = unsafe { DestroyMenu(menu) };
+        let _ = unsafe { DestroyWindow(menu_owner) };
+        if replay_right_click {
+            unsafe {
+                mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            }
+        }
+        menu_outcome
+    })();
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    outcome
+}
+
+#[tauri::command]
+async fn local_file_context_menu(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        #[allow(clippy::unnecessary_cast)]
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("allmystuff-shell-menu".into())
+            .spawn(move || {
+                let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
+                let result = unsafe { windows_shell_context_menu(hwnd, &PathBuf::from(path)) }
+                    .map_err(|error| error.to_string());
+                let _ = send.send(result);
+            })
+            .map_err(|error| error.to_string())?;
+        let result = receive.await.map_err(|error| error.to_string())?;
+        if let Err(error) = &result {
+            tracing::warn!(%error, "couldn't show Windows Shell context menu");
+        }
+        return result;
+    }
+    #[cfg(not(windows))]
+    Err("native file context menus are not implemented on this desktop yet".into())
+}
+
+fn safe_child(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err("use a single file or folder name".into());
+    }
+    Ok(parent.join(name.trim()))
+}
+
+#[tauri::command]
+async fn local_file_mkdir(
+    parent: String,
+    name: String,
+    unique: Option<bool>,
+) -> Result<LocalFileEntry, String> {
+    tokio::task::spawn_blocking(move || {
+        let parent = PathBuf::from(parent);
+        let base_name = name.trim().to_string();
+        safe_child(&parent, &base_name)?;
+        let mut sequence = 1_u32;
+        loop {
+            let candidate_name = if sequence == 1 {
+                base_name.clone()
+            } else {
+                format!("{base_name} ({sequence})")
+            };
+            let path = safe_child(&parent, &candidate_name)?;
+            match std::fs::create_dir(&path) {
+                Ok(()) => return local_file_entry(&path),
+                Err(error)
+                    if unique.unwrap_or(false)
+                        && error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or("couldn't find an available folder name")?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_rename(path: String, name: String) -> Result<LocalFileEntry, String> {
+    tokio::task::spawn_blocking(move || {
+        let from = PathBuf::from(path);
+        let parent = from.parent().ok_or("that item has no parent folder")?;
+        let to = safe_child(parent, &name)?;
+        if to.exists() {
+            #[cfg(windows)]
+            let case_only =
+                from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
+            #[cfg(not(windows))]
+            let case_only = false;
+            if !case_only {
+                return Err("an item with that name already exists".into());
+            }
+        }
+        std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+        local_file_entry(&to)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete uses the OS Trash/Recycle Bin. The canvas never offers an
+/// irreversible unlink operation.
+#[tauri::command]
+async fn local_file_trash(paths: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            trash::delete(PathBuf::from(path)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn local_file_operation_apply(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    destination: String,
+    kind: local_file_operations::LocalFileOperationKind,
+) -> Result<local_file_operations::LocalFileOperationResult, String> {
+    let operations = state.local_file_operations.clone();
+    tokio::task::spawn_blocking(move || operations.lock().apply(paths, destination, kind))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_operation_undo(
+    state: State<'_, AppState>,
+) -> Result<local_file_operations::LocalFileOperationResult, String> {
+    let operations = state.local_file_operations.clone();
+    tokio::task::spawn_blocking(move || operations.lock().undo())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_operation_redo(
+    state: State<'_, AppState>,
+) -> Result<local_file_operations::LocalFileOperationResult, String> {
+    let operations = state.local_file_operations.clone();
+    tokio::task::spawn_blocking(move || operations.lock().redo())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn local_file_operation_state(
+    state: State<'_, AppState>,
+) -> Result<local_file_operations::LocalFileOperationResult, String> {
+    Ok(state.local_file_operations.lock().state())
+}
+
+/// Publish real local file references to the OS clipboard. This uses the
+/// node's long-lived native clipboard owner, so Finder/Explorer and the mesh
+/// clipboard watcher see exactly the same selection as the Files workspace.
+#[tauri::command]
+async fn local_file_clipboard_set(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    state
+        .node
+        .request("local_file_clipboard_set", json!({ "paths": paths }))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Read native file references from the OS clipboard. Folders are retained
+/// here even though remote-control clipboard streaming currently only sends
+/// regular files; local Files paste must match Finder/Explorer behavior.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalFileClipboardData {
+    paths: Vec<String>,
+    prefers_move: bool,
+}
+
+#[cfg(windows)]
+fn clipboard_prefers_move() -> bool {
+    use clipboard_win::{formats::RawData, get_clipboard, register_format};
+    let Some(format) = register_format("Preferred DropEffect") else {
+        return false;
+    };
+    let Ok(bytes): Result<Vec<u8>, _> = get_clipboard(RawData(format.get())) else {
+        return false;
+    };
+    bytes
+        .get(..4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        == Some(2)
+}
+
+#[cfg(not(windows))]
+fn clipboard_prefers_move() -> bool {
+    false
+}
+
+#[tauri::command]
+async fn local_file_clipboard_get(
+    state: State<'_, AppState>,
+) -> Result<LocalFileClipboardData, String> {
+    let value = state
+        .node
+        .request("local_file_clipboard_get", json!({}))
+        .await
+        .map_err(|error| error.to_string())?;
+    let paths = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    Ok(LocalFileClipboardData {
+        paths,
+        prefers_move: clipboard_prefers_move(),
+    })
+}
+
 /// Forward one file request from a files window down its active files
 /// route (the viewer side of a mesh-native file session).
 #[tauri::command]
@@ -992,6 +2286,203 @@ async fn file_send(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+#[tauri::command]
+async fn local_file_transfer_scan(
+    state: State<'_, AppState>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("file_transfer_scan", json!({ "id": id, "paths": paths }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn local_file_transfer_start(
+    state: State<'_, AppState>,
+    id: String,
+    route_id: String,
+    paths: Vec<String>,
+    destination: String,
+    target_label: String,
+    expected_files: u64,
+    expected_folders: u64,
+    expected_bytes: u64,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "file_transfer_start",
+            json!({
+                "id": id,
+                "route_id": route_id,
+                "paths": paths,
+                "destination": destination,
+                "target_label": target_label,
+                "expected_files": expected_files,
+                "expected_folders": expected_folders,
+                "expected_bytes": expected_bytes,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn local_file_transfer_cancel(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request("file_transfer_cancel", json!({ "id": id }))
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn local_file_transfer_operations(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("file_transfer_operations", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn local_file_operation_dismiss(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request("file_operation_dismiss", json!({ "id": id }))
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_local_desktop(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleetfiles_local_desktop", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_storage_status", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_set_policy(
+    state: State<'_, AppState>,
+    policy: Value,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_storage_set_policy", json!({ "policy": policy }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleet_storage_set_allocation(
+    state: State<'_, AppState>,
+    device: String,
+    volume: String,
+    quota_bytes: u64,
+    enabled: bool,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleet_storage_set_allocation",
+            json!({
+                "device": device,
+                "volume": volume,
+                "quota_bytes": quota_bytes,
+                "enabled": enabled,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn fleet_storage_set_device_role(
+    state: State<'_, AppState>,
+    device: String,
+    role: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleet_storage_set_device_role",
+            json!({
+                "device": device,
+                "role": role,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+async fn fleet_service_profiles(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_service_profiles", json!({}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetStorageVolume {
+    id: String,
+    name: String,
+    path: Option<String>,
+    filesystem: Option<String>,
+    total_bytes: u64,
+    available_bytes: u64,
+    removable: bool,
+    kind: String,
+}
+
+#[tauri::command]
+async fn fleet_storage_local_volumes(
+    state: State<'_, AppState>,
+) -> Result<Vec<FleetStorageVolume>, String> {
+    let adapter_mounts = allmystuff_adapter_mounts(&state).await;
+    Ok(allmystuff_inventory::scan()
+        .storage
+        .into_iter()
+        .filter(|volume| {
+            volume.mount_point.as_deref().is_none_or(|path| {
+                !adapter_mounts
+                    .iter()
+                    .any(|mount| same_native_mount_path(path, mount))
+            })
+        })
+        .map(|volume| FleetStorageVolume {
+            id: volume.id,
+            name: volume.name,
+            path: volume.mount_point,
+            filesystem: volume.filesystem,
+            total_bytes: volume.total_bytes,
+            available_bytes: volume.available_bytes,
+            removable: volume.removable,
+            kind: format!("{:?}", volume.kind).to_lowercase(),
+        })
+        .collect())
 }
 
 /// Register the calling files window's interest in a route's responses.
@@ -1069,6 +2560,23 @@ async fn file_download(
 
 /// Open (or focus) the dedicated files window for `node` — one OS window
 /// per machine, the finder-like view of its disk. The window loads the
+#[tauri::command]
+async fn file_download_cancel(
+    state: State<'_, AppState>,
+    route_id: String,
+    req: u64,
+) -> Result<bool, String> {
+    let value = state
+        .node
+        .request(
+            "file_download_cancel",
+            json!({ "route_id": route_id, "req": req }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
 /// same app with `?files=<node>`.
 #[tauri::command]
 async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
@@ -1079,6 +2587,31 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
         "AllMyStuff files",
         (940.0, 640.0),
         (480.0, 320.0),
+        AUMID_FILES,
+    )
+}
+
+#[tauri::command]
+async fn open_files_workspace_window(
+    app: tauri::AppHandle,
+    target: String,
+    title: String,
+    instance: String,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target);
+    let label = format!("files-workspace-{}", window_slug(&instance));
+    open_secondary_window(
+        &app,
+        &label,
+        format!("index.html?files-workspace={encoded}"),
+        if title.trim().is_empty() {
+            "AllMyStuff Files"
+        } else {
+            &title
+        },
+        (1120.0, 760.0),
+        (640.0, 420.0),
         AUMID_FILES,
     )
 }
@@ -2780,7 +4313,9 @@ fn schedule_macos_autostart_refresh(app: &tauri::AppHandle) -> Result<bool, Stri
         .status()
         .map_err(|e| format!("submitting the macOS login-item refresh helper: {e}"))?;
     if !submitted.success() {
-        return Err(format!("launchctl could not submit the refresh helper ({submitted})"));
+        return Err(format!(
+            "launchctl could not submit the refresh helper ({submitted})"
+        ));
     }
     Ok(true)
 }
@@ -2829,8 +4364,7 @@ fn run_macos_autostart_refresh(parent_pid: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    std::fs::write(&marker, [])
-        .map_err(|e| format!("writing {}: {e}", marker.display()))?;
+    std::fs::write(&marker, []).map_err(|e| format!("writing {}: {e}", marker.display()))?;
     let load = std::process::Command::new("launchctl")
         .args(["load", "-w"])
         .arg(&plist)
@@ -3298,6 +4832,7 @@ fn main() {
             drive_map_from,
             drive_mappings,
             drive_unmap,
+            native_drives,
             folder_share_from,
             folder_open,
             folder_open_on,
@@ -3319,6 +4854,10 @@ fn main() {
             kvm_mesh_add,
             kvm_mesh_remove,
             share_grant,
+            fleet_storage_status,
+            fleet_storage_set_policy,
+            fleet_storage_set_allocation,
+            fleet_storage_set_device_role,
             share_revoke,
             share_stop,
             send_input,
@@ -3337,16 +4876,50 @@ fn main() {
             open_video_window,
             term_send,
             term_watch,
+            fleet_service_profiles,
+            fleet_storage_local_volumes,
             term_poll,
             term_unwatch,
             terminal_sessions,
             open_terminal_window,
             file_send,
+            local_file_transfer_scan,
+            local_file_transfer_start,
+            local_file_transfer_cancel,
+            local_file_transfer_operations,
+            local_file_operation_dismiss,
+            fleetfiles_local_desktop,
             file_watch,
             file_poll,
             file_unwatch,
             file_download,
+            file_download_cancel,
             open_files_window,
+            open_files_workspace_window,
+            files_namespace_adopt,
+            files_namespace_mutate,
+            files_namespace_list,
+            files_canvas_snapshot,
+            files_canvas_status,
+            files_canvas_apply,
+            files_canvas_purge_tombstones,
+            local_file_locations,
+            local_file_list,
+            local_directory_watch,
+            local_directory_unwatch,
+            local_file_icon,
+            local_file_preview,
+            local_file_open,
+            local_file_context_menu,
+            local_file_mkdir,
+            local_file_rename,
+            local_file_trash,
+            local_file_operation_apply,
+            local_file_operation_undo,
+            local_file_operation_redo,
+            local_file_operation_state,
+            local_file_clipboard_set,
+            local_file_clipboard_get,
             site_scan,
             site_exposed,
             site_set_exposed,
@@ -3456,6 +5029,12 @@ fn main() {
             app.manage(AppState {
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
+                local_files: Arc::new(Mutex::new(LocalFileBrowser::default())),
+                local_directory_watchers: Arc::new(Mutex::new(HashMap::new())),
+                next_local_directory_watch: AtomicU64::new(1),
+                local_file_operations: Arc::new(Mutex::new(
+                    local_file_operations::LocalFileOperations::default(),
+                )),
             });
             // Installer hooks cover new NSIS installs. Existing installations
             // can arrive here through the self-updater, so migrate the old
@@ -3677,5 +5256,33 @@ mod tests {
             Some(ServiceCmd::Uninstall)
         ));
         assert!(service_cmd("frobnicate").is_none());
+    }
+
+    #[test]
+    fn windows_shell_links_match_only_final_native_extensions() {
+        assert!(windows_shell_link_name("AllMyAgents.lnk"));
+        assert!(windows_shell_link_name("Meeting.URL"));
+        assert!(!windows_shell_link_name("notes.lnk.txt"));
+        assert!(!windows_shell_link_name("meeting.url.backup"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_hidden_attributes_include_hidden_and_system_files() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_SYSTEM,
+        };
+        assert!(windows_file_is_hidden(FILE_ATTRIBUTE_HIDDEN));
+        assert!(windows_file_is_hidden(FILE_ATTRIBUTE_SYSTEM));
+        assert!(!windows_file_is_hidden(FILE_ATTRIBUTE_NORMAL));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_file_paths_hide_windows_device_syntax() {
+        assert_eq!(
+            local_path_for_display(Path::new(r"\\?\C:\Users\Chris\Desktop")),
+            r"C:\Users\Chris\Desktop"
+        );
     }
 }

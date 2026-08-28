@@ -52,6 +52,7 @@ fn main() {
             cpu: "SG2002 (T-Head C906)".into(),
             ram_bytes: 256 << 20,
             device_count: 2,
+            storage: Vec::new(),
             product: "NanoKVM".into(),
         },
         capabilities: vec![
@@ -223,6 +224,7 @@ fn main() {
             cpu: "SG2002 (T-Head C906)".into(),
             ram_bytes: 256 << 20,
             device_count: 2,
+            storage: Vec::new(),
             product: "NanoKVM".into(),
         }),
     );

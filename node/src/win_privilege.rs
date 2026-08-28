@@ -181,7 +181,11 @@ mod imp {
     use std::ffi::c_void;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BAD_DEVICE, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, FALSE, HANDLE,
+        NO_ERROR, TRUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::NetworkManagement::WNet::{WNetCancelConnection2W, WNetGetConnectionW};
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
         ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
@@ -366,11 +370,101 @@ mod imp {
     }
 
     fn read_interactive_user_logical_drive_mask() -> Result<u32, String> {
+        with_interactive_user(|| {
+            let mask = unsafe { GetLogicalDrives() };
+            (mask != 0)
+                .then_some(mask)
+                .ok_or_else(|| "couldn't inspect the signed-in user's drive letters".into())
+        })
+        .map(|mask| mask.unwrap_or(0))
+    }
+
+    /// Resolve a drive in the signed-in Explorer user's DOS-device namespace.
+    pub fn interactive_user_network_mapping(mount: &str) -> Result<Option<String>, String> {
+        let mount = mount.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-lookup".into())
+            .spawn(move || {
+                with_interactive_user(|| read_network_mapping(&mount)).map(Option::flatten)
+            })
+            .map_err(|error| format!("couldn't start the drive mapping check: {error}"))?
+            .join()
+            .map_err(|_| "the drive mapping check stopped unexpectedly".to_string())?
+    }
+
+    fn read_network_mapping(mount: &str) -> Result<Option<String>, String> {
+        let local = mount
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut remote = vec![0_u16; 512];
+        loop {
+            let mut length = remote.len() as u32;
+            let status =
+                unsafe { WNetGetConnectionW(local.as_ptr(), remote.as_mut_ptr(), &mut length) };
+            match status {
+                NO_ERROR => {
+                    let end = remote
+                        .iter()
+                        .position(|unit| *unit == 0)
+                        .unwrap_or(remote.len());
+                    return Ok(Some(String::from_utf16_lossy(&remote[..end])));
+                }
+                ERROR_MORE_DATA => {
+                    let required = usize::try_from(length)
+                        .map_err(|_| "Windows returned an invalid network path length")?;
+                    if required == 0 || required > 32_768 {
+                        return Err("Windows returned an invalid network path length".into());
+                    }
+                    remote.resize(required.saturating_add(1), 0);
+                }
+                ERROR_BAD_DEVICE | ERROR_NOT_CONNECTED => return Ok(None),
+                error => {
+                    return Err(format!(
+                        "Windows couldn't inspect {mount} in the signed-in user's drive namespace (error {error})"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Disconnect a mapping after the caller has separately proven its exact
+    /// endpoint belongs to AllMyStuff.
+    pub fn disconnect_interactive_user_network_mapping(mount: &str) -> Result<bool, String> {
+        let mount = mount.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-disconnect".into())
+            .spawn(move || {
+                with_interactive_user(|| {
+                    let local = mount
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let status = unsafe { WNetCancelConnection2W(local.as_ptr(), 0, TRUE) };
+                    match status {
+                        NO_ERROR => Ok(true),
+                        ERROR_BAD_DEVICE | ERROR_NOT_CONNECTED => Ok(false),
+                        error => Err(format!(
+                            "Windows couldn't disconnect {mount} in the signed-in user's drive namespace (error {error})"
+                        )),
+                    }
+                })
+                .map(|removed| removed.unwrap_or(false))
+            })
+            .map_err(|error| format!("couldn't start the drive disconnect: {error}"))?
+            .join()
+            .map_err(|_| "the drive disconnect stopped unexpectedly".to_string())?
+    }
+
+    /// Run one bounded operation as the signed-in Explorer user. Every public
+    /// caller uses a disposable OS thread so a failed revert cannot leak the
+    /// desktop user's token onto a long-lived async executor worker.
+    fn with_interactive_user<T>(
+        read: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
         let shell = unsafe { GetShellWindow() };
         if shell.is_null() {
-            // No interactive shell means there is no second desktop device map
-            // to collide with. The caller still unions its own drive mask.
-            return Ok(0);
+            return Ok(None);
         }
         let mut process_id = 0;
         if unsafe { GetWindowThreadProcessId(shell, &mut process_id) } == 0 || process_id == 0 {
@@ -396,16 +490,13 @@ mod imp {
             unsafe { CloseHandle(token) };
             return Err("couldn't enter the signed-in user's drive namespace".into());
         }
-        let mask = unsafe { GetLogicalDrives() };
+        let result = read();
         let reverted = unsafe { RevertToSelf() };
         unsafe { CloseHandle(token) };
         if reverted == 0 {
             return Err("couldn't leave the signed-in user's drive namespace".into());
         }
-        if mask == 0 {
-            return Err("couldn't inspect the signed-in user's drive letters".into());
-        }
-        Ok(mask)
+        result.map(Some)
     }
 
     /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
@@ -752,6 +843,14 @@ mod imp {
         Ok(0)
     }
 
+    pub fn interactive_user_network_mapping(_mount: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    pub fn disconnect_interactive_user_network_mapping(_mount: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// No session-0 split to escape: a Unix daemon that needs a display gets it
     /// from the display server's own rules, not from token surgery.
     pub struct ConsoleAgent;
@@ -790,7 +889,8 @@ mod imp {
 }
 
 pub use imp::{
-    active_console_session, current_posture, interactive_user_logical_drive_mask, ConsoleAgent,
+    active_console_session, current_posture, disconnect_interactive_user_network_mapping,
+    interactive_user_logical_drive_mask, interactive_user_network_mapping, ConsoleAgent,
     DesktopFollower,
 };
 
@@ -891,6 +991,12 @@ mod tests {
     #[test]
     fn the_interactive_drive_namespace_can_be_inspected_without_mutation() {
         interactive_user_logical_drive_mask().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_interactive_network_namespace_can_be_queried_without_mutation() {
+        interactive_user_network_mapping("X:").unwrap();
     }
 
     #[test]

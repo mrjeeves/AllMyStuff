@@ -253,6 +253,7 @@ windows-sys = { version = "0.60", features = [
     # timeBeginPeriod/timeEndPeriod — the stream's 1 ms timer-resolution
     # guard (os_perf.rs); without it the pacing sleeps quantize at ~15.6 ms.
     "Win32_Media",
+    "Win32_NetworkManagement_WNet",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",

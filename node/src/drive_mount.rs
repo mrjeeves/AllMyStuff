@@ -773,23 +773,46 @@ async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
 }
 
 #[cfg(any(windows, test))]
-fn windows_mapping_output_matches_port(bytes: &[u8], port: u16) -> bool {
+fn windows_endpoint_matches_port(remote: &str, port: u16) -> bool {
     let expected = format!(r"\\localhost@{port}\DavWWWRoot");
-    String::from_utf8_lossy(bytes).split_whitespace().any(|token| {
-        token
-            .trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(&expected)
-    })
+    remote
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(&expected)
+}
+
+#[cfg(any(windows, test))]
+fn windows_mapping_output_remote(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .find(|token| token.starts_with(r"\\"))
+        .map(|token| token.trim_end_matches(['\\', '/']).to_string())
+}
+
+#[cfg(any(windows, test))]
+fn windows_mapping_output_matches_port(bytes: &[u8], port: u16) -> bool {
+    windows_mapping_output_remote(bytes)
+        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
 }
 
 #[cfg(windows)]
-async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
+async fn windows_mount_ownership(mount: &str, port: u16) -> Result<(bool, bool), String> {
     let output = crate::child_process::command("net.exe")
         .args(["use", mount])
         .output()
         .await
         .map_err(|error| format!("couldn't inspect Windows drive mapping {mount}: {error}"))?;
-    Ok(output.status.success() && windows_mapping_output_matches_port(&output.stdout, port))
+    let current =
+        output.status.success() && windows_mapping_output_matches_port(&output.stdout, port);
+    let interactive = crate::win_privilege::interactive_user_network_mapping(mount)?
+        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port));
+    Ok((current, interactive))
+}
+
+#[cfg(windows)]
+async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
+    let (current, interactive) = windows_mount_ownership(mount, port).await?;
+    Ok(current || interactive)
 }
 
 #[cfg(target_os = "macos")]
@@ -833,18 +856,51 @@ async fn native_mount_matches_port(_mount: &str, _port: u16) -> Result<bool, Str
     Ok(false)
 }
 
+#[cfg(windows)]
+async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, String> {
+    let (current_owned, interactive_seen) = windows_mount_ownership(mount, port).await?;
+    let interactive_owned = if interactive_seen {
+        // Reconfirm immediately before touching letter-scoped Explorer state.
+        // If another process won a remap race, its different endpoint wins.
+        crate::win_privilege::interactive_user_network_mapping(mount)?
+            .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
+    } else {
+        false
+    };
+    if !current_owned && !interactive_owned {
+        clear_unowned_native_metadata(mount, Some(port)).await?;
+        let _ = forget_native_mount(mount);
+        return Ok(false);
+    }
+
+    if interactive_owned {
+        clear_owned_native_display(mount, Some(port)).await?;
+    }
+    if current_owned {
+        unmount_native(mount).await?;
+    }
+    if interactive_owned {
+        // net.exe may have removed the same mapping when both calls see one
+        // logon namespace. Query again and cancel only if the endpoint is
+        // still exactly the AllMyStuff loopback server recorded by the lease.
+        let remaining = crate::win_privilege::interactive_user_network_mapping(mount)?;
+        if remaining.is_some_and(|remote| windows_endpoint_matches_port(&remote, port)) {
+            crate::win_privilege::disconnect_interactive_user_network_mapping(mount)?;
+        }
+    }
+    clear_native_lease_marker(mount, Some(port)).await?;
+    forget_native_mount(mount)?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
 async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, String> {
     if !native_mount_matches_port(mount, port).await? {
         clear_unowned_native_metadata(mount, Some(port)).await?;
         let _ = forget_native_mount(mount);
         return Ok(false);
     }
-    #[cfg(windows)]
-    clear_owned_native_display(mount, Some(port)).await?;
     unmount_native(mount).await?;
-    #[cfg(windows)]
-    clear_native_lease_marker(mount, Some(port)).await?;
-    #[cfg(not(windows))]
     clear_native_label(mount, Some(port)).await?;
     forget_native_mount(mount)?;
     Ok(true)
@@ -1281,11 +1337,15 @@ async fn clear_unowned_native_metadata(mount: &str, port: Option<u16>) -> Result
         Ok(mask) => drive_letter_bit(mount).is_none_or(|bit| mask & bit != 0),
         Err(_) => true,
     };
+    let interactive_assigned = match crate::win_privilege::interactive_user_logical_drive_mask() {
+        Ok(mask) => drive_letter_bit(mount).is_none_or(|bit| mask & bit != 0),
+        Err(_) => true,
+    };
     let remembered_assigned = remembered_network_mounts()
         .await
         .map(|mounts| mounts.contains(&mount.to_ascii_uppercase()))
         .unwrap_or(true);
-    let assigned = logical_assigned || remembered_assigned;
+    let assigned = logical_assigned || interactive_assigned || remembered_assigned;
     if assigned {
         clear_native_lease_marker(mount, port).await
     } else {

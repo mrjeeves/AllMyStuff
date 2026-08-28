@@ -7153,11 +7153,29 @@ impl Mesh {
                 hit.predecessor,
             );
         }
-        let msg = {
+        let (msg, already_torn_down) = {
             let mut st = self.state.lock();
-            st.session.as_mut().and_then(|s| s.teardown(&route_id))
+            match st.session.as_mut() {
+                Some(session) => {
+                    let already_torn_down = session
+                        .route(&route_id)
+                        .is_some_and(|route| route.state == RouteState::TornDown);
+                    let msg = if already_torn_down {
+                        None
+                    } else {
+                        session.teardown(&route_id)
+                    };
+                    (msg, already_torn_down)
+                }
+                None => (None, false),
+            }
         };
-        tracing::info!("local route teardown committing for {route_id}");
+        if already_torn_down {
+            return Ok(());
+        }
+        if msg.is_some() {
+            tracing::info!("local route teardown committing for {route_id}");
+        }
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);

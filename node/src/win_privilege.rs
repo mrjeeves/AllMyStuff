@@ -186,7 +186,10 @@ mod imp {
         ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_PATH_NOT_FOUND,
         FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
     };
-    use windows_sys::Win32::NetworkManagement::WNet::{WNetCancelConnection2W, WNetGetConnectionW};
+    use windows_sys::Win32::NetworkManagement::WNet::{
+        NETRESOURCEW, RESOURCETYPE_DISK, WNetAddConnection2W, WNetCancelConnection2W,
+        WNetGetConnectionW,
+    };
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
         ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation, SetTokenInformation,
@@ -451,6 +454,59 @@ mod imp {
                 }
             }
         }
+    }
+
+    /// Create a temporary drive mapping in the signed-in Explorer user's
+    /// logon namespace. A service or scheduled task has a different DOS-device
+    /// map; running `net use` there produces a drive the user cannot see and
+    /// leaks one private-session mapping on every restart.
+    pub fn connect_interactive_user_network_mapping(
+        mount: &str,
+        remote: &str,
+    ) -> Result<(), String> {
+        let mount = mount.to_string();
+        let remote = remote.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-connect".into())
+            .spawn(move || {
+                with_interactive_user(|| {
+                    let mut local = mount
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let mut remote_wide = remote
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<_>>();
+                    let resource = NETRESOURCEW {
+                        dwType: RESOURCETYPE_DISK,
+                        lpLocalName: local.as_mut_ptr(),
+                        lpRemoteName: remote_wide.as_mut_ptr(),
+                        ..Default::default()
+                    };
+                    let status = unsafe {
+                        WNetAddConnection2W(
+                            &resource,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                        )
+                    };
+                    (status == NO_ERROR).then_some(()).ok_or_else(|| {
+                        format!(
+                            "Windows couldn't connect {mount} to {remote} in the signed-in user's drive namespace (error {status})"
+                        )
+                    })
+                })
+            })
+            .map_err(|error| format!("couldn't start the drive connection: {error}"))?
+            .join()
+            .map_err(|_| "the drive connection stopped unexpectedly".to_string())?
+            .and_then(|connected| {
+                connected.ok_or_else(|| {
+                    "there is no signed-in Explorer session to receive the drive mapping".into()
+                })
+            })
     }
     fn read_network_mapping(mount: &str) -> Result<Option<String>, String> {
         let local = mount
@@ -967,6 +1023,12 @@ mod imp {
     pub fn interactive_user_network_mapping(_mount: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+    pub fn connect_interactive_user_network_mapping(
+        _mount: &str,
+        _remote: &str,
+    ) -> Result<(), String> {
+        Err("interactive Windows drive mappings are unavailable".into())
+    }
 
     pub fn disconnect_interactive_user_network_mapping(_mount: &str) -> Result<bool, String> {
         Ok(false)
@@ -1018,8 +1080,9 @@ mod imp {
 }
 
 pub use imp::{
-    active_console_session, current_posture, disconnect_interactive_user_network_mapping,
-    dos_device_targets, interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
+    active_console_session, connect_interactive_user_network_mapping, current_posture,
+    disconnect_interactive_user_network_mapping, dos_device_targets,
+    interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
     interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
 };
 

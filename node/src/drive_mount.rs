@@ -1113,6 +1113,16 @@ async fn remove_known_native_mount(_mount: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn windows_webdav_remote(url: &str) -> Result<String, String> {
+    let port = url
+        .strip_prefix("http://localhost:")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .and_then(|port| port.parse::<u16>().ok())
+        .ok_or_else(|| format!("invalid local Fleetfiles WebDAV address: {url}"))?;
+    Ok(format!(r"\\localhost@{port}\DavWWWRoot"))
+}
+
 #[cfg(windows)]
 async fn warm_native_mount(mount: &str) {
     // Windows starts the WebClient redirector lazily. Make its one initial
@@ -1138,22 +1148,8 @@ async fn warm_native_mount(mount: &str) {
 
 #[cfg(windows)]
 async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
-    let output = crate::child_process::command("net.exe")
-        .args(["use", mount, url, "/persistent:no"])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't launch Windows drive mapping: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if detail.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        } else {
-            detail
-        };
-        Err(format!("Windows couldn't map {mount}: {detail}"))
-    }
+    let remote = windows_webdav_remote(url)?;
+    crate::win_privilege::connect_interactive_user_network_mapping(mount, &remote)
 }
 
 #[cfg(target_os = "macos")]
@@ -1930,7 +1926,7 @@ mod windows_tests {
         drive_letter_reserved, mount_available, normalize_requested_mount,
         parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
         windows_dos_device_targets_match_port, windows_mapping_output_matches_port,
-        NativeDriveInfo,
+        windows_webdav_remote, NativeDriveInfo,
     };
     use std::collections::HashSet;
 
@@ -1951,6 +1947,15 @@ mod windows_tests {
     }
 
     #[test]
+    fn fleetfiles_webdav_url_becomes_the_windows_redirector_endpoint() {
+        assert_eq!(
+            windows_webdav_remote("http://localhost:64895/").unwrap(),
+            r"\\localhost@64895\DavWWWRoot"
+        );
+        assert!(windows_webdav_remote("http://server:64895/").is_err());
+    }
+    #[test]
+
     fn requested_drive_letters_are_canonical_and_strict() {
         assert_eq!(
             normalize_requested_mount(" x:\\").unwrap(),

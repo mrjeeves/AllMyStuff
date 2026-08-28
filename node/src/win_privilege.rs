@@ -194,7 +194,10 @@ mod imp {
         TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
     use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
-    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
+    };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     };
@@ -462,14 +465,9 @@ mod imp {
     fn with_interactive_user<T>(
         read: impl FnOnce() -> Result<T, String>,
     ) -> Result<Option<T>, String> {
-        let shell = unsafe { GetShellWindow() };
-        if shell.is_null() {
+        let Some(process_id) = interactive_explorer_process_id()? else {
             return Ok(None);
-        }
-        let mut process_id = 0;
-        if unsafe { GetWindowThreadProcessId(shell, &mut process_id) } == 0 || process_id == 0 {
-            return Err("couldn't identify the signed-in user's Explorer process".into());
-        }
+        };
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id) };
         if process.is_null() {
             return Err("couldn't inspect the signed-in user's Explorer process".into());
@@ -499,6 +497,72 @@ mod imp {
         result.map(Some)
     }
 
+
+    /// Find Explorer in the physical console session even when the caller is a
+    /// service or scheduled task in a different Windows session. GetShellWindow
+    /// only sees the caller's window station and is therefore merely a fallback.
+    fn interactive_explorer_process_id() -> Result<Option<u32>, String> {
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        if session == NO_SESSION {
+            return Ok(None);
+        }
+
+        let mut processes: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
+        let mut count = 0_u32;
+        let enumerated = unsafe {
+            WTSEnumerateProcessesW(
+                WTS_CURRENT_SERVER_HANDLE,
+                0,
+                1,
+                &mut processes,
+                &mut count,
+            )
+        };
+        if enumerated != 0 {
+            let process_id = if processes.is_null() || count == 0 {
+                None
+            } else {
+                let entries =
+                    unsafe { std::slice::from_raw_parts(processes, count as usize) };
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.SessionId == session
+                            && wide_process_name_is(entry.pProcessName, "explorer.exe")
+                    })
+                    .map(|entry| entry.ProcessId)
+                    .filter(|process_id| *process_id != 0)
+            };
+            if !processes.is_null() {
+                unsafe { WTSFreeMemory(processes.cast()) };
+            }
+            return Ok(process_id);
+        }
+
+        // Restricted desktop builds can deny WTS enumeration while still
+        // allowing a same-session process to inspect its own shell.
+        let shell = unsafe { GetShellWindow() };
+        if shell.is_null() {
+            return Err("couldn't enumerate the signed-in user's Explorer process".into());
+        }
+        let mut process_id = 0;
+        if unsafe { GetWindowThreadProcessId(shell, &mut process_id) } == 0 || process_id == 0 {
+            return Err("couldn't identify the signed-in user's Explorer process".into());
+        }
+        Ok(Some(process_id))
+    }
+
+    fn wide_process_name_is(name: *const u16, expected: &str) -> bool {
+        if name.is_null() {
+            return false;
+        }
+        let mut length = 0;
+        while length < 260 && unsafe { *name.add(length) } != 0 {
+            length += 1;
+        }
+        let name = unsafe { std::slice::from_raw_parts(name, length) };
+        String::from_utf16_lossy(name).eq_ignore_ascii_case(expected)
+    }
     /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
     /// to the console — between a logoff and the next logon, or on a box whose
     /// session is being transferred.

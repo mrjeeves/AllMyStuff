@@ -529,7 +529,7 @@ fn default_unix_mount_root() -> Result<PathBuf, String> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn select_windows_mount(
     requested: Option<String>,
     mut available: impl FnMut(&str) -> bool,
@@ -605,7 +605,7 @@ fn windows_logical_drive_mask() -> Result<u32, String> {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn drive_letter_bit(mount: &str) -> Option<u32> {
     let letter = mount.as_bytes().first()?.to_ascii_uppercase();
     if !letter.is_ascii_alphabetic() {
@@ -646,7 +646,7 @@ async fn remembered_network_mounts() -> Result<std::collections::HashSet<String>
     Ok(mounts)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn parse_network_registry_mounts(bytes: &[u8]) -> std::collections::HashSet<String> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -689,7 +689,7 @@ async fn remembered_network_registry_mounts() -> Result<std::collections::HashSe
         Err("Windows couldn't inspect the signed-in user's remembered drive mappings".into())
     }
 }
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
     drive_letter_bit(mount).is_some_and(|bit| logical_drives & bit != 0)
 }
@@ -802,7 +802,7 @@ async fn remove_known_native_mount(mount: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_endpoint_matches_port(remote: &str, port: u16) -> bool {
     let expected = format!(r"\\localhost@{port}\DavWWWRoot");
     remote
@@ -811,7 +811,7 @@ fn windows_endpoint_matches_port(remote: &str, port: u16) -> bool {
         .eq_ignore_ascii_case(&expected)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_mapping_output_remote(bytes: &[u8]) -> Option<String> {
     String::from_utf8_lossy(bytes)
         .split_whitespace()
@@ -819,7 +819,7 @@ fn windows_mapping_output_remote(bytes: &[u8]) -> Option<String> {
         .map(|token| token.trim_end_matches(['\\', '/']).to_string())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_mapping_output_matches_port(bytes: &[u8], port: u16) -> bool {
     windows_mapping_output_remote(bytes)
         .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
@@ -847,7 +847,7 @@ async fn windows_mount_ownership(mount: &str, port: u16) -> Result<(bool, bool),
     Ok((current, interactive))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_dos_device_targets_match_port(targets: &[String], port: u16) -> bool {
     let endpoint = format!(r"\localhost@{port}\davwwwroot");
     targets.iter().any(|target| {
@@ -1129,7 +1129,7 @@ async fn remove_known_native_mount(_mount: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_webdav_remote(url: &str) -> Result<String, String> {
     let port = url
         .strip_prefix("http://localhost:")

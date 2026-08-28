@@ -182,8 +182,9 @@ mod imp {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BAD_DEVICE, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, FALSE, HANDLE,
-        NO_ERROR, TRUE, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, ERROR_BAD_DEVICE, ERROR_FILE_NOT_FOUND,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_PATH_NOT_FOUND,
+        FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::NetworkManagement::WNet::{WNetCancelConnection2W, WNetGetConnectionW};
     use windows_sys::Win32::Security::{
@@ -193,7 +194,7 @@ mod imp {
         TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
         TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
-    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+    use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
     use windows_sys::Win32::System::RemoteDesktop::{
         WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
         WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
@@ -395,6 +396,62 @@ mod imp {
             .map_err(|_| "the drive mapping check stopped unexpectedly".to_string())?
     }
 
+    /// Read the DOS-device targets behind a drive in this process's logon
+    /// namespace. Unlike opening the drive or asking WebDAV to reconnect, this
+    /// is a local object-manager lookup and remains reliable when the old
+    /// localhost bridge died in a crash.
+    pub fn dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        read_dos_device_targets(mount)
+    }
+
+    /// Read the same object-manager identity in the signed-in Explorer user's
+    /// namespace. Elevated/service and desktop mappings can be different.
+    pub fn interactive_user_dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        let mount = mount.to_string();
+        std::thread::Builder::new()
+            .name("ams-drive-device-lookup".into())
+            .spawn(move || {
+                with_interactive_user(|| read_dos_device_targets(&mount))
+                    .map(|targets| targets.unwrap_or_default())
+            })
+            .map_err(|error| format!("couldn't start the drive device check: {error}"))?
+            .join()
+            .map_err(|_| "the drive device check stopped unexpectedly".to_string())?
+    }
+
+    fn read_dos_device_targets(mount: &str) -> Result<Vec<String>, String> {
+        let local = mount
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut targets = vec![0_u16; 1024];
+        loop {
+            let length = unsafe {
+                QueryDosDeviceW(local.as_ptr(), targets.as_mut_ptr(), targets.len() as u32)
+            };
+            if length != 0 {
+                return Ok(targets[..length as usize]
+                    .split(|unit| *unit == 0)
+                    .filter(|target| !target.is_empty())
+                    .map(String::from_utf16_lossy)
+                    .collect());
+            }
+            let error = unsafe { GetLastError() };
+            match error {
+                ERROR_INSUFFICIENT_BUFFER if targets.len() < 32_768 => {
+                    targets.resize((targets.len() * 2).min(32_768), 0);
+                }
+                ERROR_BAD_DEVICE | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                    return Ok(Vec::new());
+                }
+                _ => {
+                    return Err(format!(
+                        "Windows couldn't inspect the DOS-device target for {mount} (error {error})"
+                    ));
+                }
+            }
+        }
+    }
     fn read_network_mapping(mount: &str) -> Result<Option<String>, String> {
         let local = mount
             .encode_utf16()
@@ -915,6 +972,14 @@ mod imp {
         Ok(false)
     }
 
+    pub fn dos_device_targets(_mount: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    pub fn interactive_user_dos_device_targets(_mount: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
     /// No session-0 split to escape: a Unix daemon that needs a display gets it
     /// from the display server's own rules, not from token surgery.
     pub struct ConsoleAgent;
@@ -954,8 +1019,8 @@ mod imp {
 
 pub use imp::{
     active_console_session, current_posture, disconnect_interactive_user_network_mapping,
-    interactive_user_logical_drive_mask, interactive_user_network_mapping, ConsoleAgent,
-    DesktopFollower,
+    dos_device_targets, interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
+    interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
 };
 
 /// Whether this build targets Windows at all, hoisted here so callers don't

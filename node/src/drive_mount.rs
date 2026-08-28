@@ -808,11 +808,30 @@ async fn windows_mount_ownership(mount: &str, port: u16) -> Result<(bool, bool),
         .output()
         .await
         .map_err(|error| format!("couldn't inspect Windows drive mapping {mount}: {error}"))?;
-    let current =
-        output.status.success() && windows_mapping_output_matches_port(&output.stdout, port);
+    let current = (output.status.success()
+        && windows_mapping_output_matches_port(&output.stdout, port))
+        || windows_dos_device_targets_match_port(
+            &crate::win_privilege::dos_device_targets(mount)?,
+            port,
+        );
     let interactive = crate::win_privilege::interactive_user_network_mapping(mount)?
-        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port));
+        .is_some_and(|remote| windows_endpoint_matches_port(&remote, port))
+        || windows_dos_device_targets_match_port(
+            &crate::win_privilege::interactive_user_dos_device_targets(mount)?,
+            port,
+        );
     Ok((current, interactive))
+}
+
+#[cfg(any(windows, test))]
+fn windows_dos_device_targets_match_port(targets: &[String], port: u16) -> bool {
+    let endpoint = format!(r"\localhost@{port}\davwwwroot");
+    targets.iter().any(|target| {
+        target
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+            .contains(&endpoint)
+    })
 }
 
 #[cfg(windows)]
@@ -1872,7 +1891,8 @@ mod windows_tests {
     use super::{
         drive_letter_reserved, mount_available, normalize_requested_mount,
         parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
-        windows_mapping_output_matches_port, NativeDriveInfo,
+        windows_dos_device_targets_match_port, windows_mapping_output_matches_port,
+        NativeDriveInfo,
     };
     use std::collections::HashSet;
 
@@ -1880,6 +1900,16 @@ mod windows_tests {
     fn parses_allmystuff_drive_marker_port() {
         let output = b"    Port    REG_DWORD    0xf05d\r\n";
         assert_eq!(parse_registry_dword(output), Some(61_533));
+    }
+
+    #[test]
+    fn dos_device_identity_recovers_a_disconnected_webdav_mapping() {
+        let targets = vec![
+            r"\Device\WebDavRedirector\;R:0000000000001234\localhost@63229\DavWWWRoot"
+                .to_string(),
+        ];
+        assert!(windows_dos_device_targets_match_port(&targets, 63_229));
+        assert!(!windows_dos_device_targets_match_port(&targets, 63_230));
     }
 
     #[test]

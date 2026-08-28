@@ -115,6 +115,16 @@
     directoryChanges: Map<number, (event: DirectoryChangedEvent) => void>;
   };
   let locations = $state<LocalFileLocation[]>([]);
+  let locationsRequest: Promise<LocalFileLocation[]> | null = null;
+  function requestLocalFileLocations(): Promise<LocalFileLocation[]> {
+    if (!locationsRequest) {
+      locationsRequest = localFileLocations().then(
+        (value) => { locationsRequest = null; return value; },
+        (error) => { locationsRequest = null; throw error; },
+      );
+    }
+    return locationsRequest;
+  }
   let path = $state("");
   let directoryId = $state("");
   let platform = $state("windows");
@@ -1225,8 +1235,10 @@
       let nextEntries: WorkspaceEntry[];
       let routeId: string | undefined;
       if (local) {
+        const localLocations = locations.length > 0 ? locations : await requestLocalFileLocations();
+        locations = localLocations;
         const adapterMounts = await nativeDriveMounts().catch(() => []);
-        nextEntries = locations
+        nextEntries = localLocations
           .filter((location) =>
             location.kind === "volume"
             && !adapterMounts.some((adapter) => sameNativePath(location.path, adapter.mount))
@@ -1456,9 +1468,11 @@
       } catch (error) {
         console.warn("Could not watch Files backend connection:", error);
       }
-      const [places, saved] = await Promise.all([localFileLocations(), filesCanvasSnapshot()]);
+      void requestLocalFileLocations().then((places) => {
+        if (mounted) locations = places;
+      }).catch((error) => console.warn("Could not load native file locations:", error));
+      const saved = await filesCanvasSnapshot();
       if (!mounted) return;
-      locations = places;
       records = hydrateCanvasRecords(saved, records);
       canvasHydrated = true;
       if (backendRefreshPending) await refreshCanvasAfterBackendReconnect();

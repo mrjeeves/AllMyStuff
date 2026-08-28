@@ -375,9 +375,15 @@ impl DriveMounts {
         let Some(active) = self.active.lock().remove(route) else {
             return;
         };
-        active.server.abort();
         crate::spawn(async move {
-            match release_native_mount_if_owned(&active.info.mount, active.info.port).await {
+            // Keep the loopback endpoint alive while Windows verifies and
+            // disconnects this exact mapping. Aborting it first can turn the
+            // redirector into a disconnected/ambiguous state between these
+            // two operations and strand a letter with no ownership marker.
+            let released =
+                release_native_mount_if_owned(&active.info.mount, active.info.port).await;
+            active.server.abort();
+            match released {
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::warn!(

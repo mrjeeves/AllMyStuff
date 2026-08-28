@@ -544,14 +544,30 @@ mod imp {
         }
     }
 
-    /// Disconnect a mapping after the caller has separately proven its exact
-    /// endpoint belongs to AllMyStuff.
-    pub fn disconnect_interactive_user_network_mapping(mount: &str) -> Result<bool, String> {
+    /// Disconnect a mapping only while it still resolves to the exact endpoint
+    /// the caller proved belongs to AllMyStuff. Keep the identity check and
+    /// cancellation under one Explorer-token impersonation window so a drive
+    /// letter reused by another application is never cancelled from a stale
+    /// observation made by the service session.
+    pub fn disconnect_interactive_user_network_mapping_if_matches(
+        mount: &str,
+        expected_remote: &str,
+    ) -> Result<bool, String> {
         let mount = mount.to_string();
+        let expected_remote = expected_remote.to_string();
         std::thread::Builder::new()
             .name("ams-drive-disconnect".into())
             .spawn(move || {
                 with_interactive_user(|| {
+                    let Some(remote) = read_network_mapping(&mount)? else {
+                        return Ok(false);
+                    };
+                    if !remote
+                        .trim_end_matches(['\\', '/'])
+                        .eq_ignore_ascii_case(expected_remote.trim_end_matches(['\\', '/']))
+                    {
+                        return Ok(false);
+                    }
                     let local = mount
                         .encode_utf16()
                         .chain(std::iter::once(0))
@@ -1030,7 +1046,10 @@ mod imp {
         Err("interactive Windows drive mappings are unavailable".into())
     }
 
-    pub fn disconnect_interactive_user_network_mapping(_mount: &str) -> Result<bool, String> {
+    pub fn disconnect_interactive_user_network_mapping_if_matches(
+        _mount: &str,
+        _expected_remote: &str,
+    ) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -1081,7 +1100,7 @@ mod imp {
 
 pub use imp::{
     active_console_session, connect_interactive_user_network_mapping, current_posture,
-    disconnect_interactive_user_network_mapping, dos_device_targets,
+    disconnect_interactive_user_network_mapping_if_matches, dos_device_targets,
     interactive_user_dos_device_targets, interactive_user_logical_drive_mask,
     interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
 };

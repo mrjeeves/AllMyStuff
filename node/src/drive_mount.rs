@@ -944,16 +944,34 @@ async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, S
     }
     if interactive_owned {
         // net.exe may have removed the same mapping when both calls see one
-        // logon namespace. Query again and cancel only if the endpoint is
-        // still exactly the AllMyStuff loopback server recorded by the lease.
-        let remaining = crate::win_privilege::interactive_user_network_mapping(mount)?;
-        if remaining.is_some_and(|remote| windows_endpoint_matches_port(&remote, port)) {
-            crate::win_privilege::disconnect_interactive_user_network_mapping(mount)?;
+        // logon namespace. The helper rechecks the exact endpoint while
+        // impersonating Explorer and narrows the letter-reuse race around the
+        // cancellation itself.
+        let remote = format!(r"\\localhost@{port}\DavWWWRoot");
+        crate::win_privilege::disconnect_interactive_user_network_mapping_if_matches(
+            mount, &remote,
+        )?;
+    }
+
+    // WNetCancelConnection2 can report success before WebClient removes the
+    // DOS-device letter. Do not discard the private ownership lease until the
+    // union of the service and Explorer namespaces proves the letter is free.
+    // If it stays assigned (including an ambiguous or newly foreign mapping),
+    // preserving the marker lets bounded startup recovery re-prove identity;
+    // it is much safer than consuming another drive letter on every restart.
+    for attempt in 0..30 {
+        if !windows_mount_is_assigned(mount).await? {
+            clear_native_lease_marker(mount, Some(port)).await?;
+            forget_native_mount(mount)?;
+            return Ok(true);
+        }
+        if attempt < 29 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    clear_native_lease_marker(mount, Some(port)).await?;
-    forget_native_mount(mount)?;
-    Ok(true)
+    Err(format!(
+        "Windows is still releasing {mount}; its AllMyStuff ownership lease was retained"
+    ))
 }
 
 #[cfg(not(windows))]

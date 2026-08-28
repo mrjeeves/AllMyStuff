@@ -407,19 +407,9 @@ async fn choose_mount(
     {
         let remembered = remembered_network_mounts().await?;
         let logical_drives = windows_logical_drive_mask()?;
-        if let Some(mount) = normalize_requested_mount(requested)? {
-            if !mount_available(&mount, active, &remembered, logical_drives) {
-                return Err(format!("{mount} is already in use"));
-            }
-            return Ok(mount);
-        }
-        for letter in ('D'..='Z').rev() {
-            let mount = format!("{letter}:");
-            if mount_available(&mount, active, &remembered, logical_drives) {
-                return Ok(mount);
-            }
-        }
-        Err("there are no free drive letters".into())
+        select_windows_mount(normalize_requested_mount(requested)?, |mount| {
+            mount_available(mount, active, &remembered, logical_drives)
+        })
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -538,6 +528,32 @@ fn default_unix_mount_root() -> Result<PathBuf, String> {
     }
 }
 
+
+#[cfg(any(windows, test))]
+fn select_windows_mount(
+    requested: Option<String>,
+    mut available: impl FnMut(&str) -> bool,
+) -> Result<String, String> {
+    if let Some(mount) = requested.as_deref() {
+        if available(mount) {
+            return Ok(mount.to_string());
+        }
+        // A persisted reconnect preference is not ownership. If another
+        // volume now owns the letter, relocate once and persist the successful
+        // replacement instead of fighting that owner on every reconnect.
+        tracing::warn!("{mount} is already in use; choosing another drive letter");
+    }
+    for letter in ('D'..='Z').rev() {
+        let mount = format!("{letter}:");
+        if requested.as_deref() == Some(mount.as_str()) {
+            continue;
+        }
+        if available(&mount) {
+            return Ok(mount);
+        }
+    }
+    Err("there are no free drive letters".into())
+}
 #[cfg(windows)]
 fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> {
     let requested = requested.trim().trim_end_matches(['\\', '/']);
@@ -563,11 +579,11 @@ fn mount_available(
     logical_drives: u32,
 ) -> bool {
     if drive_letter_reserved(mount, logical_drives)
-        || std::path::Path::new(&format!("{mount}\\")).exists()
+        || remembered.contains(&mount.to_ascii_uppercase())
         || active
             .iter()
             .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
-        || remembered.contains(&mount.to_ascii_uppercase())
+        || std::path::Path::new(&format!("{mount}\\")).exists()
     {
         return false;
     }
@@ -1737,7 +1753,7 @@ mod registry_tests {
 mod windows_tests {
     use super::{
         drive_letter_reserved, normalize_requested_mount, parse_registry_dword,
-        windows_mapping_output_matches_port,
+        select_windows_mount, windows_mapping_output_matches_port,
     };
 
     #[test]
@@ -1763,6 +1779,21 @@ mod windows_tests {
         assert!(drive_letter_reserved("Z:", z));
         assert!(drive_letter_reserved("z:", z));
         assert!(!drive_letter_reserved("Y:", z));
+    }
+
+    #[test]
+    fn occupied_requested_letter_relocates_once_to_a_safe_letter() {
+        let exact = select_windows_mount(Some("Z:".into()), |mount| mount == "Z:").unwrap();
+        assert_eq!(exact, "Z:");
+
+        let mut checked = Vec::new();
+        let relocated = select_windows_mount(Some("Z:".into()), |mount| {
+            checked.push(mount.to_string());
+            mount == "Y:"
+        })
+        .unwrap();
+        assert_eq!(relocated, "Y:");
+        assert_eq!(checked, ["Z:", "Y:"]);
     }
 
     #[test]

@@ -722,7 +722,7 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
         clear_unowned_native_metadata(mount, None).await?;
         return Ok(());
     };
-    if !native_mount_matches_port(mount, port).await? {
+    if !wait_for_stale_mount_identity(mount, port).await? {
         tracing::warn!("preserving {mount}: its stale AllMyStuff marker does not match the current mapping");
         clear_unowned_native_metadata(mount, Some(port)).await?;
         return Ok(());
@@ -734,14 +734,44 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
     // after `net use /delete` returns. Wait for the provider's own listing,
     // not a fixed sleep, so reconnects are both fast and deterministic.
     for _ in 0..30 {
-        if !remembered_network_mounts()
-            .await?
-            .contains(&mount.to_ascii_uppercase())
-        {
+        if !windows_mount_is_assigned(mount).await? {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+#[cfg(windows)]
+async fn wait_for_stale_mount_identity(mount: &str, port: u16) -> Result<bool, String> {
+    // A newly launched process can observe the letter before Windows exposes
+    // the corresponding WebDAV DOS-device target in its logon namespace.
+    // Retry only while recovering a private stale lease; ordinary startup and
+    // drive selection never poll. A different endpoint never passes the exact
+    // port match, and loses only our stale marker after this bounded window.
+    for attempt in 0..20 {
+        if native_mount_matches_port(mount, port).await? {
+            return Ok(true);
+        }
+        if !windows_mount_is_assigned(mount).await? {
+            return Ok(false);
+        }
+        if attempt < 19 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+async fn windows_mount_is_assigned(mount: &str) -> Result<bool, String> {
+    let bit = drive_letter_bit(mount)
+        .ok_or_else(|| format!("{mount} is not a Windows drive letter"))?;
+    let logical = windows_logical_drive_mask()?
+        | crate::win_privilege::interactive_user_logical_drive_mask()?;
+    Ok(logical & bit != 0
+        || remembered_network_mounts()
+            .await?
+            .contains(&mount.to_ascii_uppercase()))
+}
     Err(format!(
         "Windows is still releasing {mount}; AllMyStuff will retry"
     ))
@@ -1428,7 +1458,7 @@ async fn cleanup_stale_native_mounts() {
             .and_then(|output| parse_registry_dword(&output.stdout))
             .and_then(|port| u16::try_from(port).ok());
         let result = match port {
-            Some(port) => release_native_mount_if_owned(&mount, port).await.map(|_| ()),
+            Some(_) => reclaim_stale_owned_mount(&mount).await,
             None => clear_unowned_native_metadata(&mount, None).await,
         };
         if let Err(error) = result {

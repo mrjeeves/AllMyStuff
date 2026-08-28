@@ -3003,23 +3003,34 @@ impl Mesh {
                 // technician node hosts nothing consent-gated — but the role
                 // flips permanently on the first dial, and a DUAL-ROLE node
                 // (dialed someone once, yet also reachable as a customer) very
-                // much still hosts a consent-gated screen. On a pure technician
-                // node the body no-ops anyway: its routes point at customers,
-                // and `knows_technician` is false for those peers.
-                // Snapshot every live route (peer, id, is-screen, drive-plane)
+                // much still hosts a consent-gated screen. Instead, classify
+                // each route by which endpoint hosts the privileged resource.
+                // This is essential on dual-role nodes: an outbound viewer
+                // route may point at a peer remembered as a technician, but it
+                // is the peer's resource and must never be torn down by our
+                // customer-side consent sweep.
+                // Snapshot every locally-hosted live route (peer, route,
+                // drive-plane)
                 // under the state lock, then drop it before touching the CEC
                 // store or tearing anything down (`disconnect` re-locks state).
-                let routes: Vec<(String, Route, Option<DrivePlane>)> = {
+                let routes: Vec<(String, Route, Option<DrivePlane>, bool)> = {
+                    let Some(me) = mesh.local_node_id() else {
+                        continue;
+                    };
                     let st = mesh.state.lock();
                     match st.session.as_ref() {
                         Some(session) => session
                             .routes()
-                            .filter(|r| cec_sweep_route_is_live(&r.state))
+                            .filter(|r| {
+                                cec_sweep_route_is_live(&r.state)
+                                    && cec_route_hosts_privilege_here(&r.route, &me)
+                            })
                             .map(|r| {
                                 (
                                     r.peer.as_str().to_string(),
                                     r.route.clone(),
                                     route_drive_plane(&r.route),
+                                    r.is_active(),
                                 )
                             })
                             .collect(),
@@ -3039,7 +3050,7 @@ impl Mesh {
                 // is tearing down for lapsed consent doesn't count.
                 let mut viewing: std::collections::BTreeMap<String, (bool, bool)> =
                     std::collections::BTreeMap::new();
-                for (peer, route, plane) in routes {
+                for (peer, route, plane, active) in routes {
                     // Only CEC technicians are consent-gated; an owner/fleet or
                     // ordinary peer's routes are none of this sweep's business.
                     if !mesh.cec.knows_technician(&peer) {
@@ -3057,6 +3068,9 @@ impl Mesh {
                     if screen_lapsed || drive_lapsed {
                         stale_routes.push(route.id.clone());
                         lapsed_techs.insert(crate::cec::pubkey_part(&peer).to_string());
+                        continue;
+                    }
+                    if !active {
                         continue;
                     }
                     let entry = viewing
@@ -3116,12 +3130,18 @@ impl Mesh {
     pub async fn cec_viewing(self: &Arc<Self>) -> Result<Value, String> {
         let mut viewing: std::collections::BTreeMap<String, (bool, bool)> =
             std::collections::BTreeMap::new();
+        let Some(me) = self.local_node_id() else {
+            return Ok(cec_viewing_value(&viewing));
+        };
         {
             let st = self.state.lock();
             if let Some(session) = st.session.as_ref() {
                 for r in session.routes() {
                     let peer = r.peer.as_str();
-                    if !self.cec.knows_technician(peer) {
+                    if !r.is_active()
+                        || !cec_route_hosts_privilege_here(&r.route, &me)
+                        || !self.cec.knows_technician(peer)
+                    {
                         continue;
                     }
                     let entry = viewing
@@ -16409,18 +16429,16 @@ impl Mesh {
     }
 
     /// Whether a **screen-viewing** (`Display`/`Video`) offer from `sender` is
-    /// authorized under CEC. Refused only when this node is on the customer
-    /// side (never dialed anyone) *and* `sender` is a CEC technician it knows
-    /// but hasn't granted screen view — the one case a screen offer must be
-    /// blocked. Everything else (an ordinary AllMyStuff screen share, a
-    /// technician's own node) falls through to the normal path. This is the
-    /// screen twin of the per-frame `Control` gate above: a revoke closes it
-    /// the next time an offer (or re-offer) is screened. Customer-ness is
-    /// role-derived now — with standing area membership there is no hosting
-    /// toggle to key on.
+    /// authorized under CEC. A remembered CEC technician without live screen
+    /// consent is a denial, independent of this node's role history: one device
+    /// can be both technician and customer. The caller combines this denial
+    /// with ordinary AllMyStuff authority, so an owner/fleet member or explicit
+    /// screen share still wins even when the same identity also appears in the
+    /// CEC directory. This is the screen twin of the per-frame `Control` gate
+    /// above: a revoke closes it the next time an offer (or re-offer) is
+    /// screened.
     fn cec_screen_offer_denied(&self, sender: &str) -> bool {
-        !self.cec.is_technician()
-            && self.cec.knows_technician(sender)
+        self.cec.knows_technician(sender)
             && !self
                 .cec
                 .is_allowed(sender, allmystuff_cec_consent::Capability::ScreenView)
@@ -19112,7 +19130,11 @@ enum DrivePlane {
 /// The privileged plane a route carries, if any — so the offer screen and the
 /// per-frame gate authorize the same plane for the same route.
 fn route_drive_plane(route: &Route) -> Option<DrivePlane> {
-    if is_terminal_route(route) {
+    if route.media == MediaKind::Input {
+        Some(DrivePlane::Input)
+    } else if route.media == MediaKind::Clipboard {
+        Some(DrivePlane::Clipboard)
+    } else if is_terminal_route(route) {
         Some(DrivePlane::Terminal)
     } else if is_files_route(route) {
         Some(DrivePlane::Files)
@@ -19222,6 +19244,28 @@ fn cec_sweep_route_is_live(state: &RouteState) -> bool {
         state,
         RouteState::Offered | RouteState::Incoming | RouteState::Active
     )
+}
+
+/// Whether this node hosts the resource whose CEC consent protects on this
+/// route. Source-hosted planes expose something from the source machine
+/// (screen, shell, files, a mapped volume, or a site). Input and clipboard
+/// instead mutate the sink machine, so their privileged host is `route.to`.
+///
+/// This directional check is deliberately independent of the peer's remembered
+/// CEC role. A machine may be both technician and customer over its lifetime;
+/// role history therefore cannot tell whether a particular live route exposes
+/// this machine or merely views another one.
+fn cec_route_hosts_privilege_here(route: &Route, me: &str) -> bool {
+    match route_drive_plane(route) {
+        Some(DrivePlane::Input | DrivePlane::Clipboard) => route_sinks_on(route, me),
+        Some(DrivePlane::Terminal | DrivePlane::Files | DrivePlane::Sites(_)) => {
+            route_sources_on(route, me)
+        }
+        None if matches!(route.media, MediaKind::Display | MediaKind::Video) => {
+            route_sources_on(route, me)
+        }
+        None => false,
+    }
 }
 
 /// Structural half of virtual-room authorization. The room's local lease has
@@ -21476,6 +21520,98 @@ mod tests {
         assert!(!cec_sweep_route_is_live(&RouteState::Rejected {
             reason: "done".into(),
         }));
+    }
+
+    #[test]
+    fn cec_sweep_only_owns_the_privileged_end_of_each_route() {
+        let source_hosted = [
+            term_route("me-A3285:screen", "peer:display", MediaKind::Display),
+            term_route("me-A3285:camera", "peer:video", MediaKind::Video),
+            term_route("me-A3285:terminal", "peer:term-view:1", MediaKind::Generic),
+            term_route("me-A3285:files", "peer:files-view:1", MediaKind::Generic),
+            term_route(
+                "me-A3285:disk:C:\\",
+                "peer:storage-in",
+                MediaKind::Storage,
+            ),
+            term_route("me-A3285:site", "peer:site-view:1", MediaKind::Generic),
+        ];
+        for route in source_hosted {
+            assert!(
+                cec_route_hosts_privilege_here(&route, "me-OTHER"),
+                "source host was missed: {}",
+                route.id
+            );
+            assert!(
+                !cec_route_hosts_privilege_here(&route, "peer-OTHER"),
+                "viewer tried to police its peer's source: {}",
+                route.id
+            );
+        }
+
+        let sink_hosted = [
+            term_route("peer:input", "me-A3285:control", MediaKind::Input),
+            term_route(
+                "peer:clipboard",
+                "me-A3285:clipboard",
+                MediaKind::Clipboard,
+            ),
+        ];
+        for route in sink_hosted {
+            assert!(
+                cec_route_hosts_privilege_here(&route, "me-OTHER"),
+                "controlled sink was missed: {}",
+                route.id
+            );
+            assert!(
+                !cec_route_hosts_privilege_here(&route, "peer-OTHER"),
+                "controller tried to police its peer's sink: {}",
+                route.id
+            );
+        }
+    }
+
+    #[test]
+    fn cec_sweep_ignores_non_cec_and_opposite_direction_routes() {
+        let ignored_here = [
+            // We are only viewing the peer's resource.
+            term_route("peer:screen", "me:display", MediaKind::Display),
+            term_route("peer:terminal", "me:term-view:1", MediaKind::Generic),
+            term_route("peer:files", "me:files-view:1", MediaKind::Generic),
+            term_route("peer:disk:D:\\", "me:storage-in", MediaKind::Storage),
+            term_route("peer:site", "me:site-view:1", MediaKind::Generic),
+            // We are the controller/source, not the controlled sink.
+            term_route("me:input", "peer:control", MediaKind::Input),
+            term_route("me:clipboard", "peer:clipboard", MediaKind::Clipboard),
+            // CEC has no microphone/audio consent plane, and arbitrary generic
+            // or storage routes are not elevated by their media alone.
+            term_route("me:mic", "peer:speaker", MediaKind::Audio),
+            term_route("me:data", "peer:data", MediaKind::Generic),
+            term_route("me:disk", "peer:disk", MediaKind::Storage),
+        ];
+        for route in ignored_here {
+            assert!(
+                !cec_route_hosts_privilege_here(&route, "me"),
+                "unowned route entered the local consent sweep: {}",
+                route.id
+            );
+        }
+    }
+
+    #[test]
+    fn route_drive_plane_covers_hot_path_control_planes() {
+        assert_eq!(
+            route_drive_plane(&term_route("peer:input", "me:control", MediaKind::Input)),
+            Some(DrivePlane::Input)
+        );
+        assert_eq!(
+            route_drive_plane(&term_route(
+                "peer:clipboard",
+                "me:clipboard",
+                MediaKind::Clipboard,
+            )),
+            Some(DrivePlane::Clipboard)
+        );
     }
 
     #[test]

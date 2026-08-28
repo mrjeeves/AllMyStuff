@@ -740,6 +740,10 @@ async fn reclaim_stale_owned_mount(mount: &str) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    Err(format!(
+        "Windows is still releasing {mount}; AllMyStuff will retry"
+    ))
+}
 #[cfg(windows)]
 async fn wait_for_stale_mount_identity(mount: &str, port: u16) -> Result<bool, String> {
     // A newly launched process can observe the letter before Windows exposes
@@ -771,10 +775,6 @@ async fn windows_mount_is_assigned(mount: &str) -> Result<bool, String> {
         || remembered_network_mounts()
             .await?
             .contains(&mount.to_ascii_uppercase()))
-}
-    Err(format!(
-        "Windows is still releasing {mount}; AllMyStuff will retry"
-    ))
 }
 
 #[cfg(windows)]
@@ -923,6 +923,14 @@ async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, S
         false
     };
     if !current_owned && !interactive_owned {
+        // An assigned-but-unresolved letter is ambiguous during Windows
+        // logon/process teardown. Keep the private lease so the next startup
+        // can prove the exact endpoint and recover it; never erase the only
+        // ownership proof while the OS still reports the letter in use.
+        if windows_mount_is_assigned(mount).await? {
+            tracing::debug!("retaining unresolved AllMyStuff drive lease for {mount}");
+            return Ok(false);
+        }
         clear_unowned_native_metadata(mount, Some(port)).await?;
         let _ = forget_native_mount(mount);
         return Ok(false);

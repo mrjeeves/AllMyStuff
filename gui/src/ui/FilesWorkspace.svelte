@@ -38,7 +38,9 @@
     localFileTrash,
     onBackendReady,
     onFileSaved,
+    onNativeFileDrag,
     onFilesCanvas,
+    type NativeFileDragEvent,
     type LocalFileEntry,
     type LocalFileLocation,
     type LocalFileTransferOperation,
@@ -113,6 +115,16 @@
     directoryChanges: Map<number, (event: DirectoryChangedEvent) => void>;
   };
   let locations = $state<LocalFileLocation[]>([]);
+  let locationsRequest: Promise<LocalFileLocation[]> | null = null;
+  function requestLocalFileLocations(): Promise<LocalFileLocation[]> {
+    if (!locationsRequest) {
+      locationsRequest = localFileLocations().then(
+        (value) => { locationsRequest = null; return value; },
+        (error) => { locationsRequest = null; throw error; },
+      );
+    }
+    return locationsRequest;
+  }
   let path = $state("");
   let directoryId = $state("");
   let platform = $state("windows");
@@ -138,6 +150,7 @@
   let records = $state<CanvasRecord[]>([]);
   let context = $state<{ x: number; y: number; item: WorkspaceEntry } | null>(null);
   let workspaceContext = $state<{ x: number; y: number; anchorX: number | null; anchorY: number | null } | null>(null);
+  let suppressContextMenuUntil = 0;
   let clipboardIntent: { paths: string[]; kind: "copy" | "move" } | null = null;
   let canUndoFileOperation = $state(false);
   let canRedoFileOperation = $state(false);
@@ -230,9 +243,12 @@
     targetLabel: string;
     impact: LocalFileTransferImpact | null;
     error: string;
+    localCopy: boolean;
   };
   let transferDialog = $state<TransferDialog | null>(null);
   let transferDropTargetId = $state<string | null>(null);
+  let nativeDropTargetLabel = $state<string | null>(null);
+  let nativeDragPaths: string[] = [];
   type TransferOperation = {
     id: string;
     phase: LocalFileTransferOperation["phase"];
@@ -242,6 +258,7 @@
     error: string;
     retryCondition?: string;
     startedAt: number;
+    local?: boolean;
   };
   let transferOperations = $state<TransferOperation[]>([]);
   let operationsOpen = $state(false);
@@ -251,7 +268,10 @@
     ).length,
   );
 
-  function operationPhaseLabel(phase: TransferOperation["phase"]): string {
+  function operationPhaseLabel(operation: TransferOperation): string {
+    const phase = operation.phase;
+    if (phase === "committing" && operation.local) return "Copying transactionally…";
+    if (phase === "complete" && operation.local) return "Copied";
     if (phase === "complete") return "Sent";
     if (phase === "failed") return "Needs attention";
     if (phase === "cancelled") return "Cancelled";
@@ -1215,8 +1235,10 @@
       let nextEntries: WorkspaceEntry[];
       let routeId: string | undefined;
       if (local) {
+        const localLocations = locations.length > 0 ? locations : await requestLocalFileLocations();
+        locations = localLocations;
         const adapterMounts = await nativeDriveMounts().catch(() => []);
-        nextEntries = locations
+        nextEntries = localLocations
           .filter((location) =>
             location.kind === "volume"
             && !adapterMounts.some((adapter) => sameNativePath(location.path, adapter.mount))
@@ -1376,10 +1398,16 @@
     let stopBackendReady = () => {};
     let stopOperations = () => {};
     let stopSaved = () => {};
+    let stopNativeFileDrag = () => {};
     let canvasHydrated = false;
     let backendRefreshPending = false;
     let canvasEventRevision = 0;
     let canvasSnapshotRequest = 0;
+
+    void onNativeFileDrag(handleNativeFileDrag).then((unlisten) => {
+      if (!mounted) unlisten();
+      else stopNativeFileDrag = unlisten;
+    }).catch((error) => console.warn("Could not watch native file drags:", error));
 
     async function refreshCanvasAfterBackendReconnect() {
       const request = ++canvasSnapshotRequest;
@@ -1440,9 +1468,11 @@
       } catch (error) {
         console.warn("Could not watch Files backend connection:", error);
       }
-      const [places, saved] = await Promise.all([localFileLocations(), filesCanvasSnapshot()]);
+      void requestLocalFileLocations().then((places) => {
+        if (mounted) locations = places;
+      }).catch((error) => console.warn("Could not load native file locations:", error));
+      const saved = await filesCanvasSnapshot();
       if (!mounted) return;
-      locations = places;
       records = hydrateCanvasRecords(saved, records);
       canvasHydrated = true;
       if (backendRefreshPending) await refreshCanvasAfterBackendReconnect();
@@ -1498,6 +1528,8 @@
       cancelPendingItemRename();
       pendingRemoteOpens.clear();
       stopSaved();
+      stopNativeFileDrag();
+      clearNativeDropTarget();
       if (transferDialog && !["review", "failed"].includes(transferDialog.phase)) {
         void localFileTransferCancel(transferDialog.id);
       }
@@ -2358,6 +2390,7 @@
   }
 
   function showWorkspaceContextMenu(event: MouseEvent) {
+    if (consumeRightDragContextMenu(event)) return;
     const target = event.target;
     if (!(target instanceof Element) || !target.closest(".browser")) return;
     if (map !== "files") return;
@@ -2389,6 +2422,7 @@
   }
 
   function showContextMenu(event: MouseEvent, item: WorkspaceEntry) {
+    if (consumeRightDragContextMenu(event)) return;
     event.preventDefault();
     event.stopPropagation();
     workspaceContext = null;
@@ -2412,6 +2446,15 @@
   }
 
   const INLINE_RENAME_SELECTOR = ".file-rename-input, .detail-rename-input, .frame-title-input";
+
+  function consumeRightDragContextMenu(event: MouseEvent): boolean {
+    if (suppressContextMenuUntil === 0 || performance.now() > suppressContextMenuUntil) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    context = null;
+    workspaceContext = null;
+    return true;
+  }
 
   function acceptInlineRenames(event?: PointerEvent) {
     const target = event?.target;
@@ -2440,6 +2483,7 @@
   }
 
   function dismissTransientMenus(event?: PointerEvent) {
+    if (event) suppressContextMenuUntil = 0;
     acceptInlineRenames(event);
     const target = event?.target;
     if (!(target instanceof Element) || !target.closest(".context-menu, .workspace-menu-button")) {
@@ -2642,12 +2686,13 @@ function newTransferId(): string {
     if (!dialog.impact || dialog.impact.symlinks > 0 || dialog.impact.unreadable > 0) return;
     const operation: TransferOperation = {
       id: dialog.id,
-      phase: "staging",
+      phase: dialog.localCopy ? "committing" : "staging",
       targetLabel: dialog.targetLabel,
       impact: dialog.impact,
       progressBytes: 0,
       error: "",
       startedAt: Date.now(),
+      local: dialog.localCopy,
     };
     transferOperations = coalesceLatestBy(
       [operation, ...transferOperations],
@@ -2655,6 +2700,30 @@ function newTransferId(): string {
     ).slice(0, 50);
     operationsOpen = true;
     transferDialog = null;
+
+    if (dialog.localCopy) {
+      fileOperationBusy = true;
+      try {
+        const result = await localFileOperationApply(dialog.paths, dialog.destination, "copy");
+        canUndoFileOperation = result.canUndo;
+        canRedoFileOperation = result.canRedo;
+        updateTransferOperation(dialog.id, {
+          phase: "complete",
+          progressBytes: dialog.impact.bytes,
+        });
+        refreshWorkspace();
+        app.toast(
+          "ok",
+          "Copied " + result.affected + " item" + (result.affected === 1 ? "" : "s") + " to " + dialog.targetLabel,
+        );
+      } catch (error) {
+        updateTransferOperation(dialog.id, { phase: "failed", error: String(error) });
+      } finally {
+        fileOperationBusy = false;
+      }
+      return;
+    }
+
     try {
       const result = await localFileTransferStart(
         dialog.id,
@@ -2665,7 +2734,10 @@ function newTransferId(): string {
         dialog.impact,
       );
       updateTransferOperation(dialog.id, { phase: "complete" });
-      app.toast("ok", `Sent ${result.files} file${result.files === 1 ? "" : "s"} to ${dialog.targetLabel}`);
+      app.toast(
+        "ok",
+        "Sent " + result.files + " file" + (result.files === 1 ? "" : "s") + " to " + dialog.targetLabel,
+      );
     } catch (error) {
       const cancelled = String(error).toLowerCase().includes("cancelled")
         || transferOperations.find((item) => item.id === dialog.id)?.phase === "cancelling";
@@ -2675,7 +2747,6 @@ function newTransferId(): string {
       });
     }
   }
-
   function cancelTransferOperation(id: string) {
     const operation = transferOperations.find((item) => item.id === id);
     if (!operation || !operationCanCancel(operation.phase)) return;
@@ -2684,6 +2755,10 @@ function newTransferId(): string {
   }
 
   async function dismissTransferOperation(id: string) {
+    if (transferOperations.find((operation) => operation.id === id)?.local) {
+      transferOperations = transferOperations.filter((operation) => operation.id !== id);
+      return;
+    }
     try {
       if (await localFileOperationDismiss(id)) {
         transferOperations = transferOperations.filter((operation) => operation.id !== id);
@@ -2692,10 +2767,9 @@ function newTransferId(): string {
       app.toast("warn", "Could not dismiss the operation: " + String(error));
     }
   }
-
   async function clearFinishedTransferOperations() {
     const ids = transferOperations
-      .filter((operation) => !["transferring", "cancelling"].includes(operation.phase))
+      .filter((operation) => ["complete", "failed", "cancelled"].includes(operation.phase))
       .map((operation) => operation.id);
     await Promise.all(ids.map((id) => dismissTransferOperation(id)));
   }
@@ -2706,7 +2780,12 @@ function newTransferId(): string {
         app.toast("warn", "Move between devices requires a materialized local source");
         return;
       }
-      await applyLocalFileOperation(dragged.map((entry) => entry.path), target.path, "move");
+      const destination = target.computerNode ? fleetfilesRootPath : target.path;
+      if (!destination) {
+        app.toast("warn", "That local destination is not available yet");
+        return;
+      }
+      await applyLocalFileOperation(dragged.map((entry) => entry.path), destination, "move");
       return;
     }
     if (transferDialog || target.binding.kind !== "remote" || target.computerOnline === false) return;
@@ -2715,23 +2794,33 @@ function newTransferId(): string {
       return;
     }
     const session = await ensureRemoteSession(target.binding.deviceId, target.binding.deviceLabel);
-    const dialog: TransferDialog = {
+    await reviewTransfer({
       id: newTransferId(),
       phase: "scanning",
       paths: dragged.map((entry) => entry.path),
       routeId: session.routeId,
       destination: target.computerNode ? "~/Desktop" : target.path,
-      targetLabel: target.computerNode ? `${target.binding.deviceLabel} Desktop` : `${displayName(target)} on ${target.binding.deviceLabel}`,
+      targetLabel: target.computerNode
+        ? target.binding.deviceLabel + " Desktop"
+        : displayName(target) + " on " + target.binding.deviceLabel,
       impact: null,
       error: "",
-    };
+      localCopy: false,
+    });
+  }
+
+  async function reviewTransfer(dialog: TransferDialog) {
     transferDialog = dialog;
     try {
       dialog.impact = await localFileTransferScan(dialog.id, dialog.paths);
       if (transferDialog?.id !== dialog.id) return;
       dialog.phase = "review";
       transferDialog = dialog;
-      if (!dialog.impact.requires_confirmation && dialog.impact.symlinks === 0 && dialog.impact.unreadable === 0) {
+      if (
+        !dialog.impact.requires_confirmation
+        && dialog.impact.symlinks === 0
+        && dialog.impact.unreadable === 0
+      ) {
         await beginReviewedTransfer(dialog);
       }
     } catch (error) {
@@ -2746,6 +2835,104 @@ function newTransferId(): string {
     }
   }
 
+  function clearNativeDropTarget() {
+    nativeDragPaths = [];
+    transferDropTargetId = null;
+    nativeDropTargetLabel = null;
+  }
+
+  function nativeDropTargetAt(clientX: number, clientY: number): WorkspaceEntry | null {
+    if (map !== "files") return null;
+    const explicit = transferTargetAt(clientX, clientY, new Set());
+    if (explicit) return explicit;
+    if (currentRemoteDirectory) {
+      return navigatorDirectoryTarget(
+        currentRemoteDirectory.deviceId,
+        currentRemoteDirectory.deviceLabel,
+        currentRemoteDirectory.path,
+        address || currentRemoteDirectory.path,
+      );
+    }
+    if (computerHome) return null;
+    const destination = fleetHome ? localRootPath : path;
+    return navigatorDirectoryTarget(
+      app.localId,
+      app.localNode?.label || "This device",
+      destination,
+      fleetHome ? "Fleetfiles" : address || destination,
+    );
+  }
+
+  function updateNativeDropTarget(clientX: number, clientY: number): WorkspaceEntry | null {
+    const target = nativeDropTargetAt(clientX, clientY);
+    transferDropTargetId = target?.id ?? null;
+    nativeDropTargetLabel = target
+      ? target.computerNode
+        ? target.binding.deviceLabel + " Desktop"
+        : displayName(target)
+      : null;
+    return target;
+  }
+
+  function handleNativeFileDrag(event: NativeFileDragEvent) {
+    if (event.type === "leave") {
+      clearNativeDropTarget();
+      return;
+    }
+    if (event.type === "enter") nativeDragPaths = event.paths;
+    const target = updateNativeDropTarget(event.x, event.y);
+    if (event.type !== "drop") return;
+    const paths = event.paths.length > 0 ? event.paths : nativeDragPaths;
+    clearNativeDropTarget();
+    if (!target) {
+      app.toast(
+        "warn",
+        computerHome
+          ? "Drop onto a drive or device destination"
+          : "Drop onto the Files canvas or a folder",
+      );
+      return;
+    }
+    void prepareNativeDrop(target, paths).catch((error) => app.toast("warn", String(error)));
+  }
+
+  async function prepareNativeDrop(target: WorkspaceEntry, paths: string[]) {
+    if (paths.length === 0 || transferDialog) return;
+    if (fileOperationBusy) {
+      app.toast("warn", "Finish the current local file operation before starting another drop");
+      return;
+    }
+    let routeId = "";
+    let destination: string;
+    let targetLabel: string;
+    const localCopy = target.binding.kind === "local";
+    if (localCopy) {
+      destination = target.computerNode ? fleetfilesRootPath : target.path;
+      if (!destination) throw new Error("That local destination is not available yet");
+      targetLabel = target.computerNode ? "Fleetfiles" : displayName(target);
+    } else {
+      if (target.computerOnline === false) {
+        throw new Error(target.binding.deviceLabel + " is offline");
+      }
+      const session = await ensureRemoteSession(target.binding.deviceId, target.binding.deviceLabel);
+      routeId = session.routeId;
+      destination = target.computerNode ? "~/Desktop" : target.path;
+      targetLabel = target.computerNode
+        ? target.binding.deviceLabel + " Desktop"
+        : displayName(target) + " on " + target.binding.deviceLabel;
+    }
+    await reviewTransfer({
+      id: newTransferId(),
+      phase: "scanning",
+      paths,
+      routeId,
+      destination,
+      targetLabel,
+      impact: null,
+      error: "",
+      localCopy,
+    });
+  }
   function cancelTransfer() {
     const dialog = transferDialog;
     if (!dialog) return;
@@ -3048,15 +3235,27 @@ function newTransferId(): string {
       event.preventDefault();
       const start = { ...pan };
       const origin = { x: event.clientX, y: event.clientY };
+      const pointerId = event.pointerId;
+      let moved = false;
       const move = (next: PointerEvent) => {
+        if (next.pointerId !== pointerId) return;
+        if (!moved && Math.hypot(next.clientX - origin.x, next.clientY - origin.y) < 3) return;
+        moved = true;
+        context = null;
+        workspaceContext = null;
+        suppressContextMenuUntil = Number.POSITIVE_INFINITY;
         pan = { x: start.x + next.clientX - origin.x, y: start.y + next.clientY - origin.y };
       };
-      const up = () => {
+      const finish = (next: PointerEvent) => {
+        if (next.pointerId !== pointerId) return;
         window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        if (moved) suppressContextMenuUntil = performance.now() + 500;
       };
       window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
       return;
     }
     if (event.button !== 0) return;
@@ -3445,6 +3644,7 @@ function newTransferId(): string {
   </aside>
 
   <main class="browser" use:measureCanvas style={wallpaper ? `--files-wallpaper:url("${wallpaper.replaceAll('"', '%22')}")` : ""}>
+    {#if nativeDropTargetLabel}<div class="native-drop-hint">Copy to <b>{nativeDropTargetLabel}</b></div>{/if}
     {#if map === "sharing"}
       <div class="sharing-canvas" role="presentation" onpointerdown={panCanvas} ondragover={(event) => event.preventDefault()} ondrop={retractDrop}>
         <p class="share-map-help">Drag files into a person’s frame to share. Drag them out to stop sharing.</p>
@@ -3666,10 +3866,10 @@ function newTransferId(): string {
           {#each transferOperations as operation (operation.id)}
             <article class:failed={operation.phase === "failed"}>
               <div class="operation-copy">
-                <b>{operationPhaseLabel(operation.phase)}</b>
+                <b>{operationPhaseLabel(operation)}</b>
                 <span>{operation.targetLabel}</span>
                 <small>{operation.impact.files.toLocaleString()} files · {operation.impact.folders.toLocaleString()} folders · {humanBytes(operation.impact.bytes)}</small>
-                {#if operation.impact.bytes > 0 && !["complete", "failed", "cancelled"].includes(operation.phase)}
+                {#if !operation.local && operation.impact.bytes > 0 && !["complete", "failed", "cancelled"].includes(operation.phase)}
                   <small>{humanBytes(operation.progressBytes)} of {humanBytes(operation.impact.bytes)}</small>
                 {/if}
                 {#if operation.error}<small class="operation-error">{operation.error}</small>{/if}
@@ -3685,7 +3885,7 @@ function newTransferId(): string {
             </article>
           {/each}
         </div>
-        {#if transferOperations.some((operation) => !["transferring", "cancelling"].includes(operation.phase))}
+        {#if transferOperations.some((operation) => ["complete", "failed", "cancelled"].includes(operation.phase))}
           <button class="clear-operations" onclick={() => void clearFinishedTransferOperations()}>Clear finished</button>
         {/if}
       {:else}
@@ -3700,7 +3900,7 @@ function newTransferId(): string {
           {transferDialog.phase === "scanning"
             ? "Assessing transfer impact…"
             : transferDialog.phase === "review"
-              ? `Send to ${transferDialog.targetLabel}?`
+              ? (transferDialog.localCopy ? "Copy to " : "Send to ") + transferDialog.targetLabel + "?"
               : transferDialog.phase === "transferring"
                 ? `Sending to ${transferDialog.targetLabel}…`
                 : transferDialog.phase === "cancelling"
@@ -3721,7 +3921,7 @@ function newTransferId(): string {
           {/if}
           <p class="transfer-note">Files remain invisible at the destination until staging completes and the whole selection passes its final collision check.</p>
         {:else if transferDialog.phase === "scanning"}
-          <p>Walking the selected tree locally. No file data has been queued or sent.</p>
+          <p>Walking the selected tree locally. No file data has been copied or sent.</p>
         {/if}
         {#if transferDialog.error}<p class="transfer-warning">{transferDialog.error}</p>{/if}
         <div class="transfer-actions">
@@ -3731,7 +3931,7 @@ function newTransferId(): string {
               class="primary"
               disabled={!transferDialog.impact || transferDialog.impact.symlinks > 0 || transferDialog.impact.unreadable > 0}
               onclick={() => { if (transferDialog) void beginReviewedTransfer(transferDialog); }}
-            >Send transactionally</button>
+            >{transferDialog.localCopy ? "Copy transactionally" : "Send transactionally"}</button>
           {/if}
         </div>
       </div>
@@ -3831,6 +4031,7 @@ function newTransferId(): string {
   .places p { color: var(--ink-faint); font-size: .72rem; padding: 0 .5rem; line-height: 1.4; }
   .background-control { display: flex; gap: .25rem; margin-top: auto; padding-top: .9rem; border-top: 1px solid var(--line); }.background-control button { display: flex; align-items: center; gap: .6rem; flex: 1; padding: .48rem .55rem; border: 0; border-radius: 7px; background: transparent; color: var(--ink-soft); text-align: left; }.background-control button:hover { background: var(--surface-2); color: var(--ink); }.background-control .clear-background { flex: 0 0 auto; width: 2rem; justify-content: center; }
   .browser { min-width: 0; min-height: 0; position: relative; overflow: hidden; background-color: var(--bg); background-image: var(--files-wallpaper, none); background-position: center; background-repeat: no-repeat; background-size: cover; }
+  .native-drop-hint { position: absolute; z-index: 110; left: 50%; top: 1rem; transform: translateX(-50%); max-width: calc(100% - 2rem); padding: .5rem .8rem; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent-ink); background: color-mix(in oklab, var(--surface) 90%, transparent); box-shadow: var(--shadow-lg); pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tree-section-toggle { margin-top: .45rem; color: var(--ink-faint) !important; font-size: .66rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .tree-section-toggle span { flex: 0 0 .72rem; text-align: center; }
   .viewport { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: default; }

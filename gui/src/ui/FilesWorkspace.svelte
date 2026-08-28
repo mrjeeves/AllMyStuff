@@ -138,6 +138,7 @@
   let records = $state<CanvasRecord[]>([]);
   let context = $state<{ x: number; y: number; item: WorkspaceEntry } | null>(null);
   let workspaceContext = $state<{ x: number; y: number; anchorX: number | null; anchorY: number | null } | null>(null);
+  let suppressContextMenuUntil = 0;
   let clipboardIntent: { paths: string[]; kind: "copy" | "move" } | null = null;
   let canUndoFileOperation = $state(false);
   let canRedoFileOperation = $state(false);
@@ -2358,6 +2359,7 @@
   }
 
   function showWorkspaceContextMenu(event: MouseEvent) {
+    if (consumeRightDragContextMenu(event)) return;
     const target = event.target;
     if (!(target instanceof Element) || !target.closest(".browser")) return;
     if (map !== "files") return;
@@ -2389,6 +2391,7 @@
   }
 
   function showContextMenu(event: MouseEvent, item: WorkspaceEntry) {
+    if (consumeRightDragContextMenu(event)) return;
     event.preventDefault();
     event.stopPropagation();
     workspaceContext = null;
@@ -2412,6 +2415,15 @@
   }
 
   const INLINE_RENAME_SELECTOR = ".file-rename-input, .detail-rename-input, .frame-title-input";
+
+  function consumeRightDragContextMenu(event: MouseEvent): boolean {
+    if (suppressContextMenuUntil === 0 || performance.now() > suppressContextMenuUntil) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    context = null;
+    workspaceContext = null;
+    return true;
+  }
 
   function acceptInlineRenames(event?: PointerEvent) {
     const target = event?.target;
@@ -2440,6 +2452,7 @@
   }
 
   function dismissTransientMenus(event?: PointerEvent) {
+    if (event) suppressContextMenuUntil = 0;
     acceptInlineRenames(event);
     const target = event?.target;
     if (!(target instanceof Element) || !target.closest(".context-menu, .workspace-menu-button")) {
@@ -3048,15 +3061,27 @@ function newTransferId(): string {
       event.preventDefault();
       const start = { ...pan };
       const origin = { x: event.clientX, y: event.clientY };
+      const pointerId = event.pointerId;
+      let moved = false;
       const move = (next: PointerEvent) => {
+        if (next.pointerId !== pointerId) return;
+        if (!moved && Math.hypot(next.clientX - origin.x, next.clientY - origin.y) < 3) return;
+        moved = true;
+        context = null;
+        workspaceContext = null;
+        suppressContextMenuUntil = Number.POSITIVE_INFINITY;
         pan = { x: start.x + next.clientX - origin.x, y: start.y + next.clientY - origin.y };
       };
-      const up = () => {
+      const finish = (next: PointerEvent) => {
+        if (next.pointerId !== pointerId) return;
         window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        if (moved) suppressContextMenuUntil = performance.now() + 500;
       };
       window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
       return;
     }
     if (event.button !== 0) return;

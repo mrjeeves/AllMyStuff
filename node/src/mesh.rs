@@ -3014,6 +3014,7 @@ impl Mesh {
                     match st.session.as_ref() {
                         Some(session) => session
                             .routes()
+                            .filter(|r| cec_sweep_route_is_live(&r.state))
                             .map(|r| {
                                 (
                                     r.peer.as_str().to_string(),
@@ -19213,6 +19214,16 @@ fn cec_screen_consent_blocks(media_authorized: bool, cec_consent_denied: bool) -
     cec_consent_denied && !media_authorized
 }
 
+/// Completed routes remain briefly in session history for the UI. The CEC
+/// consent sweep must never treat that history as live work or it will retry
+/// the same teardown every sweep interval.
+fn cec_sweep_route_is_live(state: &RouteState) -> bool {
+    matches!(
+        state,
+        RouteState::Offered | RouteState::Incoming | RouteState::Active
+    )
+}
+
 /// Structural half of virtual-room authorization. The room's local lease has
 /// already established `members`; this makes sure the route cannot use that
 /// membership as a confused deputy for a third node or a privileged plane the
@@ -21454,6 +21465,17 @@ mod tests {
         // With live CEC consent there is no CEC denial in either case.
         assert!(!cec_screen_consent_blocks(false, false));
         assert!(!cec_screen_consent_blocks(true, false));
+
+    }
+    #[test]
+    fn cec_sweep_ignores_completed_route_history() {
+        assert!(cec_sweep_route_is_live(&RouteState::Offered));
+        assert!(cec_sweep_route_is_live(&RouteState::Incoming));
+        assert!(cec_sweep_route_is_live(&RouteState::Active));
+        assert!(!cec_sweep_route_is_live(&RouteState::TornDown));
+        assert!(!cec_sweep_route_is_live(&RouteState::Rejected {
+            reason: "done".into(),
+        }));
     }
 
     #[test]

@@ -419,9 +419,17 @@ impl Session {
     }
 
     /// Locally tear a route down. Returns the message to send the peer (if
-    /// the route was known) so they stop too.
+    /// the route was known and had not already ended) so they stop too.
+    ///
+    /// This must be idempotent at the wire boundary. Several owners can
+    /// independently notice the same terminal/window cleanup, and replaying a
+    /// Teardown for a route already marked TornDown turns a harmless duplicate
+    /// close into an unbounded peer-to-peer control loop.
     pub fn teardown(&mut self, route_id: &str) -> Option<ControlMessage> {
         let r = self.routes.get_mut(route_id)?;
+        if r.state == RouteState::TornDown {
+            return None;
+        }
         let peer = r.peer.clone();
         r.state = RouteState::TornDown;
         let _ = peer;
@@ -1082,6 +1090,20 @@ mod tests {
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
         assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+    }
+
+    #[test]
+    fn local_teardown_is_idempotent_on_the_wire() {
+        let mut s = Session::new("this");
+        s.offer(route("r1"), "desk", Vec::new(), Vec::new());
+
+        assert!(matches!(
+            s.teardown("r1"),
+            Some(ControlMessage::Route(RouteControl::Teardown { route_id }))
+                if route_id == "r1"
+        ));
+        assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
+        assert_eq!(s.teardown("r1"), None);
     }
 
     #[test]

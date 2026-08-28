@@ -693,7 +693,7 @@ fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
 
     if let Some(legacy) = legacy.as_ref().filter(|path| path.exists()) {
         if !desktop.exists() {
-            std::fs::rename(&legacy, &desktop).map_err(|error| {
+            std::fs::rename(legacy, &desktop).map_err(|error| {
                 format!(
                     "move the previous Fleetfiles Desktop from {} to {}: {error}",
                     legacy.display(),
@@ -705,12 +705,12 @@ fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
                 to = %desktop.display(),
                 "migrated Fleetfiles into the user's home folder"
             );
-        } else if std::fs::read_dir(&legacy)
+        } else if std::fs::read_dir(legacy)
             .map_err(|error| format!("inspect {}: {error}", legacy.display()))?
             .next()
             .is_none()
         {
-            std::fs::remove_dir(&legacy)
+            std::fs::remove_dir(legacy)
                 .map_err(|error| format!("remove empty {}: {error}", legacy.display()))?;
         } else {
             return Err(format!(

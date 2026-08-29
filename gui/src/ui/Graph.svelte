@@ -1146,13 +1146,13 @@
       // attach dropdown so only one drop-out ever shows at a time.
       claimRevealed = claimRevealed === n.id ? null : n.id;
       app.kvmRevealed = null;
-      if (!normalMode) app.selectNode(n.id);
+      app.selectNode(n.id);
     } else {
       claimRevealed = null;
       app.kvmRevealed = null;
       // Clicking a device always selects it and keeps it selected — re-clicking
       // the focused node no longer toggles it off (close the drawer to deselect).
-      if (!normalMode) app.selectNode(n.id);
+      app.selectNode(n.id);
     }
   }
 

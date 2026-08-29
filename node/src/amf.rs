@@ -524,11 +524,14 @@ impl AmfAvc {
                 1
             };
             let _ = set(encoder, "SlicesPerFrame", v_i64(slices));
-            let _ = set(
-                encoder,
-                "IDRPeriod",
-                v_i64(i64::from(fps.saturating_mul(4).max(1))),
-            );
+            // AllMyStuff owns the adaptive IDR cadence per frame. AMF's AVC
+            // contract requires IDRPeriod=0 when ForcePictureType drives that
+            // cadence; combining a periodic GOP with forced picture types is
+            // driver-dependent and can silently ignore the repair request.
+            let status = set(encoder, "IDRPeriod", v_i64(0));
+            if status != AMF_OK {
+                return fail(context, encoder, format!("AMF IDRPeriod=0: {status}"));
+            }
             if game {
                 // GDR: continuous rolling intra — a wave is ALWAYS in
                 // flight, so a loss self-heals within one refresh period
@@ -609,9 +612,17 @@ impl AmfAvc {
                     let n = wname(name);
                     ((*(*surface).vtbl).set_property)(surface, n.as_ptr(), v)
                 };
-                let _ = sset("ForcePictureType", v_i64(PICTURE_TYPE_IDR));
-                let _ = sset("InsertSPS", v_bool(true));
-                let _ = sset("InsertPPS", v_bool(true));
+                for (name, value) in [
+                    ("ForcePictureType", v_i64(PICTURE_TYPE_IDR)),
+                    ("InsertSPS", v_bool(true)),
+                    ("InsertPPS", v_bool(true)),
+                ] {
+                    let status = sset(name, value);
+                    if status != AMF_OK {
+                        ((*(*surface).vtbl).release)(surface);
+                        return Err(format!("AMF {name} on forced IDR: {status}"));
+                    }
+                }
             }
             let duration = 10_000_000 / u64::from(self.fps.max(1));
             let input_ts = self.frame_index * duration;

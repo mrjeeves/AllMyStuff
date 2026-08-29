@@ -122,6 +122,11 @@ pub struct Mesh {
     /// enter this map; older peers continue to deliver one complete access
     /// unit per sample.
     paced_video_in: Mutex<HashMap<String, PacedInboundAu>>,
+    /// Inbound routes whose paced stream lost a fragment. Once a reference
+    /// chain is known damaged, complete deltas are still unsafe decoder input;
+    /// hold them until an IDR/parameter-set entry arrives. Route teardown
+    /// clears the mark, so same-id successors never inherit it.
+    video_awaiting_entry: Mutex<HashSet<String>>,
     /// Keyboard/mouse injection for input routes that sink here — gated on
     /// the sender being our owner or a fleet member.
     injector: Injector,
@@ -341,10 +346,10 @@ pub struct Mesh {
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
     /// listener then hears seconds late.
     audio_out: mpsc::Sender<AudioOut>,
-    /// Outbound video, deliberately *bounded*: when the link can't keep up
-    /// the capture side drops frames instead of queueing stale ones (an
-    /// MJPEG drop costs freshness only; an H.264 drop is healed by the
-    /// next forced IDR).
+    /// Outbound video, deliberately *bounded*. MJPEG may shed an encoded
+    /// picture for freshness. H.264 must not: its callback waits for bounded
+    /// admission, which stalls the encode side while the existing raw-frame
+    /// stage coalesces to the freshest capture.
     video_out: mpsc::Sender<VideoOut>,
     /// The matching receivers, parked by [`Mesh::new`] and drained by the
     /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
@@ -1238,11 +1243,11 @@ fn inbound_video_disposition_from_facts(
     }
 }
 
-/// The receiver's first sample must independently open a decoder reference
-/// chain. The daemon's `key` bit recognizes H.264 IDRs, while HEVC/AV1 entry
-/// AUs are identified by their parameter sets in the payload.
-fn should_hold_first_video_sample(first: bool, key: bool, data: &[u8]) -> bool {
-    first && !key && !crate::video_decode::is_decode_entry(data)
+/// A new route and a route with proven paced-fragment damage both require an
+/// independently decodable sample. The daemon's `key` bit recognizes H.264
+/// IDRs, while HEVC/AV1 entries are identified by parameter sets in payload.
+fn should_hold_video_sample(first: bool, awaiting_clean: bool, key: bool, data: &[u8]) -> bool {
+    (first || awaiting_clean) && !key && !crate::video_decode::is_decode_entry(data)
 }
 
 /// Queue-local recovery state shared by capture and its sender worker. The
@@ -1832,6 +1837,44 @@ fn suppress_dependent_after_drop(awaiting_key: bool, key: Option<bool>) -> bool 
     awaiting_key && key == Some(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoEnqueueOutcome {
+    Enqueued,
+    Cancelled,
+    Closed,
+}
+
+/// Admit one already-encoded H.264 access unit without ever shedding it for
+/// ordinary queue pressure. Blocking this codec thread is intentional: the
+/// raw capture pipeline ahead of it is bounded and freshest-wins, so pressure
+/// coalesces unencoded pictures instead of breaking the decoder reference
+/// chain. `still_valid` makes route teardown and a newly-armed recovery fence
+/// interrupt the wait promptly.
+fn enqueue_h264_backpressured<F>(
+    tx: &mpsc::Sender<VideoOut>,
+    mut item: VideoOut,
+    mut still_valid: F,
+) -> VideoEnqueueOutcome
+where
+    F: FnMut() -> bool,
+{
+    loop {
+        if !still_valid() {
+            return VideoEnqueueOutcome::Cancelled;
+        }
+        match tx.try_send(item) {
+            Ok(()) => return VideoEnqueueOutcome::Enqueued,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                item = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return VideoEnqueueOutcome::Closed;
+            }
+        }
+    }
+}
+
 /// Execute one pacing reservation: bulk asynchronously (the worker stays free
 /// for audio interleave), then finish with the precise sleeper so short tail
 /// waits are real instead of timer-wheel millisecond roundings. Falls back to the plain async sleep on a
@@ -1901,6 +1944,7 @@ impl Mesh {
             video_pace: Mutex::new(HashMap::new()),
             video_arrivals: Mutex::new(HashMap::new()),
             paced_video_in: Mutex::new(HashMap::new()),
+            video_awaiting_entry: Mutex::new(HashSet::new()),
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
@@ -2225,6 +2269,17 @@ impl Mesh {
             return Ok(true);
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
+        let largest_chunk = chunks.iter().map(|range| range.len()).max().unwrap_or(0);
+        if largest_chunk > crate::video::PACE_SLICE_BYTES.saturating_mul(2)
+            && self.diag_ok(&format!("paced-shape:{route_id}"))
+        {
+            tracing::warn!(
+                "paced video {route_id}: encoder produced a coarse slice-boundary chunk of {:.1} KiB in a {:.1} KiB AU ({} chunks); sender backpressure will preserve the reference chain while it drains",
+                largest_chunk as f64 / 1024.0,
+                data.len() as f64 / 1024.0,
+                chunks.len(),
+            );
+        }
         // (game posture, WAN-class path, current send rate bps, fps) — the
         // shape `VideoBridge::route_pace` hands the forwarder.
         let (game, wan, rate_bps, _fps) = pace;
@@ -5010,6 +5065,7 @@ impl Mesh {
         self.video_in_stats.lock().remove(route_id);
         self.video_arrivals.lock().remove(route_id);
         self.paced_video_in.lock().remove(route_id);
+        self.video_awaiting_entry.lock().remove(route_id);
         self.video_pace.lock().remove(route_id);
         self.paced_video_routes.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
@@ -5409,6 +5465,7 @@ impl Mesh {
             let (complete, damaged) =
                 self.accept_paced_video_fragment(&route_id, rtp_timestamp, key, data);
             if damaged {
+                self.video_awaiting_entry.lock().insert(route_id.clone());
                 if self.diag_ok(&format!("paced-au:{route_id}")) {
                     tracing::warn!(
                         "paced video access unit for {route_id} was incomplete; dropped whole and requesting a clean entry"
@@ -5463,10 +5520,25 @@ impl Mesh {
         // The arrival side of the sender's "route active — streaming" line:
         // one INFO per stream, after a complete (not fragment) AU exists.
         let first = !self.video_in_stats.lock().contains_key(route_id);
-        if should_hold_first_video_sample(first, key, &data) {
+        let clean_entry = key || crate::video_decode::is_decode_entry(&data);
+        let (hold, was_awaiting) = {
+            let mut awaiting = self.video_awaiting_entry.lock();
+            let was_awaiting = awaiting.contains(route_id);
+            let hold = should_hold_video_sample(first, was_awaiting, key, &data);
+            if clean_entry {
+                awaiting.remove(route_id);
+            }
+            (hold, was_awaiting)
+        };
+        if hold {
             if self.diag_ok(&format!("entry:{route_id}")) {
                 tracing::warn!(
-                    "holding video deltas for {route_id} until a clean decode entry starts the current route generation"
+                    "holding video deltas for {route_id} until a clean decode entry {}",
+                    if was_awaiting {
+                        "repairs the damaged paced access unit"
+                    } else {
+                        "starts the current route generation"
+                    }
                 );
             }
             let mesh = self.clone();
@@ -5475,6 +5547,9 @@ impl Mesh {
                 let _ = mesh.request_refresh(refresh_route).await;
             });
             return;
+        }
+        if was_awaiting && clean_entry {
+            tracing::info!("clean video entry restored the paced stream for {route_id}");
         }
         self.note_video_in(route_id, "H.264", data.len());
         let (wants_decode, decoder_preference) = self
@@ -7176,6 +7251,10 @@ impl Mesh {
             tracing::info!("local route teardown committing for {route_id}");
         }
         self.audio.stop(&route_id);
+        // Cancel any bounded H.264 admission wait before VideoBridge::stop
+        // joins the capture thread. Lane ownership remains intact until the
+        // normal release below; this is only the generation fence.
+        self.video_route_generations.lock().retire(&route_id);
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
@@ -9165,6 +9244,10 @@ impl Mesh {
                         "session StopMedia committing for {id} (route state {stop_state})"
                     );
                     self.audio.stop(&id);
+                    // See the local-disconnect twin: invalidate callbacks
+                    // before joining a codec thread that may be waiting for
+                    // bounded sender admission.
+                    self.video_route_generations.lock().retire(&id);
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
@@ -13317,10 +13400,11 @@ impl Mesh {
                 }
             });
         }
-        // Queue admission is not delivery. Recovery begins on either a full
-        // producer queue or a downstream lane/write failure, holds dependent
-        // deltas at both sides of the queue, and ends only after the current
-        // epoch's IDR reaches the existing media pipe successfully.
+        // Queue admission is not delivery. H.264 admission backpressures the
+        // encode thread instead of dropping an already-encoded reference;
+        // the raw stage ahead of it remains bounded/freshest-wins. Recovery is
+        // therefore reserved for real downstream lane/write damage and ends
+        // only after the current epoch's IDR reaches the media pipe.
         let recovery_mesh = Arc::downgrade(self);
         let capture_recovery = recovery;
         self.video.start_capture(
@@ -13332,9 +13416,9 @@ impl Mesh {
                 ..Default::default()
             },
             move |packet| {
-                let key = match &packet {
-                    VideoPacket::H264 { key, .. } => Some(*key),
-                    VideoPacket::Jpeg(_) => None,
+                let (key, packet_bytes) = match &packet {
+                    VideoPacket::H264 { data, key, .. } => (Some(*key), data.len()),
+                    VideoPacket::Jpeg(frame) => (None, frame.jpeg.len()),
                 };
                 if capture_recovery.suppresses(key) {
                     if let Some(mesh) = recovery_mesh.upgrade() {
@@ -13343,27 +13427,52 @@ impl Mesh {
                     return false;
                 }
                 let epoch = capture_recovery.epoch();
-                let failure = match tx.try_send((
+                let item = (
                     peer.clone(),
                     route_id.clone(),
                     generation,
                     packet,
                     epoch,
                     capture_recovery.clone(),
-                )) {
-                    Ok(()) => None,
-                    Err(mpsc::error::TrySendError::Full(_)) => Some("shared queue full"),
-                    Err(mpsc::error::TrySendError::Closed(_)) => Some("shared queue closed"),
-                };
-                if let Some(reason) = failure {
-                    if key.is_some() {
-                        if let Some(mesh) = recovery_mesh.upgrade() {
-                            capture_recovery.note_drop(&mesh, key, reason);
+                );
+                if key.is_some() {
+                    let waiting_since = Instant::now();
+                    let outcome = enqueue_h264_backpressured(&tx, item, || {
+                        recovery_mesh.upgrade().is_some_and(|mesh| {
+                            mesh.video_generation_is_current(&route_id, generation)
+                                && !capture_recovery.suppresses(key)
+                        })
+                    });
+                    match outcome {
+                        VideoEnqueueOutcome::Enqueued => {
+                            let waited = waiting_since.elapsed();
+                            if waited >= Duration::from_millis(5) {
+                                if let Some(mesh) = recovery_mesh.upgrade() {
+                                    if mesh.diag_ok(&format!("video-admission:{route_id}")) {
+                                        tracing::info!(
+                                            "video sender backpressure for {route_id}: waited {:.1} ms to admit a {:.1} KiB encoded AU; raw captures coalesced upstream",
+                                            waited.as_secs_f64() * 1000.0,
+                                            packet_bytes as f64 / 1024.0,
+                                        );
+                                    }
+                                }
+                            }
+                            true
                         }
+                        VideoEnqueueOutcome::Cancelled => {
+                            if capture_recovery.suppresses(key) {
+                                if let Some(mesh) = recovery_mesh.upgrade() {
+                                    capture_recovery.note_suppressed(&mesh);
+                                }
+                            }
+                            false
+                        }
+                        VideoEnqueueOutcome::Closed => false,
                     }
-                    false
                 } else {
-                    true
+                    // MJPEG pictures are self-contained, so ordinary queue
+                    // pressure should prefer the newest capture over latency.
+                    tx.try_send(item).is_ok()
                 }
             },
             move |state, detail| {
@@ -20723,14 +20832,102 @@ mod tests {
         let hevc_vps = [0, 0, 1, 0x40, 0x01];
         assert!(crate::video_decode::is_decode_entry(&hevc_vps));
         assert!(
-            !should_hold_first_video_sample(true, false, &hevc_vps),
+            !should_hold_video_sample(true, false, false, &hevc_vps),
             "HEVC entry is carried by VPS bytes because the daemon key bit is H.264-shaped"
         );
 
         let h264_delta = [0, 0, 1, 0x41, 0x9a];
-        assert!(should_hold_first_video_sample(true, false, &h264_delta));
-        assert!(!should_hold_first_video_sample(true, true, &h264_delta));
-        assert!(!should_hold_first_video_sample(false, false, &h264_delta));
+        assert!(should_hold_video_sample(true, false, false, &h264_delta));
+        assert!(!should_hold_video_sample(true, false, true, &h264_delta));
+        assert!(!should_hold_video_sample(false, false, false, &h264_delta));
+        assert!(
+            should_hold_video_sample(false, true, false, &h264_delta),
+            "known paced-AU damage quarantines later dependent units"
+        );
+        assert!(
+            !should_hold_video_sample(false, true, true, &h264_delta),
+            "a clean key releases the damage quarantine"
+        );
+    }
+
+    fn queued_h264(byte: u8) -> VideoOut {
+        (
+            "peer".into(),
+            "route:test".into(),
+            1,
+            VideoPacket::H264 {
+                data: vec![byte],
+                key: byte == 1,
+                duration_us: 33_333,
+            },
+            0,
+            Arc::new(VideoRecovery::new("route:test")),
+        )
+    }
+
+    #[test]
+    fn h264_queue_pressure_waits_without_dropping_the_encoded_reference() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(queued_h264(1)).expect("fill bounded queue");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let worker_entered = entered.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut first_check = true;
+            let outcome = enqueue_h264_backpressured(&tx, queued_h264(2), || {
+                if first_check {
+                    first_check = false;
+                    worker_entered.wait();
+                }
+                true
+            });
+            done_tx.send(outcome).unwrap();
+        });
+
+        entered.wait();
+        assert!(
+            done_rx.try_recv().is_err(),
+            "a full queue must not report the encoded AU dropped"
+        );
+        let _first = rx.blocking_recv().expect("drain first AU");
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+            VideoEnqueueOutcome::Enqueued
+        );
+        let second = rx.blocking_recv().expect("backpressured AU arrives");
+        assert!(matches!(
+            second.3,
+            VideoPacket::H264 { data, .. } if data == vec![2]
+        ));
+    }
+
+    #[test]
+    fn h264_backpressure_wait_is_cancelled_by_route_invalidation() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(queued_h264(1)).expect("fill bounded queue");
+        let current = Arc::new(AtomicBool::new(true));
+        let worker_current = current.clone();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let worker_entered = entered.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut first_check = true;
+            let outcome = enqueue_h264_backpressured(&tx, queued_h264(2), || {
+                if first_check {
+                    first_check = false;
+                    worker_entered.wait();
+                }
+                worker_current.load(Ordering::Acquire)
+            });
+            done_tx.send(outcome).unwrap();
+        });
+
+        entered.wait();
+        current.store(false, Ordering::Release);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+            VideoEnqueueOutcome::Cancelled
+        );
     }
 
     #[test]

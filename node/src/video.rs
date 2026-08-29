@@ -965,11 +965,12 @@ impl VideoBridge {
 
     /// Begin streaming `source` for `route_id`, encoding for `mode` — a
     /// monitor for a display route, a camera for a video one. `on_packet`
-    /// is called with each encoded packet; it returns `false` when the
-    /// packet was dropped downstream (backpressure), which is fine — the
-    /// next capture simply carries the newer picture. `on_status` is
-    /// called on capture-state transitions, for the viewer's benefit (see
-    /// [`StatusReporter`]).
+    /// is called with each encoded packet. For inter-frame codecs the callback
+    /// may block while its bounded sender drains: the raw stage upstream is
+    /// freshest-wins, but an already-encoded reference must stay ordered and
+    /// lossless. A `false` result means route teardown/recovery rejected the
+    /// unit (or a self-contained MJPEG picture was shed). `on_status` is called
+    /// on capture-state transitions for the viewer (see [`StatusReporter`]).
     pub fn start_capture<F, S>(
         &self,
         route_id: String,

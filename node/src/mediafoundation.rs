@@ -264,14 +264,20 @@ impl HwEncoder {
             );
             if crate::video::paced_slices_enabled() {
                 // Byte-capped slices for the app-side pacer (mode 1 =
-                // bits per slice). Best-effort — MFT support varies by
-                // vendor; without it the pacer still splits at whatever
-                // NAL boundaries exist.
-                let _ = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(1));
-                let _ = api.SetValue(
+                // bits per slice). MFT support varies by vendor; report a
+                // rejected contract explicitly, while the sender's actual AU
+                // shape log catches drivers that accept but ignore it.
+                let mode_result = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(1));
+                let size_result = api.SetValue(
                     &CODECAPI_AVEncSliceControlSize,
                     &variant_u32((crate::video::PACE_SLICE_BYTES * 8) as u32),
                 );
+                if let Err(e) = mode_result {
+                    tracing::warn!("{name}: MFT rejected paced slice mode: {e}");
+                }
+                if let Err(e) = size_result {
+                    tracing::warn!("{name}: MFT rejected paced slice size: {e}");
+                }
             }
         }
 

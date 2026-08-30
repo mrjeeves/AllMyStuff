@@ -259,10 +259,17 @@ pub struct RouteDials {
     pub codec: &'static str,
     pub target_bitrate_bps: u32,
     pub ceiling_bps: u32,
+    pub rate_floor_bps: u32,
     pub fps_target: u32,
     pub edge_cap: u32,
     pub out_w: u32,
     pub out_h: u32,
+    pub recv_fps: u32,
+    pub decode_fails: u32,
+    pub queue_depth: u32,
+    pub est_kbps: u32,
+    pub delay_trend_us_per_s: i32,
+    pub feedback_age_ms: Option<u64>,
 }
 
 /// Handle the mesh holds either way; capture starts fail loudly, everything

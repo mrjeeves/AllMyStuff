@@ -206,6 +206,15 @@ impl RuntimeControl {
         Self { owner, yield_tx }
     }
 
+    /// The installed AllMyStuff process is the canonical runtime and never
+    /// yields ownership. Embedded callers do not have a serve loop waiting
+    /// for a shutdown signal, so keep that channel plumbing inside this
+    /// ownership abstraction.
+    pub fn canonical_installed() -> Self {
+        let (yield_tx, _yield_rx) = mpsc::channel(1);
+        Self::new(RuntimeOwner::AllMyStuffInstalled, yield_tx)
+    }
+
     fn status(&self) -> Value {
         json!({
             "owner": self.owner,

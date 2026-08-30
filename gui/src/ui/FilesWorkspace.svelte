@@ -66,8 +66,8 @@
     descendantsOf,
     fleetfilesLogicalPath,
     hydrateCanvasRecords,
+    framesInPaintOrder,
     mergeCanvasRecords,
-    normalizeFrameNesting,
     planFleetfilesPlacementMigration,
     sharedFilesystemObject,
     type CanvasFrame,
@@ -381,7 +381,7 @@
   );
   const framePrefix = $derived(map === "files" ? `frame:${map}:${scope}:` : `frame:${map}:`);
   const frames = $derived(
-    normalizeFrameNesting(
+    framesInPaintOrder(
       records
         .filter((record) => !record.deleted && record.kind === "frame" && record.id.startsWith(framePrefix))
         .map((record) => record.value as CanvasFrame),
@@ -3672,7 +3672,7 @@ function newTransferId(): string {
         {:else}
           <section class="share-frame empty-share"><h2>Nothing shared yet</h2><p>Drag a file or folder here to begin.</p></section>
         {/each}
-        {#each frames as frame}
+        {#each frames as frame (frame.id)}
           {@const geometry = frameGeometry(frame)}
           <article class="canvas-frame user" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`}>
             <div class="frame-titlebar" role="group" aria-label={`Move and edit ${frame.title}`} title="Drag frame" onpointerdown={(event) => dragFrame(event, frame)}>
@@ -3741,7 +3741,7 @@ function newTransferId(): string {
     {:else}
       <div class="viewport" bind:this={viewportElement} role="presentation" onpointerdown={panCanvas} onwheel={zoomCanvas}>
         <div class="world" style={`transform:translate(${pan.x}px,${pan.y}px) scale(${zoom})`}>
-          {#each frames as frame}
+          {#each frames as frame (frame.id)}
             {@const geometry = frameGeometry(frame)}
             <article class="canvas-frame" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`}>
               <div class="frame-titlebar" role="group" aria-label={`Move and edit ${frame.title}`} title="Drag frame" onpointerdown={(event) => dragFrame(event, frame)}>

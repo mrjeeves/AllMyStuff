@@ -497,3 +497,32 @@ export function normalizeFrameNesting(input: readonly CanvasFrame[]): CanvasFram
   }
   return frames;
 }
+
+/** Paint each frame after its containing frame, with every nested subtree kept
+ * together. Record arrival order can differ between fleet members, so roots
+ * and siblings use frame identity as a deterministic tie-break instead of the
+ * local LWW map's insertion order. All frames remain on the same CSS layer;
+ * DOM order supplies the relative stacking without allowing deeply nested
+ * frames to climb above file tiles or canvas controls. */
+export function framesInPaintOrder(input: readonly CanvasFrame[]): CanvasFrame[] {
+  const frames = normalizeFrameNesting(input);
+  const children = new Map<string | null, CanvasFrame[]>();
+  for (const frame of frames) {
+    const siblings = children.get(frame.parentId) ?? [];
+    siblings.push(frame);
+    children.set(frame.parentId, siblings);
+  }
+  for (const siblings of children.values()) {
+    siblings.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  }
+
+  const ordered: CanvasFrame[] = [];
+  const stack = [...(children.get(null) ?? [])].reverse();
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    ordered.push(frame);
+    const nested = children.get(frame.id) ?? [];
+    for (let index = nested.length - 1; index >= 0; index -= 1) stack.push(nested[index]!);
+  }
+  return ordered;
+}

@@ -5716,12 +5716,7 @@ impl Mesh {
             // 1). If there is no safe trim point, quarantine dependent
             // deltas until a key unit arrives instead of feeding a decoder
             // across discarded references.
-            match enqueue_h264_ipc(
-                &mut w.queue,
-                &mut w.awaiting_key,
-                packet,
-                MAX_QUEUED,
-            ) {
+            match enqueue_h264_ipc(&mut w.queue, &mut w.awaiting_key, packet, MAX_QUEUED) {
                 H264IpcEnqueue::Enqueued { skipped } if skipped > 0 => {
                     tracing::debug!(
                         "video queue for {route_id} unread — skipped {skipped} stale packets to a clean keyframe"

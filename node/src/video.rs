@@ -404,8 +404,8 @@ pub enum LinkClass {
 /// the time. 60 fps over a weak WAN link remains the operator's deliberate
 /// trade, which is why this is an explicit opt-in and not the default.
 /// Production transport shaping bounds its burst walls; receiver-driven rate
-/// adaptation stays game-only by default so quality-first postures are never
-/// silently softened.
+/// adaptation also serves Balanced, but only direct link evidence may soften
+/// that quality-first posture.
 pub(crate) fn game_mode() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_GAME_MODE") {
@@ -480,7 +480,7 @@ fn h264_max_edge() -> u32 {
     *EDGE
 }
 
-/// Target bitrate for one stream's encode. Balanced starts at 4 Mbps; the
+/// Target bitrate for one stream's encode. Balanced starts at 8 Mbps; the
 /// higher-throughput postures retain the existing pixel budget of ~0.16 bits
 /// per pixel per frame, clamped to 8 Mbps up to a cap the link class earns.
 /// On a LAN pair the cap is 80 Mbps, so a 4K60 desktop
@@ -499,7 +499,7 @@ fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass, posture: Posture)
         return *OVERRIDE;
     }
     if posture == Posture::Balanced {
-        return 4_000_000;
+        return 8_000_000;
     }
     let cap = match link {
         LinkClass::Lan => 80_000_000,
@@ -1187,8 +1187,9 @@ impl VideoBridge {
             Posture::Studio => "studio",
             Posture::StudioLossless => "studio-lossless",
         };
+        let rate_floor_bps = rate_floor(tune.posture());
         // The closed-loop bitrate the encoder is actually aiming at right now
-        // (AIMD moves it under Game), and the posture budget it climbs back
+        // (AIMD moves it under interactive postures), and the posture budget it climbs back
         // toward. Absent until the encode lane registers its rate cell.
         let (target_bitrate_bps, ceiling_bps) = route_rates()
             .lock()
@@ -1216,16 +1217,38 @@ impl VideoBridge {
                 )
             })
             .unwrap_or((0, 0, "", String::new()));
+        let (recv_fps, decode_fails, queue_depth, est_kbps, delay_trend_us_per_s, feedback_age_ms) =
+            self.feedback
+                .lock()
+                .get(route_id)
+                .map(|feedback| {
+                    (
+                        feedback.recv_fps,
+                        feedback.decode_fails,
+                        feedback.queue_depth,
+                        feedback.est_kbps,
+                        feedback.delay_trend_us_per_s,
+                        Some(feedback.at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0, None));
         Some(RouteDials {
             posture,
             encoder_label,
             codec,
             target_bitrate_bps,
             ceiling_bps,
+            rate_floor_bps,
             fps_target: tune.fps(),
             edge_cap,
             out_w,
             out_h,
+            recv_fps,
+            decode_fails,
+            queue_depth,
+            est_kbps,
+            delay_trend_us_per_s,
+            feedback_age_ms,
         })
     }
 
@@ -1340,20 +1363,19 @@ impl VideoBridge {
         }
         // Closed-loop bitrate: AIMD against the posture lane's budget,
         // applied by the encode thread through the in-place reconfigure
-        // (no reset, no IDR, no visible seam). Reserved to the postures
-        // whose use case it serves in every case — Game by default (see
-        // [`rate_adapt_mode`]). Skips besides the gate: user-pinned
-        // bitrates (their wire to own), lossless (no rate to move), and
-        // routes with no live rate registration (CPU lane, MJPEG floor).
+        // (no reset, no IDR, no visible seam). Balanced and Game participate
+        // by default with posture-specific evidence (see [`rate_adapt_mode`]).
+        // Skips besides the gate: user-pinned bitrates (their wire to own),
+        // lossless (no rate to move), and codecs with no movable rate.
         {
-            let (pinned, target_fps, game) = {
+            let (pinned, target_fps, posture) = {
                 let routes = self.routes.lock();
                 routes
                     .get(route_id)
-                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps(), r.tune.game()))
-                    .unwrap_or((true, 0, false))
+                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps(), r.tune.posture()))
+                    .unwrap_or((true, 0, Posture::Studio))
             };
-            if !pinned && rate_adapt_allowed(game, rate_adapt_mode()) {
+            if !pinned && rate_adapt_allowed(posture, rate_adapt_mode()) {
                 if let Some(rate) = route_rates().lock().get(route_id).cloned() {
                     let current = rate.target.load(Ordering::Relaxed);
                     let ceiling = rate.ceiling.load(Ordering::Relaxed);
@@ -1361,6 +1383,7 @@ impl VideoBridge {
                         let step = rate_adapt_step(
                             &mut rate.adapt.lock(),
                             &fb,
+                            posture,
                             target_fps,
                             current,
                             ceiling,
@@ -3679,6 +3702,9 @@ impl RebuildPolicy {
 /// error, which the pumps surface to the viewer as a capture failure.
 struct HealingEncoder {
     enc: StreamEncoder,
+    /// Keeps the CPU H.264 route in the shared rate registry for exactly the
+    /// encoder lane's lifetime. MJPEG has no rate controller.
+    rate_registration: Option<CpuRateRegistration>,
     route_id: String,
     mode: VideoMode,
     tune: Tune,
@@ -3703,17 +3729,25 @@ impl HealingEncoder {
         idr_ms: &Arc<AtomicU64>,
         auto: &Arc<AutoAdapt>,
     ) -> Result<Self, String> {
-        let enc = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
-        // Name the CPU pipeline for the effective-dials panel (the actual
-        // encoder after any MJPEG-floor fallback). The GPU lane, when it
-        // wins, set "GPU (hardware)" before this constructor was ever reached
-        // on the fallback path.
-        *route_live_cell(route_id).encoder.lock() = match enc.mode() {
-            VideoMode::H264 => "H.264 (CPU)".to_string(),
-            VideoMode::Mjpeg => "MJPEG (CPU)".to_string(),
+        let mut enc = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
+        let rate_registration = match &mut enc {
+            StreamEncoder::H264(stream) => {
+                let registration = CpuRateRegistration::new(route_id, stream.applied_rate);
+                stream.install_rate(registration.rate.clone());
+                Some(registration)
+            }
+            StreamEncoder::Mjpeg(_) => None,
+        };
+        // Publish the actual rung, not the old coarse "H.264 (CPU)" label:
+        // this system-memory lane still feeds an AMD/NVIDIA/Intel hardware
+        // MFT on Windows.
+        *route_live_cell(route_id).encoder.lock() = match &enc {
+            StreamEncoder::H264(stream) => stream.encoder_label().to_string(),
+            StreamEncoder::Mjpeg(_) => "MJPEG (CPU)".to_string(),
         };
         Ok(HealingEncoder {
             enc,
+            rate_registration,
             route_id: route_id.to_string(),
             mode,
             tune,
@@ -3811,7 +3845,17 @@ impl HealingEncoder {
                     "encoder for {} failed ({err}); rebuilding through the ladder",
                     self.route_id
                 );
-                self.enc = self.rebuild(source_hint)?;
+                let mut rebuilt = self.rebuild(source_hint)?;
+                if let (Some(registration), StreamEncoder::H264(stream)) =
+                    (&self.rate_registration, &mut rebuilt)
+                {
+                    stream.install_rate(registration.rate.clone());
+                }
+                *route_live_cell(&self.route_id).encoder.lock() = match &rebuilt {
+                    StreamEncoder::H264(stream) => stream.encoder_label().to_string(),
+                    StreamEncoder::Mjpeg(_) => "MJPEG (CPU)".to_string(),
+                };
+                self.enc = rebuilt;
                 // A fresh encoder's first unit is an IDR; arm the refresh
                 // flag so the quiet path serves one promptly too.
                 self.refresh.store(true, Ordering::SeqCst);
@@ -3960,6 +4004,7 @@ impl StreamEncoder {
                 auto.clone(),
             ))),
             VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new(
+                route_id,
                 source_hint,
                 tune,
                 refresh.clone(),
@@ -4094,6 +4139,7 @@ impl StreamEncoder {
 /// a decode entry point within seconds. A resolution change (monitor swap)
 /// re-initializes the encoder inside openh264; the next unit out is an IDR.
 struct H264Stream {
+    route_id: String,
     /// The active H.264 backend — a hardware encoder (Media Foundation's GPU
     /// H.264 MFT on Windows; NVENC/AMF/QSV/VideoToolbox/VA-API via FFmpeg on
     /// Linux/macOS) when one passed the frame-send test, else software openh264.
@@ -4127,10 +4173,17 @@ struct H264Stream {
     /// tuned edge per frame — a changed fit re-inits the encoder through the
     /// budget-size rebuild below, no capture restart.
     auto: Arc<AutoAdapt>,
+    /// Shared with receiver feedback, the transport pacer, and route
+    /// diagnostics. Installed by the CPU lane's lifetime registration.
+    rate: Option<Arc<RouteRate>>,
+    /// The rate the current codec has actually accepted. If a backend rejects
+    /// a live change, the shared target is pinned back to this value.
+    applied_rate: u32,
 }
 
 impl H264Stream {
     fn new(
+        route_id: &str,
         source_hint: (u32, u32),
         tune: Tune,
         refresh: Arc<AtomicBool>,
@@ -4152,7 +4205,9 @@ impl H264Stream {
             fit_within_even(source_hint.0, source_hint.1, auto_capped_edge)
         };
         let codec = make_h264_codec(bw, bh, fps, tune)?;
+        let applied_rate = tuned_bitrate(tune, bw, bh, fps);
         Ok(H264Stream {
+            route_id: route_id.to_string(),
             codec,
             budget_size: (bw, bh),
             tune,
@@ -4165,7 +4220,57 @@ impl H264Stream {
             refresh,
             idr_ms,
             auto,
+            rate: None,
+            applied_rate,
         })
+    }
+
+    fn install_rate(&mut self, rate: Arc<RouteRate>) {
+        let bitrate = tuned_bitrate(self.tune, self.budget_size.0, self.budget_size.1, self.fps);
+        rate.target.store(bitrate, Ordering::Relaxed);
+        rate.ceiling.store(bitrate, Ordering::Relaxed);
+        *rate.adapt.lock() = RateAdaptState::default();
+        self.applied_rate = bitrate;
+        self.rate = Some(rate);
+    }
+
+    fn encoder_label(&self) -> &str {
+        self.codec.label()
+    }
+
+    fn reset_rate_budget(&mut self, bitrate: u32) {
+        self.applied_rate = bitrate;
+        if let Some(rate) = &self.rate {
+            rate.target.store(bitrate, Ordering::Relaxed);
+            rate.ceiling.store(bitrate, Ordering::Relaxed);
+            *rate.adapt.lock() = RateAdaptState::default();
+        }
+    }
+
+    fn apply_target_rate(&mut self) {
+        let Some(rate) = &self.rate else { return };
+        let target = rate.target.load(Ordering::Relaxed);
+        if target == 0 || target == self.applied_rate {
+            return;
+        }
+        if self.codec.set_bitrate(target) {
+            tracing::info!(
+                "{}: rate re-aimed {:.1} → {:.1} Mbps in place for {}",
+                self.codec.label(),
+                self.applied_rate as f64 / 1e6,
+                target as f64 / 1e6,
+                self.route_id,
+            );
+            self.applied_rate = target;
+        } else {
+            rate.target.store(self.applied_rate, Ordering::Relaxed);
+            tracing::debug!(
+                "{} rejects in-place bitrate changes for {}; keeping {:.1} Mbps",
+                self.codec.label(),
+                self.route_id,
+                self.applied_rate as f64 / 1e6,
+            );
+        }
     }
 
     /// The edge this frame fits to: the tuned ceiling, capped by the
@@ -4235,6 +4340,7 @@ impl H264Stream {
         if (dw, dh) != self.budget_size {
             self.codec = make_h264_codec(dw, dh, self.fps, self.tune)?;
             self.budget_size = (dw, dh);
+            self.reset_rate_budget(tuned_bitrate(self.tune, dw, dh, self.fps));
             self.last_idr = None;
             self.prev = Vec::new();
             self.prev_size = (0, 0);
@@ -4268,6 +4374,7 @@ impl H264Stream {
         // hardware pipeline may hand back a small backlog) and whether it
         // actually accepted this frame.
         let t1 = Instant::now();
+        self.apply_target_rate();
         let outcome = self
             .codec
             .encode_yuv(&yuv, dw as usize, dh as usize, force_idr)?;
@@ -4309,6 +4416,7 @@ impl H264Stream {
         }
         let (dw, dh) = self.prev_size;
         let t1 = Instant::now();
+        self.apply_target_rate();
         let outcome = self
             .codec
             .encode_yuv(&self.prev, dw as usize, dh as usize, force_idr)?;
@@ -4475,6 +4583,44 @@ pub(crate) fn route_rates(
     &RATES
 }
 
+/// Owns the rate-map entry for one CPU H.264 lane. The GPU path has the
+/// same lane-lifetime seam locally; this guard gives the system-memory
+/// MF/software path equal pacing, feedback, and diagnostics without
+/// letting an older route incarnation remove a newer one's cell.
+struct CpuRateRegistration {
+    route_id: String,
+    rate: Arc<RouteRate>,
+}
+
+impl CpuRateRegistration {
+    fn new(route_id: &str, bitrate: u32) -> Self {
+        let rate = Arc::new(RouteRate {
+            target: AtomicU32::new(bitrate),
+            ceiling: AtomicU32::new(bitrate),
+            adapt: Mutex::new(RateAdaptState::default()),
+        });
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), rate.clone());
+        CpuRateRegistration {
+            route_id: route_id.to_string(),
+            rate,
+        }
+    }
+}
+
+impl Drop for CpuRateRegistration {
+    fn drop(&mut self) {
+        let mut rates = route_rates().lock();
+        if rates
+            .get(&self.route_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.rate))
+        {
+            rates.remove(&self.route_id);
+        }
+    }
+}
+
 /// Live, pollable per-route encode facts for the GUI's "effective reality"
 /// panel — the counterpart to [`route_rates`] for the dials the rate
 /// controller doesn't own. Published cheaply by the encode lanes through
@@ -4523,27 +4669,30 @@ pub struct RouteDials {
     pub codec: &'static str,
     pub target_bitrate_bps: u32,
     pub ceiling_bps: u32,
+    pub rate_floor_bps: u32,
     pub fps_target: u32,
     pub edge_cap: u32,
     pub out_w: u32,
     pub out_h: u32,
+    pub recv_fps: u32,
+    pub decode_fails: u32,
+    pub queue_depth: u32,
+    pub est_kbps: u32,
+    pub delay_trend_us_per_s: i32,
+    pub feedback_age_ms: Option<u64>,
 }
 
-/// Where the closed-loop bitrate may act. The rule: an automatic rate
-/// changer runs by default ONLY where it is beneficial in every case
-/// for that mode's use case. **Game qualifies** — its identity is
-/// smoothness/latency over quality, so a congestion cut is always the
-/// right trade there and even a false positive costs little (the climb
-/// restores). **Balanced and Studio don't**: their deal is the picked
-/// quality, and a false-positive cut (viewer-side CPU hiccup reading as
-/// congestion) would silently soften a healthy stream — the same
-/// native-quality contract that keeps [`auto_adapt_enabled`] opt-in.
-/// `ALLMYSTUFF_RATE_ADAPT=1` opts every lossy posture in (field A/B);
-/// `=0` kills it everywhere; unset = game-only.
+/// Where the closed-loop bitrate may act. Interactive postures participate by
+/// default, but with different evidence: Game may trade quality for cadence
+/// when the renderer is falling behind; Balanced cuts only on link evidence
+/// (arrival-rate sag or a sustained delay ramp), so a local decoder hiccup
+/// cannot silently soften a healthy stream. Studio remains pinned unless the
+/// operator opts every lossy posture in. `ALLMYSTUFF_RATE_ADAPT=1` does
+/// that; `=0` kills adaptation everywhere; unset = Balanced + Game.
 #[derive(Clone, Copy, PartialEq)]
 enum RateAdaptMode {
     Off,
-    GameOnly,
+    Interactive,
     All,
 }
 
@@ -4565,17 +4714,19 @@ fn rate_adapt_mode() -> RateAdaptMode {
                 );
                 RateAdaptMode::All
             }
-            _ => RateAdaptMode::GameOnly,
+            _ => RateAdaptMode::Interactive,
         }
     });
     *MODE
 }
 
 /// The gate itself, pure for the tests.
-fn rate_adapt_allowed(game: bool, mode: RateAdaptMode) -> bool {
+fn rate_adapt_allowed(posture: Posture, mode: RateAdaptMode) -> bool {
     match mode {
         RateAdaptMode::Off => false,
-        RateAdaptMode::GameOnly => game,
+        RateAdaptMode::Interactive => {
+            matches!(posture, Posture::Balanced | Posture::Game)
+        }
         RateAdaptMode::All => true,
     }
 }
@@ -4590,8 +4741,15 @@ const RATE_GOOD_STREAK: u32 = 5;
 /// the reconfigure and the viewer's queue need a beat to show up in the
 /// feedback before it's evidence about the new rate.
 const RATE_HOLD: Duration = Duration::from_secs(6);
-/// The floor AIMD never cuts through — the existing stream budget floor.
-const RATE_FLOOR: u32 = 8_000_000;
+/// The emergency floor for each lossy posture. Balanced normally targets
+/// 8 Mbps but may retreat to 4 on direct network evidence; the higher-rate
+/// postures retain the prior 8 Mbps floor.
+fn rate_floor(posture: Posture) -> u32 {
+    match posture {
+        Posture::Balanced => 4_000_000,
+        Posture::Game | Posture::Studio | Posture::StudioLossless => 8_000_000,
+    }
+}
 
 /// One AIMD step from one feedback report: multiplicative down on
 /// congestion evidence, additive up on sustained health, `None` to hold.
@@ -4599,6 +4757,7 @@ const RATE_FLOOR: u32 = 8_000_000;
 fn rate_adapt_step(
     state: &mut RateAdaptState,
     fb: &RecvFeedback,
+    posture: Posture,
     target_fps: u32,
     current: u32,
     ceiling: u32,
@@ -4610,13 +4769,13 @@ fn rate_adapt_step(
     // rendered cadence collapsing versus target.
     let est_sagging = fb.est_kbps > 0 && (fb.est_kbps as u64 * 1000) < (current as u64 * 85 / 100);
     let delay_ramping = fb.delay_trend_us_per_s > 20_000; // +20 ms of queue per second
-    let struggling = fb.queue_depth > 8
+    let renderer_struggling = fb.queue_depth > 8
         || fb.decode_fails > 0
-        || est_sagging
-        || delay_ramping
         || (target_fps > 0
             && fb.recv_fps > 0
             && fb.recv_fps.saturating_mul(10) < target_fps.saturating_mul(7));
+    let link_struggling = est_sagging || delay_ramping;
+    let struggling = link_struggling || (posture == Posture::Game && renderer_struggling);
     let held = state
         .last_step
         .is_some_and(|t| now.duration_since(t) < RATE_HOLD);
@@ -4640,7 +4799,7 @@ fn rate_adapt_step(
             // floor (`ALLMYSTUFF_VIDEO_BITRATE` bypasses the floor) makes
             // reachable via two peer congestion reports. When the ceiling
             // is under the floor we simply don't cut below it.
-            let next = next.clamp(RATE_FLOOR.min(ceiling), ceiling);
+            let next = next.clamp(rate_floor(posture).min(ceiling), ceiling);
             if next < current {
                 state.bad = 0;
                 state.last_step = Some(now);
@@ -4958,6 +5117,12 @@ trait H264Codec: Send {
         h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String>;
+    /// Re-aim the encoder without rebuilding its reference chain. Backends
+    /// that cannot do this return false; the route then pins the shared
+    /// target back to the last rate actually applied.
+    fn set_bitrate(&mut self, _bitrate: u32) -> bool {
+        false
+    }
     /// Human label for logs ("openh264 (software)", "h264_nvenc", …).
     fn label(&self) -> &str;
 }
@@ -5016,6 +5181,9 @@ impl H264Codec for MfCodec {
         // The MFT is fixed to the size it was opened at — the same (dw, dh) the
         // ladder built it for; `H264Stream` rebuilds on resize.
         self.0.encode_nv12(yuv, force_idr)
+    }
+    fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        self.0.set_bitrate(bitrate)
     }
     fn label(&self) -> &str {
         self.0.label()
@@ -5582,21 +5750,37 @@ mod tests {
         let t0 = Instant::now();
         // One bad report is a hiccup, not a verdict.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, Posture::Game, 60, ceiling, ceiling, t0,),
             None
         );
         // The second cuts ×0.7.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, Posture::Game, 60, ceiling, ceiling, t0,),
             Some(28_000_000)
         );
         // Inside the hold window nothing moves, evidence or not.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            rate_adapt_step(
+                &mut st,
+                &congested,
+                Posture::Game,
+                60,
+                28_000_000,
+                ceiling,
+                t0,
+            ),
             None
         );
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            rate_adapt_step(
+                &mut st,
+                &congested,
+                Posture::Game,
+                60,
+                28_000_000,
+                ceiling,
+                t0,
+            ),
             None
         );
         // Past the hold, with a measured estimate as the witness, the cut
@@ -5608,7 +5792,7 @@ mod tests {
         // The bad streak carried through the hold, so the first post-hold
         // report with congestion evidence steps immediately.
         let t1 = t0 + RATE_HOLD + Duration::from_secs(1);
-        let cut = rate_adapt_step(&mut st, &est, 60, 28_000_000, ceiling, t1)
+        let cut = rate_adapt_step(&mut st, &est, Posture::Game, 60, 28_000_000, ceiling, t1)
             .expect("estimate-guided cut");
         assert_eq!(cut, 8_500_000, "85% of the measured 10 Mbps");
         // Clean reports climb additively — and only after the streak.
@@ -5616,7 +5800,7 @@ mod tests {
         let t2 = t1 + RATE_HOLD + Duration::from_secs(1);
         let mut up = None;
         for _ in 0..RATE_GOOD_STREAK {
-            up = rate_adapt_step(&mut st, &clean, 60, cut, ceiling, t2);
+            up = rate_adapt_step(&mut st, &clean, Posture::Game, 60, cut, ceiling, t2);
         }
         let up = up.expect("climb after the streak");
         assert_eq!(up, cut + (ceiling / 12).max(500_000));
@@ -5630,27 +5814,125 @@ mod tests {
         let mut st2 = RateAdaptState::default();
         let t3 = t2 + RATE_HOLD + Duration::from_secs(1);
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            rate_adapt_step(&mut st2, &ramping, Posture::Game, 60, ceiling, ceiling, t3,),
             None
         );
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            rate_adapt_step(&mut st2, &ramping, Posture::Game, 60, ceiling, ceiling, t3,),
             Some(28_000_000)
         );
     }
 
-    /// The reservation rule: automatic bitrate changes act only where
-    /// they are beneficial in every case for the mode's use case — Game
-    /// by default; everything else opt-in, off means off.
+    /// The reservation rule: both interactive modes adapt by default, while
+    /// Studio remains pinned unless explicitly opted in.
     #[test]
-    fn rate_adapt_is_reserved_to_game_by_default() {
-        assert!(rate_adapt_allowed(true, RateAdaptMode::GameOnly));
-        assert!(
-            !rate_adapt_allowed(false, RateAdaptMode::GameOnly),
-            "balanced/studio keep the picked quality unless opted in"
+    fn rate_adapt_defaults_to_interactive_postures() {
+        assert!(rate_adapt_allowed(
+            Posture::Balanced,
+            RateAdaptMode::Interactive
+        ));
+        assert!(rate_adapt_allowed(
+            Posture::Game,
+            RateAdaptMode::Interactive
+        ));
+        assert!(!rate_adapt_allowed(
+            Posture::Studio,
+            RateAdaptMode::Interactive
+        ));
+        assert!(rate_adapt_allowed(Posture::Studio, RateAdaptMode::All));
+        assert!(!rate_adapt_allowed(Posture::Game, RateAdaptMode::Off));
+    }
+
+    #[test]
+    fn balanced_uses_link_evidence_only_and_can_reach_four_mbps() {
+        let ceiling = 8_000_000;
+        let local_decoder_hiccup = RecvFeedback {
+            recv_fps: 8,
+            decode_fails: 3,
+            queue_depth: 40,
+            ..fb(8, 3, 40)
+        };
+        let mut state = RateAdaptState::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(
+                rate_adapt_step(
+                    &mut state,
+                    &local_decoder_hiccup,
+                    Posture::Balanced,
+                    30,
+                    ceiling,
+                    ceiling,
+                    now,
+                ),
+                None,
+                "decoder pressure alone must not soften Balanced"
+            );
+        }
+
+        let weak_link = RecvFeedback {
+            est_kbps: 2_000,
+            ..fb(30, 0, 0)
+        };
+        assert_eq!(
+            rate_adapt_step(
+                &mut state,
+                &weak_link,
+                Posture::Balanced,
+                30,
+                ceiling,
+                ceiling,
+                now,
+            ),
+            None
         );
-        assert!(rate_adapt_allowed(false, RateAdaptMode::All));
-        assert!(!rate_adapt_allowed(true, RateAdaptMode::Off));
+        assert_eq!(
+            rate_adapt_step(
+                &mut state,
+                &weak_link,
+                Posture::Balanced,
+                30,
+                ceiling,
+                ceiling,
+                now,
+            ),
+            Some(4_000_000),
+            "two direct link reports may use Balanced's emergency floor"
+        );
+    }
+
+    #[test]
+    fn cpu_rate_registration_cannot_remove_a_newer_route_incarnation() {
+        let route_id = "cpu-rate-incarnation-test";
+        route_rates().lock().remove(route_id);
+        let old = CpuRateRegistration::new(route_id, 20_000_000);
+        assert_eq!(
+            route_rates()
+                .lock()
+                .get(route_id)
+                .expect("old registration")
+                .target
+                .load(Ordering::Relaxed),
+            20_000_000
+        );
+
+        let newer = Arc::new(RouteRate {
+            target: AtomicU32::new(8_000_000),
+            ceiling: AtomicU32::new(8_000_000),
+            adapt: Mutex::new(RateAdaptState::default()),
+        });
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), newer.clone());
+        drop(old);
+        assert!(
+            route_rates()
+                .lock()
+                .get(route_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &newer)),
+            "the old guard must not reap a replacement route's rate cell"
+        );
+        route_rates().lock().remove(route_id);
     }
 
     /// The wave chooser: a first loss heals with the smooth default; a
@@ -5954,7 +6236,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_starts_at_four_mbps_and_thirty_fps() {
+    fn balanced_starts_at_eight_mbps_and_thirty_fps() {
         // Balanced is the safe starting point regardless of link or pixels.
         let balanced_lan = Tune {
             link: LinkClass::Lan,
@@ -5962,8 +6244,8 @@ mod tests {
         };
         assert_eq!(balanced_lan.fps(), 30);
         assert_eq!(Tune::default().fps(), 30);
-        assert_eq!(tuned_bitrate(balanced_lan, 3840, 2160, 30), 4_000_000);
-        assert_eq!(tuned_bitrate(Tune::default(), 1920, 1080, 30), 4_000_000);
+        assert_eq!(tuned_bitrate(balanced_lan, 3840, 2160, 30), 8_000_000);
+        assert_eq!(tuned_bitrate(Tune::default(), 1920, 1080, 30), 8_000_000);
 
         // Game and Studio retain the existing high-throughput defaults.
         let game_lan = Tune {
@@ -6155,6 +6437,7 @@ mod tests {
     fn h264_stream_emits_annexb_with_a_leading_idr() {
         let mut stats = StreamStats::new("r", VideoMode::H264);
         let mut enc = H264Stream::new(
+            "r",
             (64, 64),
             Tune::default(),
             Arc::new(AtomicBool::new(false)),
@@ -6222,10 +6505,36 @@ mod tests {
         }
     }
 
+    struct RateAwareCodec {
+        applied: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl H264Codec for RateAwareCodec {
+        fn encode_yuv(
+            &mut self,
+            _yuv: &[u8],
+            _w: usize,
+            _h: usize,
+            _force_idr: bool,
+        ) -> Result<EncodeOutcome, String> {
+            Ok(EncodeOutcome::consumed(Some((vec![1], false))))
+        }
+
+        fn set_bitrate(&mut self, bitrate: u32) -> bool {
+            self.applied.lock().push(bitrate);
+            true
+        }
+
+        fn label(&self) -> &str {
+            "rate-aware (test)"
+        }
+    }
+
     /// An [`H264Stream`] around an injected codec, budget-sized so a 64×64
     /// test frame never triggers the real-ladder rebuild.
     fn h264_stream_with(codec: Box<dyn H264Codec>) -> H264Stream {
         H264Stream {
+            route_id: "r".into(),
             codec,
             budget_size: (64, 64),
             tune: Tune::default(),
@@ -6238,6 +6547,8 @@ mod tests {
             refresh: Arc::new(AtomicBool::new(false)),
             idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
             auto: AutoAdapt::new(),
+            rate: None,
+            applied_rate: tuned_bitrate(Tune::default(), 64, 64, 30),
         }
     }
 
@@ -6265,6 +6576,52 @@ mod tests {
         assert_eq!(datas, vec![vec![1, 1], vec![2, 2], vec![3, 3]]);
         assert_eq!(stats.keyframes, 1, "the drained key is counted");
         assert_eq!(stats.bytes, 6);
+    }
+
+    #[test]
+    fn cpu_h264_applies_shared_rate_without_rebuilding() {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = h264_stream_with(Box::new(RateAwareCodec {
+            applied: applied.clone(),
+        }));
+        stream.applied_rate = 20_000_000;
+        let rate = Arc::new(RouteRate {
+            target: AtomicU32::new(8_000_000),
+            ceiling: AtomicU32::new(20_000_000),
+            adapt: Mutex::new(RateAdaptState::default()),
+        });
+        stream.rate = Some(rate);
+
+        let mut stats = StreamStats::new("r", VideoMode::H264);
+        let rgba = vec![128u8; 64 * 64 * 4];
+        let packets = stream
+            .encode(rgba, 64, 64, &mut stats)
+            .expect("rate-aware encode");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&*applied.lock(), &[8_000_000]);
+        assert_eq!(stream.applied_rate, 8_000_000);
+    }
+
+    #[test]
+    fn cpu_h264_pins_rejected_rate_to_encoder_reality() {
+        let mut stream = h264_stream_with(Box::new(ScriptedCodec::new(vec![Ok(
+            EncodeOutcome::consumed(Some((vec![1], false))),
+        )])));
+        stream.applied_rate = 20_000_000;
+        let rate = Arc::new(RouteRate {
+            target: AtomicU32::new(8_000_000),
+            ceiling: AtomicU32::new(20_000_000),
+            adapt: Mutex::new(RateAdaptState::default()),
+        });
+        stream.rate = Some(rate.clone());
+
+        let mut stats = StreamStats::new("r", VideoMode::H264);
+        let rgba = vec![128u8; 64 * 64 * 4];
+        stream
+            .encode(rgba, 64, 64, &mut stats)
+            .expect("backend rejection is not a stream failure");
+        assert_eq!(rate.target.load(Ordering::Relaxed), 20_000_000);
+        assert_eq!(stream.applied_rate, 20_000_000);
     }
 
     #[test]
@@ -6316,6 +6673,7 @@ mod tests {
         let mode = enc.mode();
         HealingEncoder {
             enc,
+            rate_registration: None,
             route_id: "r".into(),
             mode,
             tune: Tune::default(),

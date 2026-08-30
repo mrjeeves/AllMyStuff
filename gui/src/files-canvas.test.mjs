@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fileTileSizeLabel, fleetfilesLogicalPath, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
+import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fileTileSizeLabel, fleetfilesLogicalPath, framesInPaintOrder, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
 
 test("overlapping snapshots keep stable order and the latest value per domain key", () => {
   const rows = [
@@ -107,6 +107,17 @@ test("nesting chooses the smallest frame and never chooses a descendant", () => 
   assert.equal(containingFrame({ x: 80, y: 80, width: 40, height: 40 }, frames), "inner");
   assert.deepEqual([...descendantsOf("outer", frames)], ["inner"]);
   assert.equal(containingFrame(frames[0], frames, descendantsOf("outer", frames)), null);
+});
+
+test("nested frames paint in front of their containers on every fleet member", () => {
+  const outer = { id: "frame:z-outer", title: "Outer", color: "", parentId: null, x: 0, y: 0, width: 500, height: 500 };
+  const inner = { id: "frame:a-inner", title: "Inner", color: "", parentId: outer.id, x: 40, y: 40, width: 300, height: 300 };
+  const leaf = { id: "frame:0-leaf", title: "Leaf", color: "", parentId: inner.id, x: 80, y: 80, width: 120, height: 120 };
+  const separate = { id: "frame:b-separate", title: "Separate", color: "", parentId: null, x: 600, y: 0, width: 200, height: 200 };
+
+  const expected = [separate.id, outer.id, inner.id, leaf.id];
+  assert.deepEqual(framesInPaintOrder([leaf, outer, separate, inner]).map((frame) => frame.id), expected);
+  assert.deepEqual(framesInPaintOrder([inner, separate, leaf, outer]).map((frame) => frame.id), expected);
 });
 
 test("fallback file identity folds Windows paths but not POSIX case", () => {

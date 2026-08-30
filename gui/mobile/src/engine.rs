@@ -31,7 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use allmystuff_node::control_client::ControlClient;
 use allmystuff_node::mesh::Mesh;
 use allmystuff_node::networks_store::DisabledNetworks;
-use allmystuff_node::node_control::{dispatch, DispatchOut, NodeRequest};
+use allmystuff_node::node_control::{dispatch, DispatchOut, NodeRequest, RuntimeControl};
 use allmystuff_node::UiSink;
 
 /// The live in-process stack. Held in Tauri state for the app's lifetime;
@@ -40,6 +40,7 @@ pub struct Engine {
     mesh: Arc<Mesh>,
     client: Arc<ControlClient>,
     disabled: Arc<DisabledNetworks>,
+    runtime: RuntimeControl,
     /// The embedded daemon. Never shut down explicitly — iOS gives no
     /// "about to terminate" moment worth trusting; peers age the phone out
     /// through the same heartbeat that covers a battery dying.
@@ -54,7 +55,7 @@ impl Engine {
             cmd: cmd.to_string(),
             args,
         };
-        match dispatch(&self.mesh, &self.client, &self.disabled, req).await {
+        match dispatch(&self.mesh, &self.client, &self.disabled, &self.runtime, req).await {
             DispatchOut::Json(v) => Ok(v),
             DispatchOut::Bytes(_) => Err(format!("{cmd}: binary reply for a json command")),
             DispatchOut::Err(e) => Err(e),
@@ -68,7 +69,7 @@ impl Engine {
             cmd: cmd.to_string(),
             args,
         };
-        match dispatch(&self.mesh, &self.client, &self.disabled, req).await {
+        match dispatch(&self.mesh, &self.client, &self.disabled, &self.runtime, req).await {
             DispatchOut::Bytes(b) => Ok(b),
             DispatchOut::Json(_) => Err(format!("{cmd}: json reply for a binary command")),
             DispatchOut::Err(e) => Err(e),
@@ -200,10 +201,15 @@ async fn boot_at(
     mesh.attach_disabled_networks(disabled.clone());
     mesh.clone().start().await;
 
+    // The embedded mobile engine is the installed AllMyStuff runtime itself,
+    // never the yieldable CEC Support fallback.
+    let runtime = RuntimeControl::canonical_installed();
+
     Ok(Arc::new(Engine {
         mesh,
         client,
         disabled,
+        runtime,
         _daemon: daemon,
     }))
 }

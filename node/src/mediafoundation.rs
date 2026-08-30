@@ -705,9 +705,6 @@ impl MediaFoundationH264 {
     /// the knob smooth receiver-driven adaptation needs: today a bitrate
     /// move costs a codec rebuild whose first unit is an IDR — a burst on
     /// the wire at the exact moment the link is struggling.
-    // Production consumer lands with receiver-driven bitrate adaptation
-    // (BWE); until then `hardware_bitrate_reconfigures_in_place` proves it.
-    #[allow(dead_code)]
     pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> bool {
         let Some(api) = &self.codecapi else {
             return false;

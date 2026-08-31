@@ -132,6 +132,9 @@ pub struct Mesh {
     video_au_out_sequences: Mutex<HashMap<String, u64>>,
     video_au_out_codecs: Mutex<HashMap<String, AuCodec>>,
     video_au_in_sequences: Mutex<HashMap<String, u64>>,
+    /// Recovery contract advertised by the active encoder in its latest AU
+    /// identity. Missing/old senders default to reset recovery.
+    video_au_in_recovery: Mutex<HashMap<String, crate::video_wire::AuRecovery>>,
     /// Viewer-side accept time, consumed by the first usable complete AU. This
     /// keeps cold-link setup latency separate from steady-state queue latency.
     video_accepted_at: Mutex<HashMap<String, Instant>>,
@@ -564,6 +567,7 @@ struct VideoWatcher {
 enum H264IpcEnqueue {
     Enqueued { skipped: usize },
     AwaitingKey { started: bool },
+    Converging { skipped: usize, started: bool },
 }
 
 fn ipc_h264_key(packet: &[u8]) -> bool {
@@ -578,9 +582,14 @@ fn enqueue_h264_ipc(
     awaiting_key: &mut bool,
     packet: Vec<u8>,
     max_queued: usize,
+    gradual: bool,
 ) -> H264IpcEnqueue {
     let key = ipc_h264_key(&packet);
-    if *awaiting_key {
+    if gradual {
+        if *awaiting_key && queue.len() < max_queued / 2 {
+            *awaiting_key = false;
+        }
+    } else if *awaiting_key {
         if !key {
             return H264IpcEnqueue::AwaitingKey { started: false };
         }
@@ -602,6 +611,12 @@ fn enqueue_h264_ipc(
 
         let skipped = queue.len();
         queue.clear();
+        if gradual {
+            let started = !*awaiting_key;
+            *awaiting_key = true;
+            queue.push_back(packet);
+            return H264IpcEnqueue::Converging { skipped, started };
+        }
         if key {
             queue.push_back(packet);
             return H264IpcEnqueue::Enqueued { skipped };
@@ -1337,6 +1352,7 @@ struct VideoRecovery {
     state: AtomicU64,
     drops: AtomicU64,
     suppressed: AtomicU64,
+    last_gradual: Mutex<Option<Instant>>,
 }
 
 impl VideoRecovery {
@@ -1347,6 +1363,7 @@ impl VideoRecovery {
             state: AtomicU64::new(0),
             drops: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
+            last_gradual: Mutex::new(None),
         }
     }
 
@@ -1370,6 +1387,34 @@ impl VideoRecovery {
     }
 
     fn note_drop(&self, mesh: &Mesh, key: Option<bool>, reason: &str) {
+        if mesh.video.route_supports_gdr(&self.route_id) {
+            let dropped = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = Instant::now();
+            let arm = {
+                let mut last = self.last_gradual.lock();
+                if last.is_some_and(|at| now.duration_since(at) < VIDEO_REFRESH_QUIET) {
+                    false
+                } else {
+                    *last = Some(now);
+                    true
+                }
+            };
+            if arm {
+                mesh.video.route_wave_or_refresh(&self.route_id);
+            }
+            if mesh.diag_ok(&self.diag_key) {
+                tracing::warn!(
+                    "video queue recovery for {}: {dropped} total drops ({reason}); {}",
+                    self.route_id,
+                    if arm {
+                        "GDR convergence wave armed"
+                    } else {
+                        "GDR convergence already in flight"
+                    }
+                );
+            }
+            return;
+        }
         let (arm, dropped, _) = self.mark_drop(key);
         // The first loss starts recovery. A keyframe that itself fails must
         // re-arm it; suppressed deltas never do, avoiding an IDR storm.
@@ -2091,6 +2136,7 @@ impl Mesh {
             video_au_out_sequences: Mutex::new(HashMap::new()),
             video_au_out_codecs: Mutex::new(HashMap::new()),
             video_au_in_sequences: Mutex::new(HashMap::new()),
+            video_au_in_recovery: Mutex::new(HashMap::new()),
             video_accepted_at: Mutex::new(HashMap::new()),
             video_awaiting_entry: Mutex::new(HashSet::new()),
             injector: Injector::new(),
@@ -2369,7 +2415,14 @@ impl Mesh {
                     };
                     crate::video_wire::insert_au_identity_marker(
                         &mut data,
-                        sequence,
+                        crate::video_wire::AuIdentity {
+                            sequence,
+                            recovery: if self.video.route_supports_gdr(route_id) {
+                                crate::video_wire::AuRecovery::Gradual
+                            } else {
+                                crate::video_wire::AuRecovery::Reset
+                            },
+                        },
                         matches!(codec, AuCodec::Hevc),
                     );
                 }
@@ -3178,9 +3231,16 @@ impl Mesh {
         if media_pipes {
             let (video_tx, mut video_rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
             let (audio_tx, mut audio_rx) = mpsc::channel(MEDIA_AUDIO_QUEUE_CAPACITY);
+            let paced_mesh = Arc::downgrade(self);
+            let video_framing = Arc::new(move |from: &str, stream: u8| {
+                let mesh = paced_mesh.upgrade()?;
+                let route_id = mesh.video_route_for_lane(from, stream)?;
+                let paced = mesh.paced_video_routes.lock().contains(&route_id);
+                Some(paced)
+            });
             match self
                 .client
-                .subscribe_media_source(client_id, video_tx, audio_tx)
+                .subscribe_media_source(client_id, video_tx, audio_tx, video_framing)
                 .await
             {
                 Ok(()) => {
@@ -3199,13 +3259,32 @@ impl Mesh {
                                     f.rtp_timestamp,
                                     f.key,
                                     f.data,
+                                    true,
+                                ),
+                                InboundVideoEvent::Unframed(f) => mesh.handle_video_inbound(
+                                    &f.from,
+                                    f.stream,
+                                    f.rtp_timestamp,
+                                    f.key,
+                                    f.data,
+                                    false,
                                 ),
                                 InboundVideoEvent::Discontinuity {
                                     from,
                                     stream,
                                     entry,
                                 } => {
-                                    mesh.handle_video_discontinuity(&from, stream, entry.is_none());
+                                    let entry_is_clean = entry.as_ref().is_some_and(|f| {
+                                        f.key || crate::video_decode::is_decode_entry(&f.data)
+                                    });
+                                    let lost_ts_us =
+                                        entry.as_ref().map(|f| f.rtp_timestamp as u64 * 1000 / 90);
+                                    mesh.handle_video_discontinuity(
+                                        &from,
+                                        stream,
+                                        !entry_is_clean,
+                                        lost_ts_us,
+                                    );
                                     if let Some(f) = entry {
                                         mesh.handle_video_inbound(
                                             &f.from,
@@ -3213,6 +3292,7 @@ impl Mesh {
                                             f.rtp_timestamp,
                                             f.key,
                                             f.data,
+                                            true,
                                         );
                                     }
                                 }
@@ -3960,7 +4040,7 @@ impl Mesh {
                 let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
                     return;
                 };
-                self.handle_video_inbound(from, stream, rtp_timestamp, key, data);
+                self.handle_video_inbound(from, stream, rtp_timestamp, key, data, false);
             }
             "audio_inbound" => {
                 let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
@@ -5276,6 +5356,7 @@ impl Mesh {
         self.video_au_out_sequences.lock().remove(route_id);
         self.video_au_out_codecs.lock().remove(route_id);
         self.video_au_in_sequences.lock().remove(route_id);
+        self.video_au_in_recovery.lock().remove(route_id);
         self.video_accepted_at.lock().remove(route_id);
         self.video_awaiting_entry.lock().remove(route_id);
         self.video_pace.lock().remove(route_id);
@@ -5627,11 +5708,16 @@ impl Mesh {
     }
 
     /// The bounded daemon -> node pipe shed at least one access unit from this
-    /// peer/lane. Resolve the lane exactly like an arriving frame, fence the
-    /// route before any later delta can reach a decoder, and ask once for a
-    /// clean entry. The pipe itself suppresses dependent deltas, so this does
-    /// not become a per-frame refresh loop.
-    fn handle_video_discontinuity(self: &Arc<Self>, from: &str, stream: u8, request_entry: bool) {
+    /// peer/lane. Resolve the lane exactly like an arriving frame, then apply
+    /// the active encoder's recovery contract. Reset streams fence to an IDR;
+    /// gradual streams request one wave and continue consuming its frames.
+    fn handle_video_discontinuity(
+        self: &Arc<Self>,
+        from: &str,
+        stream: u8,
+        request_entry: bool,
+        lost_ts_us: Option<u64>,
+    ) {
         let Some(route_id) = self.video_route_for_lane(from, stream) else {
             tracing::debug!(
                 "video IPC discontinuity from {} on unmapped lane {stream}; the pipe still waits for a keyframe",
@@ -5649,18 +5735,42 @@ impl Mesh {
             &route_id,
             "local media IPC exceeded its live-video latency bound",
             request_entry,
+            lost_ts_us,
         );
     }
 
-    /// Put one live route behind its clean-entry fence. Returns true only for
-    /// the transition that started this recovery episode; callers use that to
-    /// emit one diagnostic and one refresh rather than yapping on every delta.
+    /// Start one recovery episode under the active encoder contract. Reset
+    /// routes enter a clean-entry fence; gradual routes keep their deltas and
+    /// request a convergence wave. Returns true only when this call performed
+    /// useful recovery work; the shared request gate prevents control yapping.
     fn mark_video_discontinuity(
         self: &Arc<Self>,
         route_id: &str,
         reason: &str,
         request_entry: bool,
+        lost_ts_us: Option<u64>,
     ) -> bool {
+        let recovery = self
+            .video_au_in_recovery
+            .lock()
+            .get(route_id)
+            .copied()
+            .unwrap_or(crate::video_wire::AuRecovery::Reset);
+        if request_entry && recovery == crate::video_wire::AuRecovery::Gradual {
+            if self.diag_ok(&format!("video-discontinuity:{route_id}")) {
+                tracing::warn!(
+                    "video discontinuity for {route_id}: {reason}; requesting one GDR convergence wave"
+                );
+            }
+            let mesh = self.clone();
+            let recovery_route = route_id.to_string();
+            crate::spawn(async move {
+                let _ = mesh
+                    .request_video_recovery(recovery_route, lost_ts_us.or(Some(0)))
+                    .await;
+            });
+            return true;
+        }
         if !self
             .video_awaiting_entry
             .lock()
@@ -5704,6 +5814,7 @@ impl Mesh {
         rtp_timestamp: u32,
         key: bool,
         data: Vec<u8>,
+        complete_au: bool,
     ) {
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_route_for_lane(from, stream) else {
@@ -5747,7 +5858,7 @@ impl Mesh {
         // never inferred from this timing; the exact AU identity below owns it.
         self.note_video_arrival(&route_id, rtp_timestamp, data.len());
         let paced = self.paced_video_routes.lock().contains(&route_id);
-        if paced {
+        if paced && !complete_au {
             let (complete, damaged) =
                 self.accept_paced_video_fragment(&route_id, rtp_timestamp, key, data);
             if damaged {
@@ -5755,6 +5866,7 @@ impl Mesh {
                     &route_id,
                     "paced access unit was incomplete and was dropped whole",
                     true,
+                    Some(rtp_timestamp as u64 * 1000 / 90),
                 );
             }
             if let Some(complete) = complete {
@@ -5797,12 +5909,16 @@ impl Mesh {
         key: bool,
         mut data: Vec<u8>,
     ) {
-        let sequence = crate::video_wire::take_au_identity_marker(&mut data);
+        let identity = crate::video_wire::take_au_identity_marker(&mut data);
         // Classify the codec payload after removing transport metadata. This
         // matters for a parameter-less IDR, where our prefix SEI is otherwise
         // the first NAL and can obscure the clean-entry header.
         let clean_entry = key || crate::video_decode::is_decode_entry(&data);
-        if let Some(sequence) = sequence {
+        if let Some(identity) = identity {
+            self.video_au_in_recovery
+                .lock()
+                .insert(route_id.to_string(), identity.recovery);
+            let sequence = identity.sequence;
             let observation = {
                 let mut sequences = self.video_au_in_sequences.lock();
                 let previous = sequences.get(route_id).copied();
@@ -5822,6 +5938,7 @@ impl Mesh {
                         route_id,
                         "the access-unit sequence proves a whole encoded frame was lost",
                         true,
+                        Some(rtp_timestamp as u64 * 1000 / 90),
                     );
                     return;
                 }
@@ -5848,6 +5965,7 @@ impl Mesh {
             // Compatibility with a sender that predates AU identity. Do not
             // compare a later upgraded sequence against stale local state.
             self.video_au_in_sequences.lock().remove(route_id);
+            self.video_au_in_recovery.lock().remove(route_id);
         }
         // The arrival side of the sender's "route active — streaming" line:
         // one INFO per stream, after a complete (not fragment) AU exists.
@@ -5929,20 +6047,13 @@ impl Mesh {
                 },
                 move |lost_ts_us| {
                     // The native decoder hit a corrupt unit or dumped its
-                    // queue: name the broken AU in feedback (a capable
-                    // sender heals with a GDR wave, no keyframe wall) AND
-                    // keep the rate-limited re-key ask — old senders need
-                    // it, and for new ones the wave lands first so the
-                    // wall it forces is the same one today's path forced.
+                    // queue. One mode-aware request now selects a GDR wave
+                    // from a capable Game encoder or an IDR from every reset
+                    // encoder; never send both and turn a wave into a wall.
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
                         crate::spawn(async move {
-                            if lost_ts_us.is_some() {
-                                let _ = mesh
-                                    .send_video_feedback(rid.clone(), 0, 1, 0, lost_ts_us)
-                                    .await;
-                            }
-                            let _ = mesh.request_refresh(rid).await;
+                            let _ = mesh.request_video_recovery(rid, lost_ts_us).await;
                         });
                     }
                 },
@@ -5957,7 +6068,9 @@ impl Mesh {
                 let mesh = self.clone();
                 let refresh_route = route_id.to_string();
                 crate::spawn(async move {
-                    let _ = mesh.request_refresh(refresh_route).await;
+                    let _ = mesh
+                        .request_video_recovery(refresh_route, Some(ts_us))
+                        .await;
                 });
             }
         }
@@ -5966,15 +6079,18 @@ impl Mesh {
     /// Queue one packet for a watching console window; drop the packet
     /// (with a debug note) when no window watches the route. A queue
     /// nobody drains (webview wedged or closing) caps at a small live window.
-    /// H.264 overflow re-enters only at a key unit; the return value asks the
-    /// caller to request one exactly when the watcher enters that quarantine.
+    /// H.264 overflow follows the advertised encoder contract: reset streams
+    /// re-enter at a key unit, while gradual streams jump to the live edge and
+    /// request one convergence wave. The return value arms that single request.
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) -> bool {
         // Six AUs are 100 ms at 60 fps / 200 ms at 30 fps. An unread
-        // backlog is pure latency by the time the window drains it, and the
-        // overflow below re-enters at a queued keyframe
-        // instead of dumping the lot, so a slow-but-alive window loses
+        // backlog is pure latency by the time the window drains it. Reset
+        // streams trim to a queued keyframe; GDR streams retain the newest
+        // delta and converge in place, so a slow-but-alive window loses
         // moments, not the stream.
         const MAX_QUEUED: usize = 6;
+        let gradual = self.video_au_in_recovery.lock().get(route_id).copied()
+            == Some(crate::video_wire::AuRecovery::Gradual);
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -5997,14 +6113,18 @@ impl Mesh {
             w.queue.clear();
             w.queue.push_back(packet);
         } else {
-            // H.264 backlog: skip forward to the NEWEST queued key unit —
-            // decode re-enters there cleanly, and the viewer jumps to
-            // near-live instead of replaying the whole backlog. The ipc
-            // header carries the key flag (kind 2 at byte 0, key at byte
-            // 1). If there is no safe trim point, quarantine dependent
-            // deltas until a key unit arrives instead of feeding a decoder
-            // across discarded references.
-            match enqueue_h264_ipc(&mut w.queue, &mut w.awaiting_key, packet, MAX_QUEUED) {
+            // H.264 backlog: reset streams skip to the newest queued key unit
+            // or quarantine dependent deltas until one arrives. GDR streams
+            // instead keep the newest delta and request one refresh wave, so
+            // Game never recreates an IDR wall at the final GUI handoff. The
+            // IPC header carries the key flag (kind 2 at byte 0, key at byte 1).
+            match enqueue_h264_ipc(
+                &mut w.queue,
+                &mut w.awaiting_key,
+                packet,
+                MAX_QUEUED,
+                gradual,
+            ) {
                 H264IpcEnqueue::Enqueued { skipped } if skipped > 0 => {
                     tracing::debug!(
                         "video queue for {route_id} unread — skipped {skipped} stale packets to a clean keyframe"
@@ -6019,6 +6139,18 @@ impl Mesh {
                     return true;
                 }
                 H264IpcEnqueue::AwaitingKey { started: false } => return false,
+                H264IpcEnqueue::Converging {
+                    skipped,
+                    started: true,
+                } => {
+                    if self.diag_ok(&format!("ipc-reference-gap:{route_id}")) {
+                        tracing::warn!(
+                            "video queue for {route_id} skipped {skipped} stale packets — requesting one GDR convergence wave"
+                        );
+                    }
+                    return true;
+                }
+                H264IpcEnqueue::Converging { started: false, .. } => return false,
                 H264IpcEnqueue::Enqueued { .. } => {}
             }
         }
@@ -17363,6 +17495,64 @@ impl Mesh {
         result
     }
 
+    /// Repair a proven live-video discontinuity according to the active
+    /// encoder contract advertised in-band. GDR routes receive one reliable
+    /// loss report and keep their refresh wave flowing; every other route uses
+    /// the clean-entry IDR path. The shared gate collapses decoder-error bursts
+    /// for both strategies.
+    async fn request_video_recovery(
+        self: &Arc<Self>,
+        route_id: String,
+        lost_ts_us: Option<u64>,
+    ) -> Result<(), String> {
+        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        if !self.video_refresh.lock().begin(&route_id, Instant::now()) {
+            return Ok(());
+        }
+        let recovery = self
+            .video_au_in_recovery
+            .lock()
+            .get(&route_id)
+            .copied()
+            .unwrap_or(crate::video_wire::AuRecovery::Reset);
+        let result = if recovery == crate::video_wire::AuRecovery::Gradual {
+            let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
+            tracing::debug!(
+                "reliably asking {} for a GDR convergence wave on {route_id}",
+                short_id(&peer)
+            );
+            self.send_control_reliable(
+                &peer,
+                &ControlMessage::Route(RouteControl::VideoFeedback {
+                    route_id: route_id.clone(),
+                    recv_fps: 0,
+                    decode_fails: 1,
+                    queue_depth: 0,
+                    lost_ts_us: lost_ts_us.or(Some(0)),
+                    ext: crate::video::PipelineFeedback {
+                        est_kbps,
+                        delay_trend_us_per_s,
+                    }
+                    .to_ext(),
+                }),
+                Duration::from_secs(2),
+            )
+            .await
+        } else {
+            tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
+            self.send_control_reliable(
+                &peer,
+                &ControlMessage::Route(RouteControl::Refresh {
+                    route_id: route_id.clone(),
+                }),
+                Duration::from_secs(2),
+            )
+            .await
+        };
+        self.video_refresh.lock().finish(&route_id);
+        result
+    }
+
     /// Ask the far end of an inbound display/camera route to stream with
     /// these quality picks (`None` = that dial back on automatic). Old
     /// peers drop the message and stay on automatic.
@@ -21383,21 +21573,21 @@ mod tests {
         let mut awaiting_key = false;
 
         assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3),
+            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3, false),
             H264IpcEnqueue::AwaitingKey { started: true }
         );
         assert!(queue.is_empty());
         assert!(awaiting_key);
 
         assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 5), 3),
+            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 5), 3, false),
             H264IpcEnqueue::AwaitingKey { started: false },
             "dependent deltas stay out and do not request another refresh"
         );
         assert!(queue.is_empty());
 
         assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 6), 3),
+            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 6), 3, false),
             H264IpcEnqueue::Enqueued { skipped: 0 }
         );
         assert!(!awaiting_key);
@@ -21414,7 +21604,7 @@ mod tests {
         let mut awaiting_key = false;
 
         assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3),
+            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3, false),
             H264IpcEnqueue::Enqueued { skipped: 1 }
         );
         assert_eq!(
@@ -21438,11 +21628,60 @@ mod tests {
         let mut awaiting_key = false;
 
         assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 4), 3),
+            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 4), 3, false),
             H264IpcEnqueue::Enqueued { skipped: 3 }
         );
         assert_eq!(queue, std::collections::VecDeque::from([ipc_h264(true, 4)]));
         assert!(!awaiting_key);
+    }
+
+    #[test]
+    fn ipc_h264_gradual_overflow_keeps_live_deltas_and_requests_one_wave() {
+        let mut queue = std::collections::VecDeque::from([
+            ipc_h264(false, 1),
+            ipc_h264(false, 2),
+            ipc_h264(false, 3),
+        ]);
+        let mut recovery_in_flight = false;
+
+        assert_eq!(
+            enqueue_h264_ipc(
+                &mut queue,
+                &mut recovery_in_flight,
+                ipc_h264(false, 4),
+                3,
+                true,
+            ),
+            H264IpcEnqueue::Converging {
+                skipped: 3,
+                started: true,
+            }
+        );
+        assert_eq!(
+            queue,
+            std::collections::VecDeque::from([ipc_h264(false, 4)])
+        );
+        assert!(recovery_in_flight);
+
+        queue.extend([ipc_h264(false, 5), ipc_h264(false, 6)]);
+        assert_eq!(
+            enqueue_h264_ipc(
+                &mut queue,
+                &mut recovery_in_flight,
+                ipc_h264(false, 7),
+                3,
+                true,
+            ),
+            H264IpcEnqueue::Converging {
+                skipped: 3,
+                started: false,
+            },
+            "one congested episode does not yap another wave request"
+        );
+        assert_eq!(
+            queue,
+            std::collections::VecDeque::from([ipc_h264(false, 7)])
+        );
     }
 
     #[test]
@@ -21548,7 +21787,11 @@ mod tests {
     #[test]
     fn au_identity_survives_paced_fragment_reassembly() {
         let mut whole = [vec![0, 0, 0, 1, 0x67, 1], vec![0, 0, 0, 1, 0x65, 2]].concat();
-        crate::video_wire::insert_au_identity_marker(&mut whole, 91, false);
+        let identity = crate::video_wire::AuIdentity {
+            sequence: 91,
+            recovery: crate::video_wire::AuRecovery::Gradual,
+        };
+        crate::video_wire::insert_au_identity_marker(&mut whole, identity, false);
         let ranges = crate::video::split_annexb_paced(&whole, 8);
         let mut pending = HashMap::new();
         for range in &ranges {
@@ -21573,12 +21816,12 @@ mod tests {
         let mut rebuilt = complete.expect("paced AU").data;
         assert_eq!(
             crate::video_wire::take_au_identity_marker(&mut rebuilt),
-            Some(91)
+            Some(identity)
         );
         let mut original = whole;
         assert_eq!(
             crate::video_wire::take_au_identity_marker(&mut original),
-            Some(91)
+            Some(identity)
         );
         assert_eq!(rebuilt, original);
     }

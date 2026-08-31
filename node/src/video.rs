@@ -1259,6 +1259,14 @@ impl VideoBridge {
         }
     }
 
+    /// The recovery contract of the encoder that is active right now. The
+    /// wave registry exists only for a Game route that actually opened a
+    /// GDR-capable SDK encoder; requested posture and fallback labels are not
+    /// trusted here.
+    pub fn route_supports_gdr(&self, route_id: &str) -> bool {
+        wave_flags().lock().contains_key(route_id)
+    }
+
     /// Frame health's targeted heal: a GDR lane restarts its refresh
     /// wave — spread intra, no keyframe wall, no smear left behind — and
     /// any route without a registered wave falls back to the IDR refresh.
@@ -5473,6 +5481,13 @@ use allmystuff_pixels::{
 mod tests {
     use super::*;
 
+    fn au_identity(
+        sequence: u64,
+        recovery: crate::video_wire::AuRecovery,
+    ) -> crate::video_wire::AuIdentity {
+        crate::video_wire::AuIdentity { sequence, recovery }
+    }
+
     #[cfg(windows)]
     #[test]
     fn experimental_gpu_paths_require_an_explicit_boolean_value() {
@@ -5628,11 +5643,15 @@ mod tests {
     fn au_identity_marker_round_trips_without_touching_the_access_unit() {
         let original = vec![0, 0, 0, 1, 0x65, 1, 2, 3];
         let mut marked = original.clone();
-        crate::video_wire::insert_au_identity_marker(&mut marked, 0x0123_4567_89ab_cdef, false);
+        let identity = au_identity(
+            0x0123_4567_89ab_cdef,
+            crate::video_wire::AuRecovery::Gradual,
+        );
+        crate::video_wire::insert_au_identity_marker(&mut marked, identity, false);
         assert_eq!(marked[4] & 0x1f, 6, "valid H.264 prefix SEI NAL");
         assert_eq!(
             crate::video_wire::take_au_identity_marker(&mut marked),
-            Some(0x0123_4567_89ab_cdef)
+            Some(identity)
         );
         assert_eq!(marked, original);
     }
@@ -5648,7 +5667,11 @@ mod tests {
         assert_eq!(foreign, unchanged);
 
         let mut malformed = vec![9, 8, 7];
-        crate::video_wire::insert_au_identity_marker(&mut malformed, u64::MAX, false);
+        crate::video_wire::insert_au_identity_marker(
+            &mut malformed,
+            au_identity(u64::MAX, crate::video_wire::AuRecovery::Reset),
+            false,
+        );
         let last_hex = malformed.len() - 2;
         malformed[last_hex] = b'Z';
         let unchanged = malformed.clone();
@@ -5665,11 +5688,12 @@ mod tests {
         data.extend_from_slice(b"FOREIGN-UUID-000");
         data.extend_from_slice(b"0123456789abcdef");
         data.push(0x80);
-        crate::video_wire::insert_au_identity_marker(&mut data, 55, false);
+        let identity = au_identity(55, crate::video_wire::AuRecovery::Reset);
+        crate::video_wire::insert_au_identity_marker(&mut data, identity, false);
 
         assert_eq!(
             crate::video_wire::take_au_identity_marker(&mut data),
-            Some(55)
+            Some(identity)
         );
         assert!(data.windows(16).any(|w| w == b"FOREIGN-UUID-000"));
     }
@@ -5681,7 +5705,8 @@ mod tests {
             0, 0, 0, 1, 0x26, 0x01, 8, // IDR VCL
         ];
         let mut marked = original.clone();
-        crate::video_wire::insert_au_identity_marker(&mut marked, 77, true);
+        let identity = au_identity(77, crate::video_wire::AuRecovery::Reset);
+        crate::video_wire::insert_au_identity_marker(&mut marked, identity, true);
         let marker_at = marked
             .windows(6)
             .position(|w| w == [0, 0, 0, 1, 0x4e, 0x01])
@@ -5689,7 +5714,7 @@ mod tests {
         assert_eq!(marker_at, 7, "SEI follows parameters and precedes VCL");
         assert_eq!(
             crate::video_wire::take_au_identity_marker(&mut marked),
-            Some(77)
+            Some(identity)
         );
         assert_eq!(marked, original);
     }
@@ -5745,7 +5770,11 @@ mod tests {
             // Model a rolling update: an older receiver does not strip the
             // identity SEI and gives it to OpenH264. Being valid codec metadata
             // must keep that path decodable.
-            crate::video_wire::insert_au_identity_marker(&mut au, u64::from(i), false);
+            crate::video_wire::insert_au_identity_marker(
+                &mut au,
+                au_identity(u64::from(i), crate::video_wire::AuRecovery::Reset),
+                false,
+            );
             let chunks = split_annexb_paced(&au, 4 * 1024);
             let rebuilt: Vec<u8> = chunks
                 .iter()

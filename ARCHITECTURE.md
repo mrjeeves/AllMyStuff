@@ -599,14 +599,17 @@ Tauri 2 + Svelte 5, a client of the daemon.
    Codec, each defaulting to Auto) ride `RouteControl::Tune` to the
    streaming side, which restarts its capture with the picks; the codec
    pill re-offers the route on the chosen transport and picks where H.264
-   is decoded. A decoder that loses its place — a corrupt unit, a rebuilt
-   WebCodecs instance, a dumped native-decoder backlog — sends
-   `RouteControl::Refresh` and gets an IDR in ~one round trip instead of
-   sitting out the periodic interval (both asks are rate-limited and
-   silently dropped by older peers). Stream integrity itself is the
-   daemon's job: myownmesh ≥ 0.2.2 reassembles access units
-   sequence-aware, so packet loss or a late NACK retransmit costs one
-   frame, never a corrupt unit in a decoder. (These are floor thresholds;
+   is decoded. Every H.264/HEVC access unit carries an application sequence
+   and the recovery contract of the encoder that actually opened. A proven
+   gap, corrupt unit, or dumped decoder backlog therefore makes exactly one
+   bounded request: an IDR in ~one round trip for Balanced and fallback
+   encoders, or a gradual intra-refresh wave for a GDR-capable Game route.
+   Game's repair frames remain decoder input — the viewer never follows a
+   wave request with a colliding IDR wall. The daemon reassembles RTP access
+   units; AllMyStuff also validates its paced fragment trains before they
+   enter the four-complete-AU local queue, so a many-slice keyframe consumes
+   one slot rather than overflowing on its own. Older peers ignore the valid
+   SEI metadata and retain periodic-IDR compatibility. (These are floor thresholds;
    the actually-bundled daemon pin is v0.3.3 — see `.myownmesh-rev`.)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,

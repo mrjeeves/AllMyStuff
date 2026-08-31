@@ -21,6 +21,23 @@ esac
 [[ "$PIN" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] \
   || fail ".myownmesh-rev contains invalid release pin '$PIN'"
 
+if [[ "$MODE" == "sync" ]]; then
+  # `.myownmesh-rev` is the suite source of truth. A release must not rely
+  # on somebody remembering to edit the two mobile git dependencies by hand
+  # after advancing it. Keep this rewrite deliberately narrow so it cannot
+  # disturb unrelated manifest formatting or dependency options.
+  tmp="${MANIFEST}.tmp.$$"
+  trap 'rm -f "$tmp"' EXIT
+  awk -v pin="$PIN" '
+    /^myownmesh(-core)? = .*tag = "/ {
+      sub(/tag = "[^"]+"/, "tag = \"" pin "\"")
+    }
+    { print }
+  ' "$MANIFEST" > "$tmp"
+  mv "$tmp" "$MANIFEST"
+  trap - EXIT
+fi
+
 for package in myownmesh myownmesh-core; do
   grep -Eq "^${package} = .*tag = \"${PIN}\"" "$MANIFEST" \
     || fail "$MANIFEST does not pin $package to .myownmesh-rev ($PIN)"

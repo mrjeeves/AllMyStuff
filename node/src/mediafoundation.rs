@@ -263,21 +263,11 @@ impl HwEncoder {
                 &variant_u32(fps.saturating_mul(4).max(1)),
             );
             if crate::video::paced_slices_enabled() {
-                // Byte-capped slices for the app-side pacer (mode 1 =
-                // bits per slice). MFT support varies by vendor; report a
-                // rejected contract explicitly, while the sender's actual AU
-                // shape log catches drivers that accept but ignore it.
-                let mode_result = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(1));
-                let size_result = api.SetValue(
-                    &CODECAPI_AVEncSliceControlSize,
-                    &variant_u32((crate::video::PACE_SLICE_BYTES * 8) as u32),
-                );
-                if let Err(e) = mode_result {
-                    tracing::warn!("{name}: MFT rejected paced slice mode: {e}");
-                }
-                if let Err(e) = size_result {
-                    tracing::warn!("{name}: MFT rejected paced slice size: {e}");
-                }
+                // Prefer an exact byte cap, but do not mistake one rejected
+                // mode for "this encoder cannot slice". CodecAPI defines
+                // three static modes and permits an encoder to expose only a
+                // subset. Negotiate all legal modes, most precise first.
+                configure_paced_slices(api, &name, width, height);
             }
         }
 
@@ -960,9 +950,101 @@ fn variant_bool(v: bool) -> VARIANT {
     VARIANT::from(v)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SliceSetting {
+    mode: u32,
+    size: u32,
+    unit: &'static str,
+}
+
+/// CodecAPI's three legal H.264 slice-control shapes, in preference order.
+///
+/// Mode 1 is the exact wire-size ask. Modes 2 and 0 are geometry fallbacks
+/// for drivers that only expose row- or macroblock-based slicing. Field probes
+/// produced ~900 KiB high-motion 1080p IDRs, where the direct backends' usual
+/// eight lossy slices still left ~133 KiB packet walls. Two macroblock rows
+/// per slice produced the closest practical 1080p fallback to the 24 KiB
+/// transport grain; small P-frames are still coalesced by
+/// `split_annexb_paced`, so they remain one send.
+fn paced_slice_settings(width: u32, height: u32) -> [SliceSetting; 3] {
+    let target_slices = if width.saturating_mul(height) >= 1920 * 1080 {
+        64
+    } else {
+        32
+    };
+    let mb_w = width.div_ceil(16).max(1);
+    let mb_rows = height.div_ceil(16).max(1);
+    let rows_per_slice = mb_rows.div_ceil(target_slices).max(1);
+    [
+        SliceSetting {
+            mode: 1,
+            size: (crate::video::PACE_SLICE_BYTES * 8) as u32,
+            unit: "bits",
+        },
+        SliceSetting {
+            mode: 2,
+            size: rows_per_slice,
+            unit: "macroblock rows",
+        },
+        SliceSetting {
+            mode: 0,
+            size: mb_w.saturating_mul(rows_per_slice),
+            unit: "macroblocks",
+        },
+    ]
+}
+
+/// Select one slice-control mode the MFT actually accepts. Both properties
+/// must succeed as a pair: a size written after a rejected mode is dangerous,
+/// because the driver interprets it in whichever default unit it retained.
+unsafe fn configure_paced_slices(api: &ICodecAPI, name: &str, width: u32, height: u32) {
+    let mut rejected = Vec::new();
+    for setting in paced_slice_settings(width, height) {
+        if let Err(e) = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(setting.mode)) {
+            rejected.push(format!("mode {} ({}): {e}", setting.mode, setting.unit));
+            continue;
+        }
+        match api.SetValue(&CODECAPI_AVEncSliceControlSize, &variant_u32(setting.size)) {
+            Ok(()) => {
+                tracing::info!(
+                    "{name}: paced slices configured in {} mode ({} per slice)",
+                    setting.unit,
+                    setting.size,
+                );
+                return;
+            }
+            Err(e) => rejected.push(format!(
+                "mode {} size {} ({}): {e}",
+                setting.mode, setting.size, setting.unit
+            )),
+        }
+    }
+    tracing::warn!(
+        "{name}: no usable paced slice mode; encoded access-unit shape will decide the safe send path ({})",
+        rejected.join("; ")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_fallbacks_cover_every_codecapi_unit_without_pathological_counts() {
+        let full_hd = paced_slice_settings(1920, 1080);
+        assert_eq!(full_hd.map(|s| s.mode), [1, 2, 0]);
+        assert_eq!(full_hd[0].size, (crate::video::PACE_SLICE_BYTES * 8) as u32);
+        assert_eq!(full_hd[1].size, 2, "68 macroblock rows / 64 slices");
+        assert_eq!(full_hd[2].size, 240, "120 macroblocks × 2 rows");
+
+        let qhd = paced_slice_settings(2560, 1440);
+        assert_eq!(qhd[1].size, 2, "90 macroblock rows / 64 slices");
+        assert_eq!(qhd[2].size, 320, "160 macroblocks × 2 rows");
+
+        let tiny = paced_slice_settings(1, 1);
+        assert_eq!(tiny[1].size, 1);
+        assert_eq!(tiny[2].size, 1);
+    }
 
     /// Feed the real hardware MFT a burst of frames back-to-back and hold the
     /// pump to its lossless contract: every consumed frame's unit comes out
@@ -1038,6 +1120,68 @@ mod tests {
         assert!(
             decoded >= fed.saturating_sub(3),
             "decoded {decoded} of {fed} fed frames"
+        );
+    }
+
+    /// Field probe for the exact transport property paced slicing needs from
+    /// a machine's preferred hardware MFT. This is deliberately ignored in
+    /// CI: it is an assertion about the installed display driver, not merely
+    /// about our arithmetic. Run it on a sender before promoting a fallback.
+    #[test]
+    #[ignore = "requires a Windows hardware H.264 MFT"]
+    fn hardware_paced_slices_are_real_cut_points() {
+        let hw = hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            eprintln!("SKIP: no hardware H.264 MFT on this machine");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let mut enc = first
+            .open(w, h, 60, 20_000_000)
+            .unwrap_or_else(|e| panic!("{} failed to open: {e}", first.name));
+        let (wu, hu) = (w as usize, h as usize);
+        let mut nv12 = vec![128u8; wu * hu + 2 * ((wu / 2) * (hu / 2))];
+        let mut units = Vec::new();
+        for frame in 0..12u32 {
+            // High-motion luma makes the probe exercise the exact oversized
+            // access-unit shape seen in Game-mode field logs, rather than a
+            // tiny static desktop frame that would not test the contract.
+            for (pixel, value) in nv12[..wu * hu].iter_mut().enumerate() {
+                let mixed = (pixel as u32)
+                    .wrapping_add(frame.wrapping_mul(9973))
+                    .wrapping_mul(2654435761);
+                *value = (mixed >> 24) as u8;
+            }
+            units.extend(enc.encode_nv12(&nv12, frame == 0).expect("encode").units);
+        }
+        assert!(!units.is_empty(), "{} produced no access units", first.name);
+        let shapes: Vec<(usize, usize, usize)> = units
+            .iter()
+            .map(|(unit, _)| {
+                let chunks = crate::video::split_annexb_paced(unit, crate::video::PACE_SLICE_BYTES);
+                let largest = chunks.iter().map(|range| range.len()).max().unwrap_or(0);
+                (unit.len(), chunks.len(), largest)
+            })
+            .collect();
+        let max_chunks = shapes.iter().map(|shape| shape.1).max().unwrap_or(0);
+        let largest_chunk = shapes.iter().map(|shape| shape.2).max().unwrap_or(0);
+        eprintln!(
+            "{}: {} access units; max {max_chunks} paced chunks/AU; largest chunk {:.1} KiB; shapes={shapes:?}",
+            first.name,
+            units.len(),
+            largest_chunk as f64 / 1024.0,
+        );
+        assert!(
+            max_chunks > 1,
+            "{} accepted configuration but still emitted only one slice per access unit",
+            first.name
+        );
+        assert!(
+            largest_chunk <= crate::video::PACE_SLICE_BYTES * 2,
+            "{} still emitted a {:.1} KiB transport wall (limit {:.1} KiB)",
+            first.name,
+            largest_chunk as f64 / 1024.0,
+            (crate::video::PACE_SLICE_BYTES * 2) as f64 / 1024.0,
         );
     }
 

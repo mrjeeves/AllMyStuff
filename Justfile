@@ -216,8 +216,8 @@ pin-locks:
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
     @bash ./scripts/sync-pinned-locks.sh
-    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; then \
-        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; \
+    @if ! git diff --quiet .myownmesh-rev Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; then \
+        git add .myownmesh-rev Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; \
         git commit -m "chore(release): {{VERSION}}"; \
     fi
     @git push

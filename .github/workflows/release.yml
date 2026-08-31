@@ -46,6 +46,11 @@ jobs:
       # repo *variable* — it isn't secret — to enable; empty leaves the updater
       # SHA-256-only). See RELEASE-SIGNING.md.
       ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.ALLMYSTUFF_RELEASE_PUBKEY }}
+      # Development/compile-only jobs may fall back to a zero-byte sidecar
+      # placeholder, but a published app must physically contain the daemon
+      # selected by .myownmesh-rev. This is build-time only; it adds no work
+      # to the installed app.
+      ALLMYSTUFF_REQUIRE_PINNED_MESH: "1"
     steps:
       - uses: actions/checkout@v4
         with:

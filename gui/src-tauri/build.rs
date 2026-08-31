@@ -15,11 +15,13 @@
 //!      the pinned tag (fast — no WebRTC native build). Falls back to
 //!      `cargo install --git` if the download is unreachable.
 //!
-//! Everything is best-effort: on any failure we stamp a zero-byte stub at
-//! the sidecar slot (so `tauri_build`'s existence check passes) and the
+//! Development builds are best-effort: on failure we stamp a zero-byte stub
+//! at the sidecar slot (so `tauri_build`'s existence check passes) and the
 //! runtime falls back to PATH / sibling discovery in `daemon_spawn.rs`.
-//! Set `ALLMYSTUFF_SKIP_SIDECAR=1` to skip the fetch entirely (offline /
-//! CI builds that only verify compilation).
+//! Release CI sets `ALLMYSTUFF_REQUIRE_PINNED_MESH=1`, which turns that
+//! fallback into a hard build failure so a release can never omit its pinned
+//! daemon. Set `ALLMYSTUFF_SKIP_SIDECAR=1` to skip the fetch entirely
+//! (offline / compile-only CI builds).
 
 use std::env;
 use std::fs;
@@ -28,6 +30,9 @@ use std::process::Command;
 
 fn main() {
     if let Err(e) = bundle_myownmesh_sidecar() {
+        if env_flag("ALLMYSTUFF_REQUIRE_PINNED_MESH") {
+            panic!("required pinned myownmesh sidecar could not be bundled: {e}");
+        }
         println!(
             "cargo:warning=myownmesh sidecar bundle skipped: {e} — the app still \
              builds; at runtime it falls back to a sibling MyOwnMesh build, \
@@ -66,6 +71,17 @@ fn exe_suffix() -> &'static str {
     }
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn binaries_dir() -> PathBuf {
     PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("binaries")
 }
@@ -97,6 +113,8 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     println!("cargo:rerun-if-changed={}", rev_file().display());
     println!("cargo:rerun-if-env-changed=MYOWNMESH_BIN");
     println!("cargo:rerun-if-env-changed=ALLMYSTUFF_SKIP_SIDECAR");
+    println!("cargo:rerun-if-env-changed=ALLMYSTUFF_REQUIRE_PINNED_MESH");
+    let require_pinned = env_flag("ALLMYSTUFF_REQUIRE_PINNED_MESH");
 
     let bin_dir = binaries_dir();
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
@@ -114,6 +132,11 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     // stick around forever once stamped).
     //
     // 1. Explicit override.
+    if require_pinned && env::var_os("MYOWNMESH_BIN").is_some() {
+        return Err(
+            "MYOWNMESH_BIN cannot override .myownmesh-rev in a pinned release build".into(),
+        );
+    }
     if let Ok(p) = env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
@@ -133,7 +156,14 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     // stale artifact that would silently mask the very features the pin
     // bump was for (a v0.2.0 leftover shadowing the v0.2.1 video lane,
     // say), so it's skipped with a note and the pinned release is fetched.
-    if let Some(p) = sibling_daemon() {
+    // A local sibling may intentionally run ahead during development, but a
+    // release must be reproducible from the committed pin alone.
+    let sibling = if require_pinned {
+        None
+    } else {
+        sibling_daemon()
+    };
+    if let Some(p) = sibling {
         // Watch the sibling binary itself so a plain `cargo build --bin
         // myownmesh` in the sibling checkout re-triggers this script and
         // re-stages the fresh daemon. Without this, the only watched inputs

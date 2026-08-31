@@ -88,8 +88,8 @@ allmystuff-protocol = { path = "../../crates/allmystuff-protocol", optional = tr
 # socket, same wire protocol, inside the app sandbox. Pinned to the merge
 # that exposed the daemon as a library (which sits atop the system-DNS-SD
 # discovery backend the phone rides).
-myownmesh = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.10", optional = true }
-myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.10", optional = true }
+myownmesh = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.11", optional = true }
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.11", optional = true }
 # One-time identity migration: derive the public key from the adapter-era
 # `device-seed.bin` and write it as the daemon's anchor file, so the phone
 # keeps its device id across the engine swap.

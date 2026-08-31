@@ -2328,15 +2328,38 @@ impl Mesh {
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
         let largest_chunk = chunks.iter().map(|range| range.len()).max().unwrap_or(0);
-        if largest_chunk > crate::video::PACE_SLICE_BYTES.saturating_mul(2)
-            && self.diag_ok(&format!("paced-shape:{route_id}"))
-        {
-            tracing::warn!(
-                "paced video {route_id}: encoder produced a coarse slice-boundary chunk of {:.1} KiB in a {:.1} KiB AU ({} chunks); sender backpressure will preserve the reference chain while it drains",
-                largest_chunk as f64 / 1024.0,
-                data.len() as f64 / 1024.0,
-                chunks.len(),
-            );
+        let coarse_unsplittable =
+            chunks.len() == 1 && largest_chunk > crate::video::PACE_SLICE_BYTES.saturating_mul(2);
+        let marker = crate::video::paced_au_marker(chunks.len());
+        if coarse_unsplittable {
+            // A one-slice AU cannot be shaped at this layer: delaying the
+            // whole sample changes only *when* its RTP packet wall starts,
+            // not the wall's shape. Worse, reserving it against the route
+            // bucket carries debt into later frames and was observed blocking
+            // the encode queue for 3.5 s. Preserve v1's marker/count recovery,
+            // but bypass and reset the ineffective bucket for this AU.
+            if self.diag_ok(&format!("paced-shape:{route_id}")) {
+                tracing::warn!(
+                    "paced video {route_id}: encoder produced one unsplittable {:.1} KiB slice; bypassing the ineffective token bucket to avoid self-inflicted latency (marker recovery remains active)",
+                    largest_chunk as f64 / 1024.0,
+                );
+            }
+            self.video_pace.lock().remove(route_id);
+            if !current() {
+                return Ok(false);
+            }
+            let tw = Instant::now();
+            self.send_video_track(peer, lane, data, 0).await?;
+            let mut write_us = tw.elapsed().as_micros() as u64;
+            if !current() {
+                return Ok(false);
+            }
+            let tw = Instant::now();
+            self.send_video_track(peer, lane, &marker, duration_us)
+                .await?;
+            write_us += tw.elapsed().as_micros() as u64;
+            self.note_pace_gaps(&[], write_us, 2);
+            return Ok(true);
         }
         // (game posture, WAN-class path, current send rate bps, fps) — the
         // shape `VideoBridge::route_pace` hands the forwarder.
@@ -2348,7 +2371,6 @@ impl Mesh {
                 .unwrap_or(0)
         });
         let policy = pace_policy(game, wan, rate_bps, *DRAIN_OVERRIDE_MBPS);
-        let marker = crate::video::paced_au_marker(chunks.len());
         let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(chunks.len());
         // M1's pace+write split: gap time is the ledger above; this is
         // the daemon-pipe await itself — if the daemon ever backpressures
@@ -4165,26 +4187,20 @@ impl Mesh {
                     // reconnects are both filtered inside.
                     self.reconnect_drive_pulls(node_id.as_str());
                     self.retry_drive_forgets(node_id.as_str()).await;
-                    // Self-heal the fleet: if a device we still list as a fleet
-                    // member now advertises a *positively different* owner, it
-                    // has been re-claimed — evict it so the roster reflects
-                    // reality even when the explicit leave notification never
-                    // arrived (it was offline, crashed, or was claimed straight
-                    // out from under us).
+                    // Ownership in a presence advert is a direct claimant edge,
+                    // not fleet-membership authority. In a multi-owner fleet it
+                    // is normal for this device to see a signed member whose
+                    // claimant is another owner (for example Laptop -> KVM).
+                    // Presence therefore never removes membership. The signed
+                    // governance log is the sole authority for that.
                     //
-                    // An advert with *no* owner is not departure evidence: it's
-                    // ambiguous between "went unclaimed" and a merely-defaulted
-                    // field (an advert sent before the peer's ownership store
-                    // loaded, an older build, a foreign bridge like the KVM's).
-                    // Dropping on it authors a signed Evict tombstone that the
-                    // daemon's roster convergence then mirrors onto *every*
-                    // fleet device — permanently stripping the member from the
-                    // rosters that authorize remote control, which surfaced as
-                    // "video streams but keyboard/mouse are refused". A device
-                    // that truly went unclaimed keeps advertising ownerless and
-                    // claimable; evict it when it positively advertises its new
-                    // owner, or deliberately from the fleet UI.
-                    if !is_self && self.ownership.is_fleet_owner() {
+                    // We only use the edge to maintain devices claimed directly
+                    // by us: re-hand their fleet credential after a restart and
+                    // retry an admit that did not land. This is intentionally not
+                    // gated on is_fleet_owner() (the key minter); a granted
+                    // signed owner is a full owner and must be able to maintain
+                    // its own claimed devices too.
+                    if !is_self {
                         let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
                         let peer = pubkey_part(node_id.as_str()).to_string();
                         let in_my_fleet = self
@@ -4193,16 +4209,12 @@ impl Mesh {
                             .iter()
                             .any(|d| pubkey_part(d) == peer)
                             || self.fleet_authorized.lock().contains(&peer);
-                        let still_ours = advertised_owner.as_deref() == me.as_deref();
-                        if in_my_fleet
-                            && fleet_departure(advertised_owner.as_deref(), me.as_deref())
+                        if fleet_presence_relationship(
+                            in_my_fleet,
+                            advertised_owner.as_deref(),
+                            me.as_deref(),
+                        ) == FleetPresenceRelationship::DirectlyClaimed
                         {
-                            tracing::info!(
-                                "fleet member {} now answers to a different owner — dropping",
-                                short_id(node_id.as_str())
-                            );
-                            self.fleet_drop_member(node_id.to_string()).await;
-                        } else if in_my_fleet && still_ours {
                             if new_boot || !known {
                                 // A member that's still ours just (re)appeared. If the
                                 // original fleet-key handoff was lost — we were offline
@@ -4213,8 +4225,8 @@ impl Mesh {
                                 // so this is safe to repeat on every (re)appearance and
                                 // self-heals the handoff without a manual nudge. Gated on
                                 // the member still being in *our* roster so it never
-                                // undoes an eviction (an evicted device we dropped is no
-                                // longer `in_my_fleet`, so it isn't re-keyed).
+                                // undoes a signed membership removal (a removed device is
+                                // no longer `in_my_fleet`, so it isn't re-keyed).
                                 tracing::info!(
                                     "fleet member {} (re)appeared — re-handing the fleet key in case it was missed",
                                     short_id(node_id.as_str())
@@ -9951,15 +9963,18 @@ impl Mesh {
                 }
             }
             OwnershipControl::FleetDeparted => {
-                // A member is telling us it left the fleet. Evict it from the
-                // signed roster so our view (and every other member's) reflects
-                // reality. Only the fleet owner acts on this.
-                if self.ownership.is_fleet_owner() {
-                    tracing::info!(
-                        "{} left the fleet — dropping from the roster",
-                        short_id(from.as_str())
-                    );
-                    self.fleet_drop_member(from.to_string()).await;
+                // This is authenticated, explicit departure evidence from the
+                // member itself. Record it through signed governance so every
+                // owner projects the same membership; never mutate one daemon's
+                // local roster cache. Granted owners/managers are full actors
+                // here, not second-class to the fleet-key minter.
+                if let Some(network) = self.ownership.fleet_network_id() {
+                    if matches!(
+                        self.fleet_signed_role(&network).await.as_deref(),
+                        Some("owner" | "controller")
+                    ) {
+                        self.fleet_record_departure(from.to_string()).await;
+                    }
                 }
             }
             other => {
@@ -11958,8 +11973,8 @@ impl Mesh {
     }
 
     /// Front-end command: leave the fleet this device belongs to. Tell the
-    /// owner first (so it evicts us from the signed roster instead of believing
-    /// we're still a member — the leave-side mirror of the owner's kick), then
+    /// direct claimant first so it records our authenticated departure in the
+    /// signed roster instead of continuing to project us as a member, then
     /// drop the local credential, tear out of the fleet's closed network, and —
     /// since membership follows ownership — let any recorded owner go and
     /// re-advertise unowned.
@@ -11981,11 +11996,10 @@ impl Mesh {
                     .await;
             }
         } else if let Some(owner) = self.ownership.owner() {
-            // We're a member: tell the owner so it evicts us from the signed
-            // roster. Best-effort — surface the failure (don't swallow it) so
-            // it's diagnosable; our re-advertised "unowned" presence below is
-            // the backstop (the owner drops a member that answers to a
-            // different owner / none).
+            // We're a member: tell the direct claimant so it records the
+            // departure in signed governance. Best-effort — surface the failure
+            // (don't swallow it) so it is diagnosable. Presence is deliberately
+            // not a fallback: claimant topology cannot revoke fleet membership.
             if let Err(e) = self
                 .send_control(
                     &owner,
@@ -11994,7 +12008,7 @@ impl Mesh {
                 .await
             {
                 tracing::warn!(
-                    "couldn't tell the fleet owner we left ({e}); relying on our unowned re-advert to clear us from its roster"
+                    "couldn't tell the fleet owner we left ({e}); signed membership remains until a manager records the departure"
                 );
             }
         }
@@ -12144,28 +12158,33 @@ impl Mesh {
         Ok(())
     }
 
-    /// Internal: drop `device` from the fleet *locally* — a plain roster
-    /// remove, not the propagating governance `Evict`. Used for automatic
-    /// roster cleanup (a member told us it left, or a device reappeared under
-    /// a new owner) where there's no user to supply an MFA code and the device
-    /// is already gone anyway, so a local removal that keeps the owner's view
-    /// honest is the right, friction-free tool. Best-effort.
-    async fn fleet_drop_member(self: &Arc<Self>, device: String) {
+    /// Record an authenticated member departure in the fleet's signed state.
+    /// Presence never calls this: claimant topology is not membership evidence.
+    /// The wire transition retains its historical `Evict` name, but on this path
+    /// it records a voluntary `FleetDeparted` message from `device` itself.
+    async fn fleet_record_departure(self: &Arc<Self>, device: String) {
         let Ok(network) = self.ownership.kick_member(&device) else {
             return;
         };
         let target = pubkey_part(&device).to_string();
-        tracing::info!(
-            "dropping {} from the fleet roster (local)",
-            short_id(&device)
-        );
-        let _ = self
+        tracing::info!("recording signed fleet departure for {}", short_id(&device));
+        let response = self
             .client
-            .request(&Request::RosterRemove {
+            .request(&Request::GovernanceProposeEvict {
                 network,
-                device_id: target,
+                target,
+                mfa_code: None,
             })
             .await;
+        match response {
+            Ok(r) if r.ok => {}
+            Ok(r) => tracing::warn!(
+                "couldn't record signed fleet departure: {}",
+                r.error
+                    .unwrap_or_else(|| "governance request was refused".into())
+            ),
+            Err(e) => tracing::warn!("couldn't record signed fleet departure: {e}"),
+        }
         self.refresh_fleet_authorization().await;
         self.emit_owned().await;
     }
@@ -19573,16 +19592,28 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether a fleet member's presence advert is evidence it left the fleet:
-/// only an owner it *positively names* that isn't us. `None` (no owner in the
-/// advert) is ambiguous — an early advert sent before its ownership store
-/// loaded, an older build, a foreign bridge — and must never author the
-/// eviction tombstone that roster convergence then propagates fleet-wide.
-/// Pure, because getting this wrong is how remote control silently died once.
-fn fleet_departure(advertised_owner: Option<&str>, me: Option<&str>) -> bool {
-    match advertised_owner {
-        Some(owner) => Some(owner) != me,
-        None => false,
+/// How this node relates to a fleet member's *claimant* edge. This classification
+/// deliberately has no removal state: membership comes from signed governance,
+/// while presence ownership only tells us whether we maintain the device's
+/// credential handoff directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetPresenceRelationship {
+    OutsideFleet,
+    Member,
+    DirectlyClaimed,
+}
+
+fn fleet_presence_relationship(
+    in_fleet: bool,
+    advertised_owner: Option<&str>,
+    me: Option<&str>,
+) -> FleetPresenceRelationship {
+    if !in_fleet {
+        FleetPresenceRelationship::OutsideFleet
+    } else if matches!((advertised_owner, me), (Some(owner), Some(me)) if owner == me) {
+        FleetPresenceRelationship::DirectlyClaimed
+    } else {
+        FleetPresenceRelationship::Member
     }
 }
 
@@ -21239,25 +21270,34 @@ mod tests {
         }
     }
 
-    /// Regression guard for the silent fleet-wide loss of remote control: a
-    /// presence advert with *no* owner (early boot, older build, a foreign
-    /// bridge) must never read as "this member left the fleet" — the evict it
-    /// used to trigger authors a signed tombstone that roster convergence
-    /// mirrors onto every device, and input/clipboard are then refused
-    /// everywhere while video (ungated) keeps streaming. Only a positively
-    /// different advertised owner is departure.
     #[test]
-    fn ownerless_adverts_are_not_fleet_departure() {
-        // A member that positively names another owner has left us.
-        assert!(fleet_departure(Some("pkB"), Some("pkA")));
-        // A member still naming us is ours.
-        assert!(!fleet_departure(Some("pkA"), Some("pkA")));
-        // No owner in the advert: ambiguous — never an eviction trigger.
-        assert!(!fleet_departure(None, Some("pkA")));
-        // Even when our own id is unknown (mesh not ready), an ownerless
-        // advert stays inert; a named one can only be "not us".
-        assert!(!fleet_departure(None, None));
-        assert!(fleet_departure(Some("pkB"), None));
+    fn presence_owner_is_topology_not_fleet_membership() {
+        // The live multi-owner regression: Home sees a signed KVM member
+        // claimed by Laptop. That is an ordinary fleet member, never departure.
+        assert_eq!(
+            fleet_presence_relationship(true, Some("laptop"), Some("home")),
+            FleetPresenceRelationship::Member
+        );
+        // A direct child is the only relationship that asks this node to
+        // maintain the child's fleet-key handoff.
+        assert_eq!(
+            fleet_presence_relationship(true, Some("home"), Some("home")),
+            FleetPresenceRelationship::DirectlyClaimed
+        );
+        // Missing/legacy ownership metadata remains an ordinary signed member.
+        assert_eq!(
+            fleet_presence_relationship(true, None, Some("home")),
+            FleetPresenceRelationship::Member
+        );
+        assert_eq!(
+            fleet_presence_relationship(true, Some("laptop"), None),
+            FleetPresenceRelationship::Member
+        );
+        // An unsigned/non-fleet peer is outside this maintenance path.
+        assert_eq!(
+            fleet_presence_relationship(false, Some("home"), Some("home")),
+            FleetPresenceRelationship::OutsideFleet
+        );
     }
 
     /// The clock-skew estimate must blame *us* only when the majority of

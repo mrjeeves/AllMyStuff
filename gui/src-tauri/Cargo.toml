@@ -7,7 +7,7 @@
 
 [package]
 name = "allmystuff-gui"
-version = "0.2.100"
+version = "0.2.101"
 description = "AllMyStuff GUI — Tauri shell: scans this machine and talks to the myownmesh daemon over its control socket."
 authors = ["Chris Paul"]
 license = "MIT"

@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use allmystuff_protocol::control::{
     decode_inbound_frame, encode_media_frame, InboundFrame, MAX_MEDIA_FRAME_BYTES,
-    MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
+    MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY,
 };
 pub use allmystuff_protocol::{Request, Response};
 
@@ -232,6 +232,17 @@ impl InboundVideoFreshness {
 
     fn discard_paced_lane(&mut self, frame: &InboundFrame) {
         self.paced.remove(&Self::lane(frame));
+    }
+
+    fn forward_transport_discontinuity(
+        &mut self,
+        frame: InboundFrame,
+        tx: &mpsc::Sender<InboundVideoEvent>,
+    ) -> bool {
+        // Any paced fragments preceding the transport gap are necessarily an
+        // incomplete AU. Drop them before ordering the decoder reset marker.
+        self.discard_paced_lane(&frame);
+        self.note_discontinuity(frame.from, frame.stream, tx)
     }
 
     /// Return false only when the consumer has gone away and the pipe should
@@ -541,6 +552,9 @@ impl ControlClient {
                             Err(mpsc::error::TrySendError::Closed(_)) => false,
                         },
                     },
+                    MEDIA_KIND_VIDEO_DISCONTINUITY => {
+                        video_freshness.forward_transport_discontinuity(frame, &video_tx)
+                    }
                     MEDIA_KIND_AUDIO => match audio_tx.try_send(frame) {
                         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
                         Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -881,6 +895,95 @@ mod tests {
             rx.try_recv(),
             Ok(InboundVideoEvent::Frame(InboundFrame {
                 rtp_timestamp: 6,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn transport_gap_discards_partial_paced_au_and_uses_existing_recovery_gate() {
+        let (tx, mut rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+        let mut gate = InboundVideoFreshness::default();
+
+        let mut fragment = video("peer", 2, true, 90_000);
+        fragment.data = vec![1, 2, 3];
+        assert!(gate.forward_paced(fragment, &tx));
+        assert!(!gate.paced.is_empty(), "partial paced AU is buffered");
+
+        let gap = InboundFrame {
+            kind: MEDIA_KIND_VIDEO_DISCONTINUITY,
+            key: false,
+            stream: 2,
+            rtp_timestamp: 90_000,
+            from: "peer".into(),
+            data: Vec::new(),
+        };
+        assert!(gate.forward_transport_discontinuity(gap, &tx));
+        assert!(gate.paced.is_empty(), "gap discards the partial paced AU");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                from,
+                stream: 2,
+                entry: None,
+            }) if from == "peer"
+        ));
+
+        // Reset-mode recovery remains single-flight and suppresses deltas.
+        assert!(gate.forward(video("peer", 2, false, 91_000), &tx));
+        assert!(rx.try_recv().is_err());
+        assert!(gate.forward(video("peer", 2, true, 92_000), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                key: true,
+                stream: 2,
+                rtp_timestamp: 92_000,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn transport_gap_preserves_gradual_recovery_frames() {
+        let (tx, mut rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+        let mut gate = InboundVideoFreshness::default();
+        let gradual = crate::video_wire::AuRecovery::Gradual;
+
+        // Learn this lane's negotiated recovery behavior before the loss.
+        assert!(gate.forward(identified_video("peer", 3, false, 1, gradual), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame { stream: 3, .. }))
+        ));
+
+        let gap = InboundFrame {
+            kind: MEDIA_KIND_VIDEO_DISCONTINUITY,
+            key: false,
+            stream: 3,
+            rtp_timestamp: 2,
+            from: "peer".into(),
+            data: Vec::new(),
+        };
+        assert!(gate.forward_transport_discontinuity(gap, &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                stream: 3,
+                entry: None,
+                ..
+            })
+        ));
+
+        // Gradual mode must keep its convergence wave; only reset mode waits
+        // for a key. The transport reports loss but never overrides this.
+        assert!(gate.forward(identified_video("peer", 3, false, 3, gradual), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                key: false,
+                stream: 3,
+                rtp_timestamp: 3,
                 ..
             }))
         ));

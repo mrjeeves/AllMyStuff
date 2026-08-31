@@ -583,6 +583,9 @@ pub fn default_pipe_name() -> &'static str {
 pub const MEDIA_KIND_VIDEO: u8 = 0;
 /// `kind` byte for an Opus frame.
 pub const MEDIA_KIND_AUDIO: u8 = 1;
+/// Receiver-side H.264 reference discontinuity from MyOwnMesh. This is an
+/// inbound-only event; consumers reset the decoder and request one clean key.
+pub const MEDIA_KIND_VIDEO_DISCONTINUITY: u8 = 2;
 /// Defensive cap on one frame body — a corrupt length never allocates more.
 pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -748,6 +751,24 @@ mod tests {
         let f = decode_inbound_frame(&a).expect("decode");
         assert!(!f.key);
         assert!(f.data.is_empty());
+    }
+
+    #[test]
+    fn inbound_video_discontinuity_round_trips_without_payload() {
+        let body = encode_inbound_frame(
+            MEDIA_KIND_VIDEO_DISCONTINUITY,
+            false,
+            3,
+            180_000,
+            "peer-gap",
+            &[],
+        );
+        let frame = decode_inbound_frame(&body).expect("decode discontinuity");
+        assert_eq!(frame.kind, MEDIA_KIND_VIDEO_DISCONTINUITY);
+        assert_eq!(frame.stream, 3);
+        assert_eq!(frame.rtp_timestamp, 180_000);
+        assert_eq!(frame.from, "peer-gap");
+        assert!(frame.data.is_empty());
     }
 
     #[test]

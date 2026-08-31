@@ -14,6 +14,7 @@
 //!    plane, where per-send connect + round-trip would sit inside every
 //!    frame.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,105 @@ enum SocketAddr {
 
 pub struct ControlClient {
     addr: SocketAddr,
+}
+
+/// Local IPC is not a playout buffer. Four H.264 access units absorb ordinary
+/// task scheduling jitter (about 67 ms at 60 fps / 133 ms at 30 fps) without
+/// preserving seconds of history after the viewer stalls. Audio stays on its
+/// own eight-packet queue so neither plane can head-of-line block the other.
+pub(crate) const MEDIA_VIDEO_QUEUE_CAPACITY: usize = 4;
+pub(crate) const MEDIA_AUDIO_QUEUE_CAPACITY: usize = 8;
+
+/// One item on the bounded H.264 ingress queue. A discontinuity is ordered on
+/// the same queue as the access units it fences, so the consumer can never see
+/// a post-loss delta before it has entered clean-entry recovery. When a clean
+/// entry is already in hand it rides the marker, consuming one slot and
+/// recovering without waiting for a second GOP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboundVideoEvent {
+    Frame(InboundFrame),
+    Discontinuity {
+        from: String,
+        stream: u8,
+        entry: Option<InboundFrame>,
+    },
+}
+
+/// Per peer/lane state for the daemon -> node handoff. The daemon's media pipe
+/// must keep draining even if the node briefly falls behind: blocking here lets
+/// the daemon's queue grow without bound and turns a live stream into replay.
+/// Once any AU is shed, dependent deltas are unsafe and stay suppressed until a
+/// an independently decodable entry is admitted behind an ordered
+/// discontinuity marker.
+#[derive(Default)]
+struct InboundVideoFreshness {
+    /// `false` = the discontinuity marker still needs queueing; `true` = it is
+    /// already ordered ahead of the next admitted clean entry.
+    recovering: HashMap<(String, u8), bool>,
+}
+
+fn canonical_media_peer(id: &str) -> &str {
+    if let Some((body, suffix)) = id.rsplit_once('-') {
+        if suffix.len() == 5 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return body;
+        }
+    }
+    id
+}
+
+impl InboundVideoFreshness {
+    /// Return false only when the consumer has gone away and the pipe should
+    /// close. Queue pressure is handled locally and always returns true.
+    fn forward(&mut self, frame: InboundFrame, tx: &mpsc::Sender<InboundVideoEvent>) -> bool {
+        let lane = (canonical_media_peer(&frame.from).to_string(), frame.stream);
+        if let Some(marker_queued) = self.recovering.get(&lane).copied() {
+            if !marker_queued {
+                let clean_entry = frame.key || crate::video_decode::is_decode_entry(&frame.data);
+                let event = InboundVideoEvent::Discontinuity {
+                    from: frame.from.clone(),
+                    stream: frame.stream,
+                    entry: clean_entry.then_some(frame),
+                };
+                return match tx.try_send(event) {
+                    Ok(()) => {
+                        if clean_entry {
+                            self.recovering.remove(&lane);
+                        } else {
+                            self.recovering.insert(lane, true);
+                        }
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                };
+            }
+
+            if !(frame.key || crate::video_decode::is_decode_entry(&frame.data)) {
+                return true;
+            }
+            return match tx.try_send(InboundVideoEvent::Frame(frame)) {
+                Ok(()) => {
+                    self.recovering.remove(&lane);
+                    true
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            };
+        }
+
+        match tx.try_send(InboundVideoEvent::Frame(frame)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(InboundVideoEvent::Frame(frame))) => {
+                self.recovering.insert(
+                    (canonical_media_peer(&frame.from).to_string(), frame.stream),
+                    false,
+                );
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => unreachable!("sent Frame"),
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
 }
 
 impl ControlClient {
@@ -192,15 +292,19 @@ impl ControlClient {
     /// from [`subscribe_events`]). After the handshake the daemon pushes
     /// length-prefixed inbound media frames (`[u32 len][body]`) for everything
     /// that client subscribed to; this reads them and forwards each decoded
-    /// [`InboundFrame`] to `tx`. Inbound H.264/Opus then carries no base64.
-    /// The spawned reader ends when the daemon closes the pipe or `tx` is
-    /// dropped; the caller can reconnect on the next session.
+    /// [`InboundFrame`] to separate bounded video/audio queues. Inbound
+    /// H.264/Opus then carries no base64. The reader never awaits a full media
+    /// queue: audio sheds a packet, while H.264 enters an ordered clean-entry
+    /// fence and keeps draining the daemon socket. The spawned reader ends when
+    /// the daemon closes the pipe or a consumer is dropped; the caller can
+    /// reconnect on the next session.
     ///
     /// [`subscribe_events`]: ControlClient::subscribe_events
-    pub async fn subscribe_media_source(
+    pub(crate) async fn subscribe_media_source(
         &self,
         client_id: allmystuff_protocol::ClientId,
-        tx: mpsc::Sender<InboundFrame>,
+        video_tx: mpsc::Sender<InboundVideoEvent>,
+        audio_tx: mpsc::Sender<InboundFrame>,
     ) -> Result<()> {
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
@@ -237,6 +341,7 @@ impl ControlClient {
             // Hold the writer half open for the lifetime of the read loop
             // (dropping it would half-close the pipe).
             let _writer_keepalive = writer;
+            let mut video_freshness = InboundVideoFreshness::default();
             loop {
                 let mut len_buf = [0u8; 4];
                 if reader.read_exact(&mut len_buf).await.is_err() {
@@ -255,7 +360,15 @@ impl ControlClient {
                     tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
                     continue;
                 };
-                if tx.send(frame).await.is_err() {
+                let keep_open = match frame.kind {
+                    MEDIA_KIND_VIDEO => video_freshness.forward(frame, &video_tx),
+                    MEDIA_KIND_AUDIO => match audio_tx.try_send(frame) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    },
+                    _ => true,
+                };
+                if !keep_open {
                     break;
                 }
             }
@@ -294,10 +407,9 @@ impl ControlClient {
 /// reader, which logs daemon refusals (rate-limited) instead of stalling
 /// the send path to hear them.
 ///
-/// Backpressure survives: when the daemon stops keeping up, the socket
-/// buffer fills, `send` awaits, the bounded video queue behind it fills,
-/// and the capture side drops frames — freshness over latency, unchanged.
-/// Any write failure drops the connection; the next send reconnects.
+/// Live video and audio writes have short freshness deadlines; other legacy
+/// media requests retain the control-pipe deadline. Any timeout or write
+/// failure drops the connection, and the next send reconnects.
 pub struct MediaPipe {
     client: Arc<ControlClient>,
     writer: tokio::sync::Mutex<Option<interprocess::local_socket::tokio::SendHalf>>,
@@ -316,6 +428,11 @@ impl MediaPipe {
     /// arrives later via the reader task's (rate-limited) log line.
     pub async fn send(&self, req: &Request) -> Result<()> {
         let line = serde_json::to_string(req)? + "\n";
+        let write_timeout = match req {
+            Request::VideoSend { .. } => VIDEO_TRACK_WRITE_TIMEOUT,
+            Request::AudioSend { .. } => AUDIO_TRACK_WRITE_TIMEOUT,
+            _ => PIPE_WRITE_TIMEOUT,
+        };
         let mut writer = self.writer.lock().await;
         if writer.is_none() {
             let stream = self.client.connect().await?;
@@ -330,7 +447,7 @@ impl MediaPipe {
         // that into the same drop-and-reconnect a write error gets. A
         // healthy local-socket write completes in microseconds; seconds of
         // blockage is a wedged peer, not backpressure.
-        let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+        let outcome = tokio::time::timeout(write_timeout, async {
             w.write_all(line.as_bytes()).await?;
             w.flush().await
         })
@@ -344,8 +461,8 @@ impl MediaPipe {
             Err(_) => {
                 *writer = None;
                 Err(anyhow!(
-                    "media pipe write timed out after {}s — dropping the connection",
-                    PIPE_WRITE_TIMEOUT.as_secs()
+                    "media pipe write timed out after {}ms — dropping the connection",
+                    write_timeout.as_millis()
                 ))
             }
         }
@@ -358,14 +475,23 @@ impl MediaPipe {
 /// multi-second single write.
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A live media socket is a freshness boundary, not durable delivery. Local
+/// IPC normally drains in microseconds; after these deadlines the encoded
+/// unit is already stale enough that waiting longer only turns congestion into
+/// visible input lag. Closing the pipe surfaces a send failure to the existing
+/// H.264 recovery epoch, which suppresses dependent deltas and emits a new IDR.
+const VIDEO_TRACK_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+const AUDIO_TRACK_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// A persistent connection dedicated to **binary** media-track sends — the
 /// H.264 and Opus lanes. The first send converts the connection with a single
 /// [`Request::MediaTrackPipe`] line; everything after is length-prefixed binary
 /// frames (`[u32 len][body]`, see `allmystuff_protocol::encode_media_frame`) —
 /// no base64 (+33% and a CPU pass) and no per-frame JSON of a multi-KB string.
 /// MJPEG, PCM and route signalling stay on the JSON [`MediaPipe`], untouched.
-/// Backpressure and reconnect match [`MediaPipe`]: a full socket awaits, a
-/// failed write drops the connection and the next send reconnects.
+/// Video and audio have independent connections and bounded freshness
+/// deadlines, so a wedged track cannot head-of-line block the other. A timeout
+/// or failed write drops that track's connection and the next send reconnects.
 pub struct MediaTrackPipe {
     client: Arc<ControlClient>,
     writer: tokio::sync::Mutex<Option<interprocess::local_socket::tokio::SendHalf>>,
@@ -445,7 +571,12 @@ impl MediaTrackPipe {
         // encoder pass left open).
         let w = writer.as_mut().expect("connected above");
         let len = (body.len() as u32).to_le_bytes();
-        let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+        let write_timeout = match kind {
+            MEDIA_KIND_VIDEO => VIDEO_TRACK_WRITE_TIMEOUT,
+            MEDIA_KIND_AUDIO => AUDIO_TRACK_WRITE_TIMEOUT,
+            _ => PIPE_WRITE_TIMEOUT,
+        };
+        let outcome = tokio::time::timeout(write_timeout, async {
             w.write_all(&len).await?;
             w.write_all(&body).await?;
             w.flush().await
@@ -460,8 +591,8 @@ impl MediaTrackPipe {
             Err(_) => {
                 *writer = None;
                 Err(anyhow!(
-                    "media-track write timed out after {}s — dropping the connection",
-                    PIPE_WRITE_TIMEOUT.as_secs()
+                    "media-track write timed out after {}ms — dropping the connection",
+                    write_timeout.as_millis()
                 ))
             }
         }
@@ -495,4 +626,179 @@ fn spawn_response_drain(reader: interprocess::local_socket::tokio::RecvHalf) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video(from: &str, stream: u8, key: bool, timestamp: u32) -> InboundFrame {
+        InboundFrame {
+            kind: MEDIA_KIND_VIDEO,
+            key,
+            stream,
+            rtp_timestamp: timestamp,
+            from: from.to_string(),
+            data: vec![timestamp as u8],
+        }
+    }
+
+    #[test]
+    fn video_pressure_orders_one_gap_and_suppresses_deltas_until_key() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut gate = InboundVideoFreshness::default();
+
+        assert!(gate.forward(video("peer", 0, false, 1), &tx));
+        assert!(gate.forward(video("peer", 0, false, 2), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                rtp_timestamp: 1,
+                ..
+            }))
+        ));
+
+        // The first post-pressure delta becomes an ordered marker, not decoder
+        // input. Further deltas disappear until a key is admitted.
+        assert!(gate.forward(video("peer", 0, false, 3), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity { entry: None, .. })
+        ));
+        assert!(gate.forward(video("peer", 0, false, 4), &tx));
+        assert!(rx.try_recv().is_err());
+
+        assert!(gate.forward(video("peer", 0, true, 5), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                key: true,
+                rtp_timestamp: 5,
+                ..
+            }))
+        ));
+        assert!(gate.forward(video("peer", 0, false, 6), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                rtp_timestamp: 6,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn recovery_key_can_share_the_discontinuity_slot() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut gate = InboundVideoFreshness::default();
+
+        assert!(gate.forward(video("peer", 2, false, 1), &tx));
+        assert!(gate.forward(video("peer", 2, false, 2), &tx));
+        let _ = rx.try_recv();
+
+        assert!(gate.forward(video("peer", 2, true, 3), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                stream: 2,
+                entry: Some(InboundFrame {
+                    key: true,
+                    rtp_timestamp: 3,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        // The lane left recovery when the combined marker+key was admitted.
+        assert!(gate.forward(video("peer", 2, false, 4), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                rtp_timestamp: 4,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn pressure_recovery_is_scoped_to_one_peer_lane() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut gate = InboundVideoFreshness::default();
+
+        assert!(gate.forward(video("peer", 0, false, 1), &tx));
+        assert!(gate.forward(video("peer", 1, false, 2), &tx));
+        let _ = rx.try_recv();
+
+        // Lane 1 is recovering, but lane 0 remains independently live.
+        assert!(gate.forward(video("peer", 0, false, 3), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Frame(InboundFrame {
+                stream: 0,
+                rtp_timestamp: 3,
+                ..
+            }))
+        ));
+        assert!(gate.forward(video("peer", 1, false, 4), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                stream: 1,
+                entry: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_lane_canonicalises_bare_and_display_peer_ids() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut gate = InboundVideoFreshness::default();
+
+        assert!(gate.forward(video("peer-AB12C", 0, false, 1), &tx));
+        assert!(gate.forward(video("peer", 0, false, 2), &tx));
+        let _ = rx.try_recv();
+        assert!(gate.forward(video("peer-AB12C", 0, false, 3), &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                from,
+                stream: 0,
+                entry: None,
+            }) if from == "peer-AB12C"
+        ));
+    }
+
+    #[test]
+    fn parameter_set_led_entry_recovers_even_when_the_daemon_key_bit_is_false() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut gate = InboundVideoFreshness::default();
+
+        assert!(gate.forward(video("peer", 0, false, 1), &tx));
+        assert!(gate.forward(video("peer", 0, false, 2), &tx));
+        let _ = rx.try_recv();
+
+        let mut hevc_entry = video("peer", 0, false, 3);
+        hevc_entry.data = vec![0, 0, 0, 1, 0x40, 1];
+        assert!(gate.forward(hevc_entry, &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InboundVideoEvent::Discontinuity {
+                entry: Some(InboundFrame {
+                    key: false,
+                    rtp_timestamp: 3,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_closed_video_consumer_closes_the_media_pipe() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(!InboundVideoFreshness::default().forward(video("peer", 0, false, 1), &tx));
+    }
 }

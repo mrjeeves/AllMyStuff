@@ -26,7 +26,6 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use crate::UiSink;
 
 use allmystuff_graph::{Capability, Grant, MediaKind, NodeId, Person, PersonId, Route};
-use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
     DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
@@ -47,7 +46,10 @@ use crate::canvas::{
     CanvasMessage, CanvasMutation, CanvasRecord, CanvasStamp, CanvasStore, SNAPSHOT_CHUNK_RECORDS,
 };
 use crate::clipboard::{ClipboardService, LocalClip};
-use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
+use crate::control_client::{
+    ControlClient, InboundVideoEvent, MediaPipe, MediaTrackPipe, MEDIA_AUDIO_QUEUE_CAPACITY,
+    MEDIA_VIDEO_QUEUE_CAPACITY,
+};
 use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
 use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, LocalMutation};
@@ -68,7 +70,7 @@ use crate::storage_plan::{
 };
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
-use crate::video_decode::{Au, DecodeBridge, DecoderPreference};
+use crate::video_decode::{Au, AuCodec, DecodeBridge, DecoderPreference};
 use std::time::{Duration, Instant};
 
 type ClipboardReceiptWaiters =
@@ -86,9 +88,11 @@ pub struct Mesh {
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
     media_pipe: MediaPipe,
-    /// The binary lane for H.264/Opus track sends (no base64); MJPEG, PCM and
-    /// route signalling stay on `media_pipe`.
-    media_track_pipe: MediaTrackPipe,
+    /// Separate binary H.264 and Opus pipes. A stalled video write must not
+    /// head-of-line block audio, and each medium has its own live-data deadline.
+    /// MJPEG, PCM and route signalling stay on `media_pipe`.
+    media_video_track_pipe: MediaTrackPipe,
+    media_audio_track_pipe: MediaTrackPipe,
     /// Where node events surface. The GUI wires this to Tauri's event bus
     /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
     /// sink — the events are all front-end concerns, so a node with no UI
@@ -122,6 +126,15 @@ pub struct Mesh {
     /// enter this map; older peers continue to deliver one complete access
     /// unit per sample.
     paced_video_in: Mutex<HashMap<String, PacedInboundAu>>,
+    /// Exact application-level AU identity on either side of the media daemon.
+    /// The valid-SEI marker is ignored by old receivers; new receivers use it
+    /// to distinguish a genuinely missing AU from legal variable frame timing.
+    video_au_out_sequences: Mutex<HashMap<String, u64>>,
+    video_au_out_codecs: Mutex<HashMap<String, AuCodec>>,
+    video_au_in_sequences: Mutex<HashMap<String, u64>>,
+    /// Viewer-side accept time, consumed by the first usable complete AU. This
+    /// keeps cold-link setup latency separate from steady-state queue latency.
+    video_accepted_at: Mutex<HashMap<String, Instant>>,
     /// Inbound routes whose paced stream lost a fragment. Once a reference
     /// chain is known damaged, complete deltas are still unsafe decoder input;
     /// hold them until an IDR/parameter-set entry arrives. Route teardown
@@ -427,9 +440,10 @@ pub struct Mesh {
     /// legally outrun the Accept/VideoLane control messages at start, and
     /// NACKing that instant would kill a healthy stream being born.
     dead_lane_since: Mutex<HashMap<String, std::time::Instant>>,
-    /// When each route last asked its sender for a clean decode entry —
-    /// decode errors arrive at frame rate; the asks must not.
-    refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
+    /// One acknowledged refresh delivery per route at a time, plus the short
+    /// post-delivery quiet window. Decoder-error bursts collapse here instead
+    /// of becoming frame-rate control traffic.
+    video_refresh: Mutex<VideoRefreshGate>,
     /// Per-peer backoff state for the refresh round-trip ([`ControlMessage::
     /// ProfileRequest`]), so a held-down refresh can't hammer a peer. See
     /// [`Mesh::allow_profile_request`].
@@ -452,6 +466,8 @@ pub struct Mesh {
     daemon_lanes: std::sync::atomic::AtomicU8,
     /// Whether the local daemon speaks the **binary media pipes**
     /// (`media_track_pipe` / `media_source_pipe`, from Status `media_pipes`).
+    /// AllMyStuff opens independent outbound track-pipe connections for video
+    /// and audio even though the daemon capability has one protocol name.
     /// The version pin can't gate this — the feature predates a release — so
     /// it's a capability flag. While false, H.264/Opus ride the legacy base64
     /// `video_send`/`audio_send` ops and inbound arrives as base64 events, so
@@ -1698,6 +1714,75 @@ struct ArrivalState {
     last_log: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuSequenceObservation {
+    Accept,
+    Gap,
+    DropDuplicateOrStale,
+}
+
+const VIDEO_REFRESH_QUIET: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct VideoRefreshGate {
+    last: HashMap<String, Instant>,
+    inflight: HashSet<String>,
+}
+
+impl VideoRefreshGate {
+    fn begin(&mut self, route_id: &str, now: Instant) -> bool {
+        if self.inflight.contains(route_id)
+            || self
+                .last
+                .get(route_id)
+                .is_some_and(|at| now.duration_since(*at) < VIDEO_REFRESH_QUIET)
+        {
+            return false;
+        }
+        self.inflight.insert(route_id.to_string());
+        self.last.insert(route_id.to_string(), now);
+        true
+    }
+
+    fn finish(&mut self, route_id: &str) {
+        self.inflight.remove(route_id);
+    }
+
+    fn recovered(&mut self, route_id: &str) {
+        self.last.remove(route_id);
+    }
+
+    fn teardown(&mut self, route_id: &str) {
+        self.last.remove(route_id);
+        self.inflight.remove(route_id);
+    }
+}
+
+/// Classify one route-local AU sequence without guessing from timestamps.
+/// Clean entries are allowed to reset a sender that restarted in place;
+/// duplicates/stale units never move the high-water mark backwards.
+fn observe_au_sequence(
+    previous: Option<u64>,
+    incoming: u64,
+    clean_entry: bool,
+) -> AuSequenceObservation {
+    let Some(previous) = previous else {
+        return AuSequenceObservation::Accept;
+    };
+    if incoming == previous {
+        return AuSequenceObservation::DropDuplicateOrStale;
+    }
+    let expected = previous.wrapping_add(1);
+    if incoming == expected || clean_entry {
+        return AuSequenceObservation::Accept;
+    }
+    if incoming.wrapping_sub(expected) < (1u64 << 63) {
+        AuSequenceObservation::Gap
+    } else {
+        AuSequenceObservation::DropDuplicateOrStale
+    }
+}
+
 /// A route may spend this much immediately before shaping begins. Four 24 KiB
 /// slices preserve a useful keyframe/scene-change kick without letting every
 /// captured frame become a fresh unbounded burst.
@@ -1993,7 +2078,8 @@ impl Mesh {
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
-            media_track_pipe: MediaTrackPipe::new(client.clone()),
+            media_video_track_pipe: MediaTrackPipe::new(client.clone()),
+            media_audio_track_pipe: MediaTrackPipe::new(client.clone()),
             sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
@@ -2002,6 +2088,10 @@ impl Mesh {
             video_pace: Mutex::new(HashMap::new()),
             video_arrivals: Mutex::new(HashMap::new()),
             paced_video_in: Mutex::new(HashMap::new()),
+            video_au_out_sequences: Mutex::new(HashMap::new()),
+            video_au_out_codecs: Mutex::new(HashMap::new()),
+            video_au_in_sequences: Mutex::new(HashMap::new()),
+            video_accepted_at: Mutex::new(HashMap::new()),
             video_awaiting_entry: Mutex::new(HashSet::new()),
             injector: Injector::new(),
             terminal: TerminalHost::new(),
@@ -2087,7 +2177,7 @@ impl Mesh {
             video_in_stats: Mutex::new(HashMap::new()),
             video_diag_last: Mutex::new(HashMap::new()),
             dead_lane_since: Mutex::new(HashMap::new()),
-            refresh_asks: Mutex::new(HashMap::new()),
+            video_refresh: Mutex::new(VideoRefreshGate::default()),
             profile_req: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
@@ -2241,7 +2331,7 @@ impl Mesh {
                 Ok(())
             }
             VideoPacket::H264 {
-                data,
+                mut data,
                 key,
                 duration_us,
             } => {
@@ -2256,6 +2346,33 @@ impl Mesh {
                     recovery.note_drop(self, Some(key), "no route lane");
                     return Ok(());
                 };
+                let codec = {
+                    let mut codecs = self.video_au_out_codecs.lock();
+                    if let Some(codec) = crate::video_decode::sniff_codec(&data) {
+                        codecs.insert(route_id.to_string(), codec);
+                    }
+                    codecs.get(route_id).copied()
+                };
+                // AV1 has no Annex-B SEI. No sender emits it yet; when one
+                // does, it needs an OBU metadata equivalent rather than an
+                // H.26x marker smuggled into the wrong bitstream. An initial
+                // mid-GOP H.26x delta is also left untouched until a
+                // self-describing entry establishes the codec; defaulting
+                // that ambiguous AU to H.264 would corrupt an HEVC stream.
+                if let Some(codec @ (AuCodec::H264 | AuCodec::Hevc)) = codec {
+                    let sequence = {
+                        let mut sequences = self.video_au_out_sequences.lock();
+                        let next = sequences.entry(route_id.to_string()).or_insert(0);
+                        let sequence = *next;
+                        *next = next.wrapping_add(1);
+                        sequence
+                    };
+                    crate::video_wire::insert_au_identity_marker(
+                        &mut data,
+                        sequence,
+                        matches!(codec, AuCodec::Hevc),
+                    );
+                }
                 let pace = self.video.route_pace(route_id);
                 match self
                     .send_video_paced(peer, route_id, generation, lane, &data, duration_us, pace)
@@ -2586,7 +2703,7 @@ impl Mesh {
         // Binary media pipe when the daemon speaks it; otherwise the legacy
         // base64 video_send op (so an older daemon still streams).
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
-            self.media_track_pipe
+            self.media_video_track_pipe
                 .send_video(&network, pubkey_part(peer), lane, duration_us, data)
                 .await
                 .map_err(|e| e.to_string())
@@ -2612,7 +2729,7 @@ impl Mesh {
             return Err("no shared network".into());
         };
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
-            self.media_track_pipe
+            self.media_audio_track_pipe
                 .send_audio(
                     &network,
                     pubkey_part(peer),
@@ -3059,32 +3176,53 @@ impl Mesh {
         // `video_inbound`/`audio_inbound` events, which the value dispatcher
         // below still decodes and handles.
         if media_pipes {
-            let (media_tx, mut media_rx) = mpsc::channel::<InboundFrame>(256);
+            let (video_tx, mut video_rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+            let (audio_tx, mut audio_rx) = mpsc::channel(MEDIA_AUDIO_QUEUE_CAPACITY);
             match self
                 .client
-                .subscribe_media_source(client_id, media_tx)
+                .subscribe_media_source(client_id, video_tx, audio_tx)
                 .await
             {
                 Ok(()) => {
                     tracing::info!(
-                        "binary media pipes active — H.264/Opus carry raw over the IPC (no base64) in both directions"
+                        "binary media pipes active — raw H.264/Opus over separate freshness-bounded IPC queues (video {}, audio {})",
+                        MEDIA_VIDEO_QUEUE_CAPACITY,
+                        MEDIA_AUDIO_QUEUE_CAPACITY,
                     );
                     let mesh = self.clone();
                     crate::spawn(async move {
-                        while let Some(f) = media_rx.recv().await {
-                            match f.kind {
-                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound(
+                        while let Some(event) = video_rx.recv().await {
+                            match event {
+                                InboundVideoEvent::Frame(f) => mesh.handle_video_inbound(
                                     &f.from,
                                     f.stream,
                                     f.rtp_timestamp,
                                     f.key,
                                     f.data,
                                 ),
-                                MEDIA_KIND_AUDIO => {
-                                    mesh.handle_audio_inbound(&f.from, f.stream, f.data)
+                                InboundVideoEvent::Discontinuity {
+                                    from,
+                                    stream,
+                                    entry,
+                                } => {
+                                    mesh.handle_video_discontinuity(&from, stream, entry.is_none());
+                                    if let Some(f) = entry {
+                                        mesh.handle_video_inbound(
+                                            &f.from,
+                                            f.stream,
+                                            f.rtp_timestamp,
+                                            f.key,
+                                            f.data,
+                                        );
+                                    }
                                 }
-                                _ => {}
                             }
+                        }
+                    });
+                    let mesh = self.clone();
+                    crate::spawn(async move {
+                        while let Some(f) = audio_rx.recv().await {
+                            mesh.handle_audio_inbound(&f.from, f.stream, f.data);
                         }
                     });
                 }
@@ -5135,10 +5273,14 @@ impl Mesh {
         self.video_in_stats.lock().remove(route_id);
         self.video_arrivals.lock().remove(route_id);
         self.paced_video_in.lock().remove(route_id);
+        self.video_au_out_sequences.lock().remove(route_id);
+        self.video_au_out_codecs.lock().remove(route_id);
+        self.video_au_in_sequences.lock().remove(route_id);
+        self.video_accepted_at.lock().remove(route_id);
         self.video_awaiting_entry.lock().remove(route_id);
         self.video_pace.lock().remove(route_id);
         self.paced_video_routes.lock().remove(route_id);
-        self.refresh_asks.lock().remove(route_id);
+        self.video_refresh.lock().teardown(route_id);
         self.video_decode.stop(route_id);
         // Invalidate queued capture callbacks before freeing the pin. Route
         // ids are stable across a re-offer; without this fence, old AUs can be
@@ -5474,6 +5616,78 @@ impl Mesh {
         }
     }
 
+    fn note_video_accepted(&self, route_id: &str) {
+        if self.video_in_stats.lock().contains_key(route_id) {
+            return;
+        }
+        self.video_accepted_at
+            .lock()
+            .entry(route_id.to_string())
+            .or_insert_with(Instant::now);
+    }
+
+    /// The bounded daemon -> node pipe shed at least one access unit from this
+    /// peer/lane. Resolve the lane exactly like an arriving frame, fence the
+    /// route before any later delta can reach a decoder, and ask once for a
+    /// clean entry. The pipe itself suppresses dependent deltas, so this does
+    /// not become a per-frame refresh loop.
+    fn handle_video_discontinuity(self: &Arc<Self>, from: &str, stream: u8, request_entry: bool) {
+        let Some(route_id) = self.video_route_for_lane(from, stream) else {
+            tracing::debug!(
+                "video IPC discontinuity from {} on unmapped lane {stream}; the pipe still waits for a keyframe",
+                short_id(from)
+            );
+            return;
+        };
+        if !matches!(
+            self.inbound_video_disposition(&route_id, from),
+            InboundVideoDisposition::Accept
+        ) {
+            return;
+        }
+        self.mark_video_discontinuity(
+            &route_id,
+            "local media IPC exceeded its live-video latency bound",
+            request_entry,
+        );
+    }
+
+    /// Put one live route behind its clean-entry fence. Returns true only for
+    /// the transition that started this recovery episode; callers use that to
+    /// emit one diagnostic and one refresh rather than yapping on every delta.
+    fn mark_video_discontinuity(
+        self: &Arc<Self>,
+        route_id: &str,
+        reason: &str,
+        request_entry: bool,
+    ) -> bool {
+        if !self
+            .video_awaiting_entry
+            .lock()
+            .insert(route_id.to_string())
+        {
+            return false;
+        }
+        if self.diag_ok(&format!("video-discontinuity:{route_id}")) {
+            tracing::warn!(
+                "video discontinuity for {route_id}: {reason}; dropping dependent deltas{}",
+                if request_entry {
+                    " and requesting one clean entry"
+                } else {
+                    "; an inline clean entry already follows"
+                }
+            );
+        }
+        if request_entry {
+            let mesh = self.clone();
+            let refresh_route = route_id.to_string();
+            crate::spawn(async move {
+                let _ = mesh.request_refresh(refresh_route).await;
+            });
+        }
+        true
+    }
+
     /// One assembled H.264 access unit arrived on a peer's track lane
     /// `stream`. It belongs to whichever of our routes maps to that lane
     /// (the lane-th H.264 route from this peer in sorted order —
@@ -5529,23 +5743,19 @@ impl Mesh {
             }
         }
         // Time every fragment before reassembly: dispersion across the
-        // same-timestamp train is the receiver's bottleneck estimate.
+        // same-timestamp train is the receiver's bottleneck estimate. Loss is
+        // never inferred from this timing; the exact AU identity below owns it.
         self.note_video_arrival(&route_id, rtp_timestamp, data.len());
-        if self.paced_video_routes.lock().contains(&route_id) {
+        let paced = self.paced_video_routes.lock().contains(&route_id);
+        if paced {
             let (complete, damaged) =
                 self.accept_paced_video_fragment(&route_id, rtp_timestamp, key, data);
             if damaged {
-                self.video_awaiting_entry.lock().insert(route_id.clone());
-                if self.diag_ok(&format!("paced-au:{route_id}")) {
-                    tracing::warn!(
-                        "paced video access unit for {route_id} was incomplete; dropped whole and requesting a clean entry"
-                    );
-                }
-                let mesh = self.clone();
-                let refresh_route = route_id.clone();
-                crate::spawn(async move {
-                    let _ = mesh.request_refresh(refresh_route).await;
-                });
+                self.mark_video_discontinuity(
+                    &route_id,
+                    "paced access unit was incomplete and was dropped whole",
+                    true,
+                );
             }
             if let Some(complete) = complete {
                 self.deliver_video_au(
@@ -5585,18 +5795,76 @@ impl Mesh {
         route_id: &str,
         rtp_timestamp: u32,
         key: bool,
-        data: Vec<u8>,
+        mut data: Vec<u8>,
     ) {
+        let sequence = crate::video_wire::take_au_identity_marker(&mut data);
+        // Classify the codec payload after removing transport metadata. This
+        // matters for a parameter-less IDR, where our prefix SEI is otherwise
+        // the first NAL and can obscure the clean-entry header.
+        let clean_entry = key || crate::video_decode::is_decode_entry(&data);
+        if let Some(sequence) = sequence {
+            let observation = {
+                let mut sequences = self.video_au_in_sequences.lock();
+                let previous = sequences.get(route_id).copied();
+                let observation = observe_au_sequence(previous, sequence, clean_entry);
+                if matches!(
+                    observation,
+                    AuSequenceObservation::Accept | AuSequenceObservation::Gap
+                ) {
+                    sequences.insert(route_id.to_string(), sequence);
+                }
+                observation
+            };
+            match observation {
+                AuSequenceObservation::Accept => {}
+                AuSequenceObservation::Gap => {
+                    self.mark_video_discontinuity(
+                        route_id,
+                        "the access-unit sequence proves a whole encoded frame was lost",
+                        true,
+                    );
+                    return;
+                }
+                AuSequenceObservation::DropDuplicateOrStale => {
+                    tracing::debug!(
+                        "dropping duplicate or stale encoded access unit {sequence} for {route_id}"
+                    );
+                    // An IPC discontinuity can arrive with an inline clean
+                    // entry and therefore avoid an otherwise redundant ask.
+                    // If exact identity proves that entry stale, it did not
+                    // repair the new gap after all; request one through the
+                    // same single-flight gate.
+                    if clean_entry && self.video_awaiting_entry.lock().contains(route_id) {
+                        let mesh = self.clone();
+                        let refresh_route = route_id.to_string();
+                        crate::spawn(async move {
+                            let _ = mesh.request_refresh(refresh_route).await;
+                        });
+                    }
+                    return;
+                }
+            }
+        } else {
+            // Compatibility with a sender that predates AU identity. Do not
+            // compare a later upgraded sequence against stale local state.
+            self.video_au_in_sequences.lock().remove(route_id);
+        }
         // The arrival side of the sender's "route active — streaming" line:
         // one INFO per stream, after a complete (not fragment) AU exists.
         let first = !self.video_in_stats.lock().contains_key(route_id);
-        let clean_entry = key || crate::video_decode::is_decode_entry(&data);
         let (hold, was_awaiting) = {
             let mut awaiting = self.video_awaiting_entry.lock();
             let was_awaiting = awaiting.contains(route_id);
             let hold = should_hold_video_sample(first, was_awaiting, key, &data);
             if clean_entry {
                 awaiting.remove(route_id);
+            } else if hold {
+                // Initial mid-GOP arrival enters the same recovery episode as
+                // an explicit discontinuity. Remember it before returning so
+                // subsequent deltas remain quiet instead of issuing a refresh
+                // request at frame rate (even the wire limiter allowed several
+                // per second).
+                awaiting.insert(route_id.to_string());
             }
             (hold, was_awaiting)
         };
@@ -5611,15 +5879,18 @@ impl Mesh {
                     }
                 );
             }
-            let mesh = self.clone();
-            let refresh_route = route_id.to_string();
-            crate::spawn(async move {
-                let _ = mesh.request_refresh(refresh_route).await;
-            });
+            if !was_awaiting {
+                let mesh = self.clone();
+                let refresh_route = route_id.to_string();
+                crate::spawn(async move {
+                    let _ = mesh.request_refresh(refresh_route).await;
+                });
+            }
             return;
         }
         if was_awaiting && clean_entry {
-            tracing::info!("clean video entry restored the paced stream for {route_id}");
+            self.video_refresh.lock().recovered(route_id);
+            tracing::info!("clean video entry restored the stream for {route_id}");
         }
         self.note_video_in(route_id, "H.264", data.len());
         let (wants_decode, decoder_preference) = self
@@ -5629,8 +5900,13 @@ impl Mesh {
             .map(|w| (w.decode, w.decoder))
             .unwrap_or((false, DecoderPreference::Automatic));
         if first {
+            let accepted_ms = self
+                .video_accepted_at
+                .lock()
+                .remove(route_id)
+                .map(|at| at.elapsed().as_millis());
             tracing::info!(
-                "first H.264 sample for {route_id} from {} ({} bytes, key={key}, native decode={wants_decode})",
+                "first usable H.264 sample for {route_id} from {} ({} bytes, key={key}, native decode={wants_decode}, after_accept_ms={accepted_ms:?})",
                 short_id(from),
                 data.len(),
             );
@@ -5689,16 +5965,16 @@ impl Mesh {
 
     /// Queue one packet for a watching console window; drop the packet
     /// (with a debug note) when no window watches the route. A queue
-    /// nobody drains (webview wedged or closing) caps at a few seconds.
+    /// nobody drains (webview wedged or closing) caps at a small live window.
     /// H.264 overflow re-enters only at a key unit; the return value asks the
     /// caller to request one exactly when the watcher enters that quarantine.
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) -> bool {
-        // One second of 60 fps H.264. An unread backlog is pure latency by
-        // the time the window drains it (the old 120 held 2–4 s of "catch
-        // up"), and the overflow below re-enters at a queued keyframe
+        // Six AUs are 100 ms at 60 fps / 200 ms at 30 fps. An unread
+        // backlog is pure latency by the time the window drains it, and the
+        // overflow below re-enters at a queued keyframe
         // instead of dumping the lot, so a slow-but-alive window loses
         // moments, not the stream.
-        const MAX_QUEUED: usize = 60;
+        const MAX_QUEUED: usize = 6;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -12802,8 +13078,9 @@ impl Mesh {
                     let (mesh, rid, peer) = (self.clone(), route.id.clone(), to_node.clone());
                     crate::spawn(async move { mesh.announce_video_lane(&rid, &peer).await });
                 } else if to_node == me {
+                    self.note_video_accepted(&route.id);
                     tracing::info!(
-                        "route {} active — expecting screen frames from {}",
+                        "route {} accepted — waiting for first screen frame from {}",
                         route.id,
                         short_id(&from_node)
                     );
@@ -12830,8 +13107,9 @@ impl Mesh {
                     let (mesh, rid, peer) = (self.clone(), route.id.clone(), to_node.clone());
                     crate::spawn(async move { mesh.announce_video_lane(&rid, &peer).await });
                 } else if to_node == me {
+                    self.note_video_accepted(&route.id);
                     tracing::info!(
-                        "route {} active — expecting camera frames from {}",
+                        "route {} accepted — waiting for first camera frame from {}",
                         route.id,
                         short_id(&from_node)
                     );
@@ -17061,35 +17339,28 @@ impl Mesh {
         });
     }
 
-    /// Ask the far end of an inbound display/camera route for a clean
-    /// decode entry (IDR) *now* — the decoder here lost its place.
-    /// Rate-limited per route: decode errors arrive at frame rate, the
-    /// asks must not.
-    /// Old peers don't know the message and drop it; recovery then waits
-    /// for the periodic IDR exactly as before.
+    /// Ask the far end of an inbound display/camera route for one clean decode
+    /// entry. Delivery is acknowledged and single-flight per route: a burst of
+    /// decoder failures produces one bounded control operation, not a stream of
+    /// best-effort requests. Old peers may ignore the message after accepting
+    /// it; their periodic IDR remains the compatibility fallback.
     pub async fn request_refresh(self: &Arc<Self>, route_id: String) -> Result<(), String> {
-        {
-            let mut asks = self.refresh_asks.lock();
-            let now = std::time::Instant::now();
-            // 300 ms floor: a re-key is the recovery from visible corruption, so
-            // it must turn around fast (was 600 ms). Still throttled so a viewer
-            // failing every frame can't trigger a keyframe storm — at most a few
-            // re-keys/s while it's actually broken.
-            if asks
-                .get(&route_id)
-                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(300))
-            {
-                return Ok(());
-            }
-            asks.insert(route_id.clone(), now);
-        }
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
-        tracing::debug!("asking {} to re-key {route_id}", short_id(&peer));
-        self.send_control(
-            &peer,
-            &ControlMessage::Route(RouteControl::Refresh { route_id }),
-        )
-        .await
+        if !self.video_refresh.lock().begin(&route_id, Instant::now()) {
+            return Ok(());
+        }
+        tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
+        let result = self
+            .send_control_reliable(
+                &peer,
+                &ControlMessage::Route(RouteControl::Refresh {
+                    route_id: route_id.clone(),
+                }),
+                Duration::from_secs(2),
+            )
+            .await;
+        self.video_refresh.lock().finish(&route_id);
+        result
     }
 
     /// Ask the far end of an inbound display/camera route to stream with
@@ -20389,6 +20660,81 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn au_sequence_accepts_first_consecutive_and_wrapped_units() {
+        assert_eq!(
+            observe_au_sequence(None, 42, false),
+            AuSequenceObservation::Accept
+        );
+        assert_eq!(
+            observe_au_sequence(Some(42), 43, false),
+            AuSequenceObservation::Accept
+        );
+        assert_eq!(
+            observe_au_sequence(Some(u64::MAX), 0, false),
+            AuSequenceObservation::Accept
+        );
+    }
+
+    #[test]
+    fn au_sequence_proves_a_missing_dependent_unit() {
+        assert_eq!(
+            observe_au_sequence(Some(10), 12, false),
+            AuSequenceObservation::Gap
+        );
+    }
+
+    #[test]
+    fn au_sequence_accepts_a_clean_entry_across_a_gap_or_sender_reset() {
+        assert_eq!(
+            observe_au_sequence(Some(10), 12, true),
+            AuSequenceObservation::Accept
+        );
+        assert_eq!(
+            observe_au_sequence(Some(10_000), 0, true),
+            AuSequenceObservation::Accept
+        );
+    }
+
+    #[test]
+    fn au_sequence_drops_duplicates_and_stale_units_without_refreshing() {
+        assert_eq!(
+            observe_au_sequence(Some(10), 10, false),
+            AuSequenceObservation::DropDuplicateOrStale
+        );
+        assert_eq!(
+            observe_au_sequence(Some(10), 9, false),
+            AuSequenceObservation::DropDuplicateOrStale
+        );
+    }
+
+    #[test]
+    fn video_refresh_gate_is_single_flight_and_one_per_recovery_episode() {
+        let start = Instant::now();
+        let mut gate = VideoRefreshGate::default();
+
+        assert!(gate.begin("r", start));
+        assert!(
+            !gate.begin("r", start + Duration::from_secs(2)),
+            "an acknowledged delivery already in flight never duplicates"
+        );
+        gate.finish("r");
+        assert!(
+            !gate.begin("r", start + Duration::from_millis(500)),
+            "decoder-error bursts stay inside the quiet window"
+        );
+        assert!(gate.begin("r", start + VIDEO_REFRESH_QUIET));
+        gate.finish("r");
+
+        gate.recovered("r");
+        assert!(
+            gate.begin("r", start + VIDEO_REFRESH_QUIET),
+            "a clean entry ends the episode so later damage recovers immediately"
+        );
+        gate.teardown("r");
+        assert!(gate.begin("r", start));
+    }
+
     fn inventory_summary_with_free(id: &str, available_bytes: u64) -> InventorySummary {
         InventorySummary {
             storage: vec![allmystuff_protocol::StorageSummary {
@@ -21197,6 +21543,44 @@ mod tests {
         );
         assert!(complete.is_none());
         assert!(damaged, "a missing whole fragment drops the AU");
+    }
+
+    #[test]
+    fn au_identity_survives_paced_fragment_reassembly() {
+        let mut whole = [vec![0, 0, 0, 1, 0x67, 1], vec![0, 0, 0, 1, 0x65, 2]].concat();
+        crate::video_wire::insert_au_identity_marker(&mut whole, 91, false);
+        let ranges = crate::video::split_annexb_paced(&whole, 8);
+        let mut pending = HashMap::new();
+        for range in &ranges {
+            let (complete, damaged) = accept_paced_fragment(
+                &mut pending,
+                "r",
+                90_000,
+                true,
+                whole[range.clone()].to_vec(),
+            );
+            assert!(complete.is_none());
+            assert!(!damaged);
+        }
+        let (complete, damaged) = accept_paced_fragment(
+            &mut pending,
+            "r",
+            90_000,
+            false,
+            crate::video::paced_au_marker(ranges.len()),
+        );
+        assert!(!damaged);
+        let mut rebuilt = complete.expect("paced AU").data;
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut rebuilt),
+            Some(91)
+        );
+        let mut original = whole;
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut original),
+            Some(91)
+        );
+        assert_eq!(rebuilt, original);
     }
 
     #[test]

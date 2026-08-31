@@ -155,6 +155,9 @@ pub mod video;
 #[path = "stubs/video.rs"]
 pub mod video;
 pub mod video_decode;
+/// Codec-valid metadata carried inside encoded video access units. Unlike
+/// capture, this wire contract is needed by receive-only builds too.
+pub(crate) mod video_wire;
 /// Hardware H.264 encode via VideoToolbox — the Mac's media engine, no
 /// FFmpeg toolchain; the encoder ladder in [`video`] frame-send-tests it and
 /// falls back to software openh264. Host-gated like [`video`] itself: the

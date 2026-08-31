@@ -34,15 +34,14 @@ pub struct Au {
     pub data: Vec<u8>,
 }
 
-/// Which codec an access unit opens with. H.264/HEVC are judged from the
-/// first NAL header byte of a *parameter-set-led* unit (the decode
-/// entries both encoders emit with repeated VPS/SPS/PPS); AV1 has no
-/// Annex-B start codes at all — it's OBUs — so it's judged from a
-/// leading sequence-header OBU instead ([`sniff_codec`]). Delta units
-/// return `None`: the stream's codec is a property carried key-to-key,
-/// not re-judged per frame.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum AuCodec {
+/// Which codec an access unit opens with. H.264/HEVC are judged from an
+/// identifying NAL in a self-describing unit (the decode entries both encoders
+/// emit with repeated VPS/SPS/PPS); harmless AUD/SEI prefixes are skipped.
+/// AV1 has no Annex-B start codes — it's judged from a leading sequence-header
+/// OBU instead ([`sniff_codec`]). Delta units return `None`: the stream's codec
+/// is a property carried key-to-key, not re-judged per frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuCodec {
     H264,
     Hevc,
     /// AV1 (OBU bitstream). **Decode is a STUB** — see [`Av1Rung`]: the
@@ -52,45 +51,32 @@ enum AuCodec {
     Av1,
 }
 
-fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
-    // First: the Annex-B path (H.264/HEVC always lead with a start code).
-    let mut i = 0usize;
-    let start_byte = loop {
-        if i + 3 >= data.len() {
-            // No start code anywhere — not H.264/HEVC. Fall through to the
-            // OBU check: AV1 access units carry no start codes.
-            return sniff_av1_obu(data);
-        }
-        if data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1 {
-                break data[i + 3];
-            }
-            if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
-                break data[i + 4];
-            }
-        }
-        i += 1;
-    };
+pub(crate) fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
+    let nals = crate::video_wire::annexb_nals(data);
+    if nals.is_empty() {
+        // No start code anywhere — not H.264/HEVC. AV1 access units carry no
+        // start codes, so only this case is allowed into the OBU check.
+        return sniff_av1_obu(data);
+    }
     // Exact bytes, not masked types: HEVC VPS/SPS/PPS at layer 0 are
     // precisely 0x40/0x42/0x44. A masked `(b>>1)&0x3F == 32` test would
     // also catch 0x41 — an H.264 P slice with nal_ref_idc 2, the byte
     // most delta AUs lead with — and flip a healthy H.264 stream's
     // decoder on every frame. (Caught in review; the byte-exact match is
     // collision-free because H.264 types 0/2/4 never lead an AU.)
-    match start_byte {
-        // VPS · SPS · PPS, plus IDR_W_RADL (0x26): an H.264 SEI would
-        // share that byte only with nal_ref_idc=1, which the H.264 spec
-        // forbids for SEI — so a conformant stream leading with 0x26 is
-        // HEVC, and a paramless HEVC IDR still reads as a decode entry
-        // instead of silently starving `waiting_key` (red team round 2).
-        // IDR_N_LP (0x28) stays out: it collides with a legal H.264 PPS
-        // byte, and our senders always lead IDRs with parameter sets.
-        0x40 | 0x42 | 0x44 | 0x26 => Some(AuCodec::Hevc),
-        _ => match start_byte & 0x1F {
-            5 | 7 | 8 => Some(AuCodec::H264), // IDR · SPS · PPS
-            _ => None,
-        },
+    for (_, header) in nals {
+        match header {
+            // VPS · SPS · PPS, plus IDR_W_RADL (0x26): an H.264 SEI would
+            // share that byte only with nal_ref_idc=1, which the H.264 spec
+            // forbids for SEI — so a conformant 0x26 is HEVC. IDR_N_LP
+            // (0x28) stays out because it collides with a legal H.264 PPS;
+            // our senders repeat parameter sets on clean entries.
+            0x40 | 0x42 | 0x44 | 0x26 => return Some(AuCodec::Hevc),
+            _ if matches!(header & 0x1f, 5 | 7 | 8) => return Some(AuCodec::H264),
+            _ => {}
+        }
     }
+    None
 }
 
 /// Whether this access unit is self-describing decoder entry. The media
@@ -1112,6 +1098,16 @@ mod tests {
         // HEVC VPS (0x40), SPS (0x42), PPS (0x44).
         assert_eq!(sniff_codec(&[0, 0, 1, 0x40, 0x01]), Some(AuCodec::Hevc));
         assert_eq!(sniff_codec(&[0, 0, 1, 0x42, 0x01]), Some(AuCodec::Hevc));
+        // Prefix metadata does not obscure the parameter set that actually
+        // identifies the stream.
+        assert_eq!(
+            sniff_codec(&[0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x06, 1, 0, 0, 1, 0x67, 0x42]),
+            Some(AuCodec::H264)
+        );
+        assert_eq!(
+            sniff_codec(&[0, 0, 1, 0x46, 0x01, 0, 0, 1, 0x4e, 0x01, 0, 0, 1, 0x40, 0x01]),
+            Some(AuCodec::Hevc)
+        );
         // An H.264 delta P-slice (0x41) leads no key AU → None (codec
         // carries from the key) and NEVER trips the AV1 branch.
         assert_eq!(sniff_codec(&[0, 0, 1, 0x41, 0x9a]), None);

@@ -1259,6 +1259,14 @@ impl VideoBridge {
         }
     }
 
+    /// The recovery contract of the encoder that is active right now. The
+    /// wave registry exists only for a Game route that actually opened a
+    /// GDR-capable SDK encoder; requested posture and fallback labels are not
+    /// trusted here.
+    pub fn route_supports_gdr(&self, route_id: &str) -> bool {
+        wave_flags().lock().contains_key(route_id)
+    }
+
     /// Frame health's targeted heal: a GDR lane restarts its refresh
     /// wave — spread intra, no keyframe wall, no smear left behind — and
     /// any route without a registered wave falls back to the IDR refresh.
@@ -4914,21 +4922,7 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
     // start code's own bytes can never satisfy another match's [0,0]
     // look-behind, and a run of ≥3 zeros anchors at p−3 exactly where
     // the forward scan entered its 4-byte arm.
-    let mut nals: Vec<(usize, u8)> = Vec::new();
-    for p in memchr::memchr_iter(1, data) {
-        if p < 2 || data[p - 1] != 0 || data[p - 2] != 0 {
-            continue;
-        }
-        let i = if p >= 3 && data[p - 3] == 0 {
-            p - 3
-        } else {
-            p - 2
-        };
-        let hdr = p + 1;
-        if hdr < data.len() {
-            nals.push((i, data[hdr]));
-        }
-    }
+    let nals = crate::video_wire::annexb_nals(data);
     // Exact parameter-set bytes (0x40/0x42/0x44 = VPS/SPS/PPS, layer 0)
     // — a masked type test would also match 0x41, the H.264 referenced
     // P-slice byte, and misread whole H.264 streams as HEVC.
@@ -5487,6 +5481,13 @@ use allmystuff_pixels::{
 mod tests {
     use super::*;
 
+    fn au_identity(
+        sequence: u64,
+        recovery: crate::video_wire::AuRecovery,
+    ) -> crate::video_wire::AuIdentity {
+        crate::video_wire::AuIdentity { sequence, recovery }
+    }
+
     #[cfg(windows)]
     #[test]
     fn experimental_gpu_paths_require_an_explicit_boolean_value() {
@@ -5638,6 +5639,86 @@ mod tests {
         assert_eq!(paced_au_marker_count(&[0, 0, 0, 1, 0x06]), None);
     }
 
+    #[test]
+    fn au_identity_marker_round_trips_without_touching_the_access_unit() {
+        let original = vec![0, 0, 0, 1, 0x65, 1, 2, 3];
+        let mut marked = original.clone();
+        let identity = au_identity(
+            0x0123_4567_89ab_cdef,
+            crate::video_wire::AuRecovery::Gradual,
+        );
+        crate::video_wire::insert_au_identity_marker(&mut marked, identity, false);
+        assert_eq!(marked[4] & 0x1f, 6, "valid H.264 prefix SEI NAL");
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut marked),
+            Some(identity)
+        );
+        assert_eq!(marked, original);
+    }
+
+    #[test]
+    fn au_identity_parser_ignores_foreign_or_malformed_sei() {
+        let mut foreign = paced_au_marker(4);
+        let unchanged = foreign.clone();
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut foreign),
+            None
+        );
+        assert_eq!(foreign, unchanged);
+
+        let mut malformed = vec![9, 8, 7];
+        crate::video_wire::insert_au_identity_marker(
+            &mut malformed,
+            au_identity(u64::MAX, crate::video_wire::AuRecovery::Reset),
+            false,
+        );
+        let last_hex = malformed.len() - 2;
+        malformed[last_hex] = b'Z';
+        let unchanged = malformed.clone();
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut malformed),
+            None
+        );
+        assert_eq!(malformed, unchanged);
+    }
+
+    #[test]
+    fn au_identity_parser_skips_a_foreign_same_shape_sei_before_ours() {
+        let mut data = vec![0, 0, 0, 1, 0x06, 0x05, 32];
+        data.extend_from_slice(b"FOREIGN-UUID-000");
+        data.extend_from_slice(b"0123456789abcdef");
+        data.push(0x80);
+        let identity = au_identity(55, crate::video_wire::AuRecovery::Reset);
+        crate::video_wire::insert_au_identity_marker(&mut data, identity, false);
+
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut data),
+            Some(identity)
+        );
+        assert!(data.windows(16).any(|w| w == b"FOREIGN-UUID-000"));
+    }
+
+    #[test]
+    fn hevc_au_identity_uses_a_valid_prefix_sei_and_round_trips() {
+        let original = vec![
+            0, 0, 0, 1, 0x40, 0x01, 9, // VPS
+            0, 0, 0, 1, 0x26, 0x01, 8, // IDR VCL
+        ];
+        let mut marked = original.clone();
+        let identity = au_identity(77, crate::video_wire::AuRecovery::Reset);
+        crate::video_wire::insert_au_identity_marker(&mut marked, identity, true);
+        let marker_at = marked
+            .windows(6)
+            .position(|w| w == [0, 0, 0, 1, 0x4e, 0x01])
+            .expect("HEVC prefix SEI");
+        assert_eq!(marker_at, 7, "SEI follows parameters and precedes VCL");
+        assert_eq!(
+            crate::video_wire::take_au_identity_marker(&mut marked),
+            Some(identity)
+        );
+        assert_eq!(marked, original);
+    }
+
     /// The OpenH264-specific incremental-feed property on a REAL bitstream: an encoder
     /// with a slice cap emits multi-slice units, the splitter cuts them, and
     /// OpenH264 can consume them incrementally. Production ingress does not
@@ -5682,10 +5763,18 @@ mod tests {
                     40 + texture as u8
                 };
             }
-            let au = enc
+            let mut au = enc
                 .encode(&I420Frame { buf: &yuv, w, h })
                 .expect("encode")
                 .to_vec();
+            // Model a rolling update: an older receiver does not strip the
+            // identity SEI and gives it to OpenH264. Being valid codec metadata
+            // must keep that path decodable.
+            crate::video_wire::insert_au_identity_marker(
+                &mut au,
+                au_identity(u64::from(i), crate::video_wire::AuRecovery::Reset),
+                false,
+            );
             let chunks = split_annexb_paced(&au, 4 * 1024);
             let rebuilt: Vec<u8> = chunks
                 .iter()

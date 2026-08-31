@@ -2328,15 +2328,38 @@ impl Mesh {
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
         let largest_chunk = chunks.iter().map(|range| range.len()).max().unwrap_or(0);
-        if largest_chunk > crate::video::PACE_SLICE_BYTES.saturating_mul(2)
-            && self.diag_ok(&format!("paced-shape:{route_id}"))
-        {
-            tracing::warn!(
-                "paced video {route_id}: encoder produced a coarse slice-boundary chunk of {:.1} KiB in a {:.1} KiB AU ({} chunks); sender backpressure will preserve the reference chain while it drains",
-                largest_chunk as f64 / 1024.0,
-                data.len() as f64 / 1024.0,
-                chunks.len(),
-            );
+        let coarse_unsplittable =
+            chunks.len() == 1 && largest_chunk > crate::video::PACE_SLICE_BYTES.saturating_mul(2);
+        let marker = crate::video::paced_au_marker(chunks.len());
+        if coarse_unsplittable {
+            // A one-slice AU cannot be shaped at this layer: delaying the
+            // whole sample changes only *when* its RTP packet wall starts,
+            // not the wall's shape. Worse, reserving it against the route
+            // bucket carries debt into later frames and was observed blocking
+            // the encode queue for 3.5 s. Preserve v1's marker/count recovery,
+            // but bypass and reset the ineffective bucket for this AU.
+            if self.diag_ok(&format!("paced-shape:{route_id}")) {
+                tracing::warn!(
+                    "paced video {route_id}: encoder produced one unsplittable {:.1} KiB slice; bypassing the ineffective token bucket to avoid self-inflicted latency (marker recovery remains active)",
+                    largest_chunk as f64 / 1024.0,
+                );
+            }
+            self.video_pace.lock().remove(route_id);
+            if !current() {
+                return Ok(false);
+            }
+            let tw = Instant::now();
+            self.send_video_track(peer, lane, data, 0).await?;
+            let mut write_us = tw.elapsed().as_micros() as u64;
+            if !current() {
+                return Ok(false);
+            }
+            let tw = Instant::now();
+            self.send_video_track(peer, lane, &marker, duration_us)
+                .await?;
+            write_us += tw.elapsed().as_micros() as u64;
+            self.note_pace_gaps(&[], write_us, 2);
+            return Ok(true);
         }
         // (game posture, WAN-class path, current send rate bps, fps) — the
         // shape `VideoBridge::route_pace` hands the forwarder.
@@ -2348,7 +2371,6 @@ impl Mesh {
                 .unwrap_or(0)
         });
         let policy = pace_policy(game, wan, rate_bps, *DRAIN_OVERRIDE_MBPS);
-        let marker = crate::video::paced_au_marker(chunks.len());
         let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(chunks.len());
         // M1's pace+write split: gap time is the ledger above; this is
         // the daemon-pipe await itself — if the daemon ever backpressures

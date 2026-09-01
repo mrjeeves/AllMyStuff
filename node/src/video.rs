@@ -3416,10 +3416,13 @@ fn run_oneshot_capture(
     Ok(false)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn invalid_monitor_handle(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("0x800705b5") || error.contains("invalid monitor handle")
+    error.contains("0x800705b5")
+        || error.contains("0x80070006")
+        || error.contains("invalid monitor handle")
+        || error.contains("the handle is invalid")
 }
 
 /// Re-enumerate a Windows monitor after its raw `HMONITOR` was invalidated.
@@ -5517,13 +5520,15 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn only_invalid_hmonitor_errors_trigger_screenshot_reacquisition() {
         assert!(invalid_monitor_handle(
             "Invalid monitor handle. (0x800705B5)"
         ));
         assert!(invalid_monitor_handle("invalid monitor handle"));
+        assert!(invalid_monitor_handle(
+            "The handle is invalid. (0x80070006)"
+        ));
         assert!(!invalid_monitor_handle("Access is denied. (0x80070005)"));
         assert!(!invalid_monitor_handle(
             "screen recording permission denied"

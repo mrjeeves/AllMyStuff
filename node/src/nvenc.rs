@@ -926,29 +926,11 @@ impl NvencH264 {
         } else {
             cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_VBR;
             cfg.rc_params.average_bit_rate = bitrate;
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
+            let (peak, vbv) =
+                crate::video::burst_bounds(bitrate, self.fps, self.intra_refresh, self.studio);
             cfg.rc_params.max_bit_rate = peak;
             cfg.rc_params.vbv_buffer_size = vbv;
             cfg.rc_params.vbv_initial_delay = 0;
-        }
-        if self.studio && !self.lossless {
-            // Studio: quality-first on a LAN that can carry it — a full
-            // second of VBV lets rate control spend where the picture
-            // needs it, and the peak stays close to the (already high)
-            // mean so the pacer's bursts stay predictable. 4:4:4 chroma
-            // slots in here once the viewer decodes it (the
-            // hardware-decode epic); lossless graduated to its own rung
-            // (`open_lossless_on_device`).
-            cfg.rc_params.vbv_buffer_size = bitrate;
-            cfg.rc_params.max_bit_rate = bitrate + bitrate / 5;
-        }
-        if self.intra_refresh {
-            // Game posture: a single-frame VBV — every frame fits one
-            // frame interval's bit budget, so no frame can queue behind
-            // an oversized predecessor. GDR removes the IDR spikes that
-            // made a deep bucket necessary; what remains benefits from
-            // constant-latency framing far more than from burst headroom.
-            cfg.rc_params.vbv_buffer_size = (bitrate / self.fps.max(1)).max(50_000);
         }
         let paced = crate::video::paced_slices_enabled();
         // 8 slices sizes a lossy keyframe (~190 KB) to the 24 KB pacing
@@ -1302,21 +1284,10 @@ impl NvencH264 {
                 return false;
             };
             self.config.rc_params.average_bit_rate = bitrate;
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
+            let (peak, vbv) =
+                crate::video::burst_bounds(bitrate, self.fps, self.intra_refresh, self.studio);
             self.config.rc_params.max_bit_rate = peak;
             self.config.rc_params.vbv_buffer_size = vbv;
-            // Re-apply the posture's VBV shape — reconfigure must keep
-            // the contract init made, not regress to the generic bounds
-            // (red team: the first in-place retune would have widened
-            // game's single-frame VBV into a ~500 ms bucket and blown
-            // the GDR latency story silently).
-            if self.studio {
-                self.config.rc_params.vbv_buffer_size = bitrate;
-                self.config.rc_params.max_bit_rate = bitrate + bitrate / 5;
-            }
-            if self.intra_refresh {
-                self.config.rc_params.vbv_buffer_size = (bitrate / self.fps.max(1)).max(50_000);
-            }
             let mut params: Box<ReconfigureParams> = Box::new(std::mem::zeroed());
             params.version = sv(1) | (1 << 31);
             std::ptr::copy_nonoverlapping(&*self.init, &mut params.re_init_encode_params, 1);

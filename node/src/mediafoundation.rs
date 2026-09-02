@@ -91,7 +91,7 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<MediaFoundationH264, String> {
-        self.open_for_route(width, height, fps, bitrate, false)
+        self.open_for_route(width, height, fps, bitrate, crate::video::Posture::Balanced)
     }
 
     /// [`Self::open`] with the owning route's latency posture. Production
@@ -104,9 +104,9 @@ impl HwEncoder {
         height: u32,
         fps: u32,
         bitrate: u32,
-        game: bool,
+        posture: crate::video::Posture,
     ) -> Result<MediaFoundationH264, String> {
-        self.open_with_manager_for_route(width, height, fps, bitrate, None, game)
+        self.open_with_manager_for_route(width, height, fps, bitrate, None, posture)
     }
 
     /// [`Self::open`] bound to a DXGI device manager — the GPU lane: the MFT
@@ -120,7 +120,14 @@ impl HwEncoder {
         bitrate: u32,
         manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<MediaFoundationH264, String> {
-        self.open_with_manager_for_route(width, height, fps, bitrate, manager, false)
+        self.open_with_manager_for_route(
+            width,
+            height,
+            fps,
+            bitrate,
+            manager,
+            crate::video::Posture::Balanced,
+        )
     }
 
     /// Device-manager form of [`Self::open_for_route`]. The manager and route
@@ -132,10 +139,10 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
         manager: Option<&IMFDXGIDeviceManager>,
-        game: bool,
+        posture: crate::video::Posture,
     ) -> Result<MediaFoundationH264, String> {
         ensure_com_thread();
-        unsafe { self.open_inner(width, height, fps, bitrate, manager, game) }
+        unsafe { self.open_inner(width, height, fps, bitrate, manager, posture) }
     }
 
     unsafe fn open_inner(
@@ -145,9 +152,14 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
         manager: Option<&IMFDXGIDeviceManager>,
-        game: bool,
+        posture: crate::video::Posture,
     ) -> Result<MediaFoundationH264, String> {
         let name = self.name.clone();
+        let game = posture == crate::video::Posture::Game;
+        let studio = matches!(
+            posture,
+            crate::video::Posture::Studio | crate::video::Posture::StudioLossless
+        );
 
         // Activate the MFT into an IMFTransform.
         let transform: IMFTransform = self
@@ -249,7 +261,7 @@ impl HwEncoder {
             // Peak + VBV from the shared posture: quality-first by default,
             // trimmed for burst latency in game mode (see
             // `video::burst_bounds`).
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, game);
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, fps, game, studio);
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
                 &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
@@ -314,6 +326,7 @@ impl HwEncoder {
             frame_index: 0,
             input_credits: 0,
             game,
+            studio,
         })
     }
 
@@ -582,6 +595,7 @@ pub struct MediaFoundationH264 {
     /// This route's burst posture, retained so in-place bitrate changes keep
     /// the same peak/VBV shape chosen at open.
     game: bool,
+    studio: bool,
 }
 
 // SAFETY: a MediaFoundationH264 is built on, and only ever used from, the single
@@ -709,7 +723,7 @@ impl MediaFoundationH264 {
             // Peak + VBV follow the mean so the burst posture stays
             // proportional; best-effort — a box that only re-aims the mean
             // still adapts.
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.game);
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
             let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
             let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
             true

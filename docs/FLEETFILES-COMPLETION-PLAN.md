@@ -33,6 +33,27 @@ Statuses are **ACTIVE**, **READY**, **WAITING**, and **DONE** after the proof ga
 
 This order prevents collisions: adapters share operation IDs; placement targets immutable versions instead of paths; canvas and grants use stable object IDs; search remains disposable; and repair never infers durability from policy.
 
+## Current PR evidence
+
+The current release slice does not mark an entire F1–F10 milestone complete,
+but it closes these independently testable foundations:
+
+| Area | Implemented evidence |
+|---|---|
+| Logical browsing | Database-backed cursor pages drive normal Fleetfiles navigation; physical device paths are isolated under Local copies |
+| Search | A rebuildable trigram path index returns current logical entries in keyset pages without disk walks or body hydration |
+| Versions | Every observed path version is appended to version_history; late history cannot replace the current winner |
+| Metadata recovery | Per-peer exact-version queues drain fully in bounded batches, followed by cached-digest/keyset-page anti-entropy on presence |
+| Content | Immutable SHA-256-verified bodies live only in enabled allocations; foreground hydration uses a separate bounded cache |
+| Offline safety | Queued file versions retain an exact outbound body until every target acknowledges |
+| History | Restore can fetch a retained body from an online upgraded peer and publishes the restore as a new current version |
+| Capacity | Current bodies are protected; historical bodies reclaim oldest-first under quota pressure; logical use and protected capacity reach the UI |
+| Traffic | Equal-ledger reconnect is below 512 encoded bytes; pages are about 32 KiB; WAN/unknown background traffic is policy-paced |
+| Rendering | Main-folder pages auto-continue and Details/Canvas render only a viewport window |
+
+The data flow and bounds are detailed in
+[Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md).
+
 ## Execution board
 
 | ID | Status | Outcome | Proof gate |

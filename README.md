@@ -80,12 +80,14 @@ architecture, and maintainer material.
 - **Terminals.** Open a real shell without configuring SSH, keys, or forwarded
   ports. Terminal sessions can be attached from more than one machine when you
   want to follow the same shell together.
-- **Files and native drives.** Browse and transfer files in the app. Map an
-  authorized folder or whole drive into the operating system: a drive letter
-  in Windows, a mounted volume on macOS, or a mount point on Linux. It appears
-  in native applications, not only inside AllMyStuff. A mapping is one-way, but
-  both affected machines show the same source, destination, name, mount, and
-  availability. Reverse mapping is a second explicit action.
+- **Fleetfiles, Files, and native drives.** Browse the fleet-wide logical
+  Fleetfiles tree without choosing which device holds each body. Large folders
+  are paged and virtualized; opens hydrate verified content on demand; retained
+  versions can be restored from an online replica. Use Local copies only to
+  inspect a physical device path. You can also browse explicit remote-machine
+  grants or map an authorized folder/drive into the operating system: a drive
+  letter in Windows, a mounted volume on macOS, or a mount point on Linux. A
+  mapping is one-way, but both affected machines show the same relationship.
 - **Sites.** Publish only the local web services you mean to expose, then open
   them from another authorized machine even when the service itself listens on
   loopback.

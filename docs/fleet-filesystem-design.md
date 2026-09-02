@@ -424,7 +424,21 @@ Already present:
 - Opaque folder share IDs with path-boundary validation.
 - Fleet-synchronized canvas metadata and native Windows shell integration.
 
-Required before claiming a unified filesystem:
+Implemented in the current release slice:
+
+- Database-backed logical directory paging independent of materialization.
+- Append-only per-path version metadata, immutable verified allocation bodies,
+  and exact per-version offline queues.
+- Fleet-wide metadata fan-out plus presence-driven digest/page anti-entropy.
+- On-demand verified materialization and remote historical-version restore
+  through a bounded cache that does not count as a replica.
+- Quota/reserve enforcement, protected-capacity reporting, history-first
+  reclamation, and LAN-aware background traffic pacing.
+
+See [Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md) for the
+implemented data flow and measured bounds.
+
+Required before claiming the complete unified filesystem contract:
 
 - Stable fleet object IDs and native binding records.
 - Cursor-paged, cancellable directory enumeration.
@@ -446,4 +460,3 @@ Active implementation order, status, dependencies, and proof gates are maintaine
 - Immutable versions simplify verification and deduplication but require explicit conflict handling.
 - Native shell fidelity is strongest for native-backed selections; mixed fleet-only selections need a clear AllMyStuff command surface beside, not disguised as, OS commands.
 - Metadata quorum size, chunking algorithm, case policy, tombstone horizon, and offline conflict UX require measurement and may evolve behind versioned contracts.
-

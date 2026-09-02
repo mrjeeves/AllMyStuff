@@ -52,7 +52,11 @@ use crate::control_client::{
 };
 use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
-use crate::fleetfiles::{ChunkReader, FleetfilesMessage, FleetfilesReplica, LocalMutation};
+use crate::fleetfiles::{
+    ChunkReader, FleetfilesLedgerCursor, FleetfilesMessage, FleetfilesMetadata, FleetfilesReplica,
+    LocalMutation, LogicalDirectoryPage, LogicalSearchPage, StorageAllocationRoot,
+    VersionHistoryPage,
+};
 
 use crate::input_inject::Injector;
 use crate::namespace::{
@@ -71,7 +75,7 @@ use crate::storage_plan::{
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, AuCodec, DecodeBridge, DecoderPreference};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 type ClipboardReceiptWaiters =
     Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<Result<(), String>>>>;
@@ -82,6 +86,7 @@ type ClipboardReceiptWaiters =
 /// itself: [`Mesh::handle_channel`] accepts it only while the authenticated
 /// sender is present in the daemon's local-claim peer list.
 const CHANNEL_LOCAL_CLAIM_PRESENCE: &str = "allmystuff/local-claim-presence/v1";
+const FEATURE_FLEETFILES_LEDGER: &str = "fleetfiles-ledger-v1";
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -965,7 +970,12 @@ fn persist_drive_reconnects(
 /// `allmystuff://file-progress` events.
 struct DownloadSink {
     file: std::fs::File,
+    /// In-progress bytes. Ordinary downloads write directly to their final
+    /// destination; open-cache entries use a private `.part` path and rename
+    /// only after the complete response is durable.
     path: std::path::PathBuf,
+    completed_path: std::path::PathBuf,
+    cache_entry: Option<std::path::PathBuf>,
     written: u64,
     last_progress: std::time::Instant,
 }
@@ -3830,6 +3840,7 @@ impl Mesh {
                     allmystuff_protocol::FEATURE_FILES.to_string(),
                     allmystuff_protocol::FEATURE_ROOMS.to_string(),
                     allmystuff_protocol::FEATURE_SITES.to_string(),
+                    FEATURE_FLEETFILES_LEDGER.to_string(),
                 ];
                 // The runtime kill switch withdraws the negotiated contract
                 // as well as disabling local sends. Advertising while sending
@@ -15575,7 +15586,154 @@ impl Mesh {
             "plan": self.storage_plan.snapshot(),
             "profiles": self.service_profiles.snapshot(),
             "mount": mount,
+            "logicalUsedBytes": self.fleetfiles.logical_used_bytes(),
+            "protectedCapacityBytes": self.fleetfiles_capacity(),
         })
+    }
+
+    pub fn fleetfiles_logical_list(
+        &self,
+        parent: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<LogicalDirectoryPage, String> {
+        self.fleetfiles
+            .list_directory(&parent, cursor.as_deref(), limit)
+    }
+
+    pub fn fleetfiles_logical_search(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<LogicalSearchPage, String> {
+        self.fleetfiles.search(&query, cursor.as_deref(), limit)
+    }
+
+    pub fn fleetfiles_version_history(
+        &self,
+        path: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<VersionHistoryPage, String> {
+        self.fleetfiles
+            .version_history(&path, cursor.as_deref(), limit)
+    }
+
+    async fn fetch_fleetfiles_body(
+        &self,
+        path: &str,
+        version: &crate::fleetfiles::VersionStamp,
+        size: u64,
+        sha256: &str,
+    ) -> Result<(), String> {
+        if self.fleetfiles.has_body(sha256, size) {
+            return Ok(());
+        }
+        let local = self.local_node_id().unwrap_or_default();
+        let mut peers = self
+            .storage_plan
+            .snapshot()
+            .allocations
+            .into_iter()
+            .filter(|allocation| allocation.enabled)
+            .map(|allocation| pubkey_part(&allocation.device).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for member in self.ownership.fleet_member_ids() {
+            peers.insert(pubkey_part(&member).to_string());
+        }
+        peers.remove(pubkey_part(&local));
+        let evidence = self
+            .service_profiles
+            .snapshot()
+            .into_iter()
+            .map(|profile| {
+                (
+                    pubkey_part(&profile.peer).to_string(),
+                    (profile.state == "online", profile.service_score),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut peers = peers
+            .into_iter()
+            .filter(|peer| {
+                !peer.is_empty()
+                    && self.network_for_peer(peer).is_some()
+                    && self.peer_supports_feature(peer, FEATURE_FLEETFILES_LEDGER)
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by(|left, right| {
+            let left = evidence.get(left).copied().unwrap_or((false, 0.0));
+            let right = evidence.get(right).copied().unwrap_or((false, 0.0));
+            right.0.cmp(&left.0).then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        let mut failures = Vec::new();
+        for peer in peers {
+            let operation = format!(
+                "body-fetch-{}-{}",
+                unix_now_ms(),
+                self.file_seq.fetch_add(1, Ordering::Relaxed)
+            );
+            let result = self
+                .send_fleetfiles_and_wait(
+                    &peer,
+                    &operation,
+                    FleetfilesMessage::BodyRequest {
+                        operation: operation.clone(),
+                        path: path.to_string(),
+                        version: version.clone(),
+                        size,
+                        sha256: sha256.to_string(),
+                    },
+                    Duration::from_secs(60 * 60),
+                )
+                .await
+                .and_then(committed_result);
+            match result {
+                Ok(()) if self.fleetfiles.has_body(sha256, size) => return Ok(()),
+                Ok(()) => failures.push(format!("{} did not retain the body", short_id(&peer))),
+                Err(error) => failures.push(format!("{}: {error}", short_id(&peer))),
+            }
+        }
+        if failures.is_empty() {
+            Err("no online fleet member can supply this Fleetfiles body".into())
+        } else {
+            Err(format!(
+                "no reachable Fleetfiles replica supplied the body ({})",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    pub async fn fleetfiles_materialize(&self, path: String) -> Result<Value, String> {
+        if let Some(materialized) = self.fleetfiles.materialize(&path)? {
+            return Ok(json!({ "path": materialized }));
+        }
+        if let Some((version, size, sha256)) = self.fleetfiles.current_file_version(&path)? {
+            if sha256.is_empty() {
+                return Err("current Fleetfiles file has no content hash".into());
+            }
+            self.fetch_fleetfiles_body(&path, &version, size, &sha256)
+                .await?;
+        }
+        Ok(json!({ "path": self.fleetfiles.materialize(&path)? }))
+    }
+
+    pub async fn fleetfiles_restore_version(
+        &self,
+        path: String,
+        version: crate::fleetfiles::VersionStamp,
+    ) -> Result<Value, String> {
+        let (size, sha256) = self.fleetfiles.file_version(&path, &version)?;
+        self.fetch_fleetfiles_body(&path, &version, size, &sha256)
+            .await?;
+        Ok(json!({ "path": self.fleetfiles.restore_version(&path, &version)? }))
     }
 
     async fn local_may_manage_storage(&self) -> bool {
@@ -15615,7 +15773,7 @@ impl Mesh {
             .cloned()
     }
 
-    fn materialize_local_storage_root(&self, volume: &str) -> Result<(), String> {
+    fn materialize_local_storage_root(&self, volume: &str) -> Result<PathBuf, String> {
         let inventory = allmystuff_inventory::scan();
         let resource = inventory
             .storage
@@ -15644,23 +15802,40 @@ impl Mesh {
             }
         };
         crate::files::mark_internal_staging_hidden(&root)
-            .map_err(|error| format!("hide Fleetfiles storage root: {error}"))
+            .map_err(|error| format!("hide Fleetfiles storage root: {error}"))?;
+        Ok(root)
     }
 
     fn reconcile_local_storage_allocations(&self) {
         let Some(local) = self.local_node_id() else {
             return;
         };
-        for allocation in self.storage_plan.snapshot().allocations {
+        let snapshot = self.storage_plan.snapshot();
+        let usable_percent =
+            u64::from(100_u8.saturating_sub(snapshot.policy.value.reserve_percent));
+        let mut roots = Vec::new();
+        for allocation in snapshot.allocations {
             if allocation.enabled && same_node(&allocation.device, &local) {
-                if let Err(error) = self.materialize_local_storage_root(&allocation.volume) {
-                    tracing::warn!(
-                        "could not materialize local Fleetfiles allocation {}: {error}",
-                        allocation.id
-                    );
+                match self.materialize_local_storage_root(&allocation.volume) {
+                    Ok(root) => roots.push(StorageAllocationRoot {
+                        id: allocation.id,
+                        root,
+                        quota_bytes: allocation.quota_bytes.saturating_mul(usable_percent) / 100,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            "could not materialize local Fleetfiles allocation {}: {error}",
+                            allocation.id
+                        );
+                    }
                 }
             }
         }
+        self.fleetfiles.set_storage_allocations(
+            roots,
+            pubkey_part(&local).to_string(),
+            snapshot.policy.value.version_retention_days,
+        );
     }
 
     pub async fn fleet_storage_set_policy(
@@ -15716,6 +15891,7 @@ impl Mesh {
             quota_bytes,
             enabled,
         )?;
+        self.reconcile_local_storage_allocations();
         self.broadcast_storage_patch(None, vec![allocation.clone()], Vec::new())
             .await;
         self.sink.emit(
@@ -16834,11 +17010,79 @@ impl Mesh {
             DownloadSink {
                 file,
                 path: path.clone(),
+                completed_path: path.clone(),
+                cache_entry: None,
                 written: 0,
                 last_progress: std::time::Instant::now(),
             },
         );
         Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Register a remote file open against the private, bounded working-set
+    /// cache instead of the user's Downloads folder. `cache_key` identifies a
+    /// logical version (the GUI includes device, native identity, size, and
+    /// modification stamp), so a warm reopen can skip the transfer entirely.
+    pub fn file_open_cache(
+        &self,
+        route_id: String,
+        req: u64,
+        name: &str,
+        cache_key: &str,
+        expected_size: u64,
+    ) -> Result<Value, String> {
+        if cache_key.is_empty() || cache_key.len() > 32 * 1024 {
+            return Err("invalid open-cache identity".into());
+        }
+        let base = std::path::Path::new(name)
+            .file_name()
+            .map(|part| part.to_string_lossy().into_owned())
+            .filter(|part| !part.is_empty() && part != "." && part != "..")
+            .unwrap_or_else(|| "file".to_string());
+        let root = open_cache_root()?;
+        std::fs::create_dir_all(&root).map_err(|error| format!("create open cache: {error}"))?;
+        let mut hash = sha2::Sha256::new();
+        use sha2::Digest as _;
+        hash.update(cache_key.as_bytes());
+        let entry = root.join(format!("{:x}", hash.finalize()));
+        let completed = entry.join(&base);
+        if completed
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size)
+        {
+            touch_open_cache_entry(&entry)?;
+            prune_open_cache(&root, Some(&entry));
+            return Ok(json!({
+                "path": completed.to_string_lossy(),
+                "cached": true,
+            }));
+        }
+        if entry.exists() {
+            std::fs::remove_dir_all(&entry)
+                .map_err(|error| format!("replace stale open-cache entry: {error}"))?;
+        }
+        std::fs::create_dir_all(&entry)
+            .map_err(|error| format!("create open-cache entry: {error}"))?;
+        touch_open_cache_entry(&entry)?;
+        let staging = entry.join(".allmystuff.part");
+        let file = std::fs::File::create(&staging)
+            .map_err(|error| format!("create open-cache staging file: {error}"))?;
+        self.downloads.lock().insert(
+            (route_id, req),
+            DownloadSink {
+                file,
+                path: staging,
+                completed_path: completed.clone(),
+                cache_entry: Some(entry.clone()),
+                written: 0,
+                last_progress: std::time::Instant::now(),
+            },
+        );
+        prune_open_cache(&root, Some(&entry));
+        Ok(json!({
+            "path": completed.to_string_lossy(),
+            "cached": false,
+        }))
     }
 
     /// Stream one chunk into its registered download, if any. Returns
@@ -16850,7 +17094,10 @@ impl Mesh {
         let Some(sink) = self.downloads.lock().remove(&key) else {
             return false;
         };
-        let _ = std::fs::remove_file(sink.path);
+        let _ = std::fs::remove_file(&sink.path);
+        if let Some(entry) = sink.cache_entry {
+            let _ = std::fs::remove_dir(&entry);
+        }
         true
     }
 
@@ -16871,10 +17118,14 @@ impl Mesh {
             return false;
         };
         if let Err(e) = sink.file.write_all(data) {
-            let path = sink.path.clone();
-            map.remove(&key);
+            let failed = map.remove(&key);
             drop(map);
-            let _ = std::fs::remove_file(&path);
+            if let Some(failed) = failed {
+                let _ = std::fs::remove_file(&failed.path);
+                if let Some(entry) = failed.cache_entry {
+                    let _ = std::fs::remove_dir(&entry);
+                }
+            }
             self.sink.emit(
                 "allmystuff://file-saved",
                 json!({ "route": route_id, "req": req, "path": null, "error": e.to_string() }),
@@ -16888,11 +17139,35 @@ impl Mesh {
             };
             drop(map);
             let _ = sink.file.sync_all();
+            drop(sink.file);
+            let completed = if sink.path == sink.completed_path {
+                Ok(sink.completed_path.clone())
+            } else {
+                std::fs::rename(&sink.path, &sink.completed_path)
+                    .map(|()| sink.completed_path.clone())
+                    .map_err(|error| error.to_string())
+            };
+            let (path, error) = match completed {
+                Ok(path) => {
+                    if let Some(entry) = sink.cache_entry.as_ref() {
+                        let _ = touch_open_cache_entry(entry);
+                        if let Some(root) = entry.parent() {
+                            prune_open_cache(root, Some(entry));
+                        }
+                    }
+                    (Some(path), None)
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&sink.path);
+                    (None, Some(error))
+                }
+            };
             self.sink.emit(
                 "allmystuff://file-saved",
                 json!({
                     "route": route_id, "req": req,
-                    "path": sink.path.to_string_lossy(), "error": null,
+                    "path": path.map(|path| path.to_string_lossy().into_owned()),
+                    "error": error,
                 }),
             );
         } else if sink.last_progress.elapsed() >= std::time::Duration::from_millis(250) {
@@ -16918,6 +17193,9 @@ impl Mesh {
             return;
         };
         let _ = std::fs::remove_file(&sink.path);
+        if let Some(entry) = sink.cache_entry {
+            let _ = std::fs::remove_dir(&entry);
+        }
         self.sink.emit(
             "allmystuff://file-saved",
             json!({ "route": route_id, "req": req, "path": null, "error": reason }),
@@ -16936,6 +17214,9 @@ impl Mesh {
         for key in keys {
             if let Some(sink) = map.remove(&key) {
                 let _ = std::fs::remove_file(&sink.path);
+                if let Some(entry) = sink.cache_entry {
+                    let _ = std::fs::remove_dir(&entry);
+                }
             }
         }
     }
@@ -18666,6 +18947,7 @@ impl Mesh {
             .acquire()
             .await
             .map_err(|_| "Fleetfiles transfer scheduler stopped")?;
+        self.reconcile_local_storage_allocations();
         let actor = self
             .resolve_local_id()
             .await
@@ -18681,10 +18963,25 @@ impl Mesh {
 
         let local = self.local_node_id().unwrap_or_default();
         let plan = self.storage_plan.snapshot();
-        let local_is_replica = plan
+        let local_is_allocated = plan
             .allocations
             .iter()
             .any(|allocation| allocation.enabled && same_node(&allocation.device, &local));
+        let local_is_replica = if local_is_allocated {
+            match self.fleetfiles.persist_mutation_content(&mutation) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    tracing::warn!("could not place local Fleetfiles content: {error}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if local_is_replica {
+            self.fleetfiles
+                .record_replica_receipt(pubkey_part(&local), &mutation)?;
+        }
         let needed = usize::from(plan.policy.value.replicas.max(1))
             .saturating_sub(usize::from(local_is_replica));
         let evidence = self
@@ -18733,13 +19030,47 @@ impl Mesh {
                 targets.len()
             );
         }
+        for target in &targets {
+            self.fleetfiles.queue_for(target, &mutation)?;
+        }
+
+        // Namespace and history are universal fleet knowledge. This fan-out is
+        // deliberately independent of the storage plan: a laptop with no
+        // allocated volume still knows every logical path and version.
+        let metadata = FleetfilesMetadata::from_mutation(&mutation);
+        let roster = self.fleet_roster_value().await;
+        let mut metadata_targets = roster
+            .get("members")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|member| member.get("device").and_then(Value::as_str))
+            .map(|device| pubkey_part(device).to_string())
+            .filter(|device| !device.is_empty() && !same_node(device, &local))
+            .collect::<std::collections::BTreeSet<_>>();
+        for member in self.ownership.fleet_member_ids() {
+            let member = pubkey_part(&member).to_string();
+            if !member.is_empty() && !same_node(&member, &local) {
+                metadata_targets.insert(member);
+            }
+        }
+        for target in &metadata_targets {
+            self.fleetfiles.queue_metadata(target, &metadata)?;
+            let online = evidence
+                .get(pubkey_part(target))
+                .is_some_and(|(online, _)| *online);
+            if online && self.peer_supports_feature(target, FEATURE_FLEETFILES_LEDGER) {
+                self.send_fleetfiles_metadata(target, &metadata).await?;
+                self.fleetfiles.acknowledge_metadata(target, &metadata)?;
+            }
+        }
         for target in targets {
-            self.fleetfiles.queue_for(&target, &mutation)?;
             let online = evidence
                 .get(pubkey_part(&target))
                 .is_some_and(|(online, _)| *online);
             if online {
                 self.send_fleetfiles_mutation(&target, &mutation).await?;
+                self.fleetfiles.record_replica_receipt(&target, &mutation)?;
                 self.fleetfiles.acknowledge(&target, &mutation)?;
             }
         }
@@ -18747,7 +19078,8 @@ impl Mesh {
     }
     /// Drain only when presence tells us the peer is reachable. The per-peer
     /// guard prevents duplicate presence frames from creating overlapping
-    /// sends, and the item limit bounds work per appearance without polling.
+    /// sends. Work is page-bounded and yielded, but continues until the
+    /// durable backlog is empty or reachability/policy pauses it.
     fn schedule_fleetfiles_drain(self: &Arc<Self>, peer: &str) {
         let target = pubkey_part(peer).to_string();
         if target.is_empty() || !self.fleetfiles_draining.lock().insert(target.clone()) {
@@ -18766,7 +19098,7 @@ impl Mesh {
     }
 
     async fn drain_fleetfiles_queue(&self, target: &str) -> Result<(), String> {
-        const MAX_PER_APPEARANCE: usize = 32;
+        const BATCH: usize = 32;
         let local = self.local_node_id().unwrap_or_default();
         let allocated = self
             .storage_plan
@@ -18778,26 +19110,290 @@ impl Mesh {
                     && !same_node(&allocation.device, &local)
                     && same_node(&allocation.device, target)
             });
-        if !allocated {
-            return Ok(());
-        }
         let _permit = self
             .fleetfiles_transfer_gate
             .acquire()
             .await
             .map_err(|_| "Fleetfiles transfer scheduler stopped")?;
-        for mutation in self.fleetfiles.pending_for(target, MAX_PER_APPEARANCE)? {
-            self.send_fleetfiles_mutation(target, &mutation).await?;
-            self.fleetfiles.acknowledge(target, &mutation)?;
-            tokio::task::yield_now().await;
+        let supports_ledger = self.peer_supports_feature(target, FEATURE_FLEETFILES_LEDGER);
+        if supports_ledger {
+            loop {
+                let pending = self.fleetfiles.pending_metadata(target, BATCH)?;
+                if pending.is_empty() {
+                    break;
+                }
+                let mut batch = Vec::new();
+                let mut encoded = 0_usize;
+                for metadata in &pending {
+                    let bytes = serde_json::to_vec(metadata)
+                        .map_err(|error| format!("encode Fleetfiles metadata queue: {error}"))?
+                        .len();
+                    if !batch.is_empty() && encoded.saturating_add(bytes) > 32 * 1024 {
+                        break;
+                    }
+                    encoded = encoded.saturating_add(bytes);
+                    batch.push(metadata.clone());
+                }
+                let operation = format!(
+                    "metadata-drain-{}-{}",
+                    unix_now_ms(),
+                    self.file_seq.fetch_add(1, Ordering::Relaxed)
+                );
+                let message = FleetfilesMessage::LedgerApply {
+                    operation: operation.clone(),
+                    entries: batch.clone(),
+                };
+                self.pace_fleetfiles_metadata(target, encoded).await;
+                let reply = self
+                    .send_fleetfiles_and_wait(target, &operation, message, Duration::from_secs(30))
+                    .await?;
+                committed_result(reply)?;
+                for metadata in &batch {
+                    self.fleetfiles.acknowledge_metadata(target, metadata)?;
+                }
+                tokio::task::yield_now().await;
+                if pending.len() < BATCH && batch.len() == pending.len() {
+                    break;
+                }
+            }
+        }
+        if !allocated {
+            if supports_ledger {
+                self.reconcile_fleetfiles_ledger(target).await?;
+            }
+            return Ok(());
+        }
+        loop {
+            let pending = self.fleetfiles.pending_for(target, BATCH)?;
+            if pending.is_empty() {
+                break;
+            }
+            for mutation in &pending {
+                self.send_fleetfiles_mutation(target, mutation).await?;
+                self.fleetfiles.record_replica_receipt(target, mutation)?;
+                self.fleetfiles.acknowledge(target, mutation)?;
+                tokio::task::yield_now().await;
+            }
+            if pending.len() < BATCH {
+                break;
+            }
+        }
+        if supports_ledger {
+            self.reconcile_fleetfiles_ledger(target).await?;
         }
         Ok(())
+    }
+
+    async fn reconcile_fleetfiles_ledger(&self, peer: &str) -> Result<(), String> {
+        const PAGE: usize = 64;
+        let mut pulled = 0_u64;
+        let mut pushed = 0_u64;
+        let mut wire_bytes = 0_u64;
+        for pass in 0..3_u8 {
+            let local = self.fleetfiles.ledger_digest()?;
+            let probe = format!(
+                "ledger-probe-{}-{}-{pass}",
+                unix_now_ms(),
+                self.file_seq.fetch_add(1, Ordering::Relaxed)
+            );
+            let response = self
+                .send_fleetfiles_and_wait(
+                    peer,
+                    &probe,
+                    FleetfilesMessage::LedgerProbe {
+                        operation: probe.clone(),
+                        digest: local.clone(),
+                    },
+                    Duration::from_secs(30),
+                )
+                .await?;
+            let remote = match response {
+                FleetfilesMessage::LedgerStatus { digest, .. } => digest,
+                _ => return Err("Fleetfiles peer sent the wrong ledger response".into()),
+            };
+            if remote == local {
+                if pulled > 0 || pushed > 0 {
+                    tracing::info!(
+                        "Fleetfiles ledger reconciled with {}: pulled {pulled}, pushed {pushed}, {} encoded bytes",
+                        short_id(peer),
+                        wire_bytes
+                    );
+                }
+                return Ok(());
+            }
+
+            // Entry counts make the common exceptional cases directional:
+            // a new/lagging peer pulls, while a peer missing our tail gets a
+            // push. Equal-count divergence still exchanges both directions.
+            let pull_first = remote.entries >= local.entries;
+            if pull_first {
+                let mut after: Option<FleetfilesLedgerCursor> = None;
+                loop {
+                    let operation = format!(
+                        "ledger-pull-{}-{}",
+                        unix_now_ms(),
+                        self.file_seq.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let response = self
+                        .send_fleetfiles_and_wait(
+                            peer,
+                            &operation,
+                            FleetfilesMessage::LedgerPageRequest {
+                                operation: operation.clone(),
+                                after: after.clone(),
+                                limit: PAGE as u16,
+                            },
+                            Duration::from_secs(30),
+                        )
+                        .await?;
+                    let encoded = serde_json::to_vec(&response)
+                        .map_err(|error| format!("encode Fleetfiles ledger response: {error}"))?
+                        .len();
+                    let (entries, next_cursor) = match response {
+                        FleetfilesMessage::LedgerPage {
+                            entries,
+                            next_cursor,
+                            ..
+                        } => (entries, next_cursor),
+                        _ => return Err("Fleetfiles peer sent the wrong ledger page".into()),
+                    };
+                    pulled = pulled.saturating_add(entries.len() as u64);
+                    wire_bytes = wire_bytes.saturating_add(encoded as u64);
+                    for metadata in entries {
+                        self.fleetfiles.apply_metadata(&metadata)?;
+                    }
+                    after = next_cursor;
+                    if after.is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            let after_pull = self.fleetfiles.ledger_digest()?;
+            let needs_push = !pull_first || after_pull != remote;
+            if needs_push {
+                let mut after: Option<FleetfilesLedgerCursor> = None;
+                loop {
+                    let page = self.fleetfiles.ledger_page(after.as_ref(), PAGE)?;
+                    if !page.entries.is_empty() {
+                        let entries = page.entries.len();
+                        let operation = format!(
+                            "ledger-push-{}-{}",
+                            unix_now_ms(),
+                            self.file_seq.fetch_add(1, Ordering::Relaxed)
+                        );
+                        let message = FleetfilesMessage::LedgerApply {
+                            operation: operation.clone(),
+                            entries: page.entries,
+                        };
+                        let bytes = serde_json::to_vec(&message)
+                            .map_err(|error| format!("encode Fleetfiles ledger page: {error}"))?
+                            .len();
+                        self.pace_fleetfiles_metadata(peer, bytes).await;
+                        let reply = self
+                            .send_fleetfiles_and_wait(
+                                peer,
+                                &operation,
+                                message,
+                                Duration::from_secs(30),
+                            )
+                            .await?;
+                        committed_result(reply)?;
+                        pushed = pushed.saturating_add(entries as u64);
+                        wire_bytes = wire_bytes.saturating_add(bytes as u64);
+                    }
+                    after = page.next_cursor;
+                    if after.is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        Err("Fleetfiles version ledger changed continuously during reconciliation".into())
+    }
+
+    fn fleetfiles_link_class(&self, peer: &str) -> crate::video::LinkClass {
+        self.state
+            .lock()
+            .peer_links
+            .get(pubkey_part(peer))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    async fn pace_fleetfiles_metadata(&self, peer: &str, bytes: usize) {
+        if self.fleetfiles_link_class(peer) == crate::video::LinkClass::Lan {
+            return;
+        }
+        const WAN_METADATA_BPS: f64 = 512.0 * 1024.0;
+        let seconds = bytes as f64 / WAN_METADATA_BPS;
+        if seconds > 0.001 {
+            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+        }
+    }
+
+    async fn pace_fleetfiles_content(&self, peer: &str, bytes: usize) -> Result<(), String> {
+        if self.fleetfiles_link_class(peer) == crate::video::LinkClass::Lan {
+            return Ok(());
+        }
+        let gib_per_day = self
+            .storage_plan
+            .snapshot()
+            .policy
+            .value
+            .rebalance_gib_per_day;
+        if gib_per_day == 0 {
+            return Err("Fleetfiles background replication is paused off-LAN by policy".into());
+        }
+        // The transfer semaphore admits at most two background streams. Give
+        // each half the configured daily rebalance budget so aggregate WAN
+        // traffic remains under the policy even at full concurrency.
+        let bytes_per_second = f64::from(gib_per_day) * 1024.0 * 1024.0 * 1024.0 / 86_400.0 / 2.0;
+        let seconds = bytes as f64 / bytes_per_second.max(1.0);
+        if seconds > 0.001 {
+            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+        }
+        Ok(())
+    }
+
+    async fn send_fleetfiles_metadata(
+        &self,
+        peer: &str,
+        metadata: &FleetfilesMetadata,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(metadata)
+            .map_err(|error| format!("encode Fleetfiles metadata: {error}"))?
+            .len();
+        self.pace_fleetfiles_metadata(peer, bytes).await;
+        let reply = self
+            .send_fleetfiles_and_wait(
+                peer,
+                &metadata.operation,
+                FleetfilesMessage::Metadata {
+                    metadata: metadata.clone(),
+                },
+                Duration::from_secs(30),
+            )
+            .await?;
+        committed_result(reply)
     }
 
     async fn send_fleetfiles_mutation(
         &self,
         peer: &str,
         mutation: &LocalMutation,
+    ) -> Result<(), String> {
+        self.send_fleetfiles_mutation_with_cache(peer, mutation, false)
+            .await
+    }
+
+    async fn send_fleetfiles_mutation_with_cache(
+        &self,
+        peer: &str,
+        mutation: &LocalMutation,
+        cache_only: bool,
     ) -> Result<(), String> {
         match mutation {
             LocalMutation::Directory {
@@ -18846,6 +19442,9 @@ impl Mesh {
                 sha256,
                 source,
             } => {
+                if !cache_only {
+                    self.pace_fleetfiles_content(peer, 0).await?;
+                }
                 let ready = self
                     .send_fleetfiles_and_wait(
                         peer,
@@ -18856,6 +19455,7 @@ impl Mesh {
                             path: path.clone(),
                             size: *size,
                             sha256: sha256.clone(),
+                            cache_only,
                         },
                         Duration::from_secs(10),
                     )
@@ -18880,6 +19480,9 @@ impl Mesh {
 
                 let mut reader = ChunkReader::open(source)?;
                 while let Some((offset, data)) = reader.next_chunk()? {
+                    if !cache_only {
+                        self.pace_fleetfiles_content(peer, data.len()).await?;
+                    }
                     self.send_fleetfiles_message(
                         peer,
                         FleetfilesMessage::FileChunk {
@@ -18980,9 +19583,16 @@ impl Mesh {
             .any(|allocation| allocation.enabled && same_node(&allocation.device, &local))
     }
 
-    async fn handle_fleetfiles_message(&self, from: &str, message: FleetfilesMessage) {
+    async fn handle_fleetfiles_message(self: &Arc<Self>, from: &str, message: FleetfilesMessage) {
         let operation = match &message {
-            FleetfilesMessage::FileBegin { operation, .. }
+            FleetfilesMessage::Metadata { metadata } => metadata.operation.clone(),
+            FleetfilesMessage::LedgerProbe { operation, .. }
+            | FleetfilesMessage::LedgerStatus { operation, .. }
+            | FleetfilesMessage::LedgerPageRequest { operation, .. }
+            | FleetfilesMessage::LedgerPage { operation, .. }
+            | FleetfilesMessage::LedgerApply { operation, .. }
+            | FleetfilesMessage::BodyRequest { operation, .. }
+            | FleetfilesMessage::FileBegin { operation, .. }
             | FleetfilesMessage::FileChunk { operation, .. }
             | FleetfilesMessage::FileCommit { operation }
             | FleetfilesMessage::Directory { operation, .. }
@@ -18993,7 +19603,10 @@ impl Mesh {
 
         if matches!(
             message,
-            FleetfilesMessage::Ready { .. } | FleetfilesMessage::Committed { .. }
+            FleetfilesMessage::Ready { .. }
+                | FleetfilesMessage::Committed { .. }
+                | FleetfilesMessage::LedgerStatus { .. }
+                | FleetfilesMessage::LedgerPage { .. }
         ) {
             let key = (pubkey_part(from).to_string(), operation.clone());
             if let Some(waiter) = self.fleetfiles_waiters.lock().remove(&key) {
@@ -19007,25 +19620,145 @@ impl Mesh {
             return;
         }
 
+        if let FleetfilesMessage::LedgerProbe { .. } = message {
+            let result = self.fleetfiles.ledger_digest();
+            let reply = match result {
+                Ok(digest) => FleetfilesMessage::LedgerStatus { operation, digest },
+                Err(error) => FleetfilesMessage::Committed {
+                    operation,
+                    accepted: false,
+                    detail: Some(error),
+                },
+            };
+            let _ = self.send_fleetfiles_message(from, reply).await;
+            return;
+        }
+
+        if let FleetfilesMessage::LedgerPageRequest { after, limit, .. } = message {
+            let result = self
+                .fleetfiles
+                .ledger_page(after.as_ref(), usize::from(limit));
+            let reply = match result {
+                Ok(page) => FleetfilesMessage::LedgerPage {
+                    operation,
+                    entries: page.entries,
+                    next_cursor: page.next_cursor,
+                },
+                Err(error) => FleetfilesMessage::Committed {
+                    operation,
+                    accepted: false,
+                    detail: Some(error),
+                },
+            };
+            let bytes = serde_json::to_vec(&reply)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            self.pace_fleetfiles_metadata(from, bytes).await;
+            let _ = self.send_fleetfiles_message(from, reply).await;
+            return;
+        }
+
+        if let FleetfilesMessage::LedgerApply { entries, .. } = message {
+            let result = if entries.len() > 128 {
+                Err("Fleetfiles ledger apply exceeds the bounded page size".into())
+            } else {
+                entries
+                    .iter()
+                    .try_for_each(|metadata| self.fleetfiles.apply_metadata(metadata).map(|_| ()))
+            };
+            let _ = self
+                .send_fleetfiles_message(
+                    from,
+                    FleetfilesMessage::Committed {
+                        operation,
+                        accepted: result.is_ok(),
+                        detail: result.err(),
+                    },
+                )
+                .await;
+            return;
+        }
+
+        if let FleetfilesMessage::Metadata { metadata } = message {
+            let result = self.fleetfiles.apply_metadata(&metadata);
+            let _ = self
+                .send_fleetfiles_message(
+                    from,
+                    FleetfilesMessage::Committed {
+                        operation,
+                        accepted: result.is_ok(),
+                        detail: result.err(),
+                    },
+                )
+                .await;
+            return;
+        }
+
+        if let FleetfilesMessage::BodyRequest {
+            path,
+            version,
+            size,
+            sha256,
+            ..
+        } = message
+        {
+            let mesh = self.clone();
+            let peer = from.to_string();
+            crate::spawn(async move {
+                let transfer_operation = format!("{operation}-body");
+                let result = match mesh.fleetfiles.body_mutation(
+                    transfer_operation,
+                    &path,
+                    &version,
+                    size,
+                    &sha256,
+                ) {
+                    Ok(mutation) => {
+                        mesh.send_fleetfiles_mutation_with_cache(&peer, &mutation, true)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = mesh
+                    .send_fleetfiles_message(
+                        &peer,
+                        FleetfilesMessage::Committed {
+                            operation,
+                            accepted: result.is_ok(),
+                            detail: result.err(),
+                        },
+                    )
+                    .await;
+            });
+            return;
+        }
+
+        self.reconcile_local_storage_allocations();
         if !self.local_has_fleetfiles_allocation() {
-            let reply = match message {
-                FleetfilesMessage::FileBegin { .. } => Some(FleetfilesMessage::Ready {
+            let reply = match &message {
+                FleetfilesMessage::FileBegin {
+                    cache_only: false, ..
+                } => Some(FleetfilesMessage::Ready {
                     operation,
                     accepted: false,
                     needs_content: false,
                     detail: Some("this device has no enabled Fleetfiles storage allocation".into()),
                 }),
-                FleetfilesMessage::FileChunk { .. } => None,
-                _ => Some(FleetfilesMessage::Committed {
-                    operation,
-                    accepted: false,
-                    detail: Some("this device has no enabled Fleetfiles storage allocation".into()),
-                }),
+                FleetfilesMessage::Directory { .. } | FleetfilesMessage::Delete { .. } => {
+                    Some(FleetfilesMessage::Committed {
+                        operation,
+                        accepted: false,
+                        detail: Some(
+                            "this device has no enabled Fleetfiles storage allocation".into(),
+                        ),
+                    })
+                }
+                _ => None,
             };
             if let Some(reply) = reply {
                 let _ = self.send_fleetfiles_message(from, reply).await;
+                return;
             }
-            return;
         }
 
         match message {
@@ -19035,14 +19768,15 @@ impl Mesh {
                 path,
                 size,
                 sha256,
+                cache_only,
             } => {
                 let result = self.fleetfiles.begin_file(
                     from,
                     operation.clone(),
                     version,
                     path,
-                    size,
-                    sha256,
+                    (size, sha256),
+                    cache_only,
                 );
                 let (accepted, needs_content, detail) = match result {
                     Ok(needs_content) => (true, needs_content, None),
@@ -19119,7 +19853,15 @@ impl Mesh {
                     )
                     .await;
             }
-            FleetfilesMessage::Ready { .. } | FleetfilesMessage::Committed { .. } => unreachable!(),
+            FleetfilesMessage::Metadata { .. }
+            | FleetfilesMessage::LedgerProbe { .. }
+            | FleetfilesMessage::LedgerStatus { .. }
+            | FleetfilesMessage::LedgerPageRequest { .. }
+            | FleetfilesMessage::LedgerPage { .. }
+            | FleetfilesMessage::LedgerApply { .. }
+            | FleetfilesMessage::BodyRequest { .. }
+            | FleetfilesMessage::Ready { .. }
+            | FleetfilesMessage::Committed { .. } => unreachable!(),
         }
     }
 
@@ -20172,6 +20914,91 @@ fn privileged_offer_refusal(route: &Route, hosts_here: bool, authorized: bool) -
         return Some("not authorized: site access needs owner/fleet or a share".into());
     }
     None
+}
+
+const OPEN_CACHE_MAX_ENTRIES: usize = 128;
+const OPEN_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const OPEN_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn open_cache_root() -> Result<PathBuf, String> {
+    dirs::cache_dir()
+        .or_else(|| std::env::temp_dir().canonicalize().ok())
+        .map(|root| {
+            root.join("AllMyStuff")
+                .join("Fleetfiles")
+                .join("open-cache-v1")
+        })
+        .ok_or_else(|| "no private cache directory is available".to_string())
+}
+
+fn touch_open_cache_entry(entry: &Path) -> Result<(), String> {
+    std::fs::write(entry.join(".access"), unix_now_ms().to_string())
+        .map_err(|error| format!("update open-cache access time: {error}"))
+}
+
+#[derive(Debug)]
+struct OpenCacheEntry {
+    path: PathBuf,
+    accessed: SystemTime,
+    bytes: u64,
+}
+
+/// Enforce a hard count, byte, and age budget over remote files opened for
+/// viewing. Failure to remove a busy file is harmless: it remains accounted
+/// and the next open/launch retries pruning instead of deleting an in-use
+/// working copy.
+fn prune_open_cache(root: &Path, protected: Option<&Path>) {
+    let Ok(children) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries = Vec::new();
+    for child in children.flatten() {
+        let path = child.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let accessed = path
+            .join(".access")
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let bytes = std::fs::read_dir(&path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|item| item.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .fold(0_u64, |total, metadata| {
+                total.saturating_add(metadata.len())
+            });
+        entries.push(OpenCacheEntry {
+            path,
+            accessed,
+            bytes,
+        });
+    }
+    entries.sort_by_key(|entry| entry.accessed);
+    let now = SystemTime::now();
+    let mut total_bytes = entries
+        .iter()
+        .fold(0_u64, |total, entry| total.saturating_add(entry.bytes));
+    let mut total_entries = entries.len();
+    for entry in entries {
+        let expired = now
+            .duration_since(entry.accessed)
+            .is_ok_and(|age| age > OPEN_CACHE_MAX_AGE);
+        let over_budget =
+            total_entries > OPEN_CACHE_MAX_ENTRIES || total_bytes > OPEN_CACHE_MAX_BYTES;
+        if (!expired && !over_budget) || protected.is_some_and(|protected| protected == entry.path)
+        {
+            continue;
+        }
+        if std::fs::remove_dir_all(&entry.path).is_ok() {
+            total_entries = total_entries.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(entry.bytes);
+        }
+    }
 }
 
 /// `dir/name`, made unique the Finder way: `name (2).ext`, `name (3).ext`…
@@ -23084,6 +23911,41 @@ mod tests {
         std::fs::write(dir.join("noext"), b"x").unwrap();
         assert_eq!(unique_path(&dir, "noext"), dir.join("noext (2)"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_cache_prunes_oldest_entries_but_never_the_active_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "amst-open-cache-test-{}-{}",
+            std::process::id(),
+            fresh_boot_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let protected = root.join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join(".access"), b"now").unwrap();
+        std::fs::write(protected.join(".allmystuff.part"), b"active").unwrap();
+
+        for index in 0..OPEN_CACHE_MAX_ENTRIES {
+            let entry = root.join(format!("old-{index:03}"));
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join(".access"), b"recent").unwrap();
+            std::fs::write(entry.join("payload"), b"cached").unwrap();
+        }
+
+        prune_open_cache(&root, Some(&protected));
+
+        assert!(
+            protected.is_dir(),
+            "the active transfer must remain protected"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            OPEN_CACHE_MAX_ENTRIES,
+            "the cache count must be brought back under its hard budget"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

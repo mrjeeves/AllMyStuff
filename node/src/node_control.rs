@@ -1389,6 +1389,33 @@ pub async fn dispatch(
         }
         "fleet_service_profiles" => DispatchOut::Json(mesh.fleet_service_profiles()),
         "fleet_storage_status" => DispatchOut::Json(mesh.fleet_storage_status()),
+        "fleetfiles_logical_list" => {
+            let parent: String = try_arg!(arg(a, "parent"));
+            let cursor: Option<String> = try_arg!(opt(a, "cursor"));
+            let limit: usize = try_arg!(arg(a, "limit"));
+            json_result(mesh.fleetfiles_logical_list(parent, cursor, limit))
+        }
+        "fleetfiles_logical_search" => {
+            let query: String = try_arg!(arg(a, "query"));
+            let cursor: Option<String> = try_arg!(opt(a, "cursor"));
+            let limit: usize = try_arg!(arg(a, "limit"));
+            json_result(mesh.fleetfiles_logical_search(query, cursor, limit))
+        }
+        "fleetfiles_version_history" => {
+            let path: String = try_arg!(arg(a, "path"));
+            let cursor: Option<String> = try_arg!(opt(a, "cursor"));
+            let limit: usize = try_arg!(arg(a, "limit"));
+            json_result(mesh.fleetfiles_version_history(path, cursor, limit))
+        }
+        "fleetfiles_materialize" => {
+            let path: String = try_arg!(arg(a, "path"));
+            json_result(mesh.fleetfiles_materialize(path).await)
+        }
+        "fleetfiles_restore_version" => {
+            let path: String = try_arg!(arg(a, "path"));
+            let version: crate::fleetfiles::VersionStamp = try_arg!(arg(a, "version"));
+            json_result(mesh.fleetfiles_restore_version(path, version).await)
+        }
         "file_transfer_operations" => DispatchOut::Json(mesh.file_transfer_operations()),
         "fleetfiles_local_desktop" => json_result(mesh.fleetfiles_local_desktop()),
         "fleet_storage_set_policy" => {
@@ -1430,6 +1457,14 @@ pub async fn dispatch(
             let req_id: u64 = try_arg!(arg(a, "req"));
             let name: String = try_arg!(arg(a, "name"));
             json_result(mesh.file_download(route_id, req_id, &name))
+        }
+        "file_open_cache" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            let req_id: u64 = try_arg!(arg(a, "req"));
+            let name: String = try_arg!(arg(a, "name"));
+            let cache_key: String = try_arg!(arg(a, "cache_key"));
+            let expected_size: u64 = try_arg!(arg(a, "expected_size"));
+            json_result(mesh.file_open_cache(route_id, req_id, &name, &cache_key, expected_size))
         }
         "file_download_cancel" => {
             let route_id: String = try_arg!(arg(a, "route_id"));

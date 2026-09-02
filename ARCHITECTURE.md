@@ -821,6 +821,16 @@ carries traffic when something happens, never on a timer. The fleet roster
 (it holds the grouping key) is only ever *handed* to fleet members; presence
 goes to everyone.
 
+Fleetfiles keeps its logical current-path table, append-only version ledger,
+durable per-peer metadata/content queues, verified replica receipts, and local
+allocation/cache records in allmystuff-fleetfiles.sqlite3. Immutable bodies
+live below enabled allocation roots in content-v1; bounded open/restore cache
+and exact offline-send snapshots live below the hidden Fleetfiles working
+staging directory. Peer presence drives queue drain and digest/page
+anti-entropy—there is no Fleetfiles polling timer. See
+[Fleetfiles current implementation](docs/FLEETFILES-IMPLEMENTATION.md) for the
+data flow, history policy, and LAN/WAN traffic budgets.
+
 ## Deeper references
 
 This document describes the current process and crate boundaries. Narrower
@@ -828,6 +838,9 @@ designs live beside it:
 
 - [Native drive mapping](docs/DRIVE-MAPPING.md) covers desktop mounts, mapping
   lifecycle, authorization, and KVM install media.
+- [Fleetfiles current implementation](docs/FLEETFILES-IMPLEMENTATION.md)
+  covers the logical namespace, version history, content placement, reconnect
+  recovery, and traffic bounds implemented today.
 - [Mobile architecture](docs/MOBILE.md) covers the in-process mobile runtime
   and current launch gaps.
 - [Performance roadmap](PERFORMANCE-ROADMAP.md) tracks video-pipeline work that

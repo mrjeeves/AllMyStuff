@@ -84,8 +84,38 @@ power menu, and install-media controls when your relationship permits them.
 
 ## Files and drives
 
-**Files** is the in-app browser. Use it to inspect, preview, upload, download,
-rename, or remove files on a machine that has granted Files access.
+**Files** is the middle app mode and the normal home of **Fleetfiles**, your
+fleet-wide logical filesystem. Fleetfiles paths do not name a computer. The app
+keeps namespace and version knowledge on the fleet, places verified file bodies
+on allocated storage, and retrieves only the bodies you open when they are not
+already available locally.
+
+The Navigator starts at **Fleetfiles**. Use its folder tree without thinking
+about physical placement. Choose **Local copies** only when you deliberately
+want to inspect one device's native working tree; that view expands Devices and
+shows a **Local copies only** banner so it cannot be mistaken for the whole
+fleet.
+
+The search chevron switches between **Search this Folder** and **Search
+Fleetfiles**. Fleetfiles search queries the indexed logical namespace across
+folders without reading file bodies. Search results and large folders load
+bounded pages as you scroll, with no result-count cutoff, and the main view
+virtualizes what it renders. Recent items remain compact in the sidebar.
+
+Right-click a logical file and choose **Version History** to see retained
+versions. **Restore as current** fetches the exact verified body from an online
+fleet member when necessary, then creates a new current version rather than
+destroying later history. History defaults to 30 days, keeps current files
+first, and uses available allocated space beyond the retention target when it
+can. A dot on the Files mode button warns when the fleet is low on protected
+usable Files space.
+
+The implementation and traffic budgets are documented in
+[Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md).
+
+Files also browses explicit remote-machine grants. Use those device/local-copy
+surfaces to inspect, preview, upload, download, rename, or remove files on a
+machine that has granted Files access.
 
 **Drives** creates an operating-system mount. The result is a real drive letter
 in Windows, a mounted volume on macOS, or a filesystem mount point on Linux.

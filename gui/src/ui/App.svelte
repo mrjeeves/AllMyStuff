@@ -15,7 +15,9 @@
     consoleWindowTarget,
     filesWindowTarget,
     filesWorkspaceWindowTarget,
+    fleetStorageStatus,
     isCecWindow,
+    onFleetStorage,
     roomWindowTarget,
     setWindowTitle,
     terminalWindowTarget,
@@ -73,6 +75,42 @@
   // The refresh button only spins briefly on click — the real progress lives in
   // the 3-step panel that floats over the graph (driven by app.restartFlow).
   let refreshSpin = $state(false);
+  let filesStorageAttention = $state<string | null>(null);
+
+  function applyFleetStorageHealth(status: Awaited<ReturnType<typeof fleetStorageStatus>>) {
+    const policy = status.plan.policy.value;
+    const enabled = status.plan.allocations.filter((allocation) => allocation.enabled);
+    const failureDomains = new Set(enabled.map((allocation) => allocation.device)).size;
+    const used = status.logicalUsedBytes ?? 0;
+    const capacity = status.protectedCapacityBytes ?? 0;
+    if (enabled.length === 0) {
+      filesStorageAttention = used > 0
+        ? "Fleetfiles has data but no protected fleet storage is allocated"
+        : null;
+      return;
+    }
+    if (failureDomains < policy.replicas) {
+      filesStorageAttention = `Fleetfiles needs ${policy.replicas} device copies; only ${failureDomains} storage target${failureDomains === 1 ? " is" : "s are"} available`;
+      return;
+    }
+    const remaining = Math.max(0, capacity - used);
+    if (capacity > 0 && used >= capacity) {
+      filesStorageAttention = "Fleetfiles protected capacity is full";
+    } else if (capacity > 0 && remaining / capacity <= 0.15) {
+      filesStorageAttention = "Fleetfiles protected capacity is running low";
+    } else {
+      filesStorageAttention = null;
+    }
+  }
+
+  async function refreshFleetStorageHealth() {
+    try {
+      applyFleetStorageHealth(await fleetStorageStatus());
+    } catch {
+      // Backend startup and dedicated web previews can race this optional
+      // indicator. The next storage event or window focus refreshes it.
+    }
+  }
   function refresh() {
     refreshSpin = true;
     setTimeout(() => (refreshSpin = false), 650);
@@ -99,6 +137,17 @@
     // backend is here; otherwise the demo graph stands in so the app is
     // never empty.
     void app.init();
+    let mounted = true;
+    let stopFleetStorage = () => {};
+    const refreshStorageOnFocus = () => { void refreshFleetStorageHealth(); };
+    window.addEventListener("focus", refreshStorageOnFocus);
+    void refreshFleetStorageHealth();
+    void onFleetStorage(() => {
+      if (mounted) void refreshFleetStorageHealth();
+    }).then((unlisten) => {
+      if (!mounted) unlisten();
+      else stopFleetStorage = unlisten;
+    });
 
     // Surface the running version like MyOwnMesh / MyOwnLLM — in the brand
     // and stamped into the window title.
@@ -108,6 +157,11 @@
         void setWindowTitle(`AllMyStuff ${v}`);
       }
     });
+    return () => {
+      mounted = false;
+      stopFleetStorage();
+      window.removeEventListener("focus", refreshStorageOnFocus);
+    };
   });
 
   // The secret handshake that reveals the CEC Support technician tab:
@@ -197,10 +251,11 @@
       ] as choice}
         <button
           class:lit={app.uiMode === choice[0]}
+          class:fleet-low={choice[0] === "files" && filesStorageAttention !== null}
           aria-pressed={app.uiMode === choice[0]}
-          title={choice[2]}
+          title={choice[0] === "files" && filesStorageAttention ? filesStorageAttention : choice[2]}
           onclick={() => app.setUiMode(choice[0] as "normal" | "files" | "advanced")}
-        >{choice[1]}</button>
+        >{choice[1]}{#if choice[0] === "files" && filesStorageAttention}<span class="fleet-low-dot" aria-label={filesStorageAttention}></span>{/if}</button>
       {/each}
     </div>
 
@@ -379,6 +434,7 @@
     box-shadow: var(--shadow-sm);
   }
   .experience-toggle button {
+    position: relative;
     min-width: 4.2rem;
     padding: 0.32rem 0.5rem;
     border-radius: var(--r-sm);
@@ -398,6 +454,9 @@
     background: var(--accent-soft);
     box-shadow: inset 0 1px 4px oklch(0 0 0 / 0.28);
   }
+  .experience-toggle button.fleet-low { opacity: .9; }
+  .experience-toggle button.fleet-low.lit { box-shadow: inset 0 1px 4px oklch(0 0 0 / 0.28), 0 0 0 1px color-mix(in oklab, var(--danger) 55%, transparent); }
+  .fleet-low-dot { position: absolute; top: .24rem; right: .24rem; width: .38rem; height: .38rem; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 2px var(--surface), 0 0 7px color-mix(in oklab, var(--danger) 70%, transparent); }
   .net-anchor {
     position: relative;
     display: inline-flex;

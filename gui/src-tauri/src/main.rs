@@ -2384,6 +2384,82 @@ async fn fleet_storage_status(state: State<'_, AppState>) -> Result<Value, Strin
 }
 
 #[tauri::command]
+async fn fleetfiles_logical_list(
+    state: State<'_, AppState>,
+    parent: String,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleetfiles_logical_list",
+            json!({ "parent": parent, "cursor": cursor, "limit": limit }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_logical_search(
+    state: State<'_, AppState>,
+    query: String,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleetfiles_logical_search",
+            json!({ "query": query, "cursor": cursor, "limit": limit }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_version_history(
+    state: State<'_, AppState>,
+    path: String,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleetfiles_version_history",
+            json!({ "path": path, "cursor": cursor, "limit": limit }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_materialize(state: State<'_, AppState>, path: String) -> Result<Value, String> {
+    state
+        .node
+        .request("fleetfiles_materialize", json!({ "path": path }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fleetfiles_restore_version(
+    state: State<'_, AppState>,
+    path: String,
+    version: Value,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "fleetfiles_restore_version",
+            json!({ "path": path, "version": version }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn fleet_storage_set_policy(
     state: State<'_, AppState>,
     policy: Value,
@@ -2556,6 +2632,34 @@ async fn file_download(
         .await
         .map_err(|e| e.to_string())?;
     serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// Register a remote file open in AllMyStuff's private bounded working-set
+/// cache. A matching logical version may already be warm, in which case the
+/// caller opens it immediately and sends no duplicate read request.
+#[tauri::command]
+async fn file_open_cache(
+    state: State<'_, AppState>,
+    route_id: String,
+    req: u64,
+    name: String,
+    cache_key: String,
+    expected_size: u64,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request(
+            "file_open_cache",
+            json!({
+                "route_id": route_id,
+                "req": req,
+                "name": name,
+                "cache_key": cache_key,
+                "expected_size": expected_size,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Open (or focus) the dedicated files window for `node` — one OS window
@@ -4855,6 +4959,11 @@ fn main() {
             kvm_mesh_remove,
             share_grant,
             fleet_storage_status,
+            fleetfiles_logical_list,
+            fleetfiles_logical_search,
+            fleetfiles_version_history,
+            fleetfiles_materialize,
+            fleetfiles_restore_version,
             fleet_storage_set_policy,
             fleet_storage_set_allocation,
             fleet_storage_set_device_role,
@@ -4893,6 +5002,7 @@ fn main() {
             file_poll,
             file_unwatch,
             file_download,
+            file_open_cache,
             file_download_cancel,
             open_files_window,
             open_files_workspace_window,

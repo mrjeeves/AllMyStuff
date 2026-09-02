@@ -567,6 +567,84 @@ export interface FleetStorageStatus {
     deviceIntents: FleetDeviceIntent[];
   };
   profiles: FleetServiceProfile[];
+  logicalUsedBytes: number;
+  protectedCapacityBytes: number;
+}
+
+export interface FleetfilesLogicalEntry {
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  size: number;
+  sha256?: string;
+  modified: number;
+  version: { counter: number; actor: string };
+  materialized: boolean;
+  contentAvailable: boolean;
+}
+
+export interface FleetfilesLogicalPage {
+  parent: string;
+  entries: FleetfilesLogicalEntry[];
+  nextCursor?: string;
+}
+
+export interface FleetfilesSearchPage {
+  query: string;
+  entries: FleetfilesLogicalEntry[];
+  nextCursor?: string;
+}
+
+export interface FleetfilesVersionEntry {
+  path: string;
+  version: { counter: number; actor: string };
+  kind: "file" | "directory" | "delete";
+  size: number;
+  sha256?: string;
+  tombstone: boolean;
+  recordedAt: number;
+  contentAvailable: boolean;
+}
+
+export interface FleetfilesVersionPage {
+  path: string;
+  entries: FleetfilesVersionEntry[];
+  nextCursor?: string;
+}
+
+export function fleetfilesLogicalList(
+  parent: string,
+  cursor?: string,
+  limit = 256,
+): Promise<FleetfilesLogicalPage> {
+  return requiredInvoke("fleetfiles_logical_list", { parent, cursor, limit });
+}
+
+export function fleetfilesLogicalSearch(
+  query: string,
+  cursor?: string,
+  limit = 256,
+): Promise<FleetfilesSearchPage> {
+  return requiredInvoke("fleetfiles_logical_search", { query, cursor, limit });
+}
+
+export function fleetfilesVersionHistory(
+  path: string,
+  cursor?: string,
+  limit = 128,
+): Promise<FleetfilesVersionPage> {
+  return requiredInvoke("fleetfiles_version_history", { path, cursor, limit });
+}
+
+export function fleetfilesMaterialize(path: string): Promise<{ path: string | null }> {
+  return requiredInvoke("fleetfiles_materialize", { path });
+}
+
+export function fleetfilesRestoreVersion(
+  path: string,
+  version: { counter: number; actor: string },
+): Promise<{ path: string }> {
+  return requiredInvoke("fleetfiles_restore_version", { path, version });
 }
 
 export function fleetStorageStatus(): Promise<FleetStorageStatus> {
@@ -1788,6 +1866,23 @@ export async function fileDownload(
   if (!isTauri()) throw new Error("Downloads need the desktop app");
   const { invoke } = await import("@tauri-apps/api/core");
   return (await invoke("file_download", { routeId, req, name })) as string;
+}
+
+export async function fileOpenCache(
+  routeId: string,
+  req: number,
+  name: string,
+  cacheKey: string,
+  expectedSize: number,
+): Promise<{ path: string; cached: boolean }> {
+  if (!isTauri()) throw new Error("Opening a fleet file needs the desktop app");
+  return requiredInvoke("file_open_cache", {
+    routeId,
+    req,
+    name,
+    cacheKey,
+    expectedSize,
+  });
 }
 
 /** A registered download finished (`allmystuff://file-saved`): where it

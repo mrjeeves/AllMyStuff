@@ -362,6 +362,13 @@ impl VideoBridge {
         (false, false, 0, 60)
     }
 
+    /// Keep the capture-less surface aligned with the real bridge. There is no
+    /// encoder rate controller to hold here, but stale receiver health still
+    /// belongs to the recovery episode and must be cleared.
+    pub fn note_recovery(&self, route_id: &str) {
+        self.feedback.lock().remove(route_id);
+    }
+
     pub fn note_feedback(
         &self,
         route_id: &str,

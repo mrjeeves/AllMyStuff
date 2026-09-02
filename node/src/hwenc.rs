@@ -53,11 +53,12 @@ pub struct FfmpegH264 {
 /// vendor's "ultra low latency / realtime" knobs.
 ///
 /// `bitrate` is the *average* target; we also hand the vendor rate controllers a
-/// **peak (`maxrate`) and VBV (`bufsize`)** so a fast-motion / scene-change
-/// frame can spend ~2× the average byte budget instead of having its QP cranked
-/// into macroblocking. Without this headroom, VBR collapses toward the average
-/// and motion frames block — the "blocky on fast motion" symptom.
-fn low_latency_opts(name: &str, bitrate: u32, game: bool) -> ff::Dictionary<'static> {
+/// **peak (`maxrate`) and VBV (`bufsize`)**. Interactive routes keep a small,
+/// cadence-relative reservoir so one scene change cannot become a packet wall;
+/// Studio retains its explicit quality-first reservoir.
+fn low_latency_opts(
+    name: &str, bitrate: u32, fps: u32, game: bool, studio: bool,
+) -> ff::Dictionary<'static> {
     let mut d = ff::Dictionary::new();
     match name {
         "h264_nvenc" => {
@@ -95,13 +96,10 @@ fn low_latency_opts(name: &str, bitrate: u32, game: bool) -> ff::Dictionary<'sta
     }
     // Peak/VBV headroom for every rate-controlled vendor (generic AVOptions →
     // rc_max_rate / rc_buffer_size; the hardware controllers honour them).
-    // VideoToolbox manages its own rate control and ignores these. The
-    // shared *route* posture (`video::burst_bounds`): 2×/1 s
-    // quality-first, trimmed to 1.5×/½ s in game mode for burst
-    // latency. This must follow the route's Tune, not the process-wide env
-    // default: balanced and game routes can encode concurrently.
+    // VideoToolbox ignores these. This follows Tune, not process-wide state:
+    // Balanced, Game and Studio routes can encode concurrently.
     if name != "h264_videotoolbox" {
-        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, game);
+        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, fps, game, studio);
         d.set("maxrate", &maxrate.to_string());
         d.set("bufsize", &bufsize.to_string());
     }
@@ -119,6 +117,7 @@ impl FfmpegH264 {
         fps: u32,
         bitrate: u32,
         game: bool,
+        studio: bool,
     ) -> Result<Self, String> {
         FF_INIT.call_once(|| {
             let _ = ff::init();
@@ -144,7 +143,7 @@ impl FfmpegH264 {
                                    // the full relaxed interval, long enough not to spam keyframes.
         video.set_gop(fps.saturating_mul(4).max(1));
         let encoder = video
-            .open_as_with(codec, low_latency_opts(name, bitrate, game))
+            .open_as_with(codec, low_latency_opts(name, bitrate, fps, game, studio))
             .map_err(|e| format!("{name}: open: {e}"))?;
         Ok(Self {
             encoder,

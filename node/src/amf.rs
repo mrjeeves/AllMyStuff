@@ -487,14 +487,7 @@ impl AmfAvc {
             // exactly: peak-constrained VBR; game = single-frame VBV
             // (burst latency), studio = deep 1 s VBV + modest peak,
             // balanced = the shared burst_bounds.
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, game);
-            let (peak, vbv) = if studio {
-                (bitrate + bitrate / 5, bitrate)
-            } else if game {
-                (peak, (bitrate / fps.max(1)).max(50_000))
-            } else {
-                (peak, vbv)
-            };
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, fps, game, studio);
             let _ = set(encoder, "RateControlMethod", v_i64(RC_PEAK_CONSTRAINED_VBR));
             let _ = set(encoder, "TargetBitrate", v_i64(i64::from(bitrate)));
             let _ = set(encoder, "PeakBitrate", v_i64(i64::from(peak)));
@@ -764,14 +757,8 @@ impl AmfAvc {
                 let n = wname(name);
                 ((*(*self.encoder).vtbl).set_property)(self.encoder, n.as_ptr(), v)
             };
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.game);
-            let (peak, vbv) = if self.studio {
-                (bitrate + bitrate / 5, bitrate)
-            } else if self.game {
-                (peak, (bitrate / self.fps.max(1)).max(50_000))
-            } else {
-                (peak, vbv)
-            };
+            let (peak, vbv) =
+                crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
             let ok = set("TargetBitrate", v_i64(i64::from(bitrate))) == AMF_OK;
             let _ = set("PeakBitrate", v_i64(i64::from(peak)));
             let _ = set("VBVBufferSize", v_i64(i64::from(vbv)));

@@ -2634,7 +2634,7 @@ impl Mesh {
             // Train complete. Dispersion needs ≥3 timed chunks and a
             // non-degenerate spread to say anything about rate.
             let spread_us = st.last.duration_since(st.first).as_micros() as u64;
-            if st.chunks >= 3 && spread_us >= 300 {
+            if Self::arrival_train_usable(st.chunks, spread_us) {
                 let mbps = (st.bytes as f64 * 8.0) / spread_us as f64;
                 st.window.push(mbps);
                 let kbps = mbps * 1000.0;
@@ -2643,25 +2643,28 @@ impl Mesh {
                 } else {
                     st.est_kbps * 0.8 + kbps * 0.2
                 };
-            }
-            // One-way-delay trend: relative delay of this train's FIRST
-            // chunk vs the anchor, windowed to ~2 s.
-            let (base_wall, base_rtp) = *st.base.get_or_insert((st.first, st.ts));
-            let rtp_delta_us = i64::from(st.ts.wrapping_sub(base_rtp) as i32) * 1000 / 90;
-            let wall_delta_us = st.first.duration_since(base_wall).as_micros() as i64;
-            st.owd.push_back((st.first, wall_delta_us - rtp_delta_us));
-            while st
-                .owd
-                .front()
-                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(2))
-            {
-                st.owd.pop_front();
-            }
-            // Re-anchor every ~5 min: RTP u32 wraps at ~13 h, and the
-            // relative math must never straddle it.
-            if st.first.duration_since(base_wall) > Duration::from_secs(300) {
-                st.base = Some((st.first, st.ts));
-                st.owd.clear();
+                // Delay is a link signal only when it belongs to the same
+                // paced chunk trains as the dispersion estimate. Whole-AU
+                // delivery has one post-daemon timestamp per frame; timing it
+                // here measures our own assembler/IPC scheduling and caused
+                // Balanced to cut 8 → 5.6 Mbps on a healthy direct route.
+                let (base_wall, base_rtp) = *st.base.get_or_insert((st.first, st.ts));
+                let rtp_delta_us = i64::from(st.ts.wrapping_sub(base_rtp) as i32) * 1000 / 90;
+                let wall_delta_us = st.first.duration_since(base_wall).as_micros() as i64;
+                st.owd.push_back((st.first, wall_delta_us - rtp_delta_us));
+                while st
+                    .owd
+                    .front()
+                    .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(2))
+                {
+                    st.owd.pop_front();
+                }
+                // Re-anchor every ~5 min: RTP u32 wraps at ~13 h, and the
+                // relative math must never straddle it.
+                if st.first.duration_since(base_wall) > Duration::from_secs(300) {
+                    st.base = Some((st.first, st.ts));
+                    st.owd.clear();
+                }
             }
             if st.last_log.elapsed() >= Duration::from_secs(60) && !st.window.is_empty() {
                 st.window.sort_by(f64::total_cmp);
@@ -2684,6 +2687,10 @@ impl Mesh {
         st.last = now;
         st.bytes += bytes;
         st.chunks += 1;
+    }
+
+    fn arrival_train_usable(chunks: u32, spread_us: u64) -> bool {
+        chunks >= 3 && spread_us >= 300
     }
 
     /// The delay-trend slope over the window: µs of added one-way delay
@@ -5744,7 +5751,7 @@ impl Mesh {
         }
         self.mark_video_discontinuity(
             &route_id,
-            "local media IPC exceeded its live-video latency bound",
+            "upstream media delivery reported a discontinuity",
             request_entry,
             lost_ts_us,
         );
@@ -5761,6 +5768,10 @@ impl Mesh {
         request_entry: bool,
         lost_ts_us: Option<u64>,
     ) -> bool {
+        // Neither a recovery wait nor the first post-gap sample is evidence
+        // of link delay. Drop the old anchor before any dependent deltas can
+        // contaminate the next controller window.
+        self.video_arrivals.lock().remove(route_id);
         let recovery = self
             .video_au_in_recovery
             .lock()
@@ -5867,7 +5878,11 @@ impl Mesh {
         // Time every fragment before reassembly: dispersion across the
         // same-timestamp train is the receiver's bottleneck estimate. Loss is
         // never inferred from this timing; the exact AU identity below owns it.
-        self.note_video_arrival(&route_id, rtp_timestamp, data.len());
+        // A reset-mode recovery intentionally discards dependent deltas. Do
+        // not turn their wait for a clean entry into a fresh delay estimate.
+        if !self.video_awaiting_entry.lock().contains(&route_id) {
+            self.note_video_arrival(&route_id, rtp_timestamp, data.len());
+        }
         let paced = self.paced_video_routes.lock().contains(&route_id);
         if paced && !complete_au {
             let (complete, damaged) =
@@ -9647,7 +9662,10 @@ impl Mesh {
                     }
                     self.start_media(&route)
                 }
-                Effect::RefreshMedia(id) => self.video.force_idr(&id),
+                Effect::RefreshMedia(id) => {
+                    self.video.note_recovery(&id);
+                    self.video.force_idr(&id);
+                }
                 Effect::TuneMedia {
                     route_id,
                     max_edge,
@@ -9678,6 +9696,7 @@ impl Mesh {
                     // is (the seam that keeps tuning backend-only).
                     let pf = crate::video::PipelineFeedback::from_ext(&ext);
                     if let Some(ts) = lost_ts_us {
+                        self.video.note_recovery(&route_id);
                         // Frame health: the viewer named the AU that died.
                         // A GDR (game) route heals with an immediate
                         // refresh-wave restart — spread intra, no keyframe
@@ -21609,6 +21628,18 @@ fn parse_media(s: &str) -> MediaKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_access_units_do_not_masquerade_as_link_timing() {
+        assert!(!super::Mesh::arrival_train_usable(1, 50_000));
+        assert!(!super::Mesh::arrival_train_usable(2, 50_000));
+        assert!(!super::Mesh::arrival_train_usable(3, 299));
+        assert!(super::Mesh::arrival_train_usable(3, 300));
+        assert!(
+            super::Mesh::arrival_train_usable(8, 12_000),
+            "only a real paced train may feed bandwidth and delay control"
+        );
+    }
+
     // ---- eviction stamps -------------------------------------------------
     //
     // The JSON below matches what `GovernanceState` actually emits — verified

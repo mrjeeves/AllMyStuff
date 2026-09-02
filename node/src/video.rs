@@ -129,6 +129,11 @@ pub struct StreamStats {
     static_skipped: u32,
     dropped: u32,
     bytes: u64,
+    /// Largest encoded access unit in the current stats window. Average
+    /// bitrate can look healthy while one oversized picture creates the
+    /// packet wall that stalls a live route, so keep this bounded maximum
+    /// beside the existing five-second aggregate.
+    max_au_bytes: usize,
     scale: Duration,
     encode: Duration,
     /// Per-frame samples (ms) inside the current window, for the p95s —
@@ -164,6 +169,7 @@ impl StreamStats {
             static_skipped: 0,
             dropped: 0,
             bytes: 0,
+            max_au_bytes: 0,
             scale: Duration::ZERO,
             encode: Duration::ZERO,
             scale_ms: Vec::new(),
@@ -263,7 +269,7 @@ impl StreamStats {
             format!(" · age {avg:.1}ms (p95 {:.1})", Self::p95(&mut self.age_ms))
         };
         let line = format!(
-            "video out {}: {:.1} fps {} {}×{} · raw {:.0} Mbps → wire {:.1} Mbps{age} · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
+            "video out {}: {:.1} fps {} {}×{} · raw {:.0} Mbps → wire {:.1} Mbps · max AU {:.1} KiB{age} · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
@@ -271,6 +277,7 @@ impl StreamStats {
             self.out_h,
             raw_mbps,
             (self.bytes as f64 * 8.0) / secs / 1_000_000.0,
+            self.max_au_bytes as f64 / 1024.0,
             self.scale.as_secs_f64() * 1000.0 / frames,
             self.encode.as_secs_f64() * 1000.0 / frames,
             self.keyframes,
@@ -288,6 +295,7 @@ impl StreamStats {
         self.static_skipped = 0;
         self.dropped = 0;
         self.bytes = 0;
+        self.max_au_bytes = 0;
         self.scale = Duration::ZERO;
         self.encode = Duration::ZERO;
         self.scale_ms.clear();
@@ -453,21 +461,34 @@ fn auto_fps(link: LinkClass, game: bool) -> u32 {
 }
 
 /// The rate controller's burst posture: `(peak, vbv_window)` for a target
-/// bitrate. The standard posture gives a fast-motion / scene-change frame
-/// ~2× headroom over a ~1 s window — quality-first, and bare mean-rate CBR
-/// (the setting before it) was exactly the "blocky on fast motion" symptom.
-/// Game mode trims to 1.5× over ~½ s: a burst that queues for a full second
-/// is *felt* as input lag mid-game, and the post-quiesce refinement passes
-/// now repair what the tighter budget costs a transition. Shared by every
-/// backend that exposes peak/VBV (MF on Windows, the FFmpeg vendor
-/// encoders; VideoToolbox manages its own and ignores these).
+/// bitrate and cadence. Peak-constrained VBR retains motion quality, but the
+/// reservoir is expressed in frame budgets rather than whole seconds: four
+/// frames for Balanced and one for Game. Studio deliberately keeps its deep
+/// quality reservoir. This prevents an interactive route's healthy average
+/// rate from accumulating a megabyte-scale access unit that `write_sample`
+/// then packetizes as one wall. Shared by every backend that exposes peak/VBV
+/// (MF, AMF and NVENC on Windows; VideoToolbox manages its own).
 #[cfg(any(windows, feature = "hwenc", test))]
-pub(crate) fn burst_bounds(bitrate: u32, game: bool) -> (u32, u32) {
-    if game {
-        (bitrate.saturating_mul(3) / 2, bitrate / 2)
-    } else {
-        (bitrate.saturating_mul(2), bitrate)
+pub(crate) fn burst_bounds(bitrate: u32, fps: u32, game: bool, studio: bool) -> (u32, u32) {
+    if studio {
+        return (bitrate.saturating_add(bitrate / 5), bitrate);
     }
+    let fps = fps.max(1);
+    let frame_bits = bitrate
+        .saturating_add(fps - 1)
+        .checked_div(fps)
+        .unwrap_or(bitrate);
+    let buffer_frames = if game { 1 } else { 4 };
+    let vbv = frame_bits
+        .saturating_mul(buffer_frames)
+        .max(50_000)
+        .min(bitrate.max(50_000));
+    let peak = if game {
+        bitrate.saturating_mul(3) / 2
+    } else {
+        bitrate.saturating_mul(2)
+    };
+    (peak, vbv)
 }
 
 /// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
@@ -1330,6 +1351,16 @@ impl VideoBridge {
             .map(|r| r.target.load(Ordering::Relaxed))
             .unwrap_or(0);
         (game, wan, rate, fps)
+    }
+
+    /// A refresh/GDR request proves the receiver is repairing a gap, not
+    /// measuring steady-state capacity. Clear stale health and hold AIMD while
+    /// the clean entry and its first feedback cross the pipeline.
+    pub fn note_recovery(&self, route_id: &str) {
+        self.feedback.lock().remove(route_id);
+        if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+            rate.adapt.lock().begin_recovery(Instant::now());
+        }
     }
 
     /// Record the decode health a viewer reported for one of our streams
@@ -2613,11 +2644,11 @@ fn open_gpu_encoder(
     h: u32,
     fps: u32,
     bitrate: u32,
-    game: bool,
+    posture: Posture,
     manager: &windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager,
 ) -> Option<crate::mediafoundation::MediaFoundationH264> {
     for hw in crate::mediafoundation::hardware_h264_mfts_on(adapter) {
-        match hw.open_with_manager_for_route(w, h, fps, bitrate, Some(manager), game) {
+        match hw.open_with_manager_for_route(w, h, fps, bitrate, Some(manager), posture) {
             Ok(enc) => return Some(enc),
             Err(e) => tracing::debug!("GPU-lane MFT {} declined: {e}", hw.name()),
         }
@@ -2761,7 +2792,7 @@ fn run_gpu_lane(
                 Err(e) => tracing::debug!("AMF rung not taken for {route_id}: {e}"),
             }
         }
-        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, game, &lane.manager) {
+        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, posture, &lane.manager) {
             Some(m) => GpuCodec::Mf(m),
             None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
         }
@@ -3076,7 +3107,7 @@ fn run_gpu_lane(
                                 dh,
                                 fps,
                                 bitrate,
-                                game,
+                                posture,
                                 &lane.manager,
                             )
                         }) {
@@ -3163,7 +3194,7 @@ fn run_gpu_lane(
                                     dh,
                                     fps,
                                     bitrate,
-                                    game,
+                                    posture,
                                     &lane.manager,
                                 )
                             }) {
@@ -3212,7 +3243,7 @@ fn run_gpu_lane(
                                     dh,
                                     fps,
                                     bitrate,
-                                    game,
+                                    posture,
                                     &lane.manager,
                                 )
                             }) {
@@ -3611,6 +3642,7 @@ impl FrameEncoder {
         let jpeg = encode_jpeg(&scaled, dw, dh, self.quality)?;
         stats.add_encode(t1.elapsed());
         stats.bytes += jpeg.len() as u64;
+        stats.max_au_bytes = stats.max_au_bytes.max(jpeg.len());
         stats.keyframes += 1; // every MJPEG frame is standalone
         self.prev = scaled;
         self.prev_size = (dw, dh);
@@ -3634,6 +3666,7 @@ impl FrameEncoder {
         let jpeg = encode_jpeg(&self.prev, dw, dh, self.quality)?;
         stats.add_encode(t1.elapsed());
         stats.bytes += jpeg.len() as u64;
+        stats.max_au_bytes = stats.max_au_bytes.max(jpeg.len());
         stats.keyframes += 1;
         self.last_sent = Some(Instant::now());
         let frame = VideoFrame::new(&self.route_id, self.seq, dw, dh, dw, dh, jpeg);
@@ -4491,7 +4524,9 @@ fn packetize_units(
                 *last_idr = Some(now);
                 stats.keyframes += 1;
             }
-            stats.bytes += data.len() as u64;
+            let len = data.len();
+            stats.bytes += len as u64;
+            stats.max_au_bytes = stats.max_au_bytes.max(len);
             VideoPacket::H264 {
                 data,
                 key,
@@ -4584,6 +4619,25 @@ struct RateAdaptState {
     bad: u32,
     good: u32,
     last_step: Option<Instant>,
+    recovery_until: Option<Instant>,
+}
+
+impl RateAdaptState {
+    fn begin_recovery(&mut self, now: Instant) {
+        self.bad = 0;
+        self.good = 0;
+        self.recovery_until = Some(now + RATE_RECOVERY_SETTLE);
+    }
+
+    fn holds_recovery(&mut self, now: Instant) -> bool {
+        if self.recovery_until.is_some_and(|until| now < until) {
+            self.bad = 0;
+            self.good = 0;
+            return true;
+        }
+        self.recovery_until = None;
+        false
+    }
 }
 
 pub(crate) fn route_rates(
@@ -4752,6 +4806,9 @@ const RATE_GOOD_STREAK: u32 = 5;
 /// the reconfigure and the viewer's queue need a beat to show up in the
 /// feedback before it's evidence about the new rate.
 const RATE_HOLD: Duration = Duration::from_secs(6);
+/// A recovery entry traverses the same pipeline as a rate step. Hold for one
+/// settle window so its intentional gap cannot become the next AIMD sample.
+const RATE_RECOVERY_SETTLE: Duration = RATE_HOLD;
 /// The emergency floor for each lossy posture. Balanced normally targets
 /// 8 Mbps but may retreat to 4 on direct network evidence; the higher-rate
 /// postures retain the prior 8 Mbps floor.
@@ -4774,6 +4831,9 @@ fn rate_adapt_step(
     ceiling: u32,
     now: Instant,
 ) -> Option<u32> {
+    if state.holds_recovery(now) {
+        return None;
+    }
     // Congestion evidence, most-direct first: the viewer's decode queue
     // backing up, decode failures (loss), the arrival-rate estimate
     // sagging below what we send, a sustained one-way-delay ramp, or the
@@ -5260,9 +5320,9 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     #[cfg(windows)]
     {
         let bitrate = tuned_bitrate(tune, bw, bh, fps);
-        let game = tune.game();
+        let posture = tune.posture();
         for hw in crate::mediafoundation::hardware_h264_mfts() {
-            match hw.open_for_route(bw, bh, fps, bitrate, game) {
+            match hw.open_for_route(bw, bh, fps, bitrate, posture) {
                 Ok(enc) => {
                     let mut probe = MfCodec(enc);
                     let label = probe.label().to_string();
@@ -5278,7 +5338,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                             );
                             continue;
                         }
-                        match hw.open_for_route(bw, bh, fps, bitrate, game) {
+                        match hw.open_for_route(bw, bh, fps, bitrate, posture) {
                             Ok(enc) => {
                                 let codec = MfCodec(enc);
                                 tracing::info!(
@@ -5344,8 +5404,9 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     {
         let bitrate = tuned_bitrate(tune, bw, bh, fps);
         let game = tune.game();
+        let studio = matches!(tune.posture(), Posture::Studio | Posture::StudioLossless);
         for &name in crate::hwenc::candidates() {
-            match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate, game) {
+            match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate, game, studio) {
                 Ok(enc) => {
                     let mut probe = FfmpegCodec(enc);
                     if codec_emits_frame(&mut probe, bw, bh) {
@@ -5354,7 +5415,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                         // grey packets or reference history.
                         drop(probe);
                         match crate::hwenc::FfmpegH264::open(
-                            name, bw, bh, fps, bitrate, game,
+                            name, bw, bh, fps, bitrate, game, studio,
                         ) {
                             Ok(enc) => {
                                 let codec = FfmpegCodec(enc);
@@ -5922,6 +5983,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rate_adaptation_does_not_react_to_its_own_recovery_gap() {
+        let ceiling = 20_000_000;
+        let bad = RecvFeedback {
+            recv_fps: 2,
+            decode_fails: 1,
+            queue_depth: 40,
+            est_kbps: 1_000,
+            delay_trend_us_per_s: 200_000,
+            at: Instant::now(),
+        };
+        let clean = fb(60, 0, 0);
+        let start = Instant::now();
+        let mut state = RateAdaptState::default();
+        state.begin_recovery(start);
+
+        for offset in [Duration::ZERO, Duration::from_secs(2), Duration::from_secs(5)] {
+            assert_eq!(
+                rate_adapt_step(
+                    &mut state,
+                    &bad,
+                    Posture::Game,
+                    60,
+                    ceiling,
+                    ceiling,
+                    start + offset,
+                ),
+                None
+            );
+        }
+        assert_eq!((state.bad, state.good), (0, 0));
+
+        let settled = start + RATE_RECOVERY_SETTLE;
+        assert_eq!(
+            rate_adapt_step(
+                &mut state,
+                &clean,
+                Posture::Game,
+                60,
+                ceiling,
+                ceiling,
+                settled,
+            ),
+            None
+        );
+        assert_eq!((state.bad, state.good), (0, 0));
+    }
+
     /// The reservation rule: both interactive modes adapt by default, while
     /// Studio remains pinned unless explicitly opted in.
     #[test]
@@ -6394,9 +6503,26 @@ mod tests {
             "game mode floors 60 off-LAN"
         );
         assert_eq!(auto_fps(LinkClass::Unknown, true), 60);
-        // Standard posture: 2× peak over ~1 s; game mode: 1.5× over ~½ s.
-        assert_eq!(burst_bounds(40_000_000, false), (80_000_000, 40_000_000));
-        assert_eq!(burst_bounds(40_000_000, true), (60_000_000, 20_000_000));
+        // Peak headroom stays quality-friendly, but the reservoir is bounded
+        // by frame cadence: four frames for Balanced, one for Game.
+        assert_eq!(
+            burst_bounds(8_000_000, 30, false, false),
+            (16_000_000, 1_066_668)
+        );
+        assert_eq!(
+            burst_bounds(20_000_000, 60, true, false),
+            (30_000_000, 333_334)
+        );
+        assert_eq!(
+            burst_bounds(40_000_000, 0, false, false),
+            (80_000_000, 40_000_000),
+            "a malformed zero cadence stays bounded without dividing by zero"
+        );
+        assert_eq!(
+            burst_bounds(40_000_000, 60, false, true),
+            (48_000_000, 40_000_000),
+            "Studio keeps its explicit quality-first reservoir"
+        );
     }
 
     #[test]

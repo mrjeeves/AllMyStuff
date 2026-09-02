@@ -57,7 +57,11 @@ pub struct FfmpegH264 {
 /// cadence-relative reservoir so one scene change cannot become a packet wall;
 /// Studio retains its explicit quality-first reservoir.
 fn low_latency_opts(
-    name: &str, bitrate: u32, fps: u32, game: bool, studio: bool,
+    name: &str,
+    bitrate: u32,
+    fps: u32,
+    game: bool,
+    studio: bool,
 ) -> ff::Dictionary<'static> {
     let mut d = ff::Dictionary::new();
     match name {

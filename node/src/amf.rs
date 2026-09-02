@@ -757,8 +757,7 @@ impl AmfAvc {
                 let n = wname(name);
                 ((*(*self.encoder).vtbl).set_property)(self.encoder, n.as_ptr(), v)
             };
-            let (peak, vbv) =
-                crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
             let ok = set("TargetBitrate", v_i64(i64::from(bitrate))) == AMF_OK;
             let _ = set("PeakBitrate", v_i64(i64::from(peak)));
             let _ = set("VBVBufferSize", v_i64(i64::from(vbv)));

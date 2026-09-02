@@ -2792,7 +2792,15 @@ fn run_gpu_lane(
                 Err(e) => tracing::debug!("AMF rung not taken for {route_id}: {e}"),
             }
         }
-        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, posture, &lane.manager) {
+        match open_gpu_encoder(
+            lane.adapter_luid,
+            dw,
+            dh,
+            fps,
+            bitrate,
+            posture,
+            &lane.manager,
+        ) {
             Some(m) => GpuCodec::Mf(m),
             None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
         }
@@ -5999,7 +6007,11 @@ mod tests {
         let mut state = RateAdaptState::default();
         state.begin_recovery(start);
 
-        for offset in [Duration::ZERO, Duration::from_secs(2), Duration::from_secs(5)] {
+        for offset in [
+            Duration::ZERO,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        ] {
             assert_eq!(
                 rate_adapt_step(
                     &mut state,

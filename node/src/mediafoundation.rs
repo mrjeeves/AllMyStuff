@@ -723,8 +723,7 @@ impl MediaFoundationH264 {
             // Peak + VBV follow the mean so the burst posture stays
             // proportional; best-effort — a box that only re-aims the mean
             // still adapts.
-            let (peak, vbv) =
-                crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.fps, self.game, self.studio);
             let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
             let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
             true

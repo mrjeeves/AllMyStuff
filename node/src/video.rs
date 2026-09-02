@@ -4840,20 +4840,25 @@ fn rate_adapt_step(
 
 pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = !std::env::var("ALLMYSTUFF_PACED_SLICES")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false"
-                )
-            })
-            .unwrap_or(false);
-        if !on {
-            tracing::warn!("ALLMYSTUFF_PACED_SLICES=0 — video burst shaping disabled");
+        let value = std::env::var("ALLMYSTUFF_PACED_SLICES").ok();
+        let on = paced_slices_requested(value.as_deref());
+        if on {
+            tracing::warn!(
+                "ALLMYSTUFF_PACED_SLICES enabled — experimental video burst shaping active"
+            );
         }
         on
     });
     *ON
+}
+
+fn paced_slices_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true"
+        )
+    })
 }
 
 /// UUID carried in the v1 paced-access-unit closing SEI. The marker is a
@@ -6392,6 +6397,17 @@ mod tests {
         // Standard posture: 2× peak over ~1 s; game mode: 1.5× over ~½ s.
         assert_eq!(burst_bounds(40_000_000, false), (80_000_000, 40_000_000));
         assert_eq!(burst_bounds(40_000_000, true), (60_000_000, 20_000_000));
+    }
+
+    #[test]
+    fn paced_slices_remain_opt_in() {
+        assert!(!paced_slices_requested(None));
+        for value in ["", "0", "off", "false", "unexpected"] {
+            assert!(!paced_slices_requested(Some(value)), "{value}");
+        }
+        for value in ["1", "on", "true", " TRUE "] {
+            assert!(paced_slices_requested(Some(value)), "{value}");
+        }
     }
 
     #[test]

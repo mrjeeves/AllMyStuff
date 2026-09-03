@@ -515,6 +515,19 @@ pub struct Mesh {
     /// authenticated peer's decision before activating the route. This is the
     /// wire-shape authority — presence only advertises ability.
     paced_video_routes: Mutex<HashSet<String>>,
+    /// The one daemon network each live route uses for its whole incarnation.
+    ///
+    /// `peer_networks` is deliberately discovery-shaped: any authenticated
+    /// frame refreshes it, so a peer shared through several meshes can move
+    /// that slot many times a second. Media is stream-shaped and must not
+    /// follow those moves — every MyOwnMesh network owns a distinct WebRTC
+    /// peer connection, RTP sequence space, and retransmit cache. Switching a
+    /// route between them access-unit by access-unit strands partial frames on
+    /// all of the connections and turns their NACK recovery into sustained
+    /// duplicate traffic. A route therefore pins the network that carried its
+    /// successful control handshake; only teardown or a real send failure
+    /// releases it for deliberate failover.
+    route_networks: Mutex<RouteNetworkPins>,
     /// The disabled-networks park store, when the embedding process shares
     /// one (the node binary's `network_set_enabled` seam). Consulted by
     /// [`Mesh::ensure_claim_networks`] so a deliberately switched-off local
@@ -542,6 +555,66 @@ enum AudioOut {
         route: String,
         data: Vec<u8>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteNetworkPin {
+    peer: String,
+    network: String,
+}
+
+/// Route-scoped network selection, separated from `Mesh` so first-writer,
+/// peer-isolation, failure, and teardown semantics stay cheap to unit-test.
+#[derive(Debug, Default)]
+struct RouteNetworkPins {
+    by_route: HashMap<String, RouteNetworkPin>,
+}
+
+impl RouteNetworkPins {
+    fn get(&self, route_id: &str, peer: &str) -> Option<String> {
+        let peer = pubkey_part(peer);
+        self.by_route
+            .get(route_id)
+            .filter(|pin| pin.peer == peer)
+            .map(|pin| pin.network.clone())
+    }
+
+    /// First successful route control wins. Later presence/control arriving on
+    /// another shared mesh cannot move the live stream. A different peer can
+    /// never reuse a stale route id to inherit its transport pin.
+    fn pin(&mut self, route_id: &str, peer: &str, network: &str) -> Option<String> {
+        let peer = pubkey_part(peer);
+        match self.by_route.get(route_id) {
+            Some(pin) if pin.peer == peer => Some(pin.network.clone()),
+            Some(_) => None,
+            None => {
+                self.by_route.insert(
+                    route_id.to_string(),
+                    RouteNetworkPin {
+                        peer: peer.to_string(),
+                        network: network.to_string(),
+                    },
+                );
+                Some(network.to_string())
+            }
+        }
+    }
+
+    fn release(&mut self, route_id: &str) {
+        self.by_route.remove(route_id);
+    }
+
+    /// A failed write may race a replacement route/control handshake. Remove
+    /// only the exact network that failed, never a newer successful pin.
+    fn release_if_network(&mut self, route_id: &str, network: &str) {
+        if self
+            .by_route
+            .get(route_id)
+            .is_some_and(|pin| pin.network == network)
+        {
+            self.by_route.remove(route_id);
+        }
+    }
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -2244,6 +2317,7 @@ impl Mesh {
             video_switch_guards: Mutex::new(VideoSwitchGuards::default()),
             video_lane_binds: Mutex::new(HashMap::new()),
             paced_video_routes: Mutex::new(HashSet::new()),
+            route_networks: Mutex::new(RouteNetworkPins::default()),
             disabled_networks: Mutex::new(None),
             cec: crate::cec::Cec::new(crate::cec::consent_store_path()),
         })
@@ -2295,7 +2369,7 @@ impl Mesh {
                             // another's route.
                             match mesh.audio_lane(&route, &peer, true) {
                                 Some(lane) => {
-                                    let r = mesh.send_audio_track(&peer, lane, data).await;
+                                    let r = mesh.send_audio_track(&peer, &route, lane, data).await;
                                     (peer, r)
                                 }
                                 None => {
@@ -2457,18 +2531,35 @@ impl Mesh {
     }
 
     async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let route_id = payload
+            .get("route")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let network = match route_id.as_deref() {
+            Some(route_id) => self.network_for_route(route_id, peer),
+            None => self.network_for_peer(peer),
+        };
+        let Some(network) = network else {
             return Err("no shared network".into());
         };
-        self.media_pipe
+        let result = self
+            .media_pipe
             .send(&Request::ChannelSendTo {
-                network,
+                network: network.clone(),
                 channel: CHANNEL_MEDIA.to_string(),
                 peer: pubkey_part(peer).to_string(),
                 payload,
             })
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        if result.is_err() {
+            if let Some(route_id) = route_id.as_deref() {
+                self.route_networks
+                    .lock()
+                    .release_if_network(route_id, &network);
+            }
+        }
+        result
     }
 
     /// Send one encoded access unit through production burst shaping when both
@@ -2503,7 +2594,8 @@ impl Mesh {
             if !current() {
                 return Ok(false);
             }
-            self.send_video_track(peer, lane, data, duration_us).await?;
+            self.send_video_track(peer, route_id, lane, data, duration_us)
+                .await?;
             return Ok(true);
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
@@ -2529,13 +2621,13 @@ impl Mesh {
                 return Ok(false);
             }
             let tw = Instant::now();
-            self.send_video_track(peer, lane, data, 0).await?;
+            self.send_video_track(peer, route_id, lane, data, 0).await?;
             let mut write_us = tw.elapsed().as_micros() as u64;
             if !current() {
                 return Ok(false);
             }
             let tw = Instant::now();
-            self.send_video_track(peer, lane, &marker, duration_us)
+            self.send_video_track(peer, route_id, lane, &marker, duration_us)
                 .await?;
             write_us += tw.elapsed().as_micros() as u64;
             self.note_pace_gaps(&[], write_us, 2);
@@ -2580,7 +2672,8 @@ impl Mesh {
                 return Ok(false);
             }
             let tw = Instant::now();
-            self.send_video_track(peer, lane, &data[range], 0).await?;
+            self.send_video_track(peer, route_id, lane, &data[range], 0)
+                .await?;
             write_us += tw.elapsed().as_micros() as u64;
             writes += 1;
         }
@@ -2601,7 +2694,7 @@ impl Mesh {
             return Ok(false);
         }
         let tw = Instant::now();
-        self.send_video_track(peer, lane, &marker, duration_us)
+        self.send_video_track(peer, route_id, lane, &marker, duration_us)
             .await?;
         write_us += tw.elapsed().as_micros() as u64;
         writes += 1;
@@ -2763,16 +2856,17 @@ impl Mesh {
     async fn send_video_track(
         &self,
         peer: &str,
+        route_id: &str,
         lane: u8,
         data: &[u8],
         duration_us: u64,
     ) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let Some(network) = self.network_for_route(route_id, peer) else {
             return Err("no shared network".into());
         };
         // Binary media pipe when the daemon speaks it; otherwise the legacy
         // base64 video_send op (so an older daemon still streams).
-        if self.daemon_media_pipes.load(Ordering::SeqCst) {
+        let result = if self.daemon_media_pipes.load(Ordering::SeqCst) {
             self.media_video_track_pipe
                 .send_video(&network, pubkey_part(peer), lane, duration_us, data)
                 .await
@@ -2781,7 +2875,7 @@ impl Mesh {
             use base64::Engine as _;
             self.media_pipe
                 .send(&Request::VideoSend {
-                    network,
+                    network: network.clone(),
                     peer: pubkey_part(peer).to_string(),
                     stream: lane,
                     duration_us,
@@ -2789,16 +2883,28 @@ impl Mesh {
                 })
                 .await
                 .map_err(|e| e.to_string())
+        };
+        if result.is_err() {
+            self.route_networks
+                .lock()
+                .release_if_network(route_id, &network);
         }
+        result
     }
 
     /// Send one encoded Opus frame to `peer` over the daemon's audio track
     /// lane — binary media pipe when supported, else legacy base64.
-    async fn send_audio_track(&self, peer: &str, lane: u8, data: Vec<u8>) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+    async fn send_audio_track(
+        &self,
+        peer: &str,
+        route_id: &str,
+        lane: u8,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let Some(network) = self.network_for_route(route_id, peer) else {
             return Err("no shared network".into());
         };
-        if self.daemon_media_pipes.load(Ordering::SeqCst) {
+        let result = if self.daemon_media_pipes.load(Ordering::SeqCst) {
             self.media_audio_track_pipe
                 .send_audio(
                     &network,
@@ -2813,7 +2919,7 @@ impl Mesh {
             use base64::Engine as _;
             self.media_pipe
                 .send(&Request::AudioSend {
-                    network,
+                    network: network.clone(),
                     peer: pubkey_part(peer).to_string(),
                     stream: lane,
                     duration_us: crate::audio::OPUS_FRAME_US,
@@ -2821,7 +2927,13 @@ impl Mesh {
                 })
                 .await
                 .map_err(|e| e.to_string())
+        };
+        if result.is_err() {
+            self.route_networks
+                .lock()
+                .release_if_network(route_id, &network);
         }
+        result
     }
 
     /// The network to reach `peer` on: the one we last saw them on (an inbound
@@ -2834,6 +2946,95 @@ impl Mesh {
             .get(pubkey_part(peer))
             .cloned()
             .or_else(|| st.network.clone())
+    }
+
+    /// Resolve one live route without letting the peer's discovery slot move
+    /// it between independent WebRTC sessions. The first caller pins the
+    /// current proven network; successful route control normally gets here
+    /// first and supplies the exact network the handshake used.
+    fn network_for_route(&self, route_id: &str, peer: &str) -> Option<String> {
+        if let Some(network) = self.route_networks.lock().get(route_id, peer) {
+            return Some(network);
+        }
+        let network = self.network_for_peer(peer)?;
+        self.pin_route_network(route_id, peer, &network)
+    }
+
+    fn pin_route_network(&self, route_id: &str, peer: &str, network: &str) -> Option<String> {
+        let pinned = self.route_networks.lock().pin(route_id, peer, network);
+        if pinned.is_none() {
+            tracing::warn!(
+                route = %route_id,
+                peer = %short_id(peer),
+                network = %network,
+                "refusing to reuse another peer's route-network pin"
+            );
+        }
+        pinned
+    }
+
+    /// Put a route's established network first for follow-up control too.
+    /// Discovery candidates remain as fallbacks, so a teardown or refresh can
+    /// still get through after the pinned connection genuinely fails.
+    fn route_network_candidates(&self, peer: &str, message: &ControlMessage) -> Vec<String> {
+        let mut candidates = self.peer_network_candidates(peer);
+        let Some(route_id) = control_route_id(message) else {
+            return candidates;
+        };
+        let Some(pinned) = self.route_networks.lock().get(route_id, peer) else {
+            return candidates;
+        };
+        candidates.retain(|network| network != &pinned);
+        candidates.insert(0, pinned);
+        candidates
+    }
+
+    /// A control send proves both that this route belongs to `peer` and that
+    /// `network` accepted traffic for it. Rejected foreign offers never enter
+    /// the session and therefore cannot allocate pins here.
+    fn pin_control_route_network(&self, peer: &str, network: &str, message: &ControlMessage) {
+        let Some(route_id) = control_route_id(message) else {
+            return;
+        };
+        let belongs = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| pubkey_part(route.peer.as_str()) == pubkey_part(peer));
+        if belongs {
+            self.pin_route_network(route_id, peer, network);
+        }
+    }
+
+    /// If the established route transport rejects a control write, clear only
+    /// that exact pin before trying the next shared network. The successful
+    /// fallback can then become the route's new stable transport.
+    fn release_control_route_network_if_failed(&self, network: &str, message: &ControlMessage) {
+        if let Some(route_id) = control_route_id(message) {
+            self.route_networks
+                .lock()
+                .release_if_network(route_id, network);
+        }
+    }
+
+    fn release_route_network_if_terminal(&self, route_id: &str) {
+        let live = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                matches!(
+                    route.state,
+                    RouteState::Offered | RouteState::Incoming | RouteState::Active
+                )
+            });
+        if !live {
+            self.route_networks.lock().release(route_id);
+        }
     }
 
     /// Seed `peer_networks` from the daemon's per-network peer list — the same
@@ -4906,6 +5107,7 @@ impl Mesh {
                                     }
                                 }
                                 self.process_effects(effects).await;
+                                self.release_route_network_if_terminal(route_id);
                                 self.emit_snapshot();
                                 return;
                             }
@@ -4974,6 +5176,7 @@ impl Mesh {
                             self.send_presence_to(&from).await;
                         }
                         msg => {
+                            let handled_route_id = control_route_id(&msg).map(str::to_string);
                             if let ControlMessage::Route(RouteControl::Accept {
                                 route_id,
                                 paced_video,
@@ -5033,6 +5236,9 @@ impl Mesh {
                                     .unwrap_or_default()
                             };
                             self.process_effects(effects).await;
+                            if let Some(route_id) = handled_route_id.as_deref() {
+                                self.release_route_network_if_terminal(route_id);
+                            }
                             if let Some((old_route, (node, host_port, local_port))) = heal_site {
                                 // Guarantee the dead route is fully cleared — a
                                 // reject on a not-yet-active offer emits no
@@ -7753,6 +7959,7 @@ impl Mesh {
             }
         };
         if already_torn_down {
+            self.route_networks.lock().release(&route_id);
             return Ok(());
         }
         if msg.is_some() {
@@ -7779,6 +7986,7 @@ impl Mesh {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
         }
+        self.route_networks.lock().release(&route_id);
         self.emit_snapshot();
         Ok(())
     }
@@ -9785,6 +9993,7 @@ impl Mesh {
                     // side) and every tunneled connection it carried.
                     self.sites.stop_route(&id);
                     self.drop_downloads(&id);
+                    self.route_networks.lock().release(&id);
                 }
                 Effect::Share { from, message } => self.handle_share(from, message).await,
                 Effect::Ownership { from, message } => self.handle_ownership(from, message).await,
@@ -13116,6 +13325,21 @@ impl Mesh {
         let me = pubkey_part(&me).to_string();
         let from_node = pubkey_part(&node_of(route.from.as_str())).to_string();
         let to_node = pubkey_part(&node_of(route.to.as_str())).to_string();
+
+        // The activating Offer/Accept normally pinned this exact route while
+        // its control send was daemon-confirmed. Keep a lazy fallback for
+        // restored/older session shapes, but do it once before any capture,
+        // terminal, file, or input pump can emit its first frame.
+        let route_peer = if from_node == me {
+            Some(to_node.as_str())
+        } else if to_node == me {
+            Some(from_node.as_str())
+        } else {
+            None
+        };
+        if let Some(peer) = route_peer.filter(|peer| *peer != me.as_str()) {
+            let _ = self.network_for_route(&route.id, peer);
+        }
 
         match route.media {
             MediaKind::Audio => {
@@ -20209,12 +20433,11 @@ impl Mesh {
     ///
     /// Tries every shared network until the daemon confirms one (the KVM's
     /// bridge sweeps its networks the same way — "the correct network's send
-    /// reaches them and others are harmless no-ops"), then pins the peer's
-    /// slot to the network that actually delivered, so the media frames that
-    /// follow a route offer ride the proven mesh instead of the last one a
-    /// presence advert happened to arrive on.
+    /// reaches them and others are harmless no-ops"), then pins the route to
+    /// the network that actually delivered, so its media frames stay on one
+    /// WebRTC session instead of following presence advertisements.
     async fn send_control(&self, peer: &str, message: &ControlMessage) -> Result<(), String> {
-        let candidates = self.peer_network_candidates(peer);
+        let candidates = self.route_network_candidates(peer, message);
         if candidates.is_empty() {
             return Err(format!("no shared network with {peer}"));
         }
@@ -20233,12 +20456,17 @@ impl Mesh {
             match resp {
                 Ok(r) if r.ok => {
                     self.note_peer_network(peer, &network);
+                    self.pin_control_route_network(peer, &network, message);
                     return Ok(());
                 }
                 Ok(r) => {
                     last_err = r.error.unwrap_or_else(|| "channel send failed".into());
+                    self.release_control_route_network_if_failed(&network, message);
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => {
+                    last_err = e.to_string();
+                    self.release_control_route_network_if_failed(&network, message);
+                }
             }
         }
         tracing::warn!("control send to {peer} failed on every shared network: {last_err}");
@@ -20265,13 +20493,22 @@ impl Mesh {
                 payload,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.release_control_route_network_if_failed(network, message);
+                return Err(error);
+            }
+        };
         if !response.ok {
+            self.release_control_route_network_if_failed(network, message);
             return Err(response
                 .error
                 .unwrap_or_else(|| "channel send failed".into()));
         }
         self.note_peer_network(peer, network);
+        self.pin_control_route_network(peer, network, message);
         Ok(())
     }
 
@@ -20297,7 +20534,7 @@ impl Mesh {
         message: &ControlMessage,
         ttl: Duration,
     ) -> Result<(), String> {
-        let candidates = self.peer_network_candidates(peer);
+        let candidates = self.route_network_candidates(peer, message);
         if candidates.is_empty() {
             return Err(format!("no shared network with {peer}"));
         }
@@ -20323,12 +20560,17 @@ impl Mesh {
             match resp {
                 Ok(r) if r.ok => {
                     self.note_peer_network(peer, &network);
+                    self.pin_control_route_network(peer, &network, message);
                     return Ok(());
                 }
                 Ok(r) => {
                     last_err = r.error.unwrap_or_else(|| "reliable send failed".into());
+                    self.release_control_route_network_if_failed(&network, message);
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => {
+                    last_err = e.to_string();
+                    self.release_control_route_network_if_failed(&network, message);
+                }
             }
         }
         Err(last_err)
@@ -21124,6 +21366,25 @@ fn pubkey_part(id: &str) -> &str {
     id
 }
 
+/// The route whose established transport a control message belongs to.
+/// Peer-wide controls and `DeadLane` (which intentionally has no route id)
+/// remain on ordinary discovery routing.
+fn control_route_id(message: &ControlMessage) -> Option<&str> {
+    match message {
+        ControlMessage::Route(RouteControl::Offer { route, .. }) => Some(&route.id),
+        ControlMessage::Route(
+            RouteControl::Accept { route_id, .. }
+            | RouteControl::Reject { route_id, .. }
+            | RouteControl::Teardown { route_id }
+            | RouteControl::Refresh { route_id }
+            | RouteControl::Tune { route_id, .. }
+            | RouteControl::VideoFeedback { route_id, .. }
+            | RouteControl::VideoLane { route_id, .. },
+        ) => Some(route_id),
+        _ => None,
+    }
+}
+
 /// Video feedback is generated repeatedly by a window that still owns the
 /// route, even for a static screen whose paint rate is zero. One-shot
 /// setup/tune controls are intentionally excluded: they can already be in
@@ -21628,6 +21889,62 @@ fn parse_media(s: &str) -> MediaKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_route_stays_on_its_first_proven_network() {
+        let mut pins = super::RouteNetworkPins::default();
+        let peer = "peer-public-key-ABCDE";
+
+        assert_eq!(
+            pins.pin("route:screen", peer, "fleet"),
+            Some("fleet".into())
+        );
+        assert_eq!(
+            pins.pin("route:screen", peer, "local-claim"),
+            Some("fleet".into()),
+            "later traffic on another shared mesh must not move the RTP stream"
+        );
+        assert_eq!(
+            pins.pin("route:screen", peer, "support-room"),
+            Some("fleet".into())
+        );
+        assert_eq!(
+            pins.get("route:screen", "peer-public-key"),
+            Some("fleet".into())
+        );
+    }
+
+    #[test]
+    fn route_network_failure_allows_deliberate_failover() {
+        let mut pins = super::RouteNetworkPins::default();
+        pins.pin("route:screen", "peer", "fleet");
+
+        pins.release_if_network("route:screen", "some-other-network");
+        assert_eq!(pins.get("route:screen", "peer"), Some("fleet".into()));
+
+        pins.release_if_network("route:screen", "fleet");
+        assert_eq!(pins.get("route:screen", "peer"), None);
+        assert_eq!(
+            pins.pin("route:screen", "peer", "backup"),
+            Some("backup".into())
+        );
+    }
+
+    #[test]
+    fn stale_route_pin_cannot_be_inherited_by_another_peer() {
+        let mut pins = super::RouteNetworkPins::default();
+        pins.pin("route:screen", "peer-a", "fleet");
+
+        assert_eq!(pins.get("route:screen", "peer-b"), None);
+        assert_eq!(pins.pin("route:screen", "peer-b", "support-room"), None);
+        assert_eq!(pins.get("route:screen", "peer-a"), Some("fleet".into()));
+
+        pins.release("route:screen");
+        assert_eq!(
+            pins.pin("route:screen", "peer-b", "support-room"),
+            Some("support-room".into())
+        );
+    }
+
     #[test]
     fn whole_access_units_do_not_masquerade_as_link_timing() {
         assert!(!super::Mesh::arrival_train_usable(1, 50_000));

@@ -4155,51 +4155,91 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
 
 /// Windows: a service needs admin, so re-launch our own binary elevated to do
 /// the work (`--service-do <verb>`, handled in `main`). Still no external CLI;
-/// the elevated child runs in its own console, so we report by exit code and
-/// let the UI re-read status.
+/// ShellExecuteEx provides the standard, visible UAC consent surface without a
+/// hidden PowerShell trampoline. We report by exit code and let the UI re-read
+/// status.
 #[cfg(windows)]
 fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
     let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
-    let exe = exe.to_string_lossy().replace('\'', "''");
     let home = dirs::home_dir()
-        .ok_or_else(|| "couldn't resolve the current Windows profile".to_string())?
-        .to_string_lossy()
-        .replace('\'', "''");
-    let sid = current_windows_user_sid()?.replace('\'', "''");
+        .ok_or_else(|| "couldn't resolve the current Windows profile".to_string())?;
+    let sid = current_windows_user_sid()?;
     // Resolve the daemon while we still have the desktop user's exact PATH
     // and bundle context, then carry that absolute path across UAC.  The
     // elevated child may see a different PATH; guessing there is what produced
     // a service whose local node answered while no mesh daemon was running.
-    let mesh_arg = if verb == "install" {
+    let mesh = if verb == "install" {
         let (mesh, _) = allmystuff_node::daemon_spawn::find_daemon_binary()
             .map_err(|e| format!("locating MyOwnMesh for Always On: {e:#}"))?;
-        format!(" --service-mesh \"{}\"", mesh.to_string_lossy())
+        Some(mesh)
     } else {
-        String::new()
+        None
     };
-    let elevated_args =
-        format!("--service-do {verb} --service-home \"{home}\" --service-sid {sid}{mesh_arg}")
-            .replace('\'', "''");
-    let ps = format!(
-        "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '{elevated_args}' \
-         -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
-         catch {{ exit 1223 }}"
-    );
-    // CREATE_NO_WINDOW: the GUI has no console, so a bare `powershell` spawn
-    // would flash one for the frame it runs (the elevated child is already
-    // hidden via `-WindowStyle Hidden`). Matches the flag the service crate
-    // sets on its own Windows spawns.
-    use std::os::windows::process::CommandExt as _;
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .creation_flags(0x0800_0000)
-        .output()
-        .map_err(|e| format!("launching elevated AllMyStuff: {e}"))?;
-    let code = out.status.code().unwrap_or(-1);
-    if code == 1223 {
-        // ERROR_CANCELLED — the user declined the UAC prompt.
-        return Err("Administrator approval was declined.".to_string());
+    let mut args = vec![
+        "--service-do".to_string(),
+        verb.to_string(),
+        "--service-home".to_string(),
+        home.to_string_lossy().into_owned(),
+        "--service-sid".to_string(),
+        sid,
+    ];
+    if let Some(mesh) = mesh {
+        args.push("--service-mesh".to_string());
+        args.push(mesh.to_string_lossy().into_owned());
     }
+    let parameters = args
+        .iter()
+        .map(|arg| windows_quote_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb_wide: Vec<u16> = "runas\0".encode_utf16().collect();
+    let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let parameters_wide: Vec<u16> = parameters.encode_utf16().chain(Some(0)).collect();
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb_wide.as_ptr();
+    info.lpFile = exe_wide.as_ptr();
+    info.lpParameters = parameters_wide.as_ptr();
+    info.nShow = SW_HIDE;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_CANCELLED {
+            return Err("Administrator approval was declined.".to_string());
+        }
+        return Err(format!(
+            "launching elevated AllMyStuff failed: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        ));
+    }
+    if info.hProcess.is_null() {
+        return Err("Windows did not return the elevated process handle".to_string());
+    }
+    let wait = unsafe { WaitForSingleObject(info.hProcess, INFINITE) };
+    if wait == WAIT_FAILED {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(info.hProcess) };
+        return Err(format!("waiting for elevated AllMyStuff failed: {error}"));
+    }
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(info.hProcess, &mut code) } == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(info.hProcess) };
+        return Err(format!(
+            "reading elevated AllMyStuff status failed: {error}"
+        ));
+    }
+    unsafe { CloseHandle(info.hProcess) };
     Ok(json!({
         "ok": code == 0,
         "output": if code == 0 {
@@ -4210,24 +4250,92 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
     }))
 }
 
+/// Quote one argument using the parsing rules used by CommandLineToArgvW.
+/// ShellExecuteExW receives a command-line string rather than an argv array.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_quote_argument(argument: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in argument.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            backslashes = 0;
+            quoted.push(ch);
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(windows)]
 fn current_windows_user_sid() -> Result<String, String> {
-    use std::os::windows::process::CommandExt as _;
-    let out = std::process::Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .creation_flags(0x0800_0000)
-        .output()
-        .map_err(|e| format!("reading the current Windows account SID: {e}"))?;
-    if !out.status.success() {
-        return Err("couldn't read the current Windows account SID".into());
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(format!(
+            "opening the current Windows account token: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let sid = text
-        .split([',', '"', '\r', '\n'])
-        .map(str::trim)
-        .find(|part| part.starts_with("S-1-"))
-        .ok_or_else(|| "Windows returned no account SID".to_string())?;
-    Ok(sid.to_string())
+
+    let result = (|| {
+        let mut needed = 0u32;
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            return Err(format!(
+                "sizing the current Windows account token: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "reading the current Windows account token: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let mut sid_text = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_text) } == 0 {
+            return Err(format!(
+                "formatting the current Windows account SID: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut len = 0usize;
+        while unsafe { *sid_text.add(len) } != 0 {
+            len += 1;
+        }
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, len) })
+            .map_err(|e| format!("Windows returned an invalid account SID: {e}"));
+        unsafe { LocalFree(sid_text.cast()) };
+        sid
+    })();
+    unsafe { CloseHandle(token) };
+    result
 }
 
 /// Transfer the one-machine node socket from a GUI-owned child to a service
@@ -4323,6 +4431,14 @@ fn behavior_json(b: window_behavior::Behavior) -> Value {
     })
 }
 
+fn should_migrate_privileged_host(status: &Value) -> bool {
+    status.get("installed").and_then(Value::as_bool) == Some(true)
+        && status
+            .get("privileged_host_current")
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
 /// Whether "Start with computer" (the OS login item) is currently registered.
 #[tauri::command]
 fn autostart_get(app: tauri::AppHandle) -> bool {
@@ -4376,14 +4492,7 @@ fn macos_update_relaunch_marker() -> Result<std::path::PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn launchctl_status_for(label: &str) -> Result<String, String> {
-    let uid = std::process::Command::new("/usr/bin/id")
-        .arg("-u")
-        .output()
-        .map_err(|e| format!("reading the macOS user id: {e}"))?;
-    if !uid.status.success() {
-        return Err("`id -u` failed while locating the macOS launchd domain".into());
-    }
-    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    let uid = unsafe { libc::getuid() };
     let output = std::process::Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{label}")])
         .output()
@@ -4426,27 +4535,23 @@ fn schedule_macos_autostart_refresh(app: &tauri::AppHandle) -> Result<bool, Stri
 
 #[cfg(target_os = "macos")]
 fn run_macos_autostart_refresh(parent_pid: &str) -> Result<(), String> {
-    use std::process::Stdio;
+    let parent_pid: libc::pid_t = parent_pid
+        .parse()
+        .map_err(|_| "the login-item refresh received an invalid parent process id".to_string())?;
+    let parent_is_alive = || {
+        if unsafe { libc::kill(parent_pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
 
     for _ in 0..200 {
-        let parent_alive = std::process::Command::new("/bin/kill")
-            .args(["-0", parent_pid])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !parent_alive {
+        if !parent_is_alive() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let parent_alive = std::process::Command::new("/bin/kill")
-        .args(["-0", parent_pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if parent_alive {
+    if parent_is_alive() {
         return Err("the previous AllMyStuff process did not exit within 10 seconds".into());
     }
 
@@ -4489,6 +4594,11 @@ fn run_macos_autostart_refresh(parent_pid: &str) -> Result<(), String> {
 /// once running, this clears the stale LWCR before the next login.
 #[cfg(target_os = "macos")]
 fn repair_macos_autostart_if_needed(app: &tauri::AppHandle) -> bool {
+    // Do not even query launchd for users who have not explicitly enabled the
+    // login item. The repair helper is part of that opt-in lifecycle only.
+    if !app.autolaunch().is_enabled().unwrap_or(false) {
+        return false;
+    }
     let Ok(status) = launchctl_status_for(MACOS_AUTOSTART_LABEL) else {
         return false;
     };
@@ -4599,7 +4709,7 @@ async fn wait_for_node_ready() -> bool {
 
 /// Apply the persisted startup preferences once the app is built: reveal the
 /// main window unless this is a login-item launch the user asked to start
-/// minimized, and — on a fresh install — default "Start with computer" on.
+/// minimized. Background execution and login persistence are opt-in.
 fn apply_startup_behavior(app: &tauri::AppHandle) {
     let wb = app.state::<window_behavior::WindowBehavior>();
 
@@ -4621,14 +4731,10 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
         let _ = win.set_focus();
     }
 
-    // First launch on this install: default "Start with computer" on, once, so
-    // a later user opt-out is never undone.
-    if wb.needs_autostart_default() {
-        match app.autolaunch().enable() {
-            Ok(()) => tracing::info!("enabled Start with computer (install default)"),
-            Err(e) => tracing::warn!("couldn't enable Start with computer by default: {e}"),
-        }
-        wb.mark_autostart_defaulted();
+    // Record the new opt-in policy without touching the OS login item. Keeping
+    // the legacy marker prevents an older build from enabling it later.
+    if wb.needs_autostart_policy_init() {
+        wb.mark_autostart_policy_initialized();
     }
 }
 
@@ -4830,20 +4936,6 @@ fn main() {
             eprintln!("AllMyStuff login-item refresh failed: {e}");
         }
         std::process::exit(0);
-    }
-
-    #[cfg(windows)]
-    if std::env::args().any(|arg| arg == "--service-bootstrap") {
-        let verb = process_arg_value("--service-bootstrap").unwrap_or_else(|| "install".into());
-        let code = match service_mutate_blocking(&verb) {
-            Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => 0,
-            Ok(_) => 1,
-            Err(e) => {
-                eprintln!("AllMyStuff privileged host setup failed: {e}");
-                1
-            }
-        };
-        std::process::exit(code);
     }
 
     // Elevated service action: `<gui-exe> --service-do <verb>`. On Windows the
@@ -5146,17 +5238,16 @@ fn main() {
                     local_file_operations::LocalFileOperations::default(),
                 )),
             });
-            // Installer hooks cover new NSIS installs. Existing installations
-            // can arrive here through the self-updater, so migrate the old
-            // Session-0 service exactly once when its ImagePath lacks the new
-            // console-session host arguments. Development builds never prompt.
+            // Repair only services the user already installed. A missing
+            // service is an intentional opt-out, never a migration signal.
+            // Existing installations can arrive here through the self-updater,
+            // so migrate an old Session-0 service when its ImagePath lacks the
+            // new console-session host arguments. Development builds never
+            // prompt.
             #[cfg(all(windows, not(debug_assertions)))]
             let migrate_privileged_host = {
                 let status = allmystuff_service::status_value(false).unwrap_or_default();
-                status
-                    .get("privileged_host_current")
-                    .and_then(Value::as_bool)
-                    != Some(true)
+                should_migrate_privileged_host(&status)
             };
             #[cfg(not(all(windows, not(debug_assertions))))]
             let migrate_privileged_host = false;
@@ -5366,6 +5457,36 @@ mod tests {
             Some(ServiceCmd::Uninstall)
         ));
         assert!(service_cmd("frobnicate").is_none());
+    }
+
+    #[test]
+    fn windows_argument_quoting_preserves_spaces_quotes_and_trailing_slashes() {
+        assert_eq!(windows_quote_argument("plain"), "\"plain\"");
+        assert_eq!(
+            windows_quote_argument(r#"C:\Users\Chris Paul\mesh.exe"#),
+            "\"C:\\Users\\Chris Paul\\mesh.exe\""
+        );
+        assert_eq!(
+            windows_quote_argument(r#"say "hello""#),
+            "\"say \\\"hello\\\"\""
+        );
+        assert_eq!(windows_quote_argument(r#"C:\path\"#), "\"C:\\path\\\\\"");
+    }
+
+    #[test]
+    fn privileged_host_migration_never_creates_a_missing_service() {
+        assert!(!should_migrate_privileged_host(&json!({
+            "installed": false,
+            "privileged_host_current": false,
+        })));
+        assert!(should_migrate_privileged_host(&json!({
+            "installed": true,
+            "privileged_host_current": false,
+        })));
+        assert!(!should_migrate_privileged_host(&json!({
+            "installed": true,
+            "privileged_host_current": true,
+        })));
     }
 
     #[test]

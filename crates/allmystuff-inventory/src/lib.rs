@@ -53,6 +53,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::{windows_disk_for_drive_letter, WindowsDiskInfo};
 
 pub mod report;
 

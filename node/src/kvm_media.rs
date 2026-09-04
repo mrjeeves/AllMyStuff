@@ -8,8 +8,6 @@
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
-#[cfg(target_os = "windows")]
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -167,34 +165,10 @@ async fn open_removable_disk(path: &Path, label: &str, _lazy: bool) -> Result<So
             "choose the root of a drive (for example E:\\) — {text} isn't one"
         ));
     };
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct DiskInfo {
-        number: u32,
-        size: u64,
-        bus_type: String,
-    }
-    let script = format!(
-        "$p=Get-Partition -DriveLetter '{letter}' -ErrorAction Stop; $d=$p|Get-Disk; [pscustomobject]@{{Number=$d.Number;Size=[uint64]$d.Size;BusType=[string]$d.BusType}}|ConvertTo-Json -Compress"
-    );
-    let output = crate::child_process::command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't inspect drive {letter}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "couldn't inspect drive {letter}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let disk: DiskInfo = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("couldn't identify drive {letter}: {error}"))?;
-    if !disk.bus_type.eq_ignore_ascii_case("usb") {
-        return Err(format!(
-            "drive {letter}: is {}, not a removable USB disk",
-            disk.bus_type
-        ));
+    let disk = allmystuff_inventory::windows_disk_for_drive_letter(letter)
+        .ok_or_else(|| format!("couldn't identify the physical disk behind drive {letter}"))?;
+    if !disk.usb {
+        return Err(format!("drive {letter}: is not a removable USB disk"));
     }
     let raw = format!(r"\\.\PhysicalDrive{}", disk.number);
     let file = std::fs::File::open(&raw).map_err(|error| {

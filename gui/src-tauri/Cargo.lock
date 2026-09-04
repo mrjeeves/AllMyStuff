@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "serde",
  "serde_json",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "serde",
  "serde_json",
@@ -110,16 +110,17 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "wmi",
 ]
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
@@ -183,7 +184,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "allmystuff-graph",
  "dirs 5.0.1",
@@ -193,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -203,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -214,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.102"
+version = "0.2.108"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -1997,12 +1998,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -2070,6 +2087,7 @@ version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -4807,7 +4825,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "libc",
  "rustix 1.1.4",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -8050,6 +8068,20 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+]
+
+[[package]]
+name = "wmi"
+version = "0.18.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c81b85c57a57500e56669586496bf2abd5cf082b9d32995251185d105208b64"
+dependencies = [
+ "futures",
+ "log",
+ "serde",
+ "thiserror 2.0.18",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

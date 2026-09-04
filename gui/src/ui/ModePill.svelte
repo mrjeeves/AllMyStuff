@@ -21,8 +21,8 @@
    *  dropdown shows and whether it's a bandwidth-heavy tier (the Studio
    *  flavors, which gate behind the one-time warning). */
   const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean }> = [
-    { key: "balanced", label: "Balanced", blurb: "Stability first: the safe default", heavy: false },
-    { key: "game", label: "Game", blurb: "Latency first, GDR healing", heavy: false },
+    { key: "balanced", label: "Balanced", blurb: "2K/30 target, stability first", heavy: false },
+    { key: "game", label: "Game", blurb: "4K/60 target, latency first, GDR healing", heavy: false },
     { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true },
     {
       key: "studio-ll",

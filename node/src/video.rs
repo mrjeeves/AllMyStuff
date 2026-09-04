@@ -384,8 +384,8 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 
 // The performance dials, each overridable for dial-in sessions without a
 // rebuild (read once per process). Defaults aim at "the screen, full
-// fidelity": H.264 carries up to a native 4K frame at a rate budgeted
-// from its true pixel count.
+// fidelity": H.264 carries the posture's native target (1440p Balanced,
+// 4K Game/Studio) at a rate budgeted from its true pixel count.
 
 /// How the ICE-nominated path to the stream's viewer actually flows —
 /// the daemon's own LAN/STUN/TURN taxonomy (`PeerInfo.selected_pair`,
@@ -491,14 +491,19 @@ pub(crate) fn burst_bounds(bitrate: u32, fps: u32, game: bool, studio: bool) -> 
     (peak, vbv)
 }
 
-/// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
-/// downscale on anything up to a UHD monitor (openh264's own hard limit
-/// is 3840×2160). Dimensions are forced even (4:2:0 chroma needs it).
-/// Override: `ALLMYSTUFF_VIDEO_MAX_EDGE`.
-fn h264_max_edge() -> u32 {
-    static EDGE: std::sync::LazyLock<u32> =
-        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_MAX_EDGE", 3840).clamp(320, 3840));
-    *EDGE
+/// Automatic H.264 ceiling on the longest edge. Balanced targets native up
+/// to 1440p at 30 fps; Game and the fidelity postures target native up to 4K
+/// at their own cadence. An explicit viewer resolution remains authoritative,
+/// and `fit_within_even` never upscales a smaller source. Process override:
+/// `ALLMYSTUFF_VIDEO_MAX_EDGE`.
+fn h264_max_edge(posture: Posture) -> u32 {
+    static OVERRIDE: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+        env_u32_opt("ALLMYSTUFF_VIDEO_MAX_EDGE").map(|edge| edge.clamp(320, 3840))
+    });
+    OVERRIDE.unwrap_or(match posture {
+        Posture::Balanced => 2560,
+        Posture::Game | Posture::Studio | Posture::StudioLossless => 3840,
+    })
 }
 
 /// Target bitrate for one stream's encode. Balanced starts at 8 Mbps; the
@@ -674,7 +679,9 @@ impl Tune {
             .clamp(1, 240)
     }
     fn h264_edge(&self) -> u32 {
-        self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
+        self.max_edge
+            .unwrap_or_else(|| h264_max_edge(self.posture()))
+            .clamp(320, 3840)
     }
     /// MJPEG honours the Res control the same way H.264 does — up to a 4K
     /// hard cap (chunked under the 64 KiB data channel) — so the pill moves
@@ -1358,6 +1365,9 @@ impl VideoBridge {
     /// the clean entry and its first feedback cross the pipeline.
     pub fn note_recovery(&self, route_id: &str) {
         self.feedback.lock().remove(route_id);
+        if let Some(route) = self.routes.lock().get(route_id) {
+            route.idr_ms.store(IDR_MS_TIGHT, Ordering::Relaxed);
+        }
         if let Some(rate) = route_rates().lock().get(route_id).cloned() {
             rate.adapt.lock().begin_recovery(Instant::now());
         }
@@ -4184,8 +4194,8 @@ impl StreamEncoder {
 }
 
 /// The H.264 encode stage of one route's stream — openh264 in
-/// screen-content mode, scaled to the [`h264_max_edge`] ceiling (even
-/// dimensions for 4:2:0, native up to 4K by default), with the same
+/// screen-content mode, scaled to the posture's [`h264_max_edge`] ceiling
+/// (even dimensions for 4:2:0; 1440p Balanced, 4K Game/Studio), with the same
 /// unchanged-frame gate as MJPEG and a forced IDR on an adaptive cadence
 /// ([`adaptive_idr_ms`], floored at [`IDR_MS_TIGHT`]) so a viewer always has
 /// a decode entry point within seconds. A resolution change (monitor swap)
@@ -6447,7 +6457,14 @@ mod tests {
         assert_eq!(big.mjpeg_edge(), 3840);
         let auto = Tune::default();
         assert_eq!(auto.fps(), 30);
-        assert_eq!(auto.h264_edge(), h264_max_edge());
+        assert_eq!(auto.h264_edge(), h264_max_edge(Posture::Balanced));
+        assert_eq!(auto.h264_edge(), 2560, "Balanced targets native up to 2K");
+        let game = Tune {
+            mode: Some(Posture::Game),
+            ..Tune::default()
+        };
+        assert_eq!(game.h264_edge(), 3840, "Game targets native up to 4K");
+        assert_eq!(game.fps(), 60, "Game targets 60 fps");
         // Untuned MJPEG defaults to HD, and untuned quality is neutral.
         assert_eq!(auto.mjpeg_edge(), mjpeg_max_edge());
         assert_eq!(auto.jpeg_quality(), JPEG_QUALITY);
@@ -6592,6 +6609,43 @@ mod tests {
         // Tearing the route down drops its feedback (no unbounded growth).
         vb.stop("r1");
         assert!(vb.latest_feedback("r1").is_none());
+    }
+
+    #[test]
+    fn recovery_request_restores_the_tight_periodic_idr_fallback() {
+        let vb = VideoBridge::new();
+        let idr_ms = Arc::new(AtomicU64::new(IDR_MS_RELAXED));
+        vb.routes.lock().insert(
+            "r1".into(),
+            RouteVideo {
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: None,
+                mode: VideoMode::Mjpeg,
+                source: VideoSource::Screen(None),
+                on_packet: Arc::new(|_| true),
+                on_status: Arc::new(|_, _| {}),
+                refresh: Arc::new(AtomicBool::new(false)),
+                idr_ms: idr_ms.clone(),
+                tune: Tune::default(),
+                auto: AutoAdapt::new(),
+            },
+        );
+        vb.feedback.lock().insert(
+            "r1".into(),
+            RecvFeedback {
+                recv_fps: 30,
+                decode_fails: 0,
+                queue_depth: 0,
+                est_kbps: 0,
+                delay_trend_us_per_s: 0,
+                at: Instant::now(),
+            },
+        );
+
+        vb.note_recovery("r1");
+
+        assert!(vb.latest_feedback("r1").is_none());
+        assert_eq!(idr_ms.load(Ordering::Relaxed), IDR_MS_TIGHT);
     }
 
     #[test]

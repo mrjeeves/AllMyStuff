@@ -452,6 +452,10 @@ pub struct Mesh {
     /// post-delivery quiet window. Decoder-error bursts collapse here instead
     /// of becoming frame-rate control traffic.
     video_refresh: Mutex<VideoRefreshGate>,
+    /// Routes with a clean-entry retry task already running. A lost repair
+    /// keyframe must not strand the viewer until the relaxed periodic IDR, but
+    /// repeated loss signals must not create repeated retry loops either.
+    video_refresh_retries: Mutex<HashSet<String>>,
     /// Per-peer backoff state for the refresh round-trip ([`ControlMessage::
     /// ProfileRequest`]), so a held-down refresh can't hammer a peer. See
     /// [`Mesh::allow_profile_request`].
@@ -1850,6 +1854,10 @@ enum AuSequenceObservation {
 }
 
 const VIDEO_REFRESH_QUIET: Duration = Duration::from_secs(1);
+/// Repeat a clean-entry request only while the receiver is explicitly fenced
+/// behind a damaged reset stream. This matches the gate's quiet period, so a
+/// lost repair keyframe gets another chance without creating an IDR storm.
+const VIDEO_CLEAN_ENTRY_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct VideoRefreshGate {
@@ -2307,6 +2315,7 @@ impl Mesh {
             video_diag_last: Mutex::new(HashMap::new()),
             dead_lane_since: Mutex::new(HashMap::new()),
             video_refresh: Mutex::new(VideoRefreshGate::default()),
+            video_refresh_retries: Mutex::new(HashSet::new()),
             profile_req: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
@@ -6016,13 +6025,10 @@ impl Mesh {
                 }
             );
         }
-        if request_entry {
-            let mesh = self.clone();
-            let refresh_route = route_id.to_string();
-            crate::spawn(async move {
-                let _ = mesh.request_refresh(refresh_route).await;
-            });
-        }
+        // Even when the daemon says an inline clean entry follows, keep a
+        // delayed safety net: that repair frame can be the packet burst that
+        // was lost. Only the explicit request path runs immediately.
+        self.ensure_clean_video_entry(route_id.to_string(), request_entry);
         true
     }
 
@@ -6230,11 +6236,7 @@ impl Mesh {
                 );
             }
             if !was_awaiting {
-                let mesh = self.clone();
-                let refresh_route = route_id.to_string();
-                crate::spawn(async move {
-                    let _ = mesh.request_refresh(refresh_route).await;
-                });
+                self.ensure_clean_video_entry(route_id.to_string(), true);
             }
             return;
         }
@@ -17995,6 +17997,49 @@ impl Mesh {
         });
     }
 
+    /// Keep asking for a clean decode entry at a bounded cadence until one is
+    /// actually observed. Reliable control delivery proves the request reached
+    /// the sender, not that the resulting (much larger) keyframe survived the
+    /// media path, so a one-shot request can still leave the viewer frozen.
+    fn ensure_clean_video_entry(self: &Arc<Self>, route_id: String, request_now: bool) {
+        if !self.video_refresh_retries.lock().insert(route_id.clone()) {
+            return;
+        }
+
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            if !request_now {
+                tokio::time::sleep(VIDEO_CLEAN_ENTRY_RETRY).await;
+            }
+            loop {
+                let Some(mesh) = mesh.upgrade() else {
+                    return;
+                };
+                let keep_retrying = {
+                    let awaiting = mesh.video_awaiting_entry.lock();
+                    if awaiting.contains(&route_id) {
+                        true
+                    } else {
+                        // Hold the awaiting lock through task-ledger removal. A
+                        // same-id successor gap can then either keep this loop or
+                        // start a new one; it cannot fall between both states.
+                        mesh.video_refresh_retries.lock().remove(&route_id);
+                        false
+                    }
+                };
+                if !keep_retrying {
+                    return;
+                }
+
+                if let Err(err) = mesh.request_refresh(route_id.clone()).await {
+                    tracing::debug!("clean-entry request for {route_id} did not deliver: {err}");
+                }
+                drop(mesh);
+                tokio::time::sleep(VIDEO_CLEAN_ENTRY_RETRY).await;
+            }
+        });
+    }
+
     /// Ask the far end of an inbound display/camera route for one clean decode
     /// entry. Delivery is acknowledged and single-flight per route: a burst of
     /// decoder failures produces one bounded control operation, not a stream of
@@ -22074,9 +22119,14 @@ mod tests {
     }
 
     #[test]
-    fn video_refresh_gate_is_single_flight_and_one_per_recovery_episode() {
+    fn video_refresh_gate_is_single_flight_and_rate_limits_recovery_retries() {
         let start = Instant::now();
         let mut gate = VideoRefreshGate::default();
+
+        assert!(
+            VIDEO_CLEAN_ENTRY_RETRY >= VIDEO_REFRESH_QUIET,
+            "the recovery loop must not wake faster than the request gate"
+        );
 
         assert!(gate.begin("r", start));
         assert!(

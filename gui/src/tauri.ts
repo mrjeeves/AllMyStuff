@@ -33,6 +33,7 @@ import type {
   UpdateStatus,
   VideoFrameMsg,
 } from "./types";
+import { makeVideoPollScheduler } from "./video-poll-scheduler";
 import type { CanvasRecord } from "./files-canvas";
 import { managedUnlisten } from "./event-lifecycle";
 
@@ -1520,39 +1521,31 @@ export async function watchVideo(
     decoder: opts?.decoder ?? "automatic",
   })) as number;
   let stopped = false;
-  let inFlight = false;
-  const tick = async () => {
-    if (stopped || inFlight) return;
-    inFlight = true;
-    try {
-      const batch = (await invoke("video_poll", { routeId })) as ArrayBuffer;
-      if (stopped || !(batch instanceof ArrayBuffer)) return;
-      const view = new DataView(batch);
-      let offset = 0;
-      while (offset + 4 <= batch.byteLength) {
-        const len = view.getUint32(offset, true);
-        offset += 4;
-        if (len === 0 || offset + len > batch.byteLength) break;
-        const packet = parseVideoPacket(batch, offset, len);
-        offset += len;
-        if (packet) cb(packet);
-      }
-    } catch {
-      // One missed poll; the next tick drains everything queued.
-    } finally {
-      inFlight = false;
+  const scheduler = makeVideoPollScheduler(async () => {
+    const batch = (await invoke("video_poll", { routeId })) as ArrayBuffer;
+    if (stopped || !(batch instanceof ArrayBuffer)) return;
+    const view = new DataView(batch);
+    let offset = 0;
+    while (offset + 4 <= batch.byteLength) {
+      const len = view.getUint32(offset, true);
+      offset += 4;
+      if (len === 0 || offset + len > batch.byteLength) break;
+      const packet = parseVideoPacket(batch, offset, len);
+      offset += len;
+      if (packet) cb(packet);
     }
-  };
+  });
   // Drain on the backend's "queue went non-empty" poke — event delivery
   // isn't timer-throttled, so an occluded (non-maximized) console keeps
   // painting at full rate, and arrival-driven pulls beat the interval's
   // worst-case 16 ms. The interval stays as the safety net.
   const unlisten = await listen<string>("allmystuff://video-ready", (e) => {
-    if (e.payload === routeId) void tick();
+    if (e.payload === routeId) scheduler.request();
   });
-  const timer = setInterval(() => void tick(), 16);
+  const timer = setInterval(scheduler.request, 16);
   return () => {
     stopped = true;
+    scheduler.stop();
     clearInterval(timer);
     unlisten();
     void invoke("video_unwatch", { routeId, token }).catch(() => {});

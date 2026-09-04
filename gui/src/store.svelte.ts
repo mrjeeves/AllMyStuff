@@ -10275,7 +10275,7 @@ class AppStore {
   async setWindowBehavior(patch: Partial<WindowBehavior>) {
     if (!isTauri()) return;
     const base = this.windowBehavior ?? {
-      close_to_tray: true,
+      close_to_tray: false,
       minimize_to_tray: false,
       start_minimized: false,
     };

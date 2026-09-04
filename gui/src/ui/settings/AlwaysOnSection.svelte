@@ -118,7 +118,7 @@
       <label class="toggle">
         <input
           type="checkbox"
-          checked={wb?.close_to_tray ?? true}
+          checked={wb?.close_to_tray ?? false}
           onchange={(e) => app.setWindowBehavior({ close_to_tray: e.currentTarget.checked })}
         />
         <span>
@@ -147,7 +147,8 @@
         <div class="grow">
           <div class="title">Run as a background service</div>
           <div class="hint">
-            Install a {serviceKind} service to stay available while logged out.
+            Install a {serviceKind} service to stay available while logged out. This is installed
+            only when you choose the button below.
           </div>
         </div>
         <span class="pill" class:on={running} class:idle={installed && !running}>{statusWord}</span>

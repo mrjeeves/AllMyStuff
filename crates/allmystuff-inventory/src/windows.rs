@@ -1,66 +1,83 @@
-//! Windows device probing via PowerShell + CIM (`Get-CimInstance`).
+//! Windows device probing through WMI's in-process COM API.
 //!
 //! Linux (`linux.rs`) is the reference; this is the Windows implementation
 //! of the same collector surface. Host basics (CPU/memory/storage/network)
-//! come from `sysinfo`; everything here queries CIM and parses the JSON.
+//! come from `sysinfo`; everything here queries typed WMI rows directly.
 //! Each probe is defensive — a failed query or a shape change degrades to
 //! "nothing here" rather than a panic.
 
 #![cfg(target_os = "windows")]
 
-use std::os::windows::process::CommandExt as _;
-use std::process::Command;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use wmi::WMIConnection;
 
 use crate::types::*;
 
-/// Each console-subsystem child of a windowless (GUI-subsystem) parent
-/// gets a fresh visible console on Windows — one flashing window per
-/// probe when the app scans. CREATE_NO_WINDOW runs the child with no
-/// console window; `.output()` pipes stdio, so nothing else changes.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Run a PowerShell snippet that ends in `ConvertTo-Json` and parse the
-/// result. `ConvertTo-Json` emits a bare object for a single row and an
-/// array for many; [`as_rows`] normalises both.
-fn ps_json(script: &str) -> Option<serde_json::Value> {
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    serde_json::from_str(trimmed).ok()
+/// The physical disk behind a drive letter, for KVM virtual-media reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsDiskInfo {
+    pub number: u32,
+    pub size: u64,
+    pub usb: bool,
 }
 
-fn as_rows(v: serde_json::Value) -> Vec<serde_json::Value> {
-    match v {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Null => Vec::new(),
-        other => vec![other],
+/// Run a read-only WMI query in-process. WMI initializes COM for this thread;
+/// failures degrade to an empty result just as the former shell probes did.
+fn query<T: DeserializeOwned>(namespace: &str, statement: &str) -> Vec<T> {
+    WMIConnection::with_namespace_path(namespace)
+        .and_then(|connection| connection.raw_query(statement))
+        .unwrap_or_default()
+}
+
+fn cimv2<T: DeserializeOwned>(statement: &str) -> Vec<T> {
+    query("ROOT\\CIMV2", statement)
+}
+
+/// Resolve a mounted drive through the native Windows Storage provider.
+/// `BusType == 7` is `BusTypeUsb` from `STORAGE_BUS_TYPE`.
+pub fn windows_disk_for_drive_letter(letter: char) -> Option<WindowsDiskInfo> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PartitionRow {
+        disk_number: u32,
     }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct DiskRow {
+        number: u32,
+        size: u64,
+        bus_type: u16,
+    }
+
+    let namespace = "ROOT\\Microsoft\\Windows\\Storage";
+    let partition = query::<PartitionRow>(
+        namespace,
+        &format!(
+            "SELECT DiskNumber FROM MSFT_Partition WHERE DriveLetter = '{}'",
+            letter.to_ascii_uppercase()
+        ),
+    )
+    .into_iter()
+    .next()?;
+    query::<DiskRow>(
+        namespace,
+        &format!(
+            "SELECT Number, Size, BusType FROM MSFT_Disk WHERE Number = {}",
+            partition.disk_number
+        ),
+    )
+    .into_iter()
+    .next()
+    .map(|disk| WindowsDiskInfo {
+        number: disk.number,
+        size: disk.size,
+        usb: disk.bus_type == 7,
+    })
 }
 
-fn rows(script: &str) -> Vec<serde_json::Value> {
-    ps_json(script).map(as_rows).unwrap_or_default()
-}
-
-fn s(v: &serde_json::Value, key: &str) -> Option<String> {
-    v[key]
-        .as_str()
+fn clean_string(value: Option<String>) -> Option<String> {
+    value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -81,8 +98,15 @@ fn dmi_placeholder(v: &str) -> bool {
 }
 
 /// A trimmed, non-empty WMI field that also isn't a DMI placeholder.
-fn clean(v: &serde_json::Value, key: &str) -> Option<String> {
-    s(v, key).filter(|x| !dmi_placeholder(x))
+fn clean(value: Option<String>) -> Option<String> {
+    clean_string(value).filter(|x| !dmi_placeholder(x))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BaseBoardRow {
+    manufacturer: Option<String>,
+    product: Option<String>,
 }
 
 /// The motherboard's own manufacturer + product from `Win32_BaseBoard`. On a
@@ -90,12 +114,11 @@ fn clean(v: &serde_json::Value, key: &str) -> Option<String> {
 /// placeholder, and the real identity is here — `Product` is the sibling of
 /// `Manufacturer` ("PRIME X570-P" next to "ASUSTeK COMPUTER INC.").
 fn baseboard() -> (Option<String>, Option<String>) {
-    match ps_json(
-        "Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product | ConvertTo-Json -Compress",
-    ) {
-        Some(v) => (clean(&v, "Manufacturer"), clean(&v, "Product")),
-        None => (None, None),
-    }
+    cimv2::<BaseBoardRow>("SELECT Manufacturer, Product FROM Win32_BaseBoard")
+        .into_iter()
+        .next()
+        .map(|row| (clean(row.manufacturer), clean(row.product)))
+        .unwrap_or_default()
 }
 
 /// The motherboard's own product string, exactly as `Win32_BaseBoard.Product`
@@ -103,8 +126,10 @@ fn baseboard() -> (Option<String>, Option<String>) {
 /// manufacturer prefixing, NO fallback to the system record: the Board row
 /// shows whatever the system has for the field.
 pub fn board_label() -> Option<String> {
-    ps_json("Get-CimInstance Win32_BaseBoard | Select-Object Product | ConvertTo-Json -Compress")
-        .and_then(|v| s(&v, "Product"))
+    cimv2::<BaseBoardRow>("SELECT Manufacturer, Product FROM Win32_BaseBoard")
+        .into_iter()
+        .next()
+        .and_then(|row| clean_string(row.product))
 }
 
 /// Just the product / model name — the friendly `Win32_ComputerSystem.Model`
@@ -113,10 +138,15 @@ pub fn board_label() -> Option<String> {
 /// fall back to the motherboard's own product — the sibling of its
 /// manufacturer in `Win32_BaseBoard` ("PRIME X570-P").
 pub fn product_label() -> Option<String> {
-    let sys_model = ps_json(
-        "Get-CimInstance Win32_ComputerSystem | Select-Object Model | ConvertTo-Json -Compress",
-    )
-    .and_then(|v| clean(&v, "Model"));
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ComputerSystemRow {
+        model: Option<String>,
+    }
+    let sys_model = cimv2::<ComputerSystemRow>("SELECT Model FROM Win32_ComputerSystem")
+        .into_iter()
+        .next()
+        .and_then(|row| clean(row.model));
     sys_model.or_else(|| baseboard().1)
 }
 
@@ -125,11 +155,18 @@ pub fn soc_label() -> Option<String> {
 }
 
 pub fn collect_gpus() -> Vec<Gpu> {
-    rows("Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress")
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct VideoControllerRow {
+        name: Option<String>,
+        adapter_ram: Option<u64>,
+        driver_version: Option<String>,
+    }
+    cimv2::<VideoControllerRow>("SELECT Name, AdapterRAM, DriverVersion FROM Win32_VideoController")
         .into_iter()
         .enumerate()
-        .filter_map(|(i, v)| {
-            let name = s(&v, "Name")?;
+        .filter_map(|(i, row)| {
+            let name = clean_string(row.name)?;
             let lname = name.to_lowercase();
             let vendor = if lname.contains("nvidia") {
                 GpuVendor::Nvidia
@@ -142,7 +179,7 @@ pub fn collect_gpus() -> Vec<Gpu> {
             };
             // AdapterRAM is a uint32 and wraps for >4 GB cards; treat 0 /
             // missing as unknown rather than wrong.
-            let vram_bytes = v["AdapterRAM"].as_u64().filter(|&b| b > 0);
+            let vram_bytes = row.adapter_ram.filter(|&b| b > 0);
             Some(Gpu {
                 id: format!("gpu:{i}"),
                 name,
@@ -155,60 +192,93 @@ pub fn collect_gpus() -> Vec<Gpu> {
                 } else {
                     GpuKind::Unknown
                 },
-                driver: s(&v, "DriverVersion"),
+                driver: clean_string(row.driver_version),
             })
         })
         .collect()
 }
 
 pub fn collect_displays() -> Vec<Display> {
-    // Decode the uint16 UserFriendlyName array from WmiMonitorID in
-    // PowerShell, then carry the primary resolution from the video
-    // controller (per-monitor native resolution needs the EDID timing
-    // block, a follow-up).
-    let script = r#"
-$res = Get-CimInstance Win32_VideoController |
-    Where-Object { $_.CurrentHorizontalResolution } |
-    Select-Object -First 1
-Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
-    $name = -join ($_.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
-    [pscustomobject]@{
-        Name = $name
-        Instance = $_.InstanceName
-        Width = $res.CurrentHorizontalResolution
-        Height = $res.CurrentVerticalResolution
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ResolutionRow {
+        current_horizontal_resolution: Option<u32>,
+        current_vertical_resolution: Option<u32>,
     }
-} | ConvertTo-Json -Compress
-"#;
-    rows(script)
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let name = s(&v, "Name").unwrap_or_else(|| format!("Display {i}"));
-            let connector = s(&v, "Instance").unwrap_or_default();
-            let internal = connector.to_uppercase().contains("LCD")
-                || name.to_lowercase().contains("internal");
-            Display {
-                id: format!("display:{i}"),
-                name,
-                connector,
-                connected: true,
-                width_px: v["Width"].as_u64().map(|w| w as u32),
-                height_px: v["Height"].as_u64().map(|h| h as u32),
-                internal,
-                default: false,
-            }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct MonitorIdRow {
+        user_friendly_name: Option<Vec<u16>>,
+        instance_name: Option<String>,
+    }
+
+    // Per-monitor native resolution needs the EDID timing block; keep the
+    // former best-effort primary resolution until that richer parser lands.
+    let resolution = cimv2::<ResolutionRow>(
+        "SELECT CurrentHorizontalResolution, CurrentVerticalResolution \
+         FROM Win32_VideoController WHERE CurrentHorizontalResolution IS NOT NULL",
+    )
+    .into_iter()
+    .next();
+    let (width_px, height_px) = resolution
+        .map(|row| {
+            (
+                row.current_horizontal_resolution,
+                row.current_vertical_resolution,
+            )
         })
-        .collect()
+        .unwrap_or_default();
+
+    query::<MonitorIdRow>(
+        "ROOT\\WMI",
+        "SELECT UserFriendlyName, InstanceName FROM WmiMonitorID",
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, row)| {
+        let name = row
+            .user_friendly_name
+            .map(|name| {
+                let end = name
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(name.len());
+                String::from_utf16_lossy(&name[..end]).trim().to_string()
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("Display {i}"));
+        let connector = clean_string(row.instance_name).unwrap_or_default();
+        let internal =
+            connector.to_uppercase().contains("LCD") || name.to_lowercase().contains("internal");
+        Display {
+            id: format!("display:{i}"),
+            name,
+            connector,
+            connected: true,
+            width_px,
+            height_px,
+            internal,
+            default: false,
+        }
+    })
+    .collect()
 }
 
 pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct AudioEndpointRow {
+        name: Option<String>,
+        device_id: Option<String>,
+    }
     let (mut mics, mut speakers) = (Vec::new(), Vec::new());
-    let endpoints = rows(
-        "Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='AudioEndpoint'\" | Select-Object Name,DeviceID | ConvertTo-Json -Compress",
+    let endpoints = cimv2::<AudioEndpointRow>(
+        "SELECT Name, DeviceID FROM Win32_PnPEntity WHERE PNPClass = 'AudioEndpoint'",
     );
-    for (i, v) in endpoints.into_iter().enumerate() {
-        let Some(name) = s(&v, "Name") else { continue };
+    for (i, row) in endpoints.into_iter().enumerate() {
+        let Some(name) = clean_string(row.name) else {
+            continue;
+        };
         let l = name.to_lowercase();
         let is_input = l.contains("microphone")
             || l.contains("mic ")
@@ -224,7 +294,7 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
                 AudioDirection::Output
             },
             channels: None,
-            card: s(&v, "DeviceID"),
+            card: clean_string(row.device_id),
             default: false,
         };
         if is_input {
@@ -237,56 +307,77 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
 }
 
 pub fn collect_cameras() -> Vec<Camera> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct CameraRow {
+        name: Option<String>,
+        pnp_class: Option<String>,
+    }
     // Webcams register under PNPClass 'Camera' on most modern drivers but
     // 'Image' on plenty of others (UVC devices especially) — query both.
     // 'Image' also covers scanners, so those rows only count when the name
     // says camera; 'Camera'-class rows are taken at their word.
-    rows("Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Camera' OR PNPClass='Image'\" | Select-Object Name,PNPClass | ConvertTo-Json -Compress")
-        .into_iter()
-        .filter(|v| {
-            let class = s(v, "PNPClass").unwrap_or_default();
-            if class.eq_ignore_ascii_case("camera") {
-                return true;
-            }
-            let name = s(v, "Name").unwrap_or_default().to_lowercase();
-            name.contains("cam") || name.contains("video")
+    cimv2::<CameraRow>(
+        "SELECT Name, PNPClass FROM Win32_PnPEntity \
+         WHERE PNPClass = 'Camera' OR PNPClass = 'Image'",
+    )
+    .into_iter()
+    .filter(|row| {
+        let class = row.pnp_class.as_deref().unwrap_or_default();
+        if class.eq_ignore_ascii_case("camera") {
+            return true;
+        }
+        let name = row.name.as_deref().unwrap_or_default().to_lowercase();
+        name.contains("cam") || name.contains("video")
+    })
+    .enumerate()
+    .filter_map(|(i, row)| {
+        Some(Camera {
+            id: format!("cam:{i}"),
+            name: clean_string(row.name)?,
+            path: None,
+            default: false,
         })
-        .enumerate()
-        .filter_map(|(i, v)| {
-            Some(Camera {
-                id: format!("cam:{i}"),
-                name: s(&v, "Name")?,
-                path: None,
-                default: false,
-            })
-        })
-        .collect()
+    })
+    .collect()
 }
 
 pub fn collect_inputs() -> Vec<InputDevice> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct InputRow {
+        name: Option<String>,
+        description: Option<String>,
+        pnp_device_id: Option<String>,
+    }
     // One physical device registers a WMI row per HID interface ("HID
     // Keyboard Device" three times over); merge them by the PnP VID:PID.
     // WMI rows carry no stable per-port path, so two identical units of
     // one model merge too — an accepted trade for a readable list (these
     // entries are display-only input sources).
     let mut raw = Vec::new();
-    for (i, v) in rows("Get-CimInstance Win32_Keyboard | Select-Object Name,Description,PNPDeviceID | ConvertTo-Json -Compress")
+    for (i, row) in cimv2::<InputRow>("SELECT Name, Description, PNPDeviceID FROM Win32_Keyboard")
         .into_iter()
         .enumerate()
     {
-        let name = s(&v, "Name").or_else(|| s(&v, "Description")).unwrap_or_else(|| "Keyboard".into());
+        let name = clean_string(row.name)
+            .or_else(|| clean_string(row.description))
+            .unwrap_or_else(|| "Keyboard".into());
         raw.push(crate::dedupe::RawInput {
-            group: s(&v, "PNPDeviceID").as_deref().and_then(pnp_vid_pid),
+            group: row.pnp_device_id.as_deref().and_then(pnp_vid_pid),
             fallback_id: format!("input:kbd:{i}"),
             name,
             kind: InputKind::Keyboard,
         });
     }
-    for (i, v) in rows("Get-CimInstance Win32_PointingDevice | Select-Object Name,Description,PNPDeviceID | ConvertTo-Json -Compress")
-        .into_iter()
-        .enumerate()
+    for (i, row) in
+        cimv2::<InputRow>("SELECT Name, Description, PNPDeviceID FROM Win32_PointingDevice")
+            .into_iter()
+            .enumerate()
     {
-        let name = s(&v, "Name").or_else(|| s(&v, "Description")).unwrap_or_else(|| "Pointer".into());
+        let name = clean_string(row.name)
+            .or_else(|| clean_string(row.description))
+            .unwrap_or_else(|| "Pointer".into());
         let l = name.to_lowercase();
         let kind = if l.contains("touchpad") || l.contains("trackpad") {
             InputKind::Touchpad
@@ -294,7 +385,7 @@ pub fn collect_inputs() -> Vec<InputDevice> {
             InputKind::Mouse
         };
         raw.push(crate::dedupe::RawInput {
-            group: s(&v, "PNPDeviceID").as_deref().and_then(pnp_vid_pid),
+            group: row.pnp_device_id.as_deref().and_then(pnp_vid_pid),
             fallback_id: format!("input:pt:{i}"),
             name,
             kind,
@@ -311,20 +402,32 @@ fn pnp_vid_pid(id: &str) -> Option<String> {
 }
 
 pub fn collect_usb() -> Vec<UsbDevice> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct UsbRow {
+        name: Option<String>,
+        manufacturer: Option<String>,
+        device_id: Option<String>,
+    }
     let mut out = Vec::new();
-    for v in rows(
-        "Get-CimInstance Win32_PnPEntity -Filter \"DeviceID like 'USB\\\\VID_%'\" | Select-Object Name,Manufacturer,DeviceID | ConvertTo-Json -Compress",
+    for row in cimv2::<UsbRow>(
+        "SELECT Name, Manufacturer, DeviceID FROM Win32_PnPEntity \
+         WHERE DeviceID LIKE 'USB%'",
     ) {
-        let Some(device_id) = s(&v, "DeviceID") else { continue };
-        let Some((vid, pid)) = parse_usb_id(&device_id) else { continue };
+        let Some(device_id) = clean_string(row.device_id) else {
+            continue;
+        };
+        let Some((vid, pid)) = parse_usb_id(&device_id) else {
+            continue;
+        };
         // Skip Microsoft/host root entries that aren't really peripherals.
-        let name = s(&v, "Name").unwrap_or_else(|| format!("USB {vid}:{pid}"));
+        let name = clean_string(row.name).unwrap_or_else(|| format!("USB {vid}:{pid}"));
         out.push(UsbDevice {
             id: format!("usb:{vid}:{pid}"),
             name,
             vendor_id: vid,
             product_id: pid,
-            manufacturer: s(&v, "Manufacturer"),
+            manufacturer: clean_string(row.manufacturer),
             class: None,
         });
     }
@@ -342,17 +445,48 @@ fn parse_usb_id(device_id: &str) -> Option<(String, String)> {
         .then_some((vid, pid))
 }
 
-/// Enumerate the TCP ports this machine is listening on, via
-/// `Get-NetTCPConnection -State Listen`, tagged with each socket's owning
-/// process name (cosmetic — `Get-Process` is SilentlyContinue, so a PID we
-/// can't open just leaves the name blank). Degrades to an empty list when
-/// PowerShell isn't available or nothing is listening.
+/// Enumerate listening TCP ports from the standard Windows networking WMI
+/// provider, tagged with a best-effort owning process name.
 pub fn collect_listening() -> Vec<ListeningService> {
-    let script = "Get-NetTCPConnection -State Listen | ForEach-Object { \
-        [PSCustomObject]@{ LocalAddress = $_.LocalAddress; LocalPort = $_.LocalPort; \
-        Process = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } } \
-        | ConvertTo-Json -Compress";
-    crate::listening::services_from_nettcp_rows(&rows(script))
+    use std::collections::HashMap;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ConnectionRow {
+        local_address: Option<String>,
+        local_port: u16,
+        owning_process: Option<u32>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ProcessRow {
+        process_id: u32,
+        name: Option<String>,
+    }
+
+    let processes: HashMap<u32, String> =
+        cimv2::<ProcessRow>("SELECT ProcessId, Name FROM Win32_Process")
+            .into_iter()
+            .filter_map(|row| clean_string(row.name).map(|name| (row.process_id, name)))
+            .collect();
+    let rows = query::<ConnectionRow>(
+        "ROOT\\StandardCimv2",
+        "SELECT LocalAddress, LocalPort, OwningProcess FROM MSFT_NetTCPConnection WHERE State = 2",
+    )
+    .into_iter()
+    .map(|row| {
+        serde_json::json!({
+            "LocalAddress": row.local_address.unwrap_or_default(),
+            "LocalPort": row.local_port,
+            "Process": row
+                .owning_process
+                .and_then(|pid| processes.get(&pid))
+                .cloned()
+                .unwrap_or_default(),
+        })
+    })
+    .collect::<Vec<_>>();
+    crate::listening::services_from_nettcp_rows(&rows)
 }
 
 #[cfg(test)]
@@ -380,15 +514,5 @@ mod tests {
             Some("046d:c52b")
         );
         assert_eq!(pnp_vid_pid("ACPI\\PNP0303\\4&1ab2c3d&0"), None);
-    }
-
-    #[test]
-    fn normalises_single_and_array_rows() {
-        assert_eq!(as_rows(serde_json::json!({"Name": "a"})).len(), 1);
-        assert_eq!(
-            as_rows(serde_json::json!([{"Name": "a"}, {"Name": "b"}])).len(),
-            2
-        );
-        assert_eq!(as_rows(serde_json::Value::Null).len(), 0);
     }
 }

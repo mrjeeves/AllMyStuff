@@ -10,8 +10,8 @@
 //! `~/.myownmesh`, `MYOWNMESH_HOME`-overridable, exactly like `networks_store`)
 //! and surfaced to the Svelte "Always On" tab through the `window_behavior` /
 //! `set_window_behavior` commands. ("Start with computer" itself is an OS-level
-//! login item owned by the autostart plugin, not stored here; only the
-//! one-time "default it on" marker lives here.)
+//! login item owned by the autostart plugin, not stored here; only a legacy
+//! one-time initialization marker lives here.)
 
 use std::path::PathBuf;
 
@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Behavior {
     /// Closing (the window's X) hides to the tray and keeps running, rather
-    /// than quitting. Default on — the requested "close button minimizes".
-    #[serde(default = "default_true")]
+    /// than quitting. Default off: background execution is an explicit choice.
+    #[serde(default)]
     pub close_to_tray: bool,
     /// Minimizing hides to the tray (gone from the taskbar), rather than the
     /// usual minimize. Default off — offered as a toggle.
@@ -34,21 +34,18 @@ pub struct Behavior {
     /// tray instead of showing the window. Default off — offered as a toggle.
     #[serde(default)]
     pub start_minimized: bool,
-    /// Internal: whether the one-time "Start with computer on by default" has
-    /// been applied on this install. Not a user-facing preference — it just
-    /// keeps us from re-enabling the login item after the user turns it off.
+    /// Internal: whether the startup policy has been initialized. The stored
+    /// name is retained for compatibility with releases that enabled the login
+    /// item by default. New releases only mark initialization; they never
+    /// create persistence without a user action.
     #[serde(default)]
     pub autostart_defaulted: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for Behavior {
     fn default() -> Self {
         Behavior {
-            close_to_tray: true,
+            close_to_tray: false,
             minimize_to_tray: false,
             start_minimized: false,
             autostart_defaulted: false,
@@ -94,15 +91,14 @@ impl WindowBehavior {
         self.inner.lock().start_minimized
     }
 
-    /// Whether the one-time "default Start with computer on" still needs
-    /// applying (true until [`mark_autostart_defaulted`] records it).
-    pub fn needs_autostart_default(&self) -> bool {
+    /// Whether this install still needs its startup policy initialized.
+    pub fn needs_autostart_policy_init(&self) -> bool {
         !self.inner.lock().autostart_defaulted
     }
 
-    /// Record that we've applied the default login item, and persist it, so we
-    /// never re-enable it after the user has turned it off.
-    pub fn mark_autostart_defaulted(&self) {
+    /// Record initialization without changing the OS login item. This also
+    /// prevents an older build from later applying its former opt-out default.
+    pub fn mark_autostart_policy_initialized(&self) {
         let mut inner = self.inner.lock();
         inner.autostart_defaulted = true;
         persist(&self.path, &inner);
@@ -135,4 +131,26 @@ fn persist(path: &Option<PathBuf>, value: &Behavior) -> bool {
 /// the rest of AllMyStuff's per-user state.
 fn store_path() -> Option<PathBuf> {
     Some(allmystuff_protocol::myownmesh_state_dir()?.join("allmystuff-window.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Behavior;
+
+    #[test]
+    fn background_behavior_is_opt_in_by_default() {
+        let behavior = Behavior::default();
+        assert!(!behavior.close_to_tray);
+        assert!(!behavior.minimize_to_tray);
+        assert!(!behavior.start_minimized);
+        assert!(!behavior.autostart_defaulted);
+    }
+
+    #[test]
+    fn missing_background_fields_deserialize_as_disabled() {
+        let behavior: Behavior = serde_json::from_str("{}").expect("valid behavior");
+        assert!(!behavior.close_to_tray);
+        assert!(!behavior.minimize_to_tray);
+        assert!(!behavior.start_minimized);
+    }
 }

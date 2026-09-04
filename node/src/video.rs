@@ -4552,8 +4552,8 @@ fn packetize_units(
 /// tail drops.
 pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 
-/// Opt-in for the app-side slice pacer (`ALLMYSTUFF_PACED_SLICES=1`),
-/// default OFF until soaked. When on: encoders emit byte-capped slices
+/// App-side slice pacer, enabled by default and explicitly disabled with
+/// `ALLMYSTUFF_PACED_SLICES=0`. Encoders emit byte-capped slices
 /// and the mesh forwarder writes each slice group as its own track send
 /// with a small gap — one keyframe's 200-packet wall becomes a handful
 /// of spaced ~20-packet bursts, with zero MyOwnMesh involvement (its
@@ -4910,10 +4910,8 @@ pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let value = std::env::var("ALLMYSTUFF_PACED_SLICES").ok();
         let on = paced_slices_requested(value.as_deref());
-        if on {
-            tracing::warn!(
-                "ALLMYSTUFF_PACED_SLICES enabled — experimental video burst shaping active"
-            );
+        if !on {
+            tracing::warn!("ALLMYSTUFF_PACED_SLICES=0 — video burst shaping disabled");
         }
         on
     });
@@ -4921,10 +4919,10 @@ pub(crate) fn paced_slices_enabled() -> bool {
 }
 
 fn paced_slices_requested(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
+    !value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true"
+            "0" | "off" | "false"
         )
     })
 }
@@ -6538,12 +6536,12 @@ mod tests {
     }
 
     #[test]
-    fn paced_slices_remain_opt_in() {
-        assert!(!paced_slices_requested(None));
-        for value in ["", "0", "off", "false", "unexpected"] {
+    fn paced_slices_default_on_with_an_explicit_opt_out() {
+        assert!(paced_slices_requested(None));
+        for value in ["0", "off", "false", " FALSE "] {
             assert!(!paced_slices_requested(Some(value)), "{value}");
         }
-        for value in ["1", "on", "true", " TRUE "] {
+        for value in ["", "1", "on", "true", "unexpected", " TRUE "] {
             assert!(paced_slices_requested(Some(value)), "{value}");
         }
     }

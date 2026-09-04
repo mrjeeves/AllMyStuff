@@ -106,15 +106,15 @@ pub fn parse_posture(s: &str) -> Option<Posture> {
 /// what it's asked to).
 pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 
-/// Mirror of the real module's pacer dial — same env, same opt-in default.
+/// Mirror of the real module's pacer dial — enabled unless explicitly off.
 pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("ALLMYSTUFF_PACED_SLICES")
+        !std::env::var("ALLMYSTUFF_PACED_SLICES")
             .ok()
             .is_some_and(|value| {
                 matches!(
                     value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "on" | "true"
+                    "0" | "off" | "false"
                 )
             })
     });

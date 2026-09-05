@@ -9,6 +9,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Route child/frontend diagnostics through the node's file-backed tracing
+/// layers. Bound Unicode safely and escape record separators via Debug fields.
+pub(crate) fn record_frontend_line(line: &str) {
+    let line: String = line.chars().take(4096).collect();
+    tracing::info!(target: "allmystuff_node::frontend", ?line, "frontend diagnostic");
+}
+
+pub(crate) fn record_daemon_line(line: &str, stderr: bool) {
+    let line: String = line.chars().take(4096).collect();
+    tracing::debug!(target: "allmystuff_node::daemon", stderr, ?line, "myownmesh diagnostic");
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct Preferences {
     /// `Option` preserves the distinction between an untouched install and a
@@ -68,6 +80,41 @@ fn store_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::resolve_debug_logging;
+
+    #[test]
+    fn forwarded_diagnostics_reach_the_tracing_writer_bounded_and_escaped() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::record_frontend_line("video stages\nnot a second record");
+            super::record_daemon_line("video loss before daemon IPC handoff", false);
+            super::record_frontend_line(&format!("{}MUST_BE_TRUNCATED", "é".repeat(4096)));
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.contains("video stages\\nnot a second record"));
+        assert!(text.contains("video loss before daemon IPC handoff"));
+        assert!(!text.contains("MUST_BE_TRUNCATED"));
+    }
 
     #[test]
     fn debug_logging_is_opt_in_and_explicit_off_wins() {

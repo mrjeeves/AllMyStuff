@@ -155,6 +155,7 @@ pub mod video;
 #[path = "stubs/video.rs"]
 pub mod video;
 pub mod video_decode;
+pub(crate) mod video_handoff;
 /// Codec-valid metadata carried inside encoded video access units. Unlike
 /// capture, this wire contract is needed by receive-only builds too.
 pub(crate) mod video_wire;

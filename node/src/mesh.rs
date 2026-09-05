@@ -634,82 +634,14 @@ struct VideoWatcher {
     /// Which native H.264 rung this local window selected. This never leaves
     /// the GUI-to-node process boundary.
     decoder: DecoderPreference,
-    queue: std::collections::VecDeque<Vec<u8>>,
-    /// The IPC queue discarded part of an H.264 reference chain. Deltas stay
-    /// quarantined until a key unit arrives; decoding across that gap paints
-    /// corrupt reference blocks even though every individual AU is intact.
-    awaiting_key: bool,
+    queue: VideoHandoff,
     /// Updated by the window's 16 ms safety poll even when no frame arrived.
     /// A post-disconnect-request poll is stronger liveness evidence than mere
     /// watcher presence because `video_unwatch` is fire-and-forget.
     last_poll: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum H264IpcEnqueue {
-    Enqueued { skipped: usize },
-    AwaitingKey { started: bool },
-    Converging { skipped: usize, started: bool },
-}
-
-fn ipc_h264_key(packet: &[u8]) -> bool {
-    packet.first() == Some(&2) && packet.get(1) == Some(&1)
-}
-
-/// Bound one window's compressed H.264 queue without ever crossing a
-/// reference gap. A queued key unit is a safe trim point. When no such point
-/// exists, deltas are discarded until the sender supplies a new key unit.
-fn enqueue_h264_ipc(
-    queue: &mut std::collections::VecDeque<Vec<u8>>,
-    awaiting_key: &mut bool,
-    packet: Vec<u8>,
-    max_queued: usize,
-    gradual: bool,
-) -> H264IpcEnqueue {
-    let key = ipc_h264_key(&packet);
-    if gradual {
-        if *awaiting_key && queue.len() < max_queued / 2 {
-            *awaiting_key = false;
-        }
-    } else if *awaiting_key {
-        if !key {
-            return H264IpcEnqueue::AwaitingKey { started: false };
-        }
-        let skipped = queue.len();
-        queue.clear();
-        *awaiting_key = false;
-        queue.push_back(packet);
-        return H264IpcEnqueue::Enqueued { skipped };
-    }
-
-    if queue.len() >= max_queued {
-        if let Some(i) = queue.iter().rposition(|queued| ipc_h264_key(queued)) {
-            if i > 0 {
-                queue.drain(..i);
-                queue.push_back(packet);
-                return H264IpcEnqueue::Enqueued { skipped: i };
-            }
-        }
-
-        let skipped = queue.len();
-        queue.clear();
-        if gradual {
-            let started = !*awaiting_key;
-            *awaiting_key = true;
-            queue.push_back(packet);
-            return H264IpcEnqueue::Converging { skipped, started };
-        }
-        if key {
-            queue.push_back(packet);
-            return H264IpcEnqueue::Enqueued { skipped };
-        }
-        *awaiting_key = true;
-        return H264IpcEnqueue::AwaitingKey { started: true };
-    }
-
-    queue.push_back(packet);
-    H264IpcEnqueue::Enqueued { skipped: 0 }
-}
+use crate::video_handoff::{Enqueue as H264IpcEnqueue, VideoHandoff};
 
 struct KvmMediaRequest {
     source: String,
@@ -6325,12 +6257,9 @@ impl Mesh {
     /// re-enter at a key unit, while gradual streams jump to the live edge and
     /// request one convergence wave. The return value arms that single request.
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) -> bool {
-        // Six AUs are 100 ms at 60 fps / 200 ms at 30 fps. An unread
-        // backlog is pure latency by the time the window drains it. Reset
-        // streams trim to a queued keyframe; GDR streams retain the newest
-        // delta and converge in place, so a slow-but-alive window loses
-        // moments, not the stream.
-        const MAX_QUEUED: usize = 6;
+        // Count is not residence time: repaired bursts can contain more than
+        // six AUs between healthy polls. Preserve their reference chain and
+        // bound actual unread age/memory in VideoHandoff instead.
         let gradual = self.video_au_in_recovery.lock().get(route_id).copied()
             == Some(crate::video_wire::AuRecovery::Gradual);
         let mut map = self.video_watchers.lock();
@@ -6352,21 +6281,14 @@ impl Mesh {
             // pulled yet is stale the moment a newer picture exists —
             // painting history buys nothing but lag. Mirrors
             // enqueue_decoded's freshest-wins.
-            w.queue.clear();
-            w.queue.push_back(packet);
+            w.queue.replace(packet);
         } else {
             // H.264 backlog: reset streams skip to the newest queued key unit
             // or quarantine dependent deltas until one arrives. GDR streams
             // instead keep the newest delta and request one refresh wave, so
             // Game never recreates an IDR wall at the final GUI handoff. The
             // IPC header carries the key flag (kind 2 at byte 0, key at byte 1).
-            match enqueue_h264_ipc(
-                &mut w.queue,
-                &mut w.awaiting_key,
-                packet,
-                MAX_QUEUED,
-                gradual,
-            ) {
+            match w.queue.push_h264(packet, Instant::now(), gradual) {
                 H264IpcEnqueue::Enqueued { skipped } if skipped > 0 => {
                     tracing::debug!(
                         "video queue for {route_id} unread — skipped {skipped} stale packets to a clean keyframe"
@@ -6375,7 +6297,7 @@ impl Mesh {
                 H264IpcEnqueue::AwaitingKey { started: true } => {
                     if self.diag_ok(&format!("ipc-reference-gap:{route_id}")) {
                         tracing::warn!(
-                            "video queue for {route_id} lost its bounded reference chain (GUI poll age {} ms, capacity {MAX_QUEUED} AUs) — quarantining deltas and requesting a clean entry",
+                            "video queue for {route_id} exceeded unread age/memory bounds (GUI poll age {} ms) — quarantining deltas and requesting a clean entry",
                             w.last_poll.elapsed().as_millis(),
                         );
                     }
@@ -6391,9 +6313,13 @@ impl Mesh {
                             "video queue for {route_id} skipped {skipped} stale packets — requesting one GDR convergence wave"
                         );
                     }
+                    self.sink.emit("allmystuff://video-ready", json!(route_id));
                     return true;
                 }
-                H264IpcEnqueue::Converging { started: false, .. } => return false,
+                H264IpcEnqueue::Converging { started: false, .. } => {
+                    self.sink.emit("allmystuff://video-ready", json!(route_id));
+                    return false;
+                }
                 H264IpcEnqueue::Enqueued { .. } => {}
             }
         }
@@ -6420,8 +6346,7 @@ impl Mesh {
             tracing::debug!("no console window watching {route_id} — decoded frame dropped");
             return;
         };
-        w.queue.clear();
-        w.queue.push_back(packet);
+        w.queue.replace(packet);
         self.sink.emit("allmystuff://video-ready", json!(route_id));
     }
 
@@ -7863,8 +7788,7 @@ impl Mesh {
                 token,
                 decode,
                 decoder,
-                queue: std::collections::VecDeque::new(),
-                awaiting_key: false,
+                queue: VideoHandoff::default(),
                 last_poll: Instant::now(),
             },
         );
@@ -7892,13 +7816,7 @@ impl Mesh {
             return Vec::new();
         };
         w.last_poll = Instant::now();
-        let total: usize = w.queue.iter().map(|p| 4 + p.len()).sum();
-        let mut out = Vec::with_capacity(total);
-        for packet in w.queue.drain(..) {
-            out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
-            out.extend_from_slice(&packet);
-        }
-        out
+        w.queue.take_batch()
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
@@ -22790,131 +22708,6 @@ mod tests {
         assert_eq!(
             done_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
             VideoEnqueueOutcome::Cancelled
-        );
-    }
-
-    fn ipc_h264(key: bool, byte: u8) -> Vec<u8> {
-        vec![2, u8::from(key), byte]
-    }
-
-    #[test]
-    fn ipc_h264_overflow_quarantines_deltas_until_a_key() {
-        let mut queue = std::collections::VecDeque::from([
-            ipc_h264(true, 1),
-            ipc_h264(false, 2),
-            ipc_h264(false, 3),
-        ]);
-        let mut awaiting_key = false;
-
-        assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3, false),
-            H264IpcEnqueue::AwaitingKey { started: true }
-        );
-        assert!(queue.is_empty());
-        assert!(awaiting_key);
-
-        assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 5), 3, false),
-            H264IpcEnqueue::AwaitingKey { started: false },
-            "dependent deltas stay out and do not request another refresh"
-        );
-        assert!(queue.is_empty());
-
-        assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 6), 3, false),
-            H264IpcEnqueue::Enqueued { skipped: 0 }
-        );
-        assert!(!awaiting_key);
-        assert_eq!(queue, std::collections::VecDeque::from([ipc_h264(true, 6)]));
-    }
-
-    #[test]
-    fn ipc_h264_overflow_keeps_the_newest_complete_reference_chain() {
-        let mut queue = std::collections::VecDeque::from([
-            ipc_h264(false, 1),
-            ipc_h264(true, 2),
-            ipc_h264(false, 3),
-        ]);
-        let mut awaiting_key = false;
-
-        assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(false, 4), 3, false),
-            H264IpcEnqueue::Enqueued { skipped: 1 }
-        );
-        assert_eq!(
-            queue,
-            std::collections::VecDeque::from([
-                ipc_h264(true, 2),
-                ipc_h264(false, 3),
-                ipc_h264(false, 4),
-            ])
-        );
-        assert!(!awaiting_key);
-    }
-
-    #[test]
-    fn ipc_h264_incoming_key_reseeds_a_full_keyless_queue_immediately() {
-        let mut queue = std::collections::VecDeque::from([
-            ipc_h264(false, 1),
-            ipc_h264(false, 2),
-            ipc_h264(false, 3),
-        ]);
-        let mut awaiting_key = false;
-
-        assert_eq!(
-            enqueue_h264_ipc(&mut queue, &mut awaiting_key, ipc_h264(true, 4), 3, false),
-            H264IpcEnqueue::Enqueued { skipped: 3 }
-        );
-        assert_eq!(queue, std::collections::VecDeque::from([ipc_h264(true, 4)]));
-        assert!(!awaiting_key);
-    }
-
-    #[test]
-    fn ipc_h264_gradual_overflow_keeps_live_deltas_and_requests_one_wave() {
-        let mut queue = std::collections::VecDeque::from([
-            ipc_h264(false, 1),
-            ipc_h264(false, 2),
-            ipc_h264(false, 3),
-        ]);
-        let mut recovery_in_flight = false;
-
-        assert_eq!(
-            enqueue_h264_ipc(
-                &mut queue,
-                &mut recovery_in_flight,
-                ipc_h264(false, 4),
-                3,
-                true,
-            ),
-            H264IpcEnqueue::Converging {
-                skipped: 3,
-                started: true,
-            }
-        );
-        assert_eq!(
-            queue,
-            std::collections::VecDeque::from([ipc_h264(false, 4)])
-        );
-        assert!(recovery_in_flight);
-
-        queue.extend([ipc_h264(false, 5), ipc_h264(false, 6)]);
-        assert_eq!(
-            enqueue_h264_ipc(
-                &mut queue,
-                &mut recovery_in_flight,
-                ipc_h264(false, 7),
-                3,
-                true,
-            ),
-            H264IpcEnqueue::Converging {
-                skipped: 3,
-                started: false,
-            },
-            "one congested episode does not yap another wave request"
-        );
-        assert_eq!(
-            queue,
-            std::collections::VecDeque::from([ipc_h264(false, 7)])
         );
     }
 

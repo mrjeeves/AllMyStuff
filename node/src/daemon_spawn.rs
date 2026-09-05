@@ -55,12 +55,19 @@ fn pump_daemon_output<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         use std::io::BufRead as _;
         use std::io::Write as _;
+        let persist = crate::diagnostics::debug_logging_enabled();
         for line in std::io::BufReader::new(reader)
             .lines()
             .map_while(Result::ok)
         {
             if !should_emit_daemon_line(&line, &seen_open_silent_drift) {
                 continue;
+            }
+            if persist {
+                // File logging is a tracing layer, not a tee of process stdout.
+                // Keep the original timestamp/level in this bounded record;
+                // inherited Windows GUI stdout alone would lose this evidence.
+                crate::diagnostics::record_daemon_line(&line, stderr);
             }
             if stderr {
                 // Keep draining even if our own stderr disappeared. Dropping
@@ -764,6 +771,15 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     tracing::info!(?bin, "spawning myownmesh daemon");
 
     let mut cmd = Command::new(&bin);
+    if crate::diagnostics::debug_logging_enabled() && std::env::var_os("MYOWNMESH_LOG").is_none() {
+        // Capture loss attribution at the local fanout, not packet-level RTP
+        // chatter. Append the user's extras last so explicit filters still win.
+        let extra = std::env::var("MYOWNMESH_LOG_EXTRA").unwrap_or_default();
+        cmd.env(
+            "MYOWNMESH_LOG_EXTRA",
+            format!("myownmesh::ipc::bridge=debug,{extra}"),
+        );
+    }
     cmd.arg("serve")
         .stdin(Stdio::null())
         // Capture only to forward line-for-line below. This lets AllMyStuff

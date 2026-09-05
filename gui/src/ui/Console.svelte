@@ -28,6 +28,7 @@
   import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { VideoStageStats } from "../video-stage-stats";
+  import { DecodeProgress } from "../decode-progress";
   import { makeRelativeMotionForwarder } from "../relative-motion";
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
@@ -739,10 +740,9 @@
         inRate > 2 && fps < inRate / 2
           ? `in ${inRate}/s · out ${fps}/s · q ${queuePeek()}${decodeModeNote ? ` · ${decodeModeNote}` : ""}`
           : "";
-      // Chunks flowing in, paints collapsed, queue deep: the decoder
-      // stopped consuming (the hardware-pool stall). Rebuild it — the
-      // ladder steps to software decode on the way.
-      if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // The active decoder checks elapsed time without output, not paint
+      // cadence or a burst of calls awaiting their first event-loop turn.
+      stallKick();
       // (Letterbox auto-detect no longer runs here — it samples the decoded
       // frame from the paint path via maybeDetect(), so it never reads the
       // live canvas and can't trigger Chromium's CPU-raster demotion.)
@@ -903,8 +903,10 @@
     // the lowest-latency, lowest-CPU rung. The ladder steps down to software
     // then native on a stall, so a box without HW decode still recovers.
     let decodeMode: HardwareAcceleration = "prefer-hardware";
-    let decodeCalls = 0;
     let decodeOutputs = 0;
+    let decodeProgress = new DecodeProgress();
+    const resumeDecodeProgress = () => decodeProgress.resume(performance.now());
+    document.addEventListener("visibilitychange", resumeDecodeProgress);
     // Decoded frames don't paint inside the output callback: the freshest
     // one is parked here (superseded frames close immediately — freshness
     // over completeness) and a rAF paints it. The decoder's frame pool can
@@ -930,25 +932,27 @@
         // Software decode stalled too — hand the stream to the backend's
         // openh264 decoder. Setting the flag re-runs this effect, which
         // re-watches the route in native mode (and tears this rung down).
-        console.warn(`video decoder (${codecString}) stalled twice: switching to native decode`);
+        clientLog(`video decoder ${route} (${codecString}) stalled twice: switching to native decode`);
         nativeDecoderPreference = "software";
         nativeDecode = true;
         decodePath = "native (sw)";
         askRefresh();
         return;
       }
-      console.warn(
-        `video decoder (${codecString}) stalled: rebuilding with ${decodeMode}`,
+      clientLog(
+        `video decoder ${route} (${codecString}) stalled: rebuilding with ${decodeMode}`,
       );
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
       } catch {
         // already closed
       }
-      decoder = null; // re-created on the next key unit (≤2s away)
+      decoder = null; // A new decoder needs a clean entry, not dependent deltas.
+      askRefresh();
     };
     stallKick = () => {
-      if (!cancelled && decoder) rebuildDecoder();
+      if (!cancelled && decoder && document.visibilityState === "visible"
+          && decodeProgress.stalled(performance.now())) rebuildDecoder();
     };
 
     const paintPending = () => {
@@ -1040,7 +1044,7 @@
       // log names them — a decoder that quietly dies reads as a freeze.
       decodeFails += 1;
       askRefresh();
-      console.warn("video decode error:", why);
+      clientLog(`video decode error ${route}: ${String(why)}`);
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
       } catch {
@@ -1124,6 +1128,7 @@
         decoder = new VideoDecoder({
           output: (frame) => {
             decodeOutputs += 1;
+            decodeProgress.output(performance.now());
             decCount += 1;
             stageStats.record("decoded", performance.now());
             if (pendingFrame) pendingFrame.close();
@@ -1143,7 +1148,7 @@
             optimizeForLatency: true,
             hardwareAcceleration: decodeMode,
           });
-          decodeCalls = 0;
+          decodeProgress = new DecodeProgress();
           decodeOutputs = 0;
         } catch (e) {
           dropDecoder(e);
@@ -1158,14 +1163,13 @@
             data: f.data,
           }),
         );
-        decodeCalls += 1;
+        decodeProgress.submit(performance.now());
       } catch (e) {
         dropDecoder(e);
         return;
       }
-      // Born-dead decoders (key accepted, nothing ever out) get the same
-      // rebuild as mid-stream stalls — without waiting for the 1s sweep.
-      if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
+      // Output is asynchronous. The health sweep tests elapsed no-progress
+      // time, never the number of calls made before this JS turn can finish.
       },
       { decode: native, decoder: nativeDecoder },
     ).then((u) => {
@@ -1176,6 +1180,7 @@
     return () => {
       cancelled = true;
       clearInterval(stageTimer);
+      document.removeEventListener("visibilitychange", resumeDecodeProgress);
       unwatch?.();
       unwatchStatus?.();
       stallKick = () => {};

@@ -876,6 +876,11 @@ pub async fn dispatch(
     }
 
     match req.cmd.as_str() {
+        "client_log" => {
+            let line: String = try_arg!(arg(a, "line"));
+            crate::diagnostics::record_frontend_line(&line);
+            DispatchOut::Json(Value::Null)
+        }
         // ---- this machine ------------------------------------------------
         "runtime_owner" => DispatchOut::Json(runtime.status()),
         "yield_runtime" => {

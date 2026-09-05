@@ -344,8 +344,19 @@ async fn kvm_media_unmount(state: State<'_, AppState>, kvm: String) -> Result<()
 /// `ALLMYSTUFF_GUI_LOG` stream as the backend's route lifecycle, so one
 /// capture reads a call end to end.
 #[tauri::command]
-fn client_log(line: String) {
+async fn client_log(app: tauri::AppHandle, line: String) {
     tracing::info!("{line}");
+    // Installed Windows GUI stdout has no persistent owner. Send the same
+    // bounded diagnostic to the node's existing file logger (local IPC only).
+    let line: String = line.chars().take(4096).collect();
+    let state = app.state::<AppState>();
+    if let Err(err) = state
+        .node
+        .request("client_log", json!({ "line": line }))
+        .await
+    {
+        tracing::debug!("frontend diagnostic could not reach node: {err}");
+    }
 }
 
 /// Claim a device as one of yours. Only takes if the target is in claim

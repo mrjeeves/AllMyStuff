@@ -772,12 +772,12 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
 
     let mut cmd = Command::new(&bin);
     if crate::diagnostics::debug_logging_enabled() && std::env::var_os("MYOWNMESH_LOG").is_none() {
-        // Capture loss attribution at the local fanout, not packet-level RTP
-        // chatter. Append the user's extras last so explicit filters still win.
+        // Capture recovery decisions and local fanout loss, not packet-level
+        // RTP chatter. Append user extras last so explicit filters still win.
         let extra = std::env::var("MYOWNMESH_LOG_EXTRA").unwrap_or_default();
         cmd.env(
             "MYOWNMESH_LOG_EXTRA",
-            format!("myownmesh::ipc::bridge=debug,{extra}"),
+            format!("myownmesh::ipc::bridge=debug,myownmesh_core::video_recovery=debug,{extra}"),
         );
     }
     cmd.arg("serve")

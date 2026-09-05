@@ -81,9 +81,9 @@ Full GUI build/typecheck and platform checks are left to CI. Three broader
 MyOwnMesh bridge fixtures failed to establish PeerApproved locally; this is
 not represented as a passing network integration test.
 
-For the combined fix, merge/release MyOwnMesh first, then update AMS's pin to
-that published release before cutting AMS. This branch does not invent a future
-release tag: the current 0.3.15 pin alone does not contain the daemon changes.
+The combined fix pins MyOwnMesh v0.3.16, including the daemon handoff changes
+from MyOwnMesh PR #129. The desktop sidecar pin and mobile Cargo dependencies
+must stay aligned. Wait for its required release assets before cutting AMS.
 
 Field acceptance still needs the same high-motion sequence, foreground state,
 source display, and negotiated quality on both versions. Compare presentation

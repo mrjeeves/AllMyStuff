@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-gui"
-version = "0.2.113"
+version = "0.3.114"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",

@@ -209,13 +209,15 @@ mod tests {
     #[test]
     fn memory_bound_checks_the_whole_suffix_and_incoming_key() {
         let start = Instant::now();
-        let mut q = VideoHandoff::default();
-        q.max_bytes = Packet {
-            data: au(true, 1),
-            at: start,
-        }
-        .charge()
-            * 2;
+        let mut q = VideoHandoff {
+            max_bytes: Packet {
+                data: au(true, 1),
+                at: start,
+            }
+            .charge()
+                * 2,
+            ..VideoHandoff::default()
+        };
         q.push_h264(au(true, 1), start, false);
         q.push_h264(au(false, 2), start, false);
         assert_eq!(

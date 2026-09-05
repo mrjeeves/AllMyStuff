@@ -68,6 +68,7 @@ pub(crate) enum InboundVideoEvent {
     Discontinuity {
         from: String,
         stream: u8,
+        reason: &'static str,
         entry: Option<InboundFrame>,
     },
 }
@@ -82,6 +83,7 @@ pub(crate) enum InboundVideoEvent {
 struct InboundRecoveryState {
     mode: crate::video_wire::AuRecovery,
     marker_queued: bool,
+    reason: &'static str,
 }
 
 const MAX_PACED_AU_CHUNKS: usize = 2048;
@@ -127,6 +129,7 @@ impl InboundVideoFreshness {
         &mut self,
         from: String,
         stream: u8,
+        reason: &'static str,
         tx: &mpsc::Sender<InboundVideoEvent>,
     ) -> bool {
         let lane = (canonical_media_peer(&from).to_string(), stream);
@@ -137,6 +140,7 @@ impl InboundVideoFreshness {
             .or_insert(InboundRecoveryState {
                 mode,
                 marker_queued: false,
+                reason,
             });
         state.mode = mode;
         if state.marker_queued {
@@ -145,6 +149,7 @@ impl InboundVideoFreshness {
         match tx.try_send(InboundVideoEvent::Discontinuity {
             from,
             stream,
+            reason: state.reason,
             entry: None,
         }) {
             Ok(()) => {
@@ -167,10 +172,20 @@ impl InboundVideoFreshness {
         let lane = Self::lane(&frame);
         if let Some(expected) = crate::video::paced_au_marker_count(&frame.data) {
             let Some(pending) = self.paced.remove(&lane) else {
-                return self.note_discontinuity(frame.from, frame.stream, tx);
+                return self.note_discontinuity(
+                    frame.from,
+                    frame.stream,
+                    "paced AU marker without fragments",
+                    tx,
+                );
             };
             if pending.frame.rtp_timestamp != frame.rtp_timestamp || pending.chunks != expected {
-                return self.note_discontinuity(frame.from, frame.stream, tx);
+                return self.note_discontinuity(
+                    frame.from,
+                    frame.stream,
+                    "paced AU timestamp/count mismatch",
+                    tx,
+                );
             }
             return self.forward(pending.frame, tx);
         }
@@ -190,7 +205,12 @@ impl InboundVideoFreshness {
                         > MAX_PACED_AU_BYTES
                 {
                     self.paced.remove(&lane);
-                    return self.note_discontinuity(frame.from, frame.stream, tx);
+                    return self.note_discontinuity(
+                        frame.from,
+                        frame.stream,
+                        "paced AU exceeded assembly bounds",
+                        tx,
+                    );
                 }
                 pending.frame.key |= frame.key;
                 pending.frame.data.extend_from_slice(&frame.data);
@@ -224,7 +244,7 @@ impl InboundVideoFreshness {
                 let pending = self.paced.get(&lane).expect("paced frame just inserted");
                 (pending.frame.from.clone(), pending.frame.stream)
             };
-            self.note_discontinuity(from, stream, tx)
+            self.note_discontinuity(from, stream, "paced AU expired or missing end marker", tx)
         } else {
             true
         }
@@ -242,7 +262,12 @@ impl InboundVideoFreshness {
         // Any paced fragments preceding the transport gap are necessarily an
         // incomplete AU. Drop them before ordering the decoder reset marker.
         self.discard_paced_lane(&frame);
-        self.note_discontinuity(frame.from, frame.stream, tx)
+        self.note_discontinuity(
+            frame.from,
+            frame.stream,
+            "MyOwnMesh reported media discontinuity (transport or daemon IPC)",
+            tx,
+        )
     }
 
     /// Return false only when the consumer has gone away and the pipe should
@@ -260,6 +285,7 @@ impl InboundVideoFreshness {
                 return match tx.try_send(InboundVideoEvent::Discontinuity {
                     from: frame.from.clone(),
                     stream: frame.stream,
+                    reason: state.reason,
                     entry: Some(frame),
                 }) {
                     Ok(()) => {
@@ -275,6 +301,7 @@ impl InboundVideoFreshness {
                 let event = InboundVideoEvent::Discontinuity {
                     from: frame.from.clone(),
                     stream: frame.stream,
+                    reason: state.reason,
                     entry: clean_entry.then_some(frame),
                 };
                 return match tx.try_send(event) {
@@ -314,6 +341,7 @@ impl InboundVideoFreshness {
                     InboundRecoveryState {
                         mode,
                         marker_queued: false,
+                        reason: "AMS complete-AU ingress queue overflow",
                     },
                 );
                 true
@@ -521,53 +549,74 @@ impl ControlClient {
             // Hold the writer half open for the lifetime of the read loop
             // (dropping it would half-close the pipe).
             let _writer_keepalive = writer;
-            let mut video_freshness = InboundVideoFreshness::default();
-            loop {
-                let mut len_buf = [0u8; 4];
-                if reader.read_exact(&mut len_buf).await.is_err() {
-                    break;
-                }
-                let len = u32::from_le_bytes(len_buf) as usize;
-                if len > MAX_MEDIA_FRAME_BYTES {
-                    tracing::warn!("media-source frame too large ({len} bytes) — closing pipe");
-                    break;
-                }
-                let mut body = vec![0u8; len];
-                if reader.read_exact(&mut body).await.is_err() {
-                    break;
-                }
-                let Some(frame) = decode_inbound_frame(&body) else {
-                    tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
-                    continue;
-                };
-                let keep_open = match frame.kind {
-                    MEDIA_KIND_VIDEO => match video_framing(&frame.from, frame.stream) {
-                        Some(true) => video_freshness.forward_paced(frame, &video_tx),
-                        Some(false) => {
-                            video_freshness.discard_paced_lane(&frame);
-                            video_freshness.forward(frame, &video_tx)
-                        }
-                        None => match video_tx.try_send(InboundVideoEvent::Unframed(frame)) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                            Err(mpsc::error::TrySendError::Closed(_)) => false,
-                        },
-                    },
-                    MEDIA_KIND_VIDEO_DISCONTINUITY => {
-                        video_freshness.forward_transport_discontinuity(frame, &video_tx)
-                    }
-                    MEDIA_KIND_AUDIO => match audio_tx.try_send(frame) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    },
-                    _ => true,
-                };
-                if !keep_open {
-                    break;
-                }
-            }
+            Self::read_media_source(reader, video_tx, audio_tx, video_framing).await;
         });
 
         Ok(())
+    }
+
+    async fn read_media_source<R: tokio::io::AsyncRead + Unpin>(
+        mut reader: R,
+        video_tx: mpsc::Sender<InboundVideoEvent>,
+        audio_tx: mpsc::Sender<InboundFrame>,
+        video_framing: Arc<VideoFramingFn>,
+    ) {
+        let mut video_freshness = InboundVideoFreshness::default();
+        loop {
+            let mut len_buf = [0u8; 4];
+            if reader.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_MEDIA_FRAME_BYTES {
+                tracing::warn!("media-source frame too large ({len} bytes) — closing pipe");
+                break;
+            }
+            let mut body = vec![0u8; len];
+            if reader.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let Some(frame) = decode_inbound_frame(&body) else {
+                tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
+                continue;
+            };
+            let keep_open = match frame.kind {
+                MEDIA_KIND_VIDEO => match video_framing(&frame.from, frame.stream) {
+                    Some(true) => video_freshness.forward_paced(frame, &video_tx),
+                    Some(false) => {
+                        video_freshness.discard_paced_lane(&frame);
+                        video_freshness.forward(frame, &video_tx)
+                    }
+                    None => match video_tx.try_send(InboundVideoEvent::Unframed(frame)) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    },
+                },
+                MEDIA_KIND_VIDEO_DISCONTINUITY => {
+                    video_freshness.forward_transport_discontinuity(frame, &video_tx)
+                }
+                MEDIA_KIND_AUDIO => match audio_tx.try_send(frame) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                },
+                _ => true,
+            };
+            if !keep_open {
+                break;
+            }
+            // A buffered read may complete synchronously many times in one
+            // task poll. try_send does not yield: without this handoff a
+            // ready consumer can lose a whole reference chain before it
+            // gets scheduled once. Yield only while delivery work exists,
+            // not for every fragment of an incomplete paced AU. This is
+            // cooperative scheduling, not a sleep or a larger buffer; a
+            // genuinely stalled consumer still takes bounded recovery.
+            if video_tx.capacity() < video_tx.max_capacity()
+                || audio_tx.capacity() < audio_tx.max_capacity()
+            {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     async fn connect(&self) -> Result<LocalSocketStream> {
@@ -826,6 +875,119 @@ fn spawn_response_drain(reader: interprocess::local_socket::tokio::RecvHalf) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn buffered_media_burst_preserves_frames_for_a_ready_consumer() {
+        check_buffered_media_burst(false).await;
+    }
+
+    #[tokio::test]
+    async fn buffered_paced_burst_preserves_whole_aus_and_audio() {
+        check_buffered_media_burst(true).await;
+    }
+
+    async fn check_buffered_media_burst(paced: bool) {
+        // Model an already-readable IPC socket after scheduler jitter or RTP
+        // repair. The consumer is ready and does no decode work. More than four
+        // complete AUs must not manufacture an H.264 reference gap locally.
+        let mut wire = Vec::new();
+        let mut append = |kind, key, ts, data: &[u8]| {
+            let body =
+                allmystuff_protocol::control::encode_inbound_frame(kind, key, 0, ts, "peer", data);
+            wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&body);
+        };
+        for ts in 1..=12u32 {
+            for _ in 0..if paced { 8 } else { 1 } {
+                append(MEDIA_KIND_VIDEO, ts == 1, ts, &[ts as u8]);
+            }
+            if paced {
+                append(
+                    MEDIA_KIND_VIDEO,
+                    false,
+                    ts,
+                    &crate::video::paced_au_marker(8),
+                );
+            }
+            append(MEDIA_KIND_AUDIO, false, ts, &[ts as u8]);
+        }
+        let (tx, mut rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+        let (audio_tx, mut audio_rx) = mpsc::channel::<InboundFrame>(MEDIA_AUDIO_QUEUE_CAPACITY);
+        let audio_consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(frame) = audio_rx.recv().await {
+                received.push(frame.rtp_timestamp);
+            }
+            received
+        });
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(event) = rx.recv().await {
+                received.push(event);
+            }
+            received
+        });
+        ControlClient::read_media_source(
+            std::io::Cursor::new(wire),
+            tx,
+            audio_tx,
+            Arc::new(move |_, _| Some(paced)),
+        )
+        .await;
+        let received = consumer.await.unwrap();
+        assert_eq!(
+            received.len(),
+            12,
+            "ready consumer lost complete access units"
+        );
+        for (index, event) in received.iter().enumerate() {
+            assert!(matches!(event, InboundVideoEvent::Frame(frame)
+                if frame.rtp_timestamp == index as u32 + 1
+                    && frame.data == vec![index as u8 + 1; if paced { 8 } else { 1 }]));
+        }
+        assert_eq!(audio_consumer.await.unwrap(), (1..=12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn stalled_video_consumer_does_not_block_audio_or_grow_the_queue() {
+        let mut wire = Vec::new();
+        for ts in 1..=12u32 {
+            for kind in [MEDIA_KIND_VIDEO, MEDIA_KIND_AUDIO] {
+                let body = allmystuff_protocol::control::encode_inbound_frame(
+                    kind,
+                    ts == 1,
+                    0,
+                    ts,
+                    "peer",
+                    &[ts as u8],
+                );
+                wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                wire.extend_from_slice(&body);
+            }
+        }
+        let (tx, rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+        let (audio_tx, mut audio_rx) = mpsc::channel(MEDIA_AUDIO_QUEUE_CAPACITY);
+        let consumer = tokio::spawn(async move {
+            let mut count = 0;
+            while audio_rx.recv().await.is_some() {
+                count += 1;
+            }
+            count
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            ControlClient::read_media_source(
+                std::io::Cursor::new(wire),
+                tx,
+                audio_tx,
+                Arc::new(|_, _| Some(false)),
+            ),
+        )
+        .await
+        .expect("a wedged video consumer must not stop the shared pipe");
+        assert_eq!(rx.len(), MEDIA_VIDEO_QUEUE_CAPACITY);
+        assert_eq!(consumer.await.unwrap(), 12);
+    }
+
     fn video(from: &str, stream: u8, key: bool, timestamp: u32) -> InboundFrame {
         InboundFrame {
             kind: MEDIA_KIND_VIDEO,
@@ -925,6 +1087,7 @@ mod tests {
             Ok(InboundVideoEvent::Discontinuity {
                 from,
                 stream: 2,
+                reason: "MyOwnMesh reported media discontinuity (transport or daemon IPC)",
                 entry: None,
             }) if from == "peer"
         ));
@@ -1067,6 +1230,7 @@ mod tests {
             Ok(InboundVideoEvent::Discontinuity {
                 from,
                 stream: 0,
+                reason: "AMS complete-AU ingress queue overflow",
                 entry: None,
             }) if from == "peer-AB12C"
         ));

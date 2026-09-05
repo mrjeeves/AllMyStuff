@@ -1078,6 +1078,8 @@ struct RoomScope {
 /// Receive-side counters for one route's stream.
 struct VideoInStats {
     since: std::time::Instant,
+    last_frame: Option<Instant>,
+    max_gap: Duration,
     frames: u32,
     bytes: u64,
     label: &'static str,
@@ -1087,6 +1089,8 @@ impl VideoInStats {
     fn new(label: &'static str) -> Self {
         VideoInStats {
             since: std::time::Instant::now(),
+            last_frame: None,
+            max_gap: Duration::ZERO,
             frames: 0,
             bytes: 0,
             label,
@@ -3499,6 +3503,7 @@ impl Mesh {
                                 InboundVideoEvent::Discontinuity {
                                     from,
                                     stream,
+                                    reason,
                                     entry,
                                 } => {
                                     let entry_is_clean = entry.as_ref().is_some_and(|f| {
@@ -3509,6 +3514,7 @@ impl Mesh {
                                     mesh.handle_video_discontinuity(
                                         &from,
                                         stream,
+                                        reason,
                                         !entry_is_clean,
                                         lost_ts_us,
                                     );
@@ -5910,14 +5916,19 @@ impl Mesh {
         st.label = label;
         st.frames += 1;
         st.bytes += bytes as u64;
+        let now = Instant::now();
+        if let Some(previous) = st.last_frame.replace(now) {
+            st.max_gap = st.max_gap.max(now.duration_since(previous));
+        }
         let elapsed = st.since.elapsed();
         if elapsed >= EVERY {
             let secs = elapsed.as_secs_f64();
             let line = format!(
-                "video in {route_id}: {:.1} fps · {:.1} Mbps · {}",
+                "video in {route_id}: {:.1} fps · {:.1} Mbps · {} · max accepted-AU gap {:.1} ms",
                 st.frames as f64 / secs,
                 (st.bytes as f64 * 8.0) / secs / 1_000_000.0,
                 st.label,
+                st.max_gap.as_secs_f64() * 1000.0,
             );
             if crate::video::stats_to_info() {
                 tracing::info!("{line}");
@@ -5927,6 +5938,7 @@ impl Mesh {
             st.since = std::time::Instant::now();
             st.frames = 0;
             st.bytes = 0;
+            st.max_gap = Duration::ZERO;
         }
     }
 
@@ -5948,6 +5960,7 @@ impl Mesh {
         self: &Arc<Self>,
         from: &str,
         stream: u8,
+        reason: &str,
         request_entry: bool,
         lost_ts_us: Option<u64>,
     ) {
@@ -5964,12 +5977,7 @@ impl Mesh {
         ) {
             return;
         }
-        self.mark_video_discontinuity(
-            &route_id,
-            "upstream media delivery reported a discontinuity",
-            request_entry,
-            lost_ts_us,
-        );
+        self.mark_video_discontinuity(&route_id, reason, request_entry, lost_ts_us);
     }
 
     /// Start one recovery episode under the active encoder contract. Reset
@@ -6367,7 +6375,8 @@ impl Mesh {
                 H264IpcEnqueue::AwaitingKey { started: true } => {
                     if self.diag_ok(&format!("ipc-reference-gap:{route_id}")) {
                         tracing::warn!(
-                            "video queue for {route_id} lost its bounded reference chain — quarantining deltas and requesting a clean entry"
+                            "video queue for {route_id} lost its bounded reference chain (GUI poll age {} ms, capacity {MAX_QUEUED} AUs) — quarantining deltas and requesting a clean entry",
+                            w.last_poll.elapsed().as_millis(),
                         );
                     }
                     return true;

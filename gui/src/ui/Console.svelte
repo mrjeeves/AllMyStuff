@@ -27,6 +27,7 @@
   // tap-then-drag holds the button, and two fingers pinch-zoom the view.
   import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { VideoStageStats } from "../video-stage-stats";
   import { makeRelativeMotionForwarder } from "../relative-motion";
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
@@ -871,6 +872,16 @@
     let cancelled = false;
     let unwatch: (() => void) | undefined;
     let unwatchStatus: (() => void) | undefined;
+    void app.loadDebugLogging();
+    const stageStats = new VideoStageStats(performance.now());
+    const stageTimer = setInterval(() => {
+      const report = stageStats.snapshot(performance.now());
+      if (app.debugLoggingEnabled) {
+        clientLog(`video stages ${route}: ${JSON.stringify({
+          ...report, decodePath, queue: queuePeek(), visibility: document.visibilityState,
+        })}`);
+      }
+    }, 5000);
     // The host's capture-state reports for this route — they explain the
     // placeholder (and any mid-stream stall) in the host's own words.
     void watchVideoStatus(route, (s) => {
@@ -981,6 +992,7 @@
           try {
             const bmp = await createImageBitmap(blob);
             decCount += 1;
+            stageStats.record("decoded", performance.now());
             paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
             maybeDetect(bmp); // sample this bitmap, not the live canvas
             bmp.close();
@@ -1010,6 +1022,7 @@
         clearTimeout(switchingTimer);
       }
       frameCount += 1;
+      stageStats.record("painted", performance.now());
     };
 
     // Decoder instances lost on this rung before they ever produced a
@@ -1050,6 +1063,7 @@
       route,
       (f) => {
       if (cancelled) return;
+      stageStats.record("input", performance.now());
       inBytes += f.data.byteLength;
       transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
@@ -1066,6 +1080,7 @@
         // native openh264 decode rate is exactly what shows up on the wire.
         inCount += 1;
         decCount += 1;
+        stageStats.record("decoded", performance.now());
         if (f.data.byteLength !== f.width * f.height * 4) return;
         const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
         const img = new ImageData(pixels, f.width, f.height);
@@ -1110,6 +1125,7 @@
           output: (frame) => {
             decodeOutputs += 1;
             decCount += 1;
+            stageStats.record("decoded", performance.now());
             if (pendingFrame) pendingFrame.close();
             pendingFrame = frame;
             if (!paintScheduled) {
@@ -1159,6 +1175,7 @@
     });
     return () => {
       cancelled = true;
+      clearInterval(stageTimer);
       unwatch?.();
       unwatchStatus?.();
       stallKick = () => {};

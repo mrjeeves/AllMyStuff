@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "serde",
  "serde_json",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cli"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "serde",
  "serde_json",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "serde",
  "serde_json",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-mobile-core"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-graph",
  "dirs",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "anyhow",
  "dirs",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-term"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "allmystuff-protocol",
  "allmystuff-service",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.112"
+version = "0.2.113"
 dependencies = [
  "dirs",
  "flate2",

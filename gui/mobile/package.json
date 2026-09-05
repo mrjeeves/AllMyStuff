@@ -1,7 +1,7 @@
 {
   "name": "allmystuff-mobile",
   "private": true,
-  "version": "0.3.114",
+  "version": "0.2.114",
   "type": "module",
   "description": "AllMyStuff mobile (iOS/Android) Tauri shell. Reuses the desktop GUI's Svelte frontend (../) verbatim; this package only carries the Tauri CLI and the mobile Rust backend.",
   "scripts": {

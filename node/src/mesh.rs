@@ -9247,15 +9247,21 @@ impl Mesh {
     /// tell every device they bring to drop it too (revocation is unilateral —
     /// the content-derived id names the same grant on both ends).
     pub async fn share_revoke(&self, person: PersonId, grant_id: String) -> Result<(), String> {
-        self.shares.revoke(&person, &grant_id);
+        let mut revoked = self.shares.revoke_ids(&person, &grant_id);
+        // A retry still reaches the peer after the local record is gone.
+        if revoked.is_empty() {
+            revoked.push(grant_id);
+        }
         self.emit_snapshot();
         let mut last_err = None;
         for node in self.shares.nodes_for(&person) {
-            let msg = ControlMessage::Share(ShareControl::Revoke {
-                grant_id: grant_id.clone(),
-            });
-            if let Err(e) = self.send_control(node.as_str(), &msg).await {
-                last_err = Some(e);
+            for id in &revoked {
+                let msg = ControlMessage::Share(ShareControl::Revoke {
+                    grant_id: id.clone(),
+                });
+                if let Err(e) = self.send_control(node.as_str(), &msg).await {
+                    last_err = Some(e);
+                }
             }
         }
         last_err.map_or(Ok(()), Err)
@@ -17456,9 +17462,9 @@ impl Mesh {
         {
             return true;
         }
-        // An explicit share this device extended over exactly this capability
-        // (honours capability pinning and the media/role scope via the canonical
-        // `Grant::permits`).
+        // An explicit share this device extended: Screens covers every screen
+        // on this machine. Other media retain exact capability and role scope
+        // through the same `Grant::permits` used by the viewer.
         let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
             return false;
         };

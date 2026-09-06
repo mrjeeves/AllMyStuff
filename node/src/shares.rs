@@ -191,6 +191,9 @@ impl Shares {
     /// structurally identical grants collapse to one. Returns whether the
     /// stored set changed.
     pub fn grant(&self, person: &Person, node: &NodeId, grant: Grant) -> bool {
+        // Preserve wire IDs from older clients for reliable revocation.
+        // Grant::permits interprets their screen:<monitor> scope as Screens;
+        // current clients and Grant::scoped create one synthetic screen grant.
         let mut i = self.inner.lock();
         let s = ensure_share(&mut i.shares, person);
         add_node(s, node);
@@ -265,15 +268,38 @@ impl Shares {
     /// The id is content-derived, so it names the same grant across a restart
     /// and on both peers. Returns whether anything was removed.
     pub fn revoke(&self, person: &PersonId, grant_id: &str) -> bool {
+        !self.revoke_ids(person, grant_id).is_empty()
+    }
+
+    /// Screens is one permission, including when disk still contains several
+    /// old per-monitor grants. Return every original ID so the caller can
+    /// revoke those records on older peers that only understand exact IDs.
+    pub fn revoke_ids(&self, person: &PersonId, grant_id: &str) -> Vec<String> {
         let mut i = self.inner.lock();
         let Some(s) = i.shares.iter_mut().find(|s| &s.person.id == person) else {
-            return false;
+            return Vec::new();
         };
-        let before = s.out_grants.len() + s.in_grants.len();
-        s.out_grants.retain(|g| g.id != grant_id);
-        s.in_grants.retain(|g| g.id != grant_id);
-        let removed = s.out_grants.len() + s.in_grants.len() != before;
-        if removed {
+        let screen = s
+            .out_grants
+            .iter()
+            .chain(&s.in_grants)
+            .find(|g| g.id == grant_id)
+            .and_then(Grant::screen_share_node)
+            .map(str::to_owned);
+        let mut removed = Vec::new();
+        for grants in [&mut s.out_grants, &mut s.in_grants] {
+            grants.retain(|g| {
+                let matches = g.id == grant_id
+                    || screen
+                        .as_deref()
+                        .is_some_and(|node| g.screen_share_node() == Some(node));
+                if matches && !removed.contains(&g.id) {
+                    removed.push(g.id.clone());
+                }
+                !matches
+            });
+        }
+        if !removed.is_empty() {
             i.version += 1;
             persist(&self.path, &i);
         }
@@ -431,6 +457,78 @@ mod tests {
             None,
             "Receive your screen",
         )
+    }
+
+    fn old_screen(id: &str, capability: &str) -> Grant {
+        Grant {
+            id: id.into(),
+            media: MediaKind::Display,
+            role: GrantRole::Provide,
+            capability: Some(capability.into()),
+            label: "Old monitor share".into(),
+        }
+    }
+
+    #[test]
+    fn durable_screens_survive_reload_and_revoke_all_old_monitor_ids() {
+        let path =
+            std::env::temp_dir().join(format!("ams-screens-share-{}.json", std::process::id()));
+        let legacy = Persisted {
+            version: 1,
+            shares: vec![PersistedShare {
+                person: alex(),
+                nodes: vec!["alex".into()],
+                out_grants: vec![
+                    old_screen("old-primary", "me-A1234:screen"),
+                    old_screen("old-third", "me-A1234:screen:1022298667"),
+                    old_screen("other-machine", "other:screen:123"),
+                ],
+                in_grants: vec![],
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let shares = Shares::load_at(Some(path.clone()));
+        assert!(shares.out_grants_for(&alex().id).iter().any(|g| {
+            g.permits(
+                MediaKind::Display,
+                GrantRole::Provide,
+                &"me-A1234:screen:80937205".into(),
+            )
+        }));
+        // Original IDs survive loading so old peers can still revoke them.
+        let removed = shares.revoke_ids(&alex().id, "old-third");
+        assert_eq!(removed, vec!["old-primary", "old-third"]);
+        let reloaded = Shares::load_at(Some(path.clone()));
+        let remaining = reloaded.out_grants_for(&alex().id);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "other-machine");
+        assert!(!remaining[0].permits(
+            MediaKind::Display,
+            GrantRole::Provide,
+            &"me-A1234:screen:80937205".into()
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_clients_can_revoke_using_their_original_monitor_ids() {
+        let shares = memory();
+        let peer = NodeId::from("alex");
+        shares.grant(&alex(), &peer, old_screen("old-one", "me:screen:1"));
+        shares.grant(&alex(), &peer, old_screen("old-two", "me:screen:2"));
+        assert!(shares.out_grants_for(&alex().id).iter().all(|g| {
+            g.permits(
+                MediaKind::Display,
+                GrantRole::Provide,
+                &"me:screen:999".into(),
+            )
+        }));
+        assert_eq!(
+            shares.revoke_ids(&alex().id, "old-two"),
+            vec!["old-one", "old-two"]
+        );
+        assert!(shares.out_grants_for(&alex().id).is_empty());
+        assert!(shares.snapshots()[0].in_grants.is_empty());
     }
 
     #[test]

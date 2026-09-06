@@ -239,8 +239,17 @@ impl Catalog {
                     person_name: denied.person_name,
                     media: denied.media,
                     role: denied.role,
-                    capability: Some(denied.capability),
-                    description: describe_grant(media, role),
+                    capability: Some(Grant::durable_capability(media, role, &denied.capability)),
+                    description: if media == MediaKind::Display
+                        && role == GrantRole::Provide
+                        && Grant::durable_capability(media, role, &denied.capability)
+                            .as_str()
+                            .ends_with(":screen")
+                    {
+                        "See all screens on this machine".into()
+                    } else {
+                        describe_grant(media, role)
+                    },
                 });
             }
         }

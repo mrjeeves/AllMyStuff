@@ -1,0 +1,310 @@
+[
+  {
+    "name": "changed monitor handle",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": true
+  },
+  {
+    "name": "primary screen",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen",
+    "allowed": true
+  },
+  {
+    "name": "new monitor",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:999999",
+    "allowed": true
+  },
+  {
+    "name": "bare identity",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation:screen:80937205",
+    "allowed": true
+  },
+  {
+    "name": "display suffix change",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-ABCDE:screen:80937205",
+    "allowed": true
+  },
+  {
+    "name": "different machine",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "other:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "similar machine",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation2:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "camera",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "video",
+    "role": "provide",
+    "capability": "workstation-D11F4:cam:0",
+    "allowed": false
+  },
+  {
+    "name": "camera cannot impersonate a display",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:cam:0",
+    "allowed": false
+  },
+  {
+    "name": "physical display sink",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:display:0",
+    "allowed": false
+  },
+  {
+    "name": "input control",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "input",
+    "role": "provide",
+    "capability": "workstation-D11F4:control",
+    "allowed": false
+  },
+  {
+    "name": "source grant cannot consume",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "consume",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "both still covers screen source",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "both",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": true
+  },
+  {
+    "name": "consume grant stays exact",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "consume",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "consume",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "generic grant stays exact",
+    "grant": {
+      "id": "legacy-id",
+      "media": "generic",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "generic request is not screen permission",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "generic",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": false
+  },
+  {
+    "name": "empty monitor suffix",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:",
+    "allowed": false
+  },
+  {
+    "name": "non-numeric monitor suffix",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:app",
+    "allowed": false
+  },
+  {
+    "name": "nested capability suffix",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen:1022298667",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:123:cam",
+    "allowed": false
+  },
+  {
+    "name": "primary durable grant covers secondary",
+    "grant": {
+      "id": "legacy-id",
+      "media": "display",
+      "role": "provide",
+      "capability": "workstation-D11F4:screen",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "display",
+    "role": "provide",
+    "capability": "workstation-D11F4:screen:80937205",
+    "allowed": true
+  },
+  {
+    "name": "ordinary camera grant remains exact",
+    "grant": {
+      "id": "legacy-id",
+      "media": "video",
+      "role": "provide",
+      "capability": "workstation-D11F4:cam:0",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "video",
+    "role": "provide",
+    "capability": "workstation-D11F4:cam:1",
+    "allowed": false
+  },
+  {
+    "name": "ordinary camera grant remains allowed",
+    "grant": {
+      "id": "legacy-id",
+      "media": "video",
+      "role": "provide",
+      "capability": "workstation-D11F4:cam:0",
+      "label": "Legacy DISPLAY3"
+    },
+    "media": "video",
+    "role": "provide",
+    "capability": "workstation-D11F4:cam:0",
+    "allowed": true
+  }
+]

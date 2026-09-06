@@ -24,7 +24,7 @@
     // are still four separate grants underneath — but they were never four
     // separate *decisions*, and offering them separately only ever produced a
     // console that came up half-dead.
-    { key: "console", label: "Remote control", icon: "🕹", note: "all screens, sound, keyboard & mouse · camera separate" },
+    { key: "console", label: "Remote control", icon: "🕹", note: "all current and future screens, sound, keyboard & mouse · camera separate" },
     { key: "terminal", label: "Terminal", icon: "📟", popout: true },
     { key: "files", label: "Folder", icon: "🗂", popout: true, note: "from this device to their fleet" },
     { key: "sites", label: "Sites", icon: "🌐", popout: true },

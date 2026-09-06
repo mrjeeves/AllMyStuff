@@ -9,12 +9,12 @@ import type {
   Capability,
   Catalog,
   Flow,
-  Grant,
   GrantRole,
   MediaKind,
   Route,
 } from "./types";
 import { MEDIA } from "./types";
+import { durableGrantCapability, grantPermits } from "./screen-shares";
 
 export type ConnectResult =
   | { ok: true; route: Route }
@@ -96,14 +96,6 @@ export function canSink(f: Flow): boolean {
   return f === "sink" || f === "duplex";
 }
 
-function grantPermits(g: Grant, media: MediaKind, role: GrantRole, capId: string): boolean {
-  if (!mediaCompatible(g.media, media)) return false;
-  if (g.capability && g.capability !== capId) return false;
-  if (role === "provide") return g.role === "provide" || g.role === "both";
-  if (role === "consume") return g.role === "consume" || g.role === "both";
-  return g.role === "both";
-}
-
 /** The content-derived, stable id for a grant of this scope in `person`'s
  *  share — `grant:{person}:{media}:{role}:{capability|*}`. Mirrors
  *  `Grant::id_for` in `allmystuff-graph` (model.rs) byte-for-byte: two
@@ -120,7 +112,7 @@ export function scopedGrantId(
   role: GrantRole,
   capability: string | null,
 ): string {
-  return `grant:${person}:${media}:${role}:${capability ?? "*"}`;
+  return `grant:${person}:${media}:${role}:${durableGrantCapability(media, role, capability) ?? "*"}`;
 }
 
 /** Returns a GrantRequest if the endpoint is on a shared node lacking
@@ -153,8 +145,10 @@ function checkEndpoint(
     personName: share.person.name,
     media,
     role,
-    capability: capId,
-    description: describeGrant(media, role),
+    capability: durableGrantCapability(media, role, capId),
+    description: media === "display" && role === "provide" && durableGrantCapability(media, role, capId)?.endsWith(":screen")
+      ? "See all screens on this machine"
+      : describeGrant(media, role),
   };
 }
 

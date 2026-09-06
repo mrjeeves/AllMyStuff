@@ -258,7 +258,9 @@ pub struct Grant {
     pub media: MediaKind,
     pub role: GrantRole,
     /// `None` = any capability of this media on the relevant node. `Some`
-    /// pins the grant to exactly one capability.
+    /// normally pins one capability. A Display/Provide screen grant covers
+    /// all screens of that machine, including legacy `screen:<monitor>` IDs.
+    /// Individual monitor/app sharing is scoped to live room routes.
     #[serde(default)]
     pub capability: Option<CapabilityId>,
     /// Human-readable summary for the share sheet ("Receive your screen").
@@ -281,7 +283,8 @@ impl Grant {
         role: GrantRole,
         capability: Option<&CapabilityId>,
     ) -> String {
-        let cap = capability.map(CapabilityId::as_str).unwrap_or("*");
+        let scope = capability.map(|cap| Self::durable_capability(media, role, cap));
+        let cap = scope.as_ref().map(CapabilityId::as_str).unwrap_or("*");
         format!(
             "grant:{}:{}:{}:{}",
             person.as_str(),
@@ -301,6 +304,7 @@ impl Grant {
         capability: Option<CapabilityId>,
         label: impl Into<String>,
     ) -> Grant {
+        let capability = capability.map(|cap| Self::durable_capability(media, role, &cap));
         Grant {
             id: Grant::id_for(person, media, role, capability.as_ref()),
             media,
@@ -308,6 +312,30 @@ impl Grant {
             capability,
             label: label.into(),
         }
+    }
+
+    /// The saved scope for Screens is the machine's synthetic `screen`,
+    /// independent of which monitor a live route is currently showing.
+    pub fn durable_capability(
+        media: MediaKind,
+        role: GrantRole,
+        capability: &CapabilityId,
+    ) -> CapabilityId {
+        if media == MediaKind::Display && role.allows_source() {
+            if let Some(node) = screen_source_node(capability.as_str()) {
+                return format!("{node}:screen").into();
+            }
+        }
+        capability.clone()
+    }
+
+    /// Machine identity for a durable Screens grant. Old per-monitor records
+    /// keep their original IDs for wire revocation, but mean the same scope.
+    pub fn screen_share_node(&self) -> Option<&str> {
+        if self.media != MediaKind::Display || !self.role.allows_source() {
+            return None;
+        }
+        screen_source_node(self.capability.as_ref()?.as_str()).map(canonical_screen_node)
     }
 
     /// Does this grant authorize a shared endpoint to act in `role` for
@@ -318,7 +346,17 @@ impl Grant {
         }
         if let Some(c) = &self.capability {
             if c != capability {
-                return false;
+                // Durable screen access follows this machine, even when a
+                // Windows monitor handle changes or another monitor appears.
+                let same_screens = media == MediaKind::Display
+                    && role == GrantRole::Provide
+                    && self.screen_share_node().is_some_and(|node| {
+                        screen_source_node(capability.as_str())
+                            .is_some_and(|requested| canonical_screen_node(requested) == node)
+                    });
+                if !same_screens {
+                    return false;
+                }
             }
         }
         match role {
@@ -327,6 +365,30 @@ impl Grant {
             GrantRole::Both => self.role == GrantRole::Both,
         }
     }
+}
+
+fn screen_source_node(capability: &str) -> Option<&str> {
+    let (node, source) = capability.split_once(':')?;
+    if node.is_empty() {
+        return None;
+    }
+    let screen = source == "screen"
+        || source
+            .strip_prefix("screen:")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
+    screen.then_some(node)
+}
+
+fn canonical_screen_node(node: &str) -> &str {
+    if let Some((body, suffix)) = node.rsplit_once('-') {
+        if !body.is_empty()
+            && suffix.len() == 5
+            && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return body;
+        }
+    }
+    node
 }
 
 /// The share envelope for a node owned by someone else.

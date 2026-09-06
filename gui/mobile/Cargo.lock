@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "serde",
  "serde_json",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "serde",
  "serde_json",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-mobile-core"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
@@ -201,7 +201,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-graph",
  "dirs 5.0.1",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.113"
+version = "0.2.114"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -3218,8 +3218,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh"
-version = "0.3.17"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.17#0dcbd4ff9a38269cd2d7a34891bfeb2f639169b0"
+version = "0.3.18"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.18#13b9cdfaddc68abc026f50ad567878623d2942c5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3243,8 +3243,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.3.17"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.17#0dcbd4ff9a38269cd2d7a34891bfeb2f639169b0"
+version = "0.3.18"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.18#13b9cdfaddc68abc026f50ad567878623d2942c5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3280,8 +3280,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-services"
-version = "0.3.17"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.17#0dcbd4ff9a38269cd2d7a34891bfeb2f639169b0"
+version = "0.3.18"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.18#13b9cdfaddc68abc026f50ad567878623d2942c5"
 dependencies = [
  "async-trait",
  "myownmesh-core",
@@ -3296,8 +3296,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.3.17"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.17#0dcbd4ff9a38269cd2d7a34891bfeb2f639169b0"
+version = "0.3.18"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.18#13b9cdfaddc68abc026f50ad567878623d2942c5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3322,8 +3322,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-updater"
-version = "0.3.17"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.17#0dcbd4ff9a38269cd2d7a34891bfeb2f639169b0"
+version = "0.3.18"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.18#13b9cdfaddc68abc026f50ad567878623d2942c5"
 dependencies = [
  "hex",
  "minisign-verify",

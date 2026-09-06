@@ -1,14 +1,5 @@
 <script lang="ts">
-  // The Help sidebar — the ambient half of the CEC technician surface. It
-  // rides alongside Sites and Rooms only when the (secret) CEC support area
-  // is unlocked, so an ordinary user never sees it. A top toggle joins the
-  // shared help queue; when it's on, the customers currently pressing "Ask
-  // for help" list below, longest-waiting first, each with a one-tap answer.
-  //
-  // This is the monitor, not the workbench: dialing by number, the dialed-
-  // customer directory, and consent live in the full CEC Console (the
-  // Settings tab / its popout window). Watching the queue is the thing a
-  // technician wants glanceable while they work, so it earns a sidebar.
+  // Connect by support number and revisit previously approved customers.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import type { CecPeer } from "../tauri";
@@ -21,15 +12,6 @@
   function groupNumber(n: string): string {
     const d = (n || "").replace(/\D/g, "");
     return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "Unknown";
-  }
-
-  /** "just now" / "4m" / "1h 12m" — how long a hand has been up. */
-  function waitingLabel(askedAt: number): string {
-    const s = Math.max(0, Math.round(Date.now() / 1000 - (askedAt || 0)));
-    if (s < 45) return "just now";
-    const m = Math.round(s / 60);
-    if (m < 60) return `${m}m`;
-    return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
 
   /** "just now" / "12m ago" / "3d ago" — how long since a machine was last used. */
@@ -53,7 +35,7 @@
   }
 
   // Inline rename: click a known machine's name to label it (stored by
-  // number in `cecAliases`, the same alias the full console and the queue
+  // number in `cecAliases`, the same alias the full console and the directory
   // read). `editingKey` is the number being edited.
   let editingKey = $state<string | null>(null);
   let aliasDraft = $state("");
@@ -90,19 +72,9 @@
     }, 3500);
   }
 
-  // The machines this technician has dialed before, grouped under the live
-  // queue: online (reachable now — one tap re-opens) then previously
-  // connected (offline, still remembered). A customer with a hand up right
-  // now is shown in the queue above, so drop them here — no double listing.
-  // `cecCustomersByRecent` is already most-recently-used first, so each
-  // group stays in that order.
-  const known = $derived.by(() => {
-    const waiting = new Set(app.cecHelpWaiting.map((w) => w.node));
-    const rows = app.cecCustomersByRecent.filter((c) => c.node && !waiting.has(c.node));
-    return {
-      online: rows.filter((c) => c.online),
-      offline: rows.filter((c) => !c.online),
-    };
+  const known = $derived({
+    online: app.cecCustomersByRecent.filter((c) => c.node && c.online),
+    offline: app.cecCustomersByRecent.filter((c) => c.node && !c.online),
   });
 </script>
 
@@ -121,8 +93,8 @@
       inputmode="numeric"
       autocomplete="off"
       spellcheck="false"
-      placeholder="Customer number"
-      aria-label="Customer number"
+      placeholder="Support number"
+      aria-label="Support number"
       bind:value={app.cecNumberDraft}
     />
     <button
@@ -134,102 +106,7 @@
     </button>
   </form>
 
-  <label
-    class="watch"
-    title="Join the shared help queue and see customers who press Ask for help. Saved: stays on across restarts."
-  >
-    <input
-      type="checkbox"
-      checked={app.cecHelpWatching}
-      onchange={(e) => void app.setCecHelpWatch(e.currentTarget.checked)}
-    />
-    <span class="watch-label">Watch the help queue</span>
-  </label>
-
-  {#if !app.cecHelpWatching}
-    <p class="notice">
-      Turn this on to see customers who press <b>Ask for help</b> in their CEC
-      Support app. Until then this machine stays off the shared help queue.
-    </p>
-  {:else if app.cecHelpWaiting.length === 0}
-    <p class="notice listening">
-      <span class="live-dot" aria-hidden="true"></span>
-      Listening: no one is asking right now.
-    </p>
-  {:else}
-    <ul class="rows">
-      {#each app.cecHelpWaiting as w (w.node)}
-        {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
-        {@const kvm = app.kvmTwin(w.node)}
-        {@const phase = app.cecWaitPhase(w.node)}
-        <li class="row">
-          <div class="row-head">
-            <span class="dot" aria-hidden="true"></span>
-            <div class="who">
-              <b class="name">{shownName}<span class="host">{hostTail(shownName, w.hostname)}</span></b>
-              <span class="sub">
-                <span class="num" title={`Number ${w.number}`}>CEC {groupNumber(w.number)}</span>
-                <span class="meta">· {waitingLabel(w.asked_at)}</span>
-              </span>
-            </div>
-          </div>
-          <!-- The card's action row. Every door this row offers lives down
-               here (and new ones join here), instead of icons squeezed
-               beside the name. While a connect to THIS row is in flight the
-               buttons give way to an inline status - the sidebar has no
-               status strip like the settings console panel, so the card
-               itself says what's happening. -->
-          <div class="row-actions">
-            {#if phase}
-              <span class="wait-line">
-                <span class="wait-dot" aria-hidden="true"></span>
-                {phase === "approval" ? "Waiting for them to approve…" : "Connecting…"}
-              </span>
-              <button
-                class="stop-btn"
-                title={phase === "approval" ? "Stop waiting for their approval" : "Stop this connection attempt"}
-                onclick={() => void (phase === "approval" ? app.stopCecWait() : app.cancelCecDial())}
-              >
-                Stop
-              </button>
-            {:else}
-              <button
-                class="answer"
-                disabled={app.cecDialing}
-                title="Answer: connect and open their screen once they approve"
-                onclick={() => void app.answerHelp(w.node, shownName)}
-              >
-                Answer
-              </button>
-              {#if kvm}
-                <!-- A raised hand from a KVM: the console (Answer) is only half
-                     the story — its manufacturer web Site rides the graph, one
-                     tap away. -->
-                <button
-                  class="site-btn"
-                  title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
-                  onclick={() => void app.openKVM(kvm.id)}
-                >
-                  🌐 Site
-                </button>
-              {:else}
-                <!-- A person's machine gets the chat door; a KVM appliance is
-                     not someone to chat with, so its row doesn't. -->
-                <button
-                  class="chat-btn"
-                  disabled={app.cecDialing}
-                  title="Chat: connect and message this customer (without taking their screen)"
-                  onclick={() => void app.chatWithCustomer(w.node)}
-                >
-                  💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
-                </button>
-              {/if}
-            {/if}
-          </div>
-        </li>
-      {/each}
-    </ul>
-  {/if}
+  <p class="notice">Enter the support number shown on the customer’s app or KVM. They approve your request before you connect.</p>
 
   {#if known.online.length > 0 || known.offline.length > 0}
     {#snippet machine(c: CecPeer)}
@@ -269,7 +146,7 @@
           </div>
         </div>
         {#if editingKey !== c.number}
-          <!-- Bottom action row, same layout as the queue cards - and the
+          <!-- Bottom action row, with the customer actions - and the
                same inline status while a connect to this row is pending. -->
           {@const phase = app.cecWaitPhase(c.node)}
           <div class="row-actions">
@@ -395,53 +272,18 @@
     opacity: 0.5;
     cursor: default;
   }
-  .watch {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.4rem 0.55rem;
-    background: var(--surface-2);
-    border-radius: var(--r-sm);
-    cursor: pointer;
-    font-size: 0.82rem;
-    font-weight: 600;
-  }
-  .watch input {
-    accent-color: var(--accent);
-  }
-  .watch-label {
-    color: var(--ink);
-  }
+
+
+
   .notice {
     margin: 0;
     font-size: 0.78rem;
     line-height: 1.45;
     color: var(--ink-soft);
   }
-  .notice.listening {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    color: var(--ok);
-  }
-  .live-dot {
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 50%;
-    background: var(--ok);
-    animation: pulse 1.8s ease-out infinite;
-  }
-  @keyframes pulse {
-    0% {
-      box-shadow: 0 0 0 0 rgba(26, 143, 76, 0.5);
-    }
-    70% {
-      box-shadow: 0 0 0 0.35rem rgba(26, 143, 76, 0);
-    }
-    100% {
-      box-shadow: 0 0 0 0 rgba(26, 143, 76, 0);
-    }
-  }
+
+
+
   .rows {
     list-style: none;
     margin: 0;
@@ -715,20 +557,6 @@
   .num {
     font-variant-numeric: tabular-nums;
   }
-  .answer {
-    flex-shrink: 0;
-    border: none;
-    background: var(--accent);
-    color: #fff;
-    font: inherit;
-    font-size: 0.76rem;
-    font-weight: 700;
-    padding: 0.3rem 0.65rem;
-    border-radius: var(--r-sm);
-    cursor: pointer;
-  }
-  .answer:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
+
+
 </style>

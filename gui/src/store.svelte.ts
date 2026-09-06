@@ -1,3 +1,4 @@
+import type { KvmSupportStatus } from "./types";
 // The single source of UI truth. Holds the graph catalog plus the
 // transient interaction state (what's selected, what's being dragged,
 // which sheet is open) as Svelte 5 runes, and exposes the verbs the
@@ -199,10 +200,6 @@ import {
   cecGrants,
   cecCancelDial,
   cecDialed,
-  cecHelpList,
-  cecHelpWatch,
-  onCecHelp,
-  type CecHelpSeeker,
   cecChatSend,
   cecChatHistory,
   onCecChat,
@@ -285,16 +282,10 @@ import {
   type UpdateStatus,
 } from "./types";
 
-/** The one shared CEC Support area every node lives on (the node's
- *  `HELP_NETWORK_ID`). Node-managed — hidden from the Meshes list, since it's
- *  driven entirely from the CEC tab. This single well-known id replaced the
- *  old per-customer `cec-<number>` rooms: sessions ride the area now. */
+/** Public support directory, managed by the node and hidden from the mesh list. */
 const CEC_AREA_NETWORK_ID = "cecsupport-clients";
 
-/** The CEC asking room (the node's `ASK_NETWORK_ID`) — the help queue itself.
- *  Membership is the raised hand: a customer sits in it only while asking, a
- *  watching technician reads it listen-only. Node-managed and transient, so
- *  the Meshes list hides it like the area. */
+/** Retired queue id: hide persisted memberships until the node removes them. */
 const CEC_ASK_NETWORK_ID = "cecsupport-asking";
 
 /** A stored customer unused for this long reads as "stale" — the cleanup nudge
@@ -785,11 +776,6 @@ class AppStore {
    *  can reach a customer by chat *before* (or without) taking their screen. A
    *  Remote-Control / Answer dial leaves this false and opens both. */
   private cecAutoOpenChatOnly = false;
-  /** The customers currently asking for help on the global help room —
-   *  longest-waiting first (the node keeps queue order). Drives the CEC tab's
-   *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
-   *  event. */
-  cecHelpWaiting = $state<CecHelpSeeker[]>([]);
   /** Chat threads with CEC customers, keyed by the customer's node id, each
    *  oldest-first. Reassigned (never mutated in place) on every change so the
    *  pop-out chat window stays reactive — the same discipline as `cecAliases`.
@@ -799,11 +785,6 @@ class AppStore {
    *  read — the little badge on the drawer's Chat affordance. Cleared by
    *  {@link markChatRead} when the chat window takes focus. */
   chatUnread = $state<Record<string, number>>({});
-  /** The "Watch the help queue" opt-in, mirrored from the node's room
-   *  membership (`cec_status.help_watching`) — the saved state lives in the
-   *  daemon, so it survives restarts without a GUI-side flag. Off means this
-   *  install is not on the global help room at all. */
-  cecHelpWatching = $derived(this.cecStatusInfo?.help_watching === true);
   /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
    *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
    *  Node CEC status/role deliberately does *not* auto-reveal it. */
@@ -1900,12 +1881,6 @@ class AppStore {
     });
     await onCecGrants((grants) => {
       this.cecGrantList = grants;
-    });
-    await onCecHelp((e) => {
-      // Technician side of `cec://help`: the node pushes the whole fresh
-      // queue on every membership change. (The `asking` field is the
-      // customer app's side of the event — irrelevant here.)
-      if (e.waiting) this.cecHelpWaiting = e.waiting;
     });
     // The customer chat plane: every window listens so any of them (the main
     // window, the console window, the chat pop-out) keeps threads live. The
@@ -5199,18 +5174,9 @@ class AppStore {
     return this.cecCustomers.find((c) => c.node && sameMachine(c.node, nodeId)) ?? null;
   }
 
-  /** Live CEC standing toward a machine: we dialed it (it's in the customer
-   *  directory) or its hand is up in the watched help queue right now. This is
-   *  the technician's authority arm for a KVM's session doors — the same
-   *  lifetime as the appliance's own approved-tech set (admitted while asking
-   *  or on dial, dropped on hangup), which is what actually authorizes every
-   *  tunneled request. This gate only decides what the GUI offers. */
+  /** A support connection saved after dialing a customer by number. */
   cecStanding(nodeId: string | undefined): boolean {
-    if (!nodeId) return false;
-    return (
-      this.isCecCustomer(nodeId) ||
-      this.cecHelpWaiting.some((w) => w.node && sameMachine(w.node, nodeId))
-    );
+    return !!nodeId && this.isCecCustomer(nodeId);
   }
 
   consoleAccess(node: MeshNode | undefined): ConsoleAccess {
@@ -5744,21 +5710,7 @@ class AppStore {
     return this.kvmAllowed(kvm) || this.cecStanding(attached.id);
   }
 
-  /** The fleet-graph twin of a CEC help/directory row, when the machine that
-   *  raised its hand (or was dialed) is a KVM we can also reach on the normal
-   *  mesh. The CEC plane's beacon carries no site adverts, but the same
-   *  appliance's graph presence does — this is the bridge that lets a
-   *  raised-hand row offer the KVM's web Site (and anything else the graph
-   *  knows) alongside the remote-control console. Undefined for an ordinary
-   *  customer, a KVM outside our graph, or one whose KVM affordances aren't
-   *  ours to use.
-   *
-   *  Authorization is the KVM's session doors (`kvmDoors`): ours to curate,
-   *  or live CEC standing — a dialed customer, or a hand up in the watched
-   *  queue right now (the hand-raise IS the ask, a beacon the customer
-   *  deliberately lit). One gate for showing the door AND opening it, so the
-   *  button can never render only for the tunnel to refuse; the KVM itself
-   *  still authorizes every request by its own approved-tech set. */
+  /** Graph presence for a saved KVM support customer, gated by its session doors. */
   kvmTwin(cecNode: string | undefined): MeshNode | undefined {
     if (!cecNode) return undefined;
     const node = this.nodeByCanonical(cecNode);
@@ -5821,6 +5773,33 @@ class AppStore {
     this.kvmConsoleMapped.add(key);
     await this.mapSite(nodeId, site, quiet, !background);
     return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
+  }
+
+  kvmSupportFor = $state<string | null>(null);
+
+  openKvmSupport(nodeId: string) {
+    if (this.kvmAllowed(this.node(nodeId))) this.kvmSupportFor = nodeId;
+  }
+
+  async readKvmSupport(nodeId: string, background = true): Promise<KvmSupportStatus | null> {
+    if (!this.kvmAllowed(this.node(nodeId))) return null;
+    const port = await this.kvmConsolePort(nodeId, true, background);
+    if (!port) return null;
+    const { rsp } = await this.kvmApi<KvmSupportStatus>(nodeId, port, "/api/mesh/help", { quiet: true, background });
+    return rsp?.code === 0 ? rsp.data ?? null : null;
+  }
+
+  async changeKvmSupport(nodeId: string, action: "arm" | "approve" | "deny", technician?: string, sessionId?: string): Promise<KvmSupportStatus | null> {
+    if (!this.kvmAllowed(this.node(nodeId))) return null;
+    const port = await this.kvmConsolePort(nodeId);
+    if (!port) { this.toast("warn", "Couldn't reach the KVM's console."); return null; }
+    const { rsp, reason } = await this.kvmApi<KvmSupportStatus>(nodeId, port, `/api/mesh/help/${action}`,
+      { method: "POST", body: action === "arm" ? undefined : { technician, sessionId } });
+    if (!rsp || rsp.code !== 0 || !rsp.data) {
+      this.toast("warn", rsp?.msg || reason || "Couldn't update KVM support approval.");
+      return null;
+    }
+    return rsp.data;
   }
 
   /** Call one KVM JSON endpoint outside the webview's CORS boundary.
@@ -9339,7 +9318,7 @@ class AppStore {
 
   /** Chat with a customer, **ensuring they're connected first** — the same
    *  guarantee the Remote-Control button gives, so a technician can open a chat
-   *  from any CEC surface (the sidebar, the Help queue, the CEC console) even
+   *  from any CEC surface (the sidebar, the support-number panel, the CEC console) even
    *  before a session exists. Opens the chat window immediately (so it's on
    *  screen while the dial runs), then dials/reconnects the customer's device;
    *  an expired grant re-prompts, a live one auto-approves. On approval only the
@@ -9367,11 +9346,6 @@ class AppStore {
     const dialed = await cecDialed();
     if (dialed) this.cecCustomers = dialed;
     else clientLog("[cec] dialed-list fetch failed: keeping the last snapshot");
-    // The help queue: same failure discipline — null keeps the last snapshot.
-    // The fetch itself is what first joins the global help room, so opening
-    // the CEC tab is enough to start hearing the beacons.
-    const waiting = await cecHelpList();
-    if (waiting) this.cecHelpWaiting = waiting;
   }
 
   /** How many CEC surfaces (Help sidebar, CEC console) are on screen right now.
@@ -9403,17 +9377,7 @@ class AppStore {
     if (dialed) this.cecCustomers = dialed;
   }
 
-  /** Technician: answer a raised hand — dial the customer's device directly
-   *  (the beacon carried its id). The headline path; no number typed. */
-  async answerHelp(node: string, label?: string) {
-    await this.dialCecTarget({ node }, label ?? "that customer");
-  }
-
-  /** Technician: dial a customer by the number they read out — the fallback
-   *  for when the raised-hand list is too crowded to spot them. The node
-   *  resolves the digits to a device on the support area (a raised hand
-   *  first, else any area member whose number matches). On success the
-   *  customer appears in the CEC tab's "Active connections" list. */
+  /** Connect using the support number the customer shares. */
   async dialCec() {
     const number = this.cecNumberDraft.trim();
     if (!number) {
@@ -9432,8 +9396,7 @@ class AppStore {
     await this.dialCecTarget({ node }, shortId(node));
   }
 
-  /** Shared connect path for every CEC dial — a raised hand (`node`), the
-   *  number fallback (`number`), or a directory reconnect (`node`). Arms the
+  /** Shared path for a support-number dial or a saved customer reconnect. Arms the
    *  console to open the moment the customer approves (see the onCecSession
    *  handler) and refreshes the CEC lists. Returns whether the dial was
    *  accepted, so the caller can clear its input only on success. */
@@ -9515,26 +9478,6 @@ class AppStore {
       return "dialing";
     }
     return null;
-  }
-
-  /** Flip the "Watch the help queue" opt-in, then re-read the node's status —
-   *  membership is the saved state, so the toggle shows what actually took
-   *  (and keeps showing it after a restart, no local flag needed). A failure
-   *  says so out loud: a silent one leaves a checkbox that just snaps back,
-   *  which reads as haunted rather than broken. */
-  async setCecHelpWatch(on: boolean) {
-    try {
-      await cecHelpWatch(on);
-    } catch (e) {
-      this.toast(
-        "warn",
-        `Couldn't ${on ? "watch" : "stop watching"} the help queue: ${String(e)}`,
-      );
-    }
-    const status = await cecStatus();
-    if (status) this.cecStatusInfo = status;
-    if (on) void this.loadCec();
-    else this.cecHelpWaiting = [];
   }
 
   /** Open the console for a just-approved CEC customer the moment their

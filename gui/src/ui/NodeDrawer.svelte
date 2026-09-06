@@ -897,6 +897,7 @@
     {#if isKvm && node}
       <section class="block kvm-section">
         <h4>KVM</h4>
+        <button class="btn small" onclick={() => app.openKvmSupport(node.id)}>Support number &amp; approvals</button>
         {#if node.kvm?.attachedTo}
           {@const target = app.kvmTargetNode(node)}
           <p class="kvm-note">

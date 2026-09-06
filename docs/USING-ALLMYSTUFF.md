@@ -63,8 +63,12 @@ on one computer does not silently enable it anywhere else.
 
 ## Remote control
 
-Choose **Remote** on a device card. The console lists the screens that device
-has shared with you.
+Choose **Remote** on a device card. A durable **Screens** share covers all
+current and future monitors on that machine. Changing a monitor, restarting,
+or moving between monitors does not require another share.
+
+Use **Rooms** when sharing an individual monitor or app for a session. A room's
+selected source does not create a durable grant.
 
 - Use the screen list to move between monitors.
 - Pop a monitor into its own native window. You can pop out several monitors

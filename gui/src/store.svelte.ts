@@ -5,6 +5,7 @@ import type { KvmSupportStatus } from "./types";
 // components call. The connection rules live in `catalog.ts`; this layer
 // is about *intent* and *feedback*.
 
+import { durableGrantCapability, screenShareKey } from "./screen-shares";
 import {
   canSink,
   canSource,
@@ -3315,38 +3316,10 @@ class AppStore {
       mkExact(media, role, `${sender}:${suffix}`, what);
     switch (cap) {
       case "console":
-        // One visible share, but every display source is explicitly granted.
-        // Extra monitors are separate `<node>:screen:<id>` capabilities; a
-        // grant for only `<node>:screen` strands the viewer when focus moves
-        // to another monitor. Cameras are Video, not Display, and are omitted
-        // deliberately: they remain a separate permission.
-        //
-        // Each capability suffix must be the id `matchEndpoint` actually
-        // resolves for that media, or the grant authorizes nothing and the
-        // route is denied: the machine's audio source is the synthetic
-        // `<node>:system-audio`, never a bare `:audio`.
-        //
-        // The role names the end being authorized, not who benefits: `screen`
-        // and `system-audio` are sources on this machine (`provide`), while
-        // `control` is an input *sink* on it (`consume`). Getting that
-        // backwards is what silently denied every screen share.
+        // One machine-wide Screens permission. Live routes still select a
+        // monitor; rooms provide individual monitor/app sharing.
         return [
-          ...this.catalog.capabilities
-            .filter(
-              (candidate) =>
-                this.capNodeOf(candidate.id) === canonicalNodeId(sender) &&
-                candidate.media === "display" &&
-                canSource(candidate.flow),
-            )
-            .sort((a, b) => a.id.localeCompare(b.id))
-            .map((screen) =>
-              mkExact(
-                "display",
-                "provide",
-                screen.id,
-                `see ${screen.label || "its screen"}`,
-              ),
-            ),
+          mk("display", "provide", "screen", "all screens"),
           mk("audio", "provide", "system-audio", "hear its audio"),
           mk("input", "consume", "control", "control it"),
           mk("clipboard", "both", "clipboard", "share its clipboard"),
@@ -3451,11 +3424,12 @@ class AppStore {
       return 0;
     }
     const ALL: ShareCap[] = ["console", "files", "terminal", "sites"];
+    const grantKey = (g: Grant) => screenShareKey(g) ?? g.id;
     const desired = new Map<string, Grant>();
     for (const cap of ALL) {
       if (!want.has(cap)) continue;
       for (const grant of this.shareCapGrants(person.id, cap, sender, senderLabel)) {
-        desired.set(grant.id, grant);
+        desired.set(grantKey(grant), grant);
       }
     }
 
@@ -3475,13 +3449,13 @@ class AppStore {
       }
     }
     for (const { holder, grant } of existing) {
-      if (!desired.has(grant.id)) this.revokeGrant(holder, grant.id);
+      if (!desired.has(grantKey(grant))) this.revokeGrant(holder, grant.id);
     }
     const retained = new Set(
-      existing.filter(({ grant }) => desired.has(grant.id)).map(({ grant }) => grant.id),
+      existing.filter(({ grant }) => desired.has(grantKey(grant))).map(({ grant }) => grantKey(grant)),
     );
     for (const grant of desired.values()) {
-      if (!retained.has(grant.id)) this.grant(receiver, grant);
+      if (!retained.has(grantKey(grant))) this.grant(receiver, grant);
     }
     // No toast — on success the builder closes and the share shows up inline:
     // the grant rows in the device drawer's "What X can do", the Sharing pane,
@@ -10705,6 +10679,17 @@ class AppStore {
         partner.sharedWithYou = partner.grants.filter(({ grant }) => !this.isShareOutGrant(grant));
       }
     }
+    for (const partner of map.values()) {
+      const screensRows = (rows: SharePartner["grants"]) => coalesceLatestBy(
+        rows, ({ grant }) => screenShareKey(grant) ?? grant.id,
+      ).map((row) => {
+        if (!screenShareKey(row.grant)) return row;
+        const source = this.machineByAnyId(row.grant.capability!.split(":")[0]);
+        return { ...row, grant: { ...row.grant, label: `${source?.label ?? "Device"}: all screens` } };
+      });
+      partner.sharedByYou = screensRows(partner.sharedByYou);
+      partner.sharedWithYou = screensRows(partner.sharedWithYou);
+    }
     return [...map.values()].sort((a, b) => a.person.name.localeCompare(b.person.name));
   });
 
@@ -10724,9 +10709,14 @@ class AppStore {
   }
 
   grant(nodeId: string, grant: Grant) {
+    const capability = durableGrantCapability(grant.media, grant.role, grant.capability ?? null);
+    if (capability !== grant.capability) grant = { ...grant, capability };
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
     const person = n.relationship.person;
+    if (screenShareKey(grant)) {
+      grant = { ...grant, id: scopedGrantId(person.id, grant.media, grant.role, capability) };
+    }
     // De-dupe by (media, role, capability) across the *person* — a grant
     // authorizes them wherever it happens to be recorded.
     const exists = this.catalog.nodes.some(
@@ -10750,6 +10740,16 @@ class AppStore {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
     const personId = n.relationship.person.id;
+    const selected = n.relationship.grants.find((g) => g.id === grantId);
+    const screens = selected ? screenShareKey(selected) : null;
+    const revoked = new Set([grantId]);
+    // Removing Screens also removes every historical per-monitor record.
+    for (const peer of this.catalog.nodes) {
+      if (peer.relationship.kind !== "shared" || peer.relationship.person.id !== personId) continue;
+      for (const g of peer.relationship.grants) {
+        if (screens && screenShareKey(g) === screens) revoked.add(g.id);
+      }
+    }
     // A grant is to the person, so it can be recorded on several of their nodes
     // (and the backend revoke is person-level). Pull it from every one of them,
     // not just the holder the row named — otherwise the Sharing list, which
@@ -10757,10 +10757,10 @@ class AppStore {
     // the next backend snapshot reconciles.
     for (const x of this.catalog.nodes) {
       if (x.relationship.kind === "shared" && x.relationship.person.id === personId) {
-        x.relationship.grants = x.relationship.grants.filter((g) => g.id !== grantId);
+        x.relationship.grants = x.relationship.grants.filter((g) => !revoked.has(g.id));
       }
     }
-    void shareRevoke(personId, grantId).catch(() => {});
+    for (const id of revoked) void shareRevoke(personId, id).catch(() => {});
     this.reauthorize();
     // No toast — the grant row vanishes from the drawer / Sharing pane (and this
     // is called in a loop when reconciling a share, so a toast would flood).
@@ -10830,13 +10830,14 @@ class AppStore {
 }
 
 function requestToGrant(req: GrantRequest): Grant {
+  const capability = durableGrantCapability(req.media, req.role, req.capability);
   return {
     // Content-derived, stable id (mirrors Grant::scoped on the Rust side) so
     // the grant persists, de-dupes, and revokes by the same id on both ends.
-    id: scopedGrantId(req.person, req.media, req.role, req.capability),
+    id: scopedGrantId(req.person, req.media, req.role, capability),
     media: req.media,
     role: req.role,
-    capability: req.capability,
+    capability,
     label: req.description,
   };
 }

@@ -620,6 +620,115 @@ mod tests {
         assert!(!g.permits(MediaKind::Display, GrantRole::Consume, &"alex:other".into()));
     }
 
+    #[test]
+    fn durable_screens_match_the_frontend_contract() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            grant: Grant,
+            media: MediaKind,
+            role: GrantRole,
+            capability: CapabilityId,
+            allowed: bool,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../../contract-fixtures/durable_screens.json"
+        ))
+        .unwrap();
+        for c in cases {
+            assert_eq!(
+                c.grant.permits(c.media, c.role, &c.capability),
+                c.allowed,
+                "{}",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn durable_screen_grants_have_one_id_for_all_monitors() {
+        let person = PersonId::from("person:alex");
+        let screen = Grant::scoped(
+            &person,
+            MediaKind::Display,
+            GrantRole::Provide,
+            Some("workstation:screen:80937205".into()),
+            "Screens",
+        );
+        let other = Grant::scoped(
+            &person,
+            MediaKind::Display,
+            GrantRole::Provide,
+            Some("workstation:screen:1022298667".into()),
+            "Screens",
+        );
+        assert_eq!(screen.capability, Some("workstation:screen".into()));
+        assert_eq!(screen.id, other.id);
+        assert_eq!(
+            screen.id,
+            "grant:person:alex:display:provide:workstation:screen"
+        );
+    }
+
+    #[test]
+    fn screen_requests_cover_the_machine_but_room_routes_keep_the_selected_monitor() {
+        let mut cat = Catalog::new();
+        cat.nodes.push(MeshNode::this("Viewer"));
+        cat.nodes.push(MeshNode {
+            id: "host".into(),
+            label: "Workstation".into(),
+            kind: NodeKind::Machine,
+            relationship: Relationship::Shared(Share {
+                person: alex(),
+                grants: vec![],
+            }),
+            online: true,
+        });
+        for id in ["host:screen:123", "host:screen:456"] {
+            cat.capabilities.push(Capability::new(
+                "host",
+                id,
+                "Monitor",
+                MediaKind::Display,
+                Flow::Source,
+                "screen",
+            ));
+        }
+        cat.capabilities.push(Capability::new(
+            "this",
+            "this:display-view",
+            "Viewer",
+            MediaKind::Display,
+            Flow::Sink,
+            "remote-desktop",
+        ));
+        let from = CapabilityId::from("host:screen:123");
+        let to = CapabilityId::from("this:display-view");
+        let request = cat.required_grants(&from, &to);
+        assert_eq!(request.len(), 1);
+        assert_eq!(request[0].capability, Some("host:screen".into()));
+        assert_eq!(request[0].description, "See all screens on this machine");
+        let room = cat.propose_room_route(&from, &to).unwrap();
+        assert_eq!(room.from, from);
+        assert!(
+            cat.propose_route(&"host:screen:456".into(), &to).is_err(),
+            "a room never creates durable screen access"
+        );
+        grant(
+            &mut cat,
+            "host",
+            Grant::scoped(
+                &alex().id,
+                MediaKind::Display,
+                GrantRole::Provide,
+                request[0].capability.clone(),
+                "Screens",
+            ),
+        );
+        let route = cat.propose_route(&"host:screen:456".into(), &to).unwrap();
+        assert_eq!(route.from, "host:screen:456".into());
+    }
+
     // ---- helpers ------------------------------------------------------
 
     fn grant(cat: &mut Catalog, node: &str, g: Grant) {

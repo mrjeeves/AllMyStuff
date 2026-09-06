@@ -38,6 +38,8 @@ export interface Grant {
   id: string;
   media: MediaKind;
   role: GrantRole;
+  /** Durable display/source screen grants cover all screens on that machine,
+   * including legacy screen:<monitor> records. Rooms select individual sources. */
   capability?: string | null;
   label: string;
 }

@@ -261,22 +261,6 @@ struct CecInner {
     /// it; the discovery poll and the connect-request re-send loop both honor
     /// it, so "stop trying" actually stops everything being tried.
     dial_cancel: Option<Arc<AtomicBool>>,
-    /// Customer: whether this node is currently asking for help — i.e.
-    /// resident in the asking room. In-memory only: on a restart the node
-    /// isn't asking, and the bring-up hygiene sweep leaves the room, which
-    /// withdraws the hand on every watching technician.
-    asking_help: bool,
-    /// Technician: whether the help-queue view is armed — i.e. this node is
-    /// sitting in the asking room reading its signaling presence. The
-    /// *standing area* membership is untouched either way (sessions ride it).
-    watching_help: bool,
-    /// Technician: the waiting customers, keyed by the asker's canonical id.
-    /// Fed two ways during the transition: signaling presence in the asking
-    /// room (rows live exactly as long as the membership), and legacy
-    /// `cec.presence` beacons from pre-asking-room customers (rows live
-    /// [`HELP_TTL_SECS`] past their last beacon; an `available: false`
-    /// beacon removes one immediately).
-    help_wanted: HashMap<String, HelpSeeker>,
     /// Per-peer chat transcripts (both roles), keyed by the peer's canonical
     /// (bare-pubkey) id, each oldest-first and capped at [`CHAT_HISTORY_CAP`].
     /// Holds both received lines and the echoes of ones this node sent, so a
@@ -288,47 +272,6 @@ struct SupportKvm {
     customer: String,
     until: Instant,
 }
-
-/// Where a queue row came from — which lifecycle rules apply to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HelpSource {
-    /// Signaling presence in the asking room. The row lives exactly as long
-    /// as the membership: it leaves via the room's leave/drop event or the
-    /// periodic presence reconcile, never by TTL (presence has no
-    /// keep-alive beat of its own to age against).
-    Presence,
-    /// A legacy `cec.presence` channel beacon (pre-asking-room customer).
-    /// TTL-pruned [`HELP_TTL_SECS`] past its last beat, exactly as before.
-    Beacon,
-}
-
-/// One customer waiting for help.
-#[derive(Clone, Debug)]
-struct HelpSeeker {
-    /// Their dialable support number — derived from the *authenticated*
-    /// sender id (a beacon) or the announced device id (presence), never
-    /// from any payload, so an entry can't impersonate another number.
-    number: String,
-    /// Their machine label. Cosmetic, and only a legacy beacon carries one —
-    /// presence is a device id alone, so presence rows are empty here and
-    /// the card leads with the number (the thing the caller reads out).
-    label: String,
-    /// Their machine hostname (cosmetic; legacy beacons only, like `label`).
-    hostname: String,
-    /// Unix seconds we first saw this ask — the queue position.
-    asked_at: u64,
-    /// Unix seconds of the latest sighting (beacon beat, or presence
-    /// arrival). Informational for presence rows; the TTL clock for beacons.
-    last_seen: u64,
-    /// Which lifecycle rules govern this row.
-    source: HelpSource,
-}
-
-/// How long a technician keeps a **legacy beacon** row past its last beat.
-/// Pre-asking-room customers re-beacon every 20 s, so this tolerates a few
-/// missed beats before a crashed asker ages out. Presence rows never TTL —
-/// their lifetime IS the asking-room membership.
-pub const HELP_TTL_SECS: u64 = 90;
 
 impl Cec {
     /// Build the CEC state, loading (or, with `None`, running an in-memory)
@@ -369,9 +312,6 @@ impl Cec {
                 kvm_support_ready: HashSet::new(),
                 support_kvms: HashMap::new(),
                 dial_cancel: None,
-                asking_help: false,
-                watching_help: false,
-                help_wanted: HashMap::new(),
                 chats,
             }),
         }
@@ -476,7 +416,7 @@ impl Cec {
             "number": inner.number,
             "network_id": allmystuff_cec_protocol::HELP_NETWORK_ID,
             "role": role_str(inner.role),
-            "asking_help": inner.asking_help,
+            "asking_help": false,
         })
     }
 
@@ -786,154 +726,6 @@ impl Cec {
         inner.pending.iter().any(|p| pubkey_part(&p.tech) == key) || inner.consent.known(tech)
     }
 
-    // ---- ask-for-help (asking-room membership + technician cache) --------
-
-    /// Flip the customer's asking-for-help state. Returns whether it actually
-    /// changed — the callers' guard against double-withdrawals (and their cue
-    /// to join/leave the asking room exactly once per transition).
-    pub fn set_asking_help(&self, on: bool) -> bool {
-        let mut inner = self.inner.lock();
-        if inner.asking_help == on {
-            return false;
-        }
-        inner.asking_help = on;
-        true
-    }
-
-    /// Whether this customer is currently asking for help.
-    pub fn asking_help(&self) -> bool {
-        self.inner.lock().asking_help
-    }
-
-    /// Technician: a device is present in the asking room — its signaling
-    /// presence IS a raised hand. The dialable number derives from the
-    /// announced device id right here; presence carries no label/hostname
-    /// (those arrive once a session is up). Returns whether the queue
-    /// membership changed (a re-announce of a known asker refreshes
-    /// `last_seen` without spamming an event).
-    pub fn help_present(&self, node: &str) -> bool {
-        let now = now_secs();
-        let mut inner = self.inner.lock();
-        let key = pubkey_part(node).to_string();
-        let number = support_id_from_device(&key);
-        match inner.help_wanted.get_mut(&key) {
-            Some(s) => {
-                s.last_seen = now;
-                // A legacy-beacon asker that also shows up by presence is
-                // one row, presence-governed from here on (presence is the
-                // stronger signal: it can't silently outlive the ask).
-                if s.source != HelpSource::Presence {
-                    s.source = HelpSource::Presence;
-                }
-                false
-            }
-            None => {
-                inner.help_wanted.insert(
-                    key,
-                    HelpSeeker {
-                        number,
-                        label: String::new(),
-                        hostname: String::new(),
-                        asked_at: now,
-                        last_seen: now,
-                        source: HelpSource::Presence,
-                    },
-                );
-                true
-            }
-        }
-    }
-
-    /// Technician: reconcile the presence-sourced queue rows against the
-    /// asking room's live member list (canonical ids) — the poll-path truth
-    /// check that catches any presence event the stream dropped. Presence
-    /// rows not in `present` leave; ids in `present` that aren't rows yet
-    /// join. Legacy beacon rows are untouched (their truth is the TTL).
-    /// Returns whether anything changed.
-    pub fn help_sync_presence(&self, present: &std::collections::HashSet<String>) -> bool {
-        let now = now_secs();
-        let mut changed = false;
-        let mut inner = self.inner.lock();
-        inner.help_wanted.retain(|key, s| {
-            let keep = s.source != HelpSource::Presence || present.contains(key);
-            changed |= !keep;
-            keep
-        });
-        for key in present {
-            if !inner.help_wanted.contains_key(key) {
-                inner.help_wanted.insert(
-                    key.clone(),
-                    HelpSeeker {
-                        number: support_id_from_device(key),
-                        label: String::new(),
-                        hostname: String::new(),
-                        asked_at: now,
-                        last_seen: now,
-                        source: HelpSource::Presence,
-                    },
-                );
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Technician: record (or refresh) a waiting customer heard as a legacy
-    /// `cec.presence` beacon (a pre-asking-room build). `number` must come
-    /// from the authenticated sender id, not the payload. Returns whether the
-    /// *membership* changed (a fresh asker, or a changed label) — pure
-    /// keep-alives refresh the TTL clock without spamming an event.
-    pub fn record_help_beacon(
-        &self,
-        node: &str,
-        number: &str,
-        label: &str,
-        hostname: &str,
-    ) -> bool {
-        let now = now_secs();
-        let mut inner = self.inner.lock();
-        let key = pubkey_part(node).to_string();
-        match inner.help_wanted.get_mut(&key) {
-            Some(s) => {
-                s.last_seen = now;
-                if s.label != label || s.hostname != hostname {
-                    s.label = label.to_string();
-                    s.hostname = hostname.to_string();
-                    return true;
-                }
-                false
-            }
-            None => {
-                inner.help_wanted.insert(
-                    key,
-                    HelpSeeker {
-                        number: number.to_string(),
-                        label: label.to_string(),
-                        hostname: hostname.to_string(),
-                        asked_at: now,
-                        last_seen: now,
-                        source: HelpSource::Beacon,
-                    },
-                );
-                true
-            }
-        }
-    }
-
-    /// Technician: drop a waiting customer — they left the asking room, or a
-    /// legacy `available: false` withdrawal arrived (cancelled, or help
-    /// arrived). Returns whether anything was removed.
-    pub fn remove_help_beacon(&self, node: &str) -> bool {
-        let key = pubkey_part(node).to_string();
-        self.inner.lock().help_wanted.remove(&key).is_some()
-    }
-
-    /// Drop every cached help beacon — the watch toggle's disarm path, so the
-    /// queue empties the moment a technician stops watching.
-    pub fn clear_help(&self) {
-        self.inner.lock().help_wanted.clear();
-    }
-
     /// Whether this node has ANY deliberate CEC relationship with `peer`:
     /// a consent grant (live or lapsed-but-remembered) or a pending connect
     /// request on the customer side, a dialed-directory row on the
@@ -1057,77 +849,6 @@ impl Cec {
             }
         }
         expired
-    }
-
-    /// Whether this node has ever acted as a technician (its role flipped on
-    /// the first dial).
-    pub fn is_technician(&self) -> bool {
-        matches!(self.inner.lock().role, Role::Technician)
-    }
-
-    /// Arm/disarm the technician's help-queue view. A view state, not a
-    /// membership: the node stays on the support area either way (sessions
-    /// ride it); this only gates whether [`Cec::help_list`] surfaces the
-    /// cached beacons.
-    pub fn set_watching_help(&self, on: bool) {
-        self.inner.lock().watching_help = on;
-    }
-
-    pub fn watching_help(&self) -> bool {
-        self.inner.lock().watching_help
-    }
-
-    /// The waiting customer whose key-derived support number matches
-    /// `digits` — the raised hand IS the number→device binding, straight
-    /// from the asking room's announced device id (or a legacy beacon's
-    /// authenticated sender). Beacon rows are TTL-pruned like
-    /// [`Cec::help_list`], so a crashed legacy asker can't be dialed by
-    /// number through a stale cache entry; a missed presence row is no
-    /// worse — the dial path falls back to scanning the standing area's
-    /// live member list.
-    pub fn help_seeker_by_number(&self, digits: &str) -> Option<String> {
-        let now = now_secs();
-        let mut inner = self.inner.lock();
-        inner.help_wanted.retain(|_, s| {
-            s.source == HelpSource::Presence || s.last_seen.saturating_add(HELP_TTL_SECS) >= now
-        });
-        inner
-            .help_wanted
-            .iter()
-            .find(|(_, s)| s.number == digits)
-            .map(|(node, _)| node.clone())
-    }
-
-    /// Technician: the customers currently waiting for help, longest-waiting
-    /// first (it's a queue, not a feed). Prunes legacy beacon rows past
-    /// their TTL on the way out, so a crashed legacy asker disappears
-    /// without a withdrawal (presence rows leave with the room membership
-    /// instead). Empty while the view is disarmed
-    /// ([`Cec::set_watching_help`]) — a technician who said "stop watching"
-    /// sees nothing.
-    pub fn help_list(&self) -> Vec<Value> {
-        let now = now_secs();
-        let mut inner = self.inner.lock();
-        if !inner.watching_help {
-            return Vec::new();
-        }
-        inner.help_wanted.retain(|_, s| {
-            s.source == HelpSource::Presence || s.last_seen.saturating_add(HELP_TTL_SECS) >= now
-        });
-        let mut list: Vec<(&String, &HelpSeeker)> = inner.help_wanted.iter().collect();
-        list.sort_by_key(|(_, s)| s.asked_at);
-        list.into_iter()
-            .map(|(node, s)| {
-                json!({
-                    "node": node,
-                    "number": s.number,
-                    "label": s.label,
-                    "hostname": s.hostname,
-                    "asked_at": s.asked_at,
-                    "last_seen": s.last_seen,
-                })
-            })
-            .collect()
     }
 
     // ---- session state --------------------------------------------------
@@ -1337,13 +1058,6 @@ pub fn grouped_number(number: &str) -> String {
 /// direct WebRTC link, with the venue/default TURN server as WebRTC's own NAT
 /// fallback; human access remains gated by CEC consent per privileged frame.
 ///
-/// An earlier revision made this area `open` so the daemon's auto-dial
-/// could carry `cec.presence` beacons — which meant every customer
-/// auto-connected (and auto-approved) every co-present stranger, and the
-/// AllMyStuff graph faithfully showed all of them. Raised hands now ride
-/// signaling presence in the sibling asking room
-/// ([`ask_network_config`]), so the area can be what it always should have
-/// been: silent.
 pub fn help_network_config() -> (String, Value) {
     let network_id = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
     let config = json!({
@@ -1360,8 +1074,7 @@ pub fn help_network_config() -> (String, Value) {
 }
 
 /// Technician view of the public customer directory. It receives customer
-/// announces but never publishes the technician's own presence, matching the
-/// asking-room watcher: lurking must be invisible.
+/// announces but never publishes the technician's own presence.
 pub fn help_watch_network_config() -> (String, Value) {
     let (network_id, mut config) = help_network_config();
     config["signaling"] = json!({
@@ -1386,51 +1099,6 @@ pub fn session_network_config(number: &str) -> (String, Value) {
         // is still gated by the CEC consent request on every privileged path.
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
-    });
-    (network_id, config)
-}
-
-/// Build the daemon config for the **asking room**
-/// ([`ASK_NETWORK_ID`](allmystuff_cec_protocol::ASK_NETWORK_ID)) — the help
-/// queue itself. Silent like the area, and joined **only while the hand is
-/// up** (customer) or **while the queue view is armed** (technician):
-/// membership is the entire signal. A raised hand is this device announcing
-/// in the room; the watching technician's queue is the room's signaling
-/// presence, longest-present first; lowering the hand is leaving. Nothing
-/// ever connects in this room — answering a hand joins and dials the selected
-/// customer's isolated session room.
-pub fn ask_network_config() -> (String, Value) {
-    let network_id = allmystuff_cec_protocol::ASK_NETWORK_ID.to_string();
-    let config = json!({
-        "id": network_id,
-        "network_id": network_id,
-        "label": "CEC Support — asking",
-        "kind": "silent",
-        // Queue membership is presence only; no peer is ever admitted here.
-        "auto_approve": false,
-        "signaling": { "strategy": "nostr", "mdns": true },
-    });
-    (network_id, config)
-}
-
-/// The technician's flavour of [`ask_network_config`]: the same asking room
-/// joined **listen-only** (daemon ≥ 0.3.3). A watcher reads the room's
-/// presence — the queue — without ever announcing in it, so watching
-/// technicians don't surface as raised hands in each other's queues (or
-/// tell waiting customers who is watching). On an older daemon the flag is
-/// unknown config and is ignored: the watcher announces like any member,
-/// and the queue's self/known filtering keeps that transitional noise out
-/// of its own view. mDNS is off because mDNS-SD cannot lurk (its
-/// browse/advertise handshake is two-way); queue reads ride the relays.
-pub fn ask_watch_network_config() -> (String, Value) {
-    let network_id = allmystuff_cec_protocol::ASK_NETWORK_ID.to_string();
-    let config = json!({
-        "id": network_id,
-        "network_id": network_id,
-        "label": "CEC Support — asking",
-        "kind": "silent",
-        "auto_approve": false,
-        "signaling": { "strategy": "nostr", "mdns": false, "listen_only": true },
     });
     (network_id, config)
 }
@@ -1473,7 +1141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn area_and_asking_room_are_silent_signaling_only() {
+    fn support_directory_and_session_have_separate_admission() {
         // The standing area is a Silent discovery-only directory with mesh
         // admission disabled and no topology to shape.
         let (id, cfg) = help_network_config();
@@ -1482,15 +1150,6 @@ mod tests {
         assert_eq!(cfg["auto_approve"], false);
         assert!(cfg.get("topology").is_none(), "signaling-only: no topology");
         assert_eq!(cfg["signaling"]["strategy"], "nostr");
-
-        // The asking room: same Silent shape under its own well-known id —
-        // membership is the whole signal.
-        let (ask_id, ask) = ask_network_config();
-        assert_eq!(ask_id, allmystuff_cec_protocol::ASK_NETWORK_ID);
-        assert_ne!(ask_id, id, "the queue is its own room");
-        assert_eq!(ask["kind"], "silent");
-        assert_eq!(ask["auto_approve"], false);
-        assert!(ask.get("topology").is_none());
 
         let (session_id, session) = session_network_config("123 456 789");
         assert_eq!(session_id, "cec-123456789");
@@ -1502,9 +1161,6 @@ mod tests {
         let (_, watcher) = help_watch_network_config();
         assert_eq!(watcher["signaling"]["listen_only"], true);
         assert_eq!(watcher["signaling"]["mdns"], false);
-        let (_, ask_watcher) = ask_watch_network_config();
-        assert_eq!(ask_watcher["auto_approve"], false);
-        assert_eq!(ask_watcher["signaling"]["listen_only"], true);
     }
 
     const ME: &str = "customerpubkeybase32aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1703,37 +1359,6 @@ mod tests {
     }
 
     #[test]
-    fn help_seeker_resolves_a_number_to_its_device() {
-        let cec = Cec::new(None);
-        // The raised hand IS the number→device binding: the beacon's
-        // authenticated sender resolves the digits.
-        cec.record_help_beacon(ME, &support_id_from_device(ME), "Front desk", "FRONT-01");
-        let digits = support_id_from_device(ME);
-        assert_eq!(
-            cec.help_seeker_by_number(&digits).as_deref(),
-            Some(pubkey_part(ME))
-        );
-        assert_eq!(cec.help_seeker_by_number("000000000"), None);
-    }
-
-    #[test]
-    fn help_list_is_gated_by_the_watch_view() {
-        let cec = Cec::new(None);
-        cec.record_help_beacon(ME, &support_id_from_device(ME), "Front desk", "FRONT-01");
-        // Cache fills regardless (membership is standing), but the queue
-        // only surfaces while the technician's view is armed.
-        assert!(cec.help_list().is_empty(), "disarmed view shows nothing");
-        cec.set_watching_help(true);
-        assert_eq!(cec.help_list().len(), 1);
-        cec.set_watching_help(false);
-        assert!(cec.help_list().is_empty());
-        // …and the number fallback still resolves while disarmed — a phoned-in
-        // number must work even when the queue view is off.
-        let digits = support_id_from_device(ME);
-        assert!(cec.help_seeker_by_number(&digits).is_some());
-    }
-
-    #[test]
     fn legacy_number_keyed_directory_migrates_by_device() {
         // An older directory: one completed dial (has a node), one nodeless
         // attempt row, both with an obsolete stored `network_id` field. The
@@ -1790,98 +1415,5 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 6);
         assert_ne!(a, verification_code(TECH, "s2"));
-    }
-
-    #[test]
-    fn help_queue_records_dedupes_and_withdraws() {
-        let cec = Cec::new(None);
-        // The queue is a technician view — armed here so `help_list` surfaces
-        // what the beacons record.
-        cec.set_watching_help(true);
-        // First beacon: a new asker — membership changed.
-        assert!(cec.record_help_beacon(ME, "123 456 789", "Reception PC", "RECEPTION-01"));
-        // Keep-alive with the same identity: TTL refresh only, no event churn.
-        assert!(!cec.record_help_beacon(ME, "123 456 789", "Reception PC", "RECEPTION-01"));
-        // A renamed machine is worth re-announcing.
-        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk", "RECEPTION-01"));
-        // ...and so is a changed hostname.
-        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk", "RECEPTION-02"));
-        // Display-suffix and bare forms are the same asker.
-        let display = format!("{ME}-AB12C");
-        assert!(!cec.record_help_beacon(&display, "123 456 789", "Front desk", "RECEPTION-02"));
-        let list = cec.help_list();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0]["number"], "123 456 789");
-        assert_eq!(list[0]["label"], "Front desk");
-        assert_eq!(list[0]["hostname"], "RECEPTION-02");
-        // Withdrawal (available:false / help arrived) empties the queue.
-        assert!(cec.remove_help_beacon(&display));
-        assert!(cec.help_list().is_empty());
-        assert!(!cec.remove_help_beacon(ME), "second withdrawal is a no-op");
-    }
-
-    #[test]
-    fn asking_help_transitions_fire_once() {
-        // The bool's edge is what joins/leaves the asking room, so a re-ask
-        // (or a double-withdrawal) must read as "no change".
-        let cec = Cec::new(None);
-        assert!(!cec.asking_help());
-        assert!(cec.set_asking_help(true));
-        assert!(!cec.set_asking_help(true), "re-ask while asking is a no-op");
-        assert!(cec.set_asking_help(false));
-        assert!(!cec.set_asking_help(false));
-    }
-
-    #[test]
-    fn presence_rows_live_by_membership_and_beacon_rows_by_ttl() {
-        let cec = Cec::new(None);
-        cec.set_watching_help(true);
-
-        // A device present in the asking room is a queue row with its number
-        // derived from the device id — no label until a session brings one.
-        assert!(cec.help_present(ME));
-        assert!(
-            !cec.help_present(ME),
-            "re-announce is a refresh, not a change"
-        );
-        let list = cec.help_list();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0]["number"], support_id_from_device(ME));
-        assert_eq!(list[0]["label"], "");
-        // The number fallback resolves straight from presence.
-        assert_eq!(
-            cec.help_seeker_by_number(&support_id_from_device(ME)),
-            Some(pubkey_part(ME).to_string())
-        );
-
-        // Reconcile against a member list that no longer holds the device —
-        // the row leaves with the membership.
-        let present = std::collections::HashSet::new();
-        assert!(cec.help_sync_presence(&present));
-        assert!(cec.help_list().is_empty());
-
-        // …and reconcile also ADDS members the event stream missed.
-        let mut present = std::collections::HashSet::new();
-        present.insert(pubkey_part(TECH).to_string());
-        assert!(cec.help_sync_presence(&present));
-        assert_eq!(cec.help_list().len(), 1);
-
-        // A legacy beacon row upgraded by presence stops being TTL-governed:
-        // syncing an empty member list removes it too (presence owns it now).
-        cec.record_help_beacon(ME, &support_id_from_device(ME), "Front desk", "FRONT-01");
-        assert!(
-            !cec.help_present(ME),
-            "presence over an existing beacon row upgrades it in place — the \
-             queue membership itself is unchanged"
-        );
-        let mut only_tech = std::collections::HashSet::new();
-        only_tech.insert(pubkey_part(TECH).to_string());
-        assert!(cec.help_sync_presence(&only_tech));
-        let left: Vec<String> = cec
-            .help_list()
-            .iter()
-            .map(|v| v["node"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(left, vec![pubkey_part(TECH).to_string()]);
     }
 }

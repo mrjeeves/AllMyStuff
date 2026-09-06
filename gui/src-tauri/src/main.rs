@@ -3361,34 +3361,7 @@ async fn cec_dialed(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Technician: the customers currently asking for help on the global help
-/// room, longest-waiting first. Read-only — joining the room is
-/// `cec_help_watch`'s job, an explicit opt-in.
-#[tauri::command]
-async fn cec_help_list(state: State<'_, AppState>) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_help_list", json!({}))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Technician: join or leave the global help room — the "Watch the help
-/// queue" toggle. The daemon persists the membership, so the choice survives
-/// restarts. This command going missing is why the toggle once did nothing:
-/// the frontend invoked it, Tauri rejected the unknown command, and the
-/// permissive tryInvoke wrapper swallowed the evidence.
-#[tauri::command]
-async fn cec_help_watch(state: State<'_, AppState>, on: bool) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_help_watch", json!({ "on": on }))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Technician: stop whatever the in-flight dial is trying (discovery poll +
-/// connect-request re-sends). The attempt row stays in the directory.
+/// Cancel the current dial and stop retrying its connection request.
 #[tauri::command]
 async fn cec_cancel_dial(state: State<'_, AppState>) -> Result<Value, String> {
     state
@@ -5172,8 +5145,6 @@ fn main() {
             cec_chat_send,
             cec_chat_history,
             cec_dialed,
-            cec_help_list,
-            cec_help_watch,
             cec_cancel_dial,
             forget_node,
             mesh_status,

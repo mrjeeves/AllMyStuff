@@ -93,15 +93,6 @@
     return app.cecCustomerIsStale(customer);
   }
 
-  /** "just now" / "4m" / "1h 12m": how long a help-asker has been waiting.
-   *  Kept short: it sits inline on the queue card. */
-  function waitingLabel(askedAt: number): string {
-    const s = Math.max(0, Math.round(Date.now() / 1000 - (askedAt || 0)));
-    if (s < 45) return "just now";
-    const m = Math.round(s / 60);
-    if (m < 60) return `${m}m`;
-    return `${Math.floor(m / 60)}h ${m % 60}m`;
-  }
 
   /** The "(HOSTNAME)" tail for a card's name: the match-up key: the
    *  customer's waiting screen shows the same name (hostname) pair, so the
@@ -181,90 +172,6 @@
         {app.cecDialing ? "Connecting…" : "Connect"}
       </button>
     </form>
-  </section>
-
-  <!-- Asking for help: customers waving on the global help room, longest-
-       waiting first (it's a queue). Strictly opt-in: a default install is
-       never on that room; the node only joins it when "Watch the help queue"
-       is turned on here (inside the secret tab), and the daemon persists the
-       membership so the toggle's state survives restarts. Control answers a
-       waver by dialing their own number mesh: the normal approval still
-       gates everything. -->
-  <section class="block">
-    <div class="head">
-      <div class="title">Asking for help</div>
-      <label class="watch-toggle" title="Join the global help room and see customers who press Ask for help. Saved: stays on across restarts.">
-        <input
-          type="checkbox"
-          checked={app.cecHelpWatching}
-          onchange={(e) => void app.setCecHelpWatch(e.currentTarget.checked)}
-        />
-        <span>Watch the help queue</span>
-      </label>
-    </div>
-    {#if !app.cecHelpWatching}
-      <p class="notice">
-        Turn this on to see customers asking for help.
-      </p>
-    {:else if app.cecHelpWaiting.length === 0}
-      <p class="notice listening">
-        <span class="live-dot" aria-hidden="true"></span>
-        Listening. No one is asking right now.
-      </p>
-    {:else}
-      <p class="hint">
-        <b>Control</b> asks for approval and opens the customer's screen.
-      </p>
-      <ul class="rows">
-        {#each app.cecHelpWaiting as w (w.node)}
-          {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
-          {@const kvm = app.kvmTwin(w.node)}
-          <li class="row col asking">
-            <div class="row-top">
-              <span class="dot busy"></span>
-              <span class="who">
-                <b>{shownName}<span class="host">{hostTail(shownName, w.hostname)}</span></b>
-                <span class="sub">
-                  <span class="mesh" title={`Number ${w.number}`}>CEC Support {groupNumber(w.number)}</span>
-                  <span class="meta">· waiting {waitingLabel(w.asked_at)}</span>
-                </span>
-              </span>
-            </div>
-            <div class="row-actions">
-              <button
-                class="btn small primary"
-                disabled={app.cecDialing}
-                title="Answer them: connect and open their screen once they approve"
-                onclick={() => void app.answerHelp(w.node, shownName)}
-              >
-                Control
-              </button>
-              {#if kvm}
-                <!-- A raised hand from a KVM: alongside the console, its
-                     manufacturer web Site is one tap away via the graph. No
-                     chat door: a KVM appliance isn't someone to chat with. -->
-                <button
-                  class="btn small"
-                  title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
-                  onclick={() => void app.openKVM(kvm.id)}
-                >
-                  🌐 Site
-                </button>
-              {:else}
-                <button
-                  class="btn small"
-                  disabled={app.cecDialing}
-                  title="Chat: connect and message them without taking their screen"
-                  onclick={() => void app.chatWithCustomer(w.node)}
-                >
-                  💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
-                </button>
-              {/if}
-            </div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
   </section>
 
   <!-- Client meshes: the customers this technician has dialed. Each is the
@@ -405,8 +312,7 @@
       <div class="title">Your support number</div>
       {#if status?.number}
         <p class="hint">
-          Your number is <code>{groupNumber(status.number)}</code>. Read it to the technician
-          or press <b>Ask for help</b>.
+          Your number is <code>{groupNumber(status.number)}</code>. Read it to your technician, then approve their incoming request.
         </p>
       {/if}
 
@@ -642,35 +548,10 @@
   }
   /* The empty-queue "we're live" state: a breathing dot, calm not urgent -
      shows the watch is real even when nobody's waving. */
-  .notice.listening {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  .live-dot {
-    width: 0.55rem;
-    height: 0.55rem;
-    border-radius: 50%;
-    background: var(--accent);
-    flex-shrink: 0;
-    animation: live-breathe 1.6s ease-in-out infinite;
-  }
-  @keyframes live-breathe {
-    0%,
-    100% {
-      transform: scale(1);
-      opacity: 1;
-    }
-    50% {
-      transform: scale(1.3);
-      opacity: 0.5;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .live-dot {
-      animation: none;
-    }
-  }
+
+
+
+
   .row-top {
     display: flex;
     align-items: center;
@@ -694,25 +575,10 @@
   }
   /* A customer waving on the help room: accented like the pending dial (both
      are "something live is waiting on a human"), solid to read as a queue. */
-  .row.asking {
-    border: 1px solid var(--accent);
-  }
+
   /* The watch opt-in, sitting in the block header opposite the title. */
-  .watch-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: var(--ink-soft);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .watch-toggle input {
-    width: 0.95rem;
-    height: 0.95rem;
-    accent-color: var(--accent);
-  }
+
+
   .dot.busy {
     background: var(--accent);
   }

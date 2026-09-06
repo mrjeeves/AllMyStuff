@@ -200,7 +200,7 @@ will reboot into the media.
 CEC Support is deliberately separate from the ordinary device graph.
 
 Customers use the CEC Support app or a CEC KVM to ask for help. Technicians use
-the CEC Support area and help queue. A support session grants only the approved
+the CEC Support directory and customer session rooms. A support session grants only the approved
 capabilities and should not turn either computer into a permanent fleet member
 or graph fixture.
 
@@ -253,3 +253,17 @@ Start with the smallest relevant refresh:
 Do not solve an authorization problem by adding more meshes. First identify
 whether the device should be fleet-owned, shared, in a room, or in a support
 session.
+
+### Support-number approval
+
+Connect to a new support customer by entering their nine-digit support number.
+Incoming requests on this computer appear in the main window with the technician's
+name and verification code. Approve once, approve for three hours, or decline.
+Existing standing-grant controls remain in CEC settings.
+
+For a KVM you own, choose **Support** on its device card (also available in the
+KVM details drawer). Read its number, approve or decline a pending request, or
+choose **Approve current or next request**. With no request pending this opens a
+five-minute wait for one request. Pressing again refreshes that wait; one request
+consumes it and receives three hours of access. The appliance web UI, CECSupport
+KVM card, and physical KVM button use the same approval window.

@@ -2319,14 +2319,10 @@ export async function fleetMfaDisable(code: string): Promise<void> {
  *  the device key), its role, and the support area it's on. Null in web mode. */
 export interface CecStatus {
   number: string;
-  /** Always the shared support area (`cecsupport-clients`) — the only mesh
-   *  CEC uses now that per-number rooms are gone. */
+  /** Public directory; actual sessions use a private room for the customer. */
   network_id: string;
   role: "client" | "technician";
-  /** Whether the technician's help-queue view is armed — a node-held view
-   *  state, so the toggle reflects it across a reload. Absent from an older
-   *  node. */
-  help_watching?: boolean;
+
 }
 
 /** One inbound technician connect-request awaiting the customer's 3-choice
@@ -2376,12 +2372,7 @@ export function cecStatus(): Promise<CecStatus | null> {
   return tryInvoke<CecStatus>("cec_status");
 }
 
-/** Technician: dial a customer by the number they read out — the fallback for
- *  when the raised-hand list is too crowded to spot them. The node resolves
- *  the digits to a device on the support area (a raised hand first, else any
- *  area member whose key-derived number matches) and connects. Throws with the
- *  backend's reason when nobody with that number is on the area. Returns the
- *  customer's node id (null in web mode). */
+/** Resolve the customer's support number in the public directory, then request access. */
 export async function cecDial(
   number: string,
   agentName: string,
@@ -2391,9 +2382,7 @@ export async function cecDial(
   return (await invoke("cec_dial", { number, agentName })) as { node: string };
 }
 
-/** Technician: dial a customer's device directly — the headline path, fed by
- *  a raised hand's beacon (its authenticated device id) or a directory
- *  reconnect. Returns the customer's node id (null in web mode). */
+/** Reconnect to a customer already saved in the technician's directory. */
 export async function cecDialNode(
   node: string,
   agentName: string,
@@ -2460,55 +2449,6 @@ export async function cecGrants(): Promise<CecGrant[] | null> {
 export async function cecDialed(): Promise<CecPeer[] | null> {
   const r = await tryInvoke<CecPeer[]>("cec_dialed");
   return Array.isArray(r) ? r : null;
-}
-
-/** One customer waiting on the global help room (`cec_help_list` rows + the
- *  `cec://help` event). `number` is derived node-side from the authenticated
- *  beacon sender, so it's dialable as-is. */
-export interface CecHelpSeeker {
-  node: string;
-  number: string;
-  label: string;
-  /** The machine's hostname, from the beacon — the match-up key beside the
-   *  name. Absent from an older node. */
-  hostname?: string;
-  /** Epoch seconds they first asked — the queue position. */
-  asked_at: number;
-  /** Epoch seconds of their latest beacon. */
-  last_seen: number;
-}
-
-/** Technician: the customers currently asking for help, longest-waiting
- *  first. Read-only — empty unless the queue view is armed (`cecHelpWatch`).
- *  Null = fetch failed (keep the last snapshot); empty in web mode. */
-export async function cecHelpList(): Promise<CecHelpSeeker[] | null> {
-  const r = await tryInvoke<CecHelpSeeker[]>("cec_help_list");
-  return Array.isArray(r) ? r : null;
-}
-
-/** Technician: arm (or disarm) the help-queue view — the "Watch the help
- *  queue" toggle. A view state, not a membership: the node stays on the
- *  support area either way (dialed customers' sessions ride it), so disarming
- *  never hangs up on anyone; it just stops surfacing raised hands. Throws on
- *  failure: this exact call once failed silently for days (the command wasn't
- *  registered) while the toggle looked merely stubborn. */
-export async function cecHelpWatch(on: boolean): Promise<void> {
-  if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("cec_help_watch", { on });
-}
-
-/** The help queue changed (`cec://help`) — a fresh asker, a withdrawal, or
- *  (customer-side) our own ask being cleared. No-op in web mode. */
-export async function onCecHelp(
-  cb: (e: { waiting?: CecHelpSeeker[]; asking?: boolean }) => void,
-): Promise<() => void> {
-  if (!isTauri()) return () => {};
-  const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ waiting?: CecHelpSeeker[]; asking?: boolean }>(
-    "cec://help",
-    (e) => cb(e.payload),
-  );
 }
 
 /** Technician: stop whatever the in-flight dial is trying — the connect-request

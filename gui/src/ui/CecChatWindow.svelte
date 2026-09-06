@@ -5,8 +5,8 @@
   // history for its one customer and then rides the live `cec://chat` plane.
   //
   // The top action bar reuses the *exact* store calls behind the NodeDrawer /
-  // CEC tab — Control = toggle keyboard/mouse on the live session, Answer =
-  // dial/answer the customer, Rename = the private CEC alias, Remove = forget
+  // CEC tab — Control = toggle keyboard/mouse on the live session, Connect =
+  // reconnect to the customer, Rename = the private CEC alias, Remove = forget
   // the customer — so this window drives the same session, not a parallel one.
   import { onMount, tick } from "svelte";
   import { app } from "../store.svelte";
@@ -17,7 +17,7 @@
   let { peer }: { peer: string } = $props();
 
   // The dialed-customer row behind this chat: the display name, their number
-  // (for Rename) and node id (for Answer / Remove). Absent for a beat until
+  // (for Rename) and node id (for Connect / Remove). Absent for a beat until
   // loadCec lands — everything degrades to the bare peer id meanwhile.
   const cust = $derived(app.cecPeerFor(peer));
   const title = $derived(cust ? app.cecCustomerName(cust) : "Customer");
@@ -35,12 +35,6 @@
       cust != null &&
       app.cecPeerFor(app.consoleNodeId ?? undefined)?.number === cust.number,
   );
-  // A raised hand from this customer waiting to be picked up — the "there's a
-  // pending/dial to answer" signal for the Answer button.
-  const pending = $derived(
-    cust != null && app.cecHelpWaiting.some((h) => h.number === cust.number),
-  );
-
   let draft = $state("");
   let threadEl = $state<HTMLDivElement | null>(null);
   let removeArmed = $state(false);
@@ -95,11 +89,7 @@
   }
   function answer() {
     if (!cust) return;
-    // A raised hand is answered; otherwise re-dial the stored device id (an
-    // expired grant re-prompts, a live one auto-approves) — the console then
-    // opens in its own window on approval.
-    if (pending) void app.answerHelp(cust.node);
-    else void app.reconnectCec(cust.node);
+    void app.reconnectCec(cust.node);
   }
   function rename() {
     if (!cust) return;
@@ -161,16 +151,14 @@
           Control
         </button>
       {/if}
-      {#if cust && (pending || !liveHere)}
+      {#if cust && !liveHere}
         <button
           class="act"
           disabled={app.cecDialing}
           onclick={answer}
-          title={pending
-            ? "Answer this customer's raised hand"
-            : "Reconnect: dial the customer; their screen opens on approval"}
+          title="Reconnect: dial the customer; their screen opens on approval"
         >
-          {app.cecDialing ? "Dialing…" : pending ? "Answer" : "Connect"}
+          {app.cecDialing ? "Dialing…" : "Connect"}
         </button>
       {/if}
       {#if cust}

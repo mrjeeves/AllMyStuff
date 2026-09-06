@@ -977,3 +977,14 @@ export function humanBytes(bytes: number): string {
   }
   return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
 }
+
+/** Current appliance-owned support consent; durations work before its clock is set. */
+export interface KvmSupportStatus {
+  enabled: boolean;
+  supportId: string;
+  approvalRemainingSeconds?: number;
+  authorised: boolean;
+  expiresAt?: number;
+  grantSeconds: number;
+  pending?: Array<{ technician: string; sessionId: string; agentName: string; verificationCode: string; wantControl: boolean; requestedAt: number }>;
+}

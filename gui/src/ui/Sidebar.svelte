@@ -53,11 +53,6 @@
     Object.values(app.roomKnocks).reduce((n, ks) => n + ks.length, 0),
   );
   const siteCount = $derived(app.sitesByMachine.reduce((n, g) => n + g.sites.length, 0));
-  // The Help tab only exists once the (secret) CEC support area is unlocked —
-  // an ordinary user never sees it. Its badge is the live count of customers
-  // with a hand up right now (only meaningful while watching the queue).
-  const helpWaiting = $derived(app.cecHelpWatching ? app.cecHelpWaiting.length : 0);
-
   // If the CEC area is re-locked while the Help tab is showing, fall back to
   // Sites so the panel never renders a tab that no longer exists.
   $effect(() => {
@@ -154,9 +149,8 @@
         {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
       </button>
       {#if app.cecEnabled}
-        <button class="rail-btn" title="Help queue" aria-label="Help queue" onclick={() => select("help")}>
-          ✋
-          {#if helpWaiting > 0}<span class="rail-count">{helpWaiting}</span>{/if}
+        <button class="rail-btn" title="Support numbers" aria-label="Support numbers" onclick={() => select("help")}>
+          #
         </button>
       {/if}
     </div>
@@ -192,8 +186,7 @@
             aria-selected={app.sidebarTab === "help"}
             onclick={() => select("help")}
           >
-            ✋ Help
-            {#if helpWaiting > 0}<span class="count">{helpWaiting}</span>{/if}
+            # Support
           </button>
         {/if}
       </div>

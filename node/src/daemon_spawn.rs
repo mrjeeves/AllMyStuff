@@ -777,7 +777,7 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         let extra = std::env::var("MYOWNMESH_LOG_EXTRA").unwrap_or_default();
         cmd.env(
             "MYOWNMESH_LOG_EXTRA",
-            format!("myownmesh::ipc::bridge=debug,myownmesh_core::video_recovery=debug,{extra}"),
+            format!("myownmesh::ipc::bridge=debug,myownmesh_core::video_recovery=debug,myownmesh_core::video_timing=debug,myownmesh::video_timing=debug,{extra}"),
         );
     }
     cmd.arg("serve")

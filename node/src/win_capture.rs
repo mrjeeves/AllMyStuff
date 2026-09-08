@@ -386,6 +386,7 @@ struct Duplication {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     dup: Option<IDXGIOutputDuplication>,
+    frame_held: bool,
     monitor_id: u32,
     device_name: String,
     /// CPU-readable copy target, reused across frames of the same size.
@@ -419,6 +420,18 @@ struct Duplication {
     /// Spent frame buffers handed back by the consumer (see [`start`]);
     /// `None` until the session wires it.
     reclaim: Option<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl Drop for Duplication {
+    fn drop(&mut self) {
+        if self.frame_held {
+            if let Some(dup) = &self.dup {
+                unsafe {
+                    let _ = dup.ReleaseFrame();
+                }
+            }
+        }
+    }
 }
 
 impl Duplication {
@@ -456,6 +469,7 @@ impl Duplication {
                 device,
                 context,
                 dup: Some(bound.dup),
+                frame_held: false,
                 monitor_id: bound.monitor_id,
                 device_name: bound.device_name,
                 staging: None,
@@ -481,6 +495,19 @@ impl Duplication {
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| NextError::Fatal("duplication is not bound".into()))?;
+            // Minimize the unowned interval: while held, DXGI tracks damage
+            // instead of redundantly copying every desktop update. Complete
+            // readback first, release immediately before the next acquire.
+            // https://learn.microsoft.com/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-releaseframe
+            if std::mem::take(&mut self.frame_held) {
+                if let Err(e) = dup.ReleaseFrame() {
+                    return Err(if e.code() == DXGI_ERROR_ACCESS_LOST {
+                        NextError::AccessLost
+                    } else {
+                        NextError::Fatal(e.to_string())
+                    });
+                }
+            }
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             let acquired_at = self.diag.as_ref().map(|_| Instant::now());
@@ -491,13 +518,14 @@ impl Duplication {
                     _ => Err(NextError::Fatal(e.to_string())),
                 };
             }
+            self.frame_held = true;
             if let (Some(diag), Some(start)) = (&mut self.diag, acquired_at) {
                 diag.wait_max = diag.wait_max.max(start.elapsed());
                 diag.coalesced += info.AccumulatedFrames.saturating_sub(1);
             }
             // From here the frame is held. Pointer metadata must be read
-            // while it's held; so must the GPU copy be *queued*. Everything
-            // else happens after release.
+            // while it's held, as must the GPU copy. Retain ownership through
+            // readback; the next call releases immediately before acquiring.
             if info.PointerShapeBufferSize > 0 {
                 // A new pointer bitmap is available — cache it. Best-effort:
                 // a failed fetch keeps the previous shape, never breaks capture.
@@ -510,22 +538,17 @@ impl Duplication {
                 self.ptr_visible = p.Visible.as_bool();
             }
             if info.LastPresentTime == 0 {
-                // No new desktop pixels: release at once. If only the pointer
+                // No new desktop pixels. If only the pointer
                 // moved, re-emit the retained clean frame with the cursor at
                 // its new spot so it doesn't freeze on a static screen.
-                let _ = dup.ReleaseFrame();
                 return Ok(self.cursor_only_frame());
             }
             // New desktop pixels: queue the GPU copy into our reusable
-            // staging texture, then release the frame IMMEDIATELY — before
-            // the CPU map/swizzle. Holding it through the readback throttled
-            // the duplication itself (the compositor can't hand over the
-            // next frame until release); copy-then-release-then-map is the
-            // documented fast path, and `Map` still waits for the queued
-            // copy to complete.
+            // staging texture. Map waits for that copy while we still own
+            // the duplication surface; no encoder or network work is done
+            // on this capture thread before the next release/acquire pair.
             let readback_at = self.diag.as_ref().map(|_| Instant::now());
             let queued = self.queue_copy(resource);
-            let _ = dup.ReleaseFrame();
             let frame = match queued.map_err(NextError::Fatal)? {
                 Some((staging, w, h)) => self.read_back(&staging, w, h).map_err(NextError::Fatal),
                 None => Ok(None),

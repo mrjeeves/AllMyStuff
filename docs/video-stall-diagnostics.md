@@ -33,7 +33,8 @@ The AMS diagnostic branch also records `video AU send timing` and
 `video AU assembly timing`. Both select the same existing AU sequence modulo
 60 (about one line/second per endpoint at 60fps), plus a local slow-frame
 exception of at least 50ms, rate-limited to one per five seconds per route
-and stage. These DEBUG targets are enabled by detailed logging. No per-packet
+on send/legacy receive, or per reader on binary IPC receive. These DEBUG
+targets are enabled by detailed logging. No per-packet
 logs, new wire metadata, timers, or payload copies are introduced.
 
 - Sender: AU sequence, bytes/chunks, selected drain rate and paced/unpaced
@@ -46,7 +47,11 @@ logs, new wire metadata, timers, or payload copies are introduced.
   fragment, and only completed valid AUs emit this line. Existing loss logs
   continue to explain damaged/discarded pictures.
 
-Match route/session, sequence, byte count and fragment count across endpoints;
+The receiver's normal binary IPC path assembles before the mesh's four-AU
+queue, and logs peer/lane there. The legacy path logs its route at the mesh
+assembler. Both are covered, without assembling a frame twice.
+
+Match route or peer/lane/session, sequence, byte count and fragment count across endpoints;
 sequence counters can restart with a new route. Compare local durations, not
 wall-clock subtraction. A long total with short fragment gaps demonstrates
 slow completion despite continuous traffic. A matching sender duration dominated

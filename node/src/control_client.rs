@@ -95,6 +95,7 @@ struct InboundPacedAu {
     frame: InboundFrame,
     chunks: usize,
     updated: Instant,
+    timing: Option<crate::video_frame_timing::AssemblyClock>,
 }
 
 #[derive(Default)]
@@ -102,6 +103,7 @@ struct InboundVideoFreshness {
     recovering: HashMap<(String, u8), InboundRecoveryState>,
     recovery: HashMap<(String, u8), crate::video_wire::AuRecovery>,
     paced: HashMap<(String, u8), InboundPacedAu>,
+    last_slow_assembly_log: Option<Instant>,
 }
 
 fn canonical_media_peer(id: &str) -> &str {
@@ -187,6 +189,29 @@ impl InboundVideoFreshness {
                     tx,
                 );
             }
+            if let Some(clock) = pending.timing {
+                let now = Instant::now();
+                let (elapsed, max_gap) = clock.finish(now);
+                let sequence = crate::video_wire::peek_au_identity_marker(&pending.frame.data)
+                    .map(|id| id.sequence);
+                let periodic = crate::video_frame_timing::periodic_sample(sequence);
+                let slow = elapsed >= Duration::from_millis(50)
+                    && self
+                        .last_slow_assembly_log
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5));
+                if periodic || slow {
+                    if !periodic {
+                        self.last_slow_assembly_log = Some(now);
+                    }
+                    tracing::debug!(target: "allmystuff_node::video_timing",
+                        from = %pending.frame.from, lane = pending.frame.stream, ?sequence,
+                        rtp_timestamp = pending.frame.rtp_timestamp,
+                        bytes = pending.frame.data.len(), chunks = pending.chunks,
+                        total_us = elapsed.as_micros() as u64,
+                        fragment_gap_max_us = max_gap.as_micros() as u64,
+                        "video AU assembly timing");
+                }
+            }
             return self.forward(pending.frame, tx);
         }
 
@@ -216,6 +241,9 @@ impl InboundVideoFreshness {
                 pending.frame.data.extend_from_slice(&frame.data);
                 pending.chunks += 1;
                 pending.updated = Instant::now();
+                if let Some(clock) = &mut pending.timing {
+                    clock.observe(pending.updated);
+                }
             }
             Some(_) => {
                 self.paced.insert(
@@ -224,6 +252,8 @@ impl InboundVideoFreshness {
                         frame,
                         chunks: 1,
                         updated: Instant::now(),
+                        timing: tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                            .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
                     },
                 );
                 damaged = true;
@@ -235,6 +265,8 @@ impl InboundVideoFreshness {
                         frame,
                         chunks: 1,
                         updated: Instant::now(),
+                        timing: tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                            .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
                     },
                 );
             }

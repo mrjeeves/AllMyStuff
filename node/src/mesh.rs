@@ -1794,6 +1794,7 @@ const VIDEO_REFRESH_QUIET: Duration = Duration::from_secs(1);
 /// behind a damaged reset stream. This matches the gate's quiet period, so a
 /// lost repair keyframe gets another chance without creating an IDR storm.
 const VIDEO_CLEAN_ENTRY_RETRY: Duration = Duration::from_secs(1);
+const VIDEO_REFRESH_DELIVERY_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct VideoRefreshGate {
@@ -1827,6 +1828,31 @@ impl VideoRefreshGate {
     fn teardown(&mut self, route_id: &str) {
         self.last.remove(route_id);
         self.inflight.remove(route_id);
+    }
+}
+
+/// Keep recovery single-flight, including cancellation, but do not let the
+/// daemon client's extra response grace park the next clean-entry request.
+struct VideoRefreshFlight<'a> {
+    gate: &'a Mutex<VideoRefreshGate>,
+    route: &'a str,
+}
+
+impl VideoRefreshFlight<'_> {
+    async fn deliver(
+        self,
+        budget: Duration,
+        send: impl std::future::Future<Output = Result<(), String>>,
+    ) -> Result<(), String> {
+        tokio::time::timeout(budget, send)
+            .await
+            .map_err(|_| "clean-entry delivery exceeded its recovery budget".to_string())?
+    }
+}
+
+impl Drop for VideoRefreshFlight<'_> {
+    fn drop(&mut self) {
+        self.gate.lock().finish(self.route);
     }
 }
 
@@ -17760,16 +17786,27 @@ impl Mesh {
             return Ok(());
         }
         tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
-        let result = self
-            .send_control_reliable(
-                &peer,
-                &ControlMessage::Route(RouteControl::Refresh {
-                    route_id: route_id.clone(),
-                }),
-                Duration::from_secs(2),
+        let started = Instant::now();
+        let flight = VideoRefreshFlight {
+            gate: &self.video_refresh,
+            route: &route_id,
+        };
+        let result = flight
+            .deliver(
+                VIDEO_REFRESH_DELIVERY_BUDGET,
+                self.send_control_reliable(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::Refresh {
+                        route_id: route_id.clone(),
+                    }),
+                    VIDEO_REFRESH_DELIVERY_BUDGET,
+                ),
             )
             .await;
-        self.video_refresh.lock().finish(&route_id);
+        tracing::debug!(target: "allmystuff_node::video_timing",
+            route = %route_id, elapsed_ms = started.elapsed().as_millis() as u64,
+            delivered = result.is_ok(), error = ?result.as_ref().err(),
+            "clean-entry delivery timing");
         result
     }
 
@@ -21857,6 +21894,39 @@ mod tests {
         );
         gate.teardown("r");
         assert!(gate.begin("r", start));
+    }
+
+    #[tokio::test]
+    async fn video_refresh_delivery_deadline_releases_single_flight() {
+        let gate = Mutex::new(VideoRefreshGate::default());
+        let start = Instant::now();
+        assert!(gate.lock().begin("r", start));
+        let result = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        }
+        .deliver(Duration::from_millis(10), std::future::pending())
+        .await;
+        assert!(result.unwrap_err().contains("recovery budget"));
+        assert!(!gate.lock().inflight.contains("r"));
+        assert!(gate.lock().begin("r", start + VIDEO_REFRESH_QUIET));
+        let result = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        }
+        .deliver(VIDEO_REFRESH_DELIVERY_BUDGET, async { Ok(()) })
+        .await;
+        assert!(result.is_ok());
+        assert!(!gate.lock().inflight.contains("r"));
+
+        assert!(gate.lock().begin("r", start + VIDEO_REFRESH_QUIET * 2));
+        let flight = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        };
+        let delivery = flight.deliver(VIDEO_REFRESH_DELIVERY_BUDGET, std::future::pending());
+        drop(delivery); // cancelled before polling must also release the gate
+        assert!(!gate.lock().inflight.contains("r"));
     }
 
     fn inventory_summary_with_free(id: &str, available_bytes: u64) -> InventorySummary {

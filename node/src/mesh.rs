@@ -1996,6 +1996,7 @@ struct PacedInboundAu {
     key: bool,
     chunks: usize,
     data: Vec<u8>,
+    timing: Option<crate::video_frame_timing::AssemblyClock>,
 }
 
 impl PacedInboundAu {
@@ -2005,6 +2006,9 @@ impl PacedInboundAu {
             key,
             chunks: 1,
             data,
+            timing:
+                tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                    .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
         }
     }
 }
@@ -2014,6 +2018,8 @@ struct CompletePacedAu {
     rtp_timestamp: u32,
     key: bool,
     data: Vec<u8>,
+    chunks: usize,
+    timing: Option<(Duration, Duration)>,
 }
 
 fn accept_paced_fragment(
@@ -2036,6 +2042,8 @@ fn accept_paced_fragment(
                 rtp_timestamp: au.rtp_timestamp,
                 key: au.key,
                 data: au.data,
+                chunks: au.chunks,
+                timing: au.timing.map(|clock| clock.finish(Instant::now())),
             }),
             false,
         );
@@ -2051,6 +2059,9 @@ fn accept_paced_fragment(
                 return (None, true);
             }
             au.key |= key;
+            if let Some(clock) = &mut au.timing {
+                clock.observe(Instant::now());
+            }
             au.chunks += 1;
             au.data.extend_from_slice(&data);
         }
@@ -2560,13 +2571,27 @@ impl Mesh {
         duration_us: u64,
         pace: (bool, bool, u32, u32),
     ) -> Result<bool, String> {
+        let timing_started =
+            tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                .then(Instant::now);
         let current = || self.video_generation_is_current(route_id, generation);
         if !self.paced_video_routes.lock().contains(route_id) {
             if !current() {
                 return Ok(false);
             }
+            let write_started = Instant::now();
             self.send_video_track(peer, route_id, lane, data, duration_us)
                 .await?;
+            self.note_video_au_send(
+                route_id,
+                data,
+                timing_started,
+                &[],
+                write_started.elapsed().as_micros() as u64,
+                1,
+                0,
+                "unpaced",
+            );
             return Ok(true);
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
@@ -2602,6 +2627,16 @@ impl Mesh {
                 .await?;
             write_us += tw.elapsed().as_micros() as u64;
             self.note_pace_gaps(&[], write_us, 2);
+            self.note_video_au_send(
+                route_id,
+                data,
+                timing_started,
+                &[],
+                write_us,
+                1,
+                0,
+                "unsplittable",
+            );
             return Ok(true);
         }
         // (game posture, WAN-class path, current send rate bps, fps) — the
@@ -2670,7 +2705,49 @@ impl Mesh {
         write_us += tw.elapsed().as_micros() as u64;
         writes += 1;
         self.note_pace_gaps(&ledger, write_us, writes);
+        self.note_video_au_send(
+            route_id,
+            data,
+            timing_started,
+            &ledger,
+            write_us,
+            writes.saturating_sub(1),
+            policy.drain_bps,
+            "paced",
+        );
         Ok(true)
+    }
+
+    /// One deterministic AU sample per 60 pictures, plus one slow exception
+    /// per existing diagnostic interval. No payload or cross-host clock math.
+    #[allow(clippy::too_many_arguments)]
+    fn note_video_au_send(
+        &self,
+        route_id: &str,
+        data: &[u8],
+        started: Option<Instant>,
+        gaps: &[(u64, u64)],
+        write_us: u64,
+        chunks: u64,
+        drain_bps: u64,
+        mode: &str,
+    ) {
+        let Some(started) = started else { return };
+        let elapsed = started.elapsed();
+        let sequence = crate::video_wire::peek_au_identity_marker(data).map(|id| id.sequence);
+        if !crate::video_frame_timing::periodic_sample(sequence)
+            && !(elapsed >= Duration::from_millis(50)
+                && self.diag_ok(&format!("au-send-timing:{route_id}")))
+        {
+            return;
+        }
+        let total_us = elapsed.as_micros() as u64;
+        let split = crate::video_frame_timing::send_breakdown(total_us, gaps, write_us);
+        tracing::debug!(target: "allmystuff_node::video_timing",
+            route = route_id, ?sequence, bytes = data.len(), chunks, mode, drain_bps,
+            total_us, requested_us = split.requested_us, slept_us = split.slept_us,
+            daemon_write_us = write_us, other_us = split.other_us,
+            "video AU send timing");
     }
 
     /// Fold one delivered video sample into the route's arrival state:
@@ -6018,6 +6095,21 @@ impl Mesh {
                 );
             }
             if let Some(complete) = complete {
+                if let Some((elapsed, max_gap)) = complete.timing {
+                    let sequence = crate::video_wire::peek_au_identity_marker(&complete.data)
+                        .map(|id| id.sequence);
+                    if crate::video_frame_timing::periodic_sample(sequence)
+                        || (elapsed >= Duration::from_millis(50)
+                            && self.diag_ok(&format!("au-assembly-timing:{route_id}")))
+                    {
+                        tracing::debug!(target: "allmystuff_node::video_timing",
+                            route = %route_id, ?sequence, rtp_timestamp = complete.rtp_timestamp,
+                            bytes = complete.data.len(), chunks = complete.chunks,
+                            total_us = elapsed.as_micros() as u64,
+                            fragment_gap_max_us = max_gap.as_micros() as u64,
+                            "video AU assembly timing");
+                    }
+                }
                 self.deliver_video_au(
                     from,
                     &route_id,

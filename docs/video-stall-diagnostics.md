@@ -27,6 +27,34 @@ For one viewer this is three periodic lines per five seconds, plus bounded
 slow-send warnings and extra fields on existing recovery warnings. No payloads
 are recorded and no queue, pacing, codec, recovery or quality policy changes.
 
+### Whole-frame timing
+
+The AMS diagnostic branch also records `video AU send timing` and
+`video AU assembly timing`. Both select the same existing AU sequence modulo
+60 (about one line/second per endpoint at 60fps), plus a local slow-frame
+exception of at least 50ms, rate-limited to one per five seconds per route
+and stage. These DEBUG targets are enabled by detailed logging. No per-packet
+logs, new wire metadata, timers, or payload copies are introduced.
+
+- Sender: AU sequence, bytes/chunks, selected drain rate and paced/unpaced
+  mode; total duration from entering send through the closing-marker write,
+  requested pacing time, actual pacing time, daemon write time and residual
+  work. This does **not** include capture, encode or outbound queue residence.
+- Receiver: matching AU sequence, RTP timestamp, bytes/chunks, first-fragment
+  to validated closing-marker duration and maximum gap between fragments,
+  including the end marker. This does **not** include time before the first
+  fragment, and only completed valid AUs emit this line. Existing loss logs
+  continue to explain damaged/discarded pictures.
+
+Match route/session, sequence, byte count and fragment count across endpoints;
+sequence counters can restart with a new route. Compare local durations, not
+wall-clock subtraction. A long total with short fragment gaps demonstrates
+slow completion despite continuous traffic. A matching sender duration dominated
+by requested pacing isolates intentional shaping; long daemon writes or a
+longer receiver interval point to different boundaries. Slow exceptions are
+independently selected, so not every exception has a matching opposite-side
+line. Deterministic samples do. Missing matches are not evidence of packet loss.
+
 ## Interpretation
 
 Compare the sender's existing encode/pacing logs and the viewer's existing

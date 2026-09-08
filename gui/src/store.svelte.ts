@@ -20,6 +20,7 @@ import {
 import { reconcileCecOnlyCanons } from "./cec-provenance";
 import { coalesceLatestBy, nearestFileTileSize, routeActivationOutcome } from "./files-canvas";
 import { demoCatalog } from "./mock";
+import { ActiveStreamTune } from "./stream-tune";
 import {
   exportNetworkSettings,
   networkAddPayloadFromEnvelope,
@@ -925,6 +926,7 @@ class AppStore {
    *  route-id; this is the GUI remembering which pick belongs to which. */
   private consoleCodecBySource = $state<Record<string, "auto" | "h264" | "mjpeg">>({});
   private consoleTuneBySource = $state<Record<string, StreamTune>>({});
+  private consoleTuneActivation = new ActiveStreamTune();
   /** The selected source's codec (which transport to *offer*). "auto" and
    *  "h264" both offer H.264; "mjpeg" forces the fallback. */
   get consoleCodec(): "auto" | "h264" | "mjpeg" {
@@ -2706,6 +2708,7 @@ class AppStore {
       }
     }
     this.routeStates = states;
+    this.applyActiveConsoleTune();
     this.routeSessions = sessions;
     for (const [routeId, waiters] of this.routeActivationWaiters) {
       const state = states[routeId];
@@ -3835,6 +3838,7 @@ class AppStore {
 
   private async applyConsoleVideo() {
     const epoch = ++this.consoleVideoEpoch;
+    this.consoleTuneActivation.reset();
     if (this.consoleVideoRouteId) {
       const old = this.consoleVideoRouteId;
       this.consoleVideoRouteId = null;
@@ -3890,9 +3894,9 @@ class AppStore {
     // created it.
     this.consoleVideoLive = leg?.id ?? null;
     this.consoleVideoRouteId = leg?.created ? leg.id : null;
-    // Carry the quality pills onto the fresh route (the sender restarts
-    // its capture with them; harmless no-op when everything is Auto).
-    if (leg && this.hasTune()) void tuneRoute(leg.id, this.consoleTune);
+    // A newly created route is still negotiating. Its active snapshot will
+    // apply the latest picks; firing Tune here raced the asynchronous Offer.
+    if (leg && !leg.created) this.applyActiveConsoleTune();
   }
 
   /** Re-drive the console's video wire once a video input for the open
@@ -3913,19 +3917,12 @@ class AppStore {
     }
   }
 
-  private hasTune(): boolean {
-    const t = this.consoleTune;
-    // Mode is a first-class tune too. Omitting it here meant a mode-only
-    // Studio/Game selection was remembered in the GUI but not re-applied to
-    // the fresh route after a monitor switch or codec re-offer, so the sender
-    // silently came back Balanced.
-    return (
-      t.maxEdge != null ||
-      t.bitrate != null ||
-      t.fps != null ||
-      t.mode != null ||
-      t.game != null
-    );
+  private applyActiveConsoleTune() {
+    const route = this.consoleVideoLive;
+    const tune = this.consoleTune;
+    if (this.consoleTuneActivation.take(
+      route, !!route && this.routeStates[route]?.state === "active", tune,
+    ) && route) void tuneRoute(route, tune);
   }
 
   /** A quality pick changed (a pill or the slider): remember it against the
@@ -3937,7 +3934,7 @@ class AppStore {
       ...this.consoleTuneBySource,
       [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...patch },
     };
-    if (this.consoleVideoLive) void tuneRoute(this.consoleVideoLive, this.consoleTune);
+    this.applyActiveConsoleTune();
   }
 
   /** The codec pick changed: remember it against the current source and

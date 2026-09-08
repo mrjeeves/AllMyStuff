@@ -21,6 +21,7 @@
   import { onMount } from "svelte";
   import { Fsr1 } from "../fsr1";
   import ModePill from "./ModePill.svelte";
+  import { ActiveStreamTune } from "../stream-tune";
   import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { makeRelativeMotionForwarder } from "../relative-motion";
@@ -233,13 +234,19 @@
     { label: "4 Mbps", value: 4_000_000 },
   ];
   let tune = $state<StreamTune>({});
+  const tuneActivation = new ActiveStreamTune();
+  $effect(() => {
+    const route = app.videoPopoutLive;
+    if (tuneActivation.take(
+      route, !!route && app.routeStates[route]?.state === "active", tune,
+    ) && route) void tuneRoute(route, tune);
+  });
   let openPill = $state<"res" | "fps" | "rate" | "live" | null>(null);
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
     choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
   function pick(field: keyof StreamTune, v: number | null) {
     tune = { ...tune, [field]: v ?? undefined };
     openPill = null;
-    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
 
   // Mode is the headline control now: Balanced is the stability-first
@@ -260,7 +267,6 @@
   ) {
     tune = { ...tune, mode: wireMode, game: gameFlag };
     openPill = null;
-    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
 
   onMount(() => {

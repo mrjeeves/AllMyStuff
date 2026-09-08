@@ -584,8 +584,8 @@ impl Duplication {
     }
 
     /// Queue the GPU copy of the held frame into the reusable staging
-    /// texture. Runs while the frame is held; the caller releases the frame
-    /// right after, before any CPU readback. `Ok(None)` = degenerate frame.
+    /// texture. Ownership lasts through readback until the next acquire.
+    /// `Ok(None)` = degenerate frame.
     unsafe fn queue_copy(
         &mut self,
         resource: Option<IDXGIResource>,

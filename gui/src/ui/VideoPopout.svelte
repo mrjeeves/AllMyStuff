@@ -255,7 +255,7 @@
   // and this bar are the same element. It hands back the resolved wire
   // values; we fold them into the route's tune.
   function applyModeWire(
-    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    wireMode: "game" | "experimental-game" | "studio" | "studio-lossless" | undefined,
     gameFlag: boolean | undefined,
   ) {
     tune = { ...tune, mode: wireMode, game: gameFlag };
@@ -791,8 +791,7 @@
         mode={tune.mode}
         game={tune.game}
         onapply={applyModeWire}
-        experimental={app.labsTier}
-        onexperimental={(on) => app.setLabsTier(on)}
+        experimental={app.devMode && app.labsTier}
       />
       <button
         class="pill"

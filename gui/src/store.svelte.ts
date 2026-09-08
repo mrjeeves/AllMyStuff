@@ -305,6 +305,7 @@ export type SettingsTab =
   | "always_on"
   | "updates"
   | "danger"
+  | "dev_tools"
   // The secret CEC Support tab — shown only when a technician reveals it with
   // the hidden keyboard gesture (see `App.cecRevealed`).
   | "cec";
@@ -944,7 +945,8 @@ class AppStore {
    *  so it survives restarts and is pushed to the node on boot; the node's
    *  labs gate is what every future field-trial feature reads. Off by
    *  default: a stock session behaves exactly like today. */
-  labsTier = $state<boolean>(localStorage.getItem("ams.labs") === "1");
+  devMode = $state<boolean>(localStorage.getItem("ams.devMode") === "1");
+  labsTier = $state<boolean>(localStorage.getItem("ams.devMode") === "1" && localStorage.getItem("ams.labs") === "1");
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
   /** The live outbound clipboard route a paste pushes our clipboard down. */
@@ -1683,6 +1685,14 @@ class AppStore {
   /** Wire up live backend data, if there is a backend. No-op (keeps the
    *  demo graph) in web mode. Called once on mount. */
   async init() {
+    const syncDevTools = (event: StorageEvent) => {
+      if (event.key !== "ams.devMode" && event.key !== "ams.labs") return;
+      this.devMode = localStorage.getItem("ams.devMode") === "1";
+      this.labsTier = this.devMode && localStorage.getItem("ams.labs") === "1";
+      if (!this.devMode && this.settingsTab === "dev_tools") this.settingsTab = "danger";
+      void this.pushLabsTier();
+    };
+    window.addEventListener("storage", syncDevTools);
     this.loadRooms();
     if (!isTauri()) {
       this.seedDemoFleet();
@@ -3956,7 +3966,7 @@ class AppStore {
    *  [`pushLabsTier`] so a restart honors the last setting. `on` is
    *  optional — omit to flip. */
   setLabsTier(on?: boolean) {
-    this.labsTier = on ?? !this.labsTier;
+    this.labsTier = this.devMode && (on ?? !this.labsTier);
     try {
       localStorage.setItem("ams.labs", this.labsTier ? "1" : "0");
     } catch {
@@ -3968,7 +3978,16 @@ class AppStore {
   /** Push the persisted Labs tier to this node's gate — on boot and on
    *  every toggle. A no-op in web mode (labsSet tryInvokes). */
   private pushLabsTier() {
-    return labsSet(this.labsTier);
+    return labsSet(this.devMode && this.labsTier);
+  }
+
+  setDevMode(on: boolean) {
+    this.devMode = on;
+    try { localStorage.setItem("ams.devMode", on ? "1" : "0"); } catch {}
+    if (!on) {
+      this.setLabsTier(false);
+      if (this.settingsTab === "dev_tools") this.settingsTab = "danger";
+    }
   }
 
   /** Audio passthrough: play what the remote machine is playing — its

@@ -439,7 +439,8 @@ pub(crate) fn target_fps_for(link: LinkClass, posture: Posture) -> u32 {
         std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
     FPS.unwrap_or_else(|| match posture {
         Posture::Balanced => 30,
-        Posture::Game => auto_fps(link, true),
+        Posture::Game => 60,
+        Posture::ExperimentalGame => auto_fps(link, true),
         Posture::Studio | Posture::StudioLossless => auto_fps(link, false),
     })
     .clamp(1, 240)
@@ -502,7 +503,9 @@ fn h264_max_edge(posture: Posture) -> u32 {
     });
     OVERRIDE.unwrap_or(match posture {
         Posture::Balanced => 2560,
-        Posture::Game | Posture::Studio | Posture::StudioLossless => 3840,
+        Posture::Game | Posture::ExperimentalGame | Posture::Studio | Posture::StudioLossless => {
+            3840
+        }
     })
 }
 
@@ -526,6 +529,9 @@ fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass, posture: Posture)
     }
     if posture == Posture::Balanced {
         return 8_000_000;
+    }
+    if posture == Posture::Game {
+        return 25_000_000;
     }
     let cap = match link {
         LinkClass::Lan => 80_000_000,
@@ -607,9 +613,9 @@ pub struct Tune {
     pub link: LinkClass,
 }
 
-/// A stream's tuned character — the three-way dial that replaced the
-/// old quality slider. Balanced is the stability/quality default; Game
-/// trades for latency and instant recovery (GDR, tight VBV, 1 ms
+/// A stream's tuned character. Game shares Balanced's encode/recovery
+/// algorithm, with 25 Mbps / 4K / 60 fps defaults. ExperimentalGame preserves
+/// the previous latency/recovery experiment (GDR, tight VBV, 1 ms
 /// pacing); Studio trades bandwidth for fidelity on links that have it
 /// (the LAN "full pipe" mode — high-bitrate quality-first encoding
 /// today; 4:4:4 chroma and lossless land with the hardware-decode
@@ -617,7 +623,10 @@ pub struct Tune {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
     Balanced,
+    /// Balanced algorithm with 25 Mbps / native-up-to-4K / 60 fps defaults.
     Game,
+    /// Previous Game algorithm (GDR and aggressive recovery), developer opt-in.
+    ExperimentalGame,
     Studio,
     /// Studio's top shelf: mathematically lossless HEVC (constQP-0,
     /// transquant bypass) on the NVENC rung, decoded by the viewer's
@@ -634,6 +643,7 @@ pub enum Posture {
 pub fn parse_posture(s: &str) -> Option<Posture> {
     match s {
         "game" => Some(Posture::Game),
+        "experimental-game" => Some(Posture::ExperimentalGame),
         "studio" => Some(Posture::Studio),
         "studio-lossless" => Some(Posture::StudioLossless),
         "balanced" => Some(Posture::Balanced),
@@ -657,14 +667,14 @@ impl Tune {
         // slam the full pipe wherever they want it. The env override still
         // promotes a bare Balanced to Game node-wide.
         match p {
-            Posture::Balanced if game_mode() => Posture::Game,
+            Posture::Balanced if game_mode() => Posture::ExperimentalGame,
             p => p,
         }
     }
 
     /// The route's effective game posture (see [`Tune::posture`]).
     pub(crate) fn game(&self) -> bool {
-        self.posture() == Posture::Game
+        self.posture() == Posture::ExperimentalGame
     }
 
     /// Studio fidelity active.
@@ -1212,6 +1222,7 @@ impl VideoBridge {
         let posture = match tune.posture() {
             Posture::Balanced => "balanced",
             Posture::Game => "game",
+            Posture::ExperimentalGame => "experimental-game",
             Posture::Studio => "studio",
             Posture::StudioLossless => "studio-lossless",
         };
@@ -1537,6 +1548,7 @@ impl VideoBridge {
         let posture = match tune.posture() {
             Posture::Balanced => "balanced",
             Posture::Game => "game",
+            Posture::ExperimentalGame => "experimental-game",
             Posture::Studio => "studio",
             Posture::StudioLossless => "studio-lossless",
         };
@@ -2743,7 +2755,7 @@ fn run_gpu_lane(
             bitrate as f64 / 1e6
         );
     }
-    let game = posture == Posture::Game;
+    let game = posture == Posture::ExperimentalGame;
     let requested_lossless = posture == Posture::StudioLossless;
     // The lossy-fallback opens (rung unavailable, noise guard) run as
     // plain Studio — the posture's spirit with rate control back on.
@@ -4808,7 +4820,10 @@ fn rate_adapt_allowed(posture: Posture, mode: RateAdaptMode) -> bool {
     match mode {
         RateAdaptMode::Off => false,
         RateAdaptMode::Interactive => {
-            matches!(posture, Posture::Balanced | Posture::Game)
+            matches!(
+                posture,
+                Posture::Balanced | Posture::Game | Posture::ExperimentalGame
+            )
         }
         RateAdaptMode::All => true,
     }
@@ -4832,8 +4847,8 @@ const RATE_RECOVERY_SETTLE: Duration = RATE_HOLD;
 /// postures retain the prior 8 Mbps floor.
 fn rate_floor(posture: Posture) -> u32 {
     match posture {
-        Posture::Balanced => 4_000_000,
-        Posture::Game | Posture::Studio | Posture::StudioLossless => 8_000_000,
+        Posture::Balanced | Posture::Game => 4_000_000,
+        Posture::ExperimentalGame | Posture::Studio | Posture::StudioLossless => 8_000_000,
     }
 }
 
@@ -4864,7 +4879,8 @@ fn rate_adapt_step(
             && fb.recv_fps > 0
             && fb.recv_fps.saturating_mul(10) < target_fps.saturating_mul(7));
     let link_struggling = est_sagging || delay_ramping;
-    let struggling = link_struggling || (posture == Posture::Game && renderer_struggling);
+    let struggling =
+        link_struggling || (posture == Posture::ExperimentalGame && renderer_struggling);
     let held = state
         .last_step
         .is_some_and(|t| now.duration_since(t) < RATE_HOLD);
@@ -5074,8 +5090,8 @@ fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
         // lossy-Studio fallback when the HEVC rung can't open (and the
         // noise guard's landing spot), so it mirrors Studio.
         Posture::Studio | Posture::StudioLossless => (auto.max(150_000_000), 500_000_000),
-        Posture::Game => (auto, 200_000_000),
-        Posture::Balanced => (auto, 80_000_000),
+        Posture::ExperimentalGame => (auto, 200_000_000),
+        Posture::Balanced | Posture::Game => (auto, 80_000_000),
     };
     tune.bitrate.unwrap_or(floor).clamp(250_000, ceiling)
 }
@@ -5592,7 +5608,7 @@ mod tests {
     fn gpu_lane_policy_quarantines_every_posture_unless_explicitly_enabled() {
         for posture in [
             Posture::Balanced,
-            Posture::Game,
+            Posture::ExperimentalGame,
             Posture::Studio,
             Posture::StudioLossless,
         ] {
@@ -5926,12 +5942,28 @@ mod tests {
         let t0 = Instant::now();
         // One bad report is a hiccup, not a verdict.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, Posture::Game, 60, ceiling, ceiling, t0,),
+            rate_adapt_step(
+                &mut st,
+                &congested,
+                Posture::ExperimentalGame,
+                60,
+                ceiling,
+                ceiling,
+                t0,
+            ),
             None
         );
         // The second cuts ×0.7.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, Posture::Game, 60, ceiling, ceiling, t0,),
+            rate_adapt_step(
+                &mut st,
+                &congested,
+                Posture::ExperimentalGame,
+                60,
+                ceiling,
+                ceiling,
+                t0,
+            ),
             Some(28_000_000)
         );
         // Inside the hold window nothing moves, evidence or not.
@@ -5939,7 +5971,7 @@ mod tests {
             rate_adapt_step(
                 &mut st,
                 &congested,
-                Posture::Game,
+                Posture::ExperimentalGame,
                 60,
                 28_000_000,
                 ceiling,
@@ -5951,7 +5983,7 @@ mod tests {
             rate_adapt_step(
                 &mut st,
                 &congested,
-                Posture::Game,
+                Posture::ExperimentalGame,
                 60,
                 28_000_000,
                 ceiling,
@@ -5968,15 +6000,31 @@ mod tests {
         // The bad streak carried through the hold, so the first post-hold
         // report with congestion evidence steps immediately.
         let t1 = t0 + RATE_HOLD + Duration::from_secs(1);
-        let cut = rate_adapt_step(&mut st, &est, Posture::Game, 60, 28_000_000, ceiling, t1)
-            .expect("estimate-guided cut");
+        let cut = rate_adapt_step(
+            &mut st,
+            &est,
+            Posture::ExperimentalGame,
+            60,
+            28_000_000,
+            ceiling,
+            t1,
+        )
+        .expect("estimate-guided cut");
         assert_eq!(cut, 8_500_000, "85% of the measured 10 Mbps");
         // Clean reports climb additively — and only after the streak.
         let clean = fb(60, 0, 0);
         let t2 = t1 + RATE_HOLD + Duration::from_secs(1);
         let mut up = None;
         for _ in 0..RATE_GOOD_STREAK {
-            up = rate_adapt_step(&mut st, &clean, Posture::Game, 60, cut, ceiling, t2);
+            up = rate_adapt_step(
+                &mut st,
+                &clean,
+                Posture::ExperimentalGame,
+                60,
+                cut,
+                ceiling,
+                t2,
+            );
         }
         let up = up.expect("climb after the streak");
         assert_eq!(up, cut + (ceiling / 12).max(500_000));
@@ -5990,11 +6038,27 @@ mod tests {
         let mut st2 = RateAdaptState::default();
         let t3 = t2 + RATE_HOLD + Duration::from_secs(1);
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, Posture::Game, 60, ceiling, ceiling, t3,),
+            rate_adapt_step(
+                &mut st2,
+                &ramping,
+                Posture::ExperimentalGame,
+                60,
+                ceiling,
+                ceiling,
+                t3,
+            ),
             None
         );
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, Posture::Game, 60, ceiling, ceiling, t3,),
+            rate_adapt_step(
+                &mut st2,
+                &ramping,
+                Posture::ExperimentalGame,
+                60,
+                ceiling,
+                ceiling,
+                t3,
+            ),
             Some(28_000_000)
         );
     }
@@ -6024,7 +6088,7 @@ mod tests {
                 rate_adapt_step(
                     &mut state,
                     &bad,
-                    Posture::Game,
+                    Posture::ExperimentalGame,
                     60,
                     ceiling,
                     ceiling,
@@ -6040,7 +6104,7 @@ mod tests {
             rate_adapt_step(
                 &mut state,
                 &clean,
-                Posture::Game,
+                Posture::ExperimentalGame,
                 60,
                 ceiling,
                 ceiling,
@@ -6060,7 +6124,7 @@ mod tests {
             RateAdaptMode::Interactive
         ));
         assert!(rate_adapt_allowed(
-            Posture::Game,
+            Posture::ExperimentalGame,
             RateAdaptMode::Interactive
         ));
         assert!(!rate_adapt_allowed(
@@ -6068,7 +6132,10 @@ mod tests {
             RateAdaptMode::Interactive
         ));
         assert!(rate_adapt_allowed(Posture::Studio, RateAdaptMode::All));
-        assert!(!rate_adapt_allowed(Posture::Game, RateAdaptMode::Off));
+        assert!(!rate_adapt_allowed(
+            Posture::ExperimentalGame,
+            RateAdaptMode::Off
+        ));
     }
 
     #[test]
@@ -6460,7 +6527,7 @@ mod tests {
         assert_eq!(auto.h264_edge(), h264_max_edge(Posture::Balanced));
         assert_eq!(auto.h264_edge(), 2560, "Balanced targets native up to 2K");
         let game = Tune {
-            mode: Some(Posture::Game),
+            mode: Some(Posture::ExperimentalGame),
             ..Tune::default()
         };
         assert_eq!(game.h264_edge(), 3840, "Game targets native up to 4K");
@@ -6484,13 +6551,13 @@ mod tests {
 
         // Game and Studio retain the existing high-throughput defaults.
         let game_lan = Tune {
-            mode: Some(Posture::Game),
+            mode: Some(Posture::ExperimentalGame),
             link: LinkClass::Lan,
             ..Tune::default()
         };
         assert_eq!(game_lan.fps(), 60);
         assert_eq!(
-            h264_bitrate_for(3840, 2160, 60, LinkClass::Lan, Posture::Game),
+            h264_bitrate_for(3840, 2160, 60, LinkClass::Lan, Posture::ExperimentalGame),
             79_626_240
         );
 
@@ -6503,6 +6570,42 @@ mod tests {
         };
         assert_eq!(pinned.fps(), 48);
         assert_eq!(tuned_bitrate(pinned, 1920, 1080, 48), 60_000_000);
+    }
+
+    #[test]
+    fn game_is_balanced_algorithm_with_4k60_25mbps_defaults() {
+        let game = Tune {
+            mode: Some(Posture::Game),
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        assert!(
+            !game.game(),
+            "GDR/tight recovery is experimental, not the Game preset"
+        );
+        assert_eq!(game.fps(), 60);
+        assert_eq!(game.h264_edge(), 3840);
+        assert_eq!(tuned_bitrate(game, 1920, 1080, 60), 25_000_000);
+        assert_eq!(tuned_bitrate(game, 3840, 2160, 60), 25_000_000);
+        assert_eq!(rate_floor(Posture::Game), rate_floor(Posture::Balanced));
+        let explicit = Tune {
+            fps: Some(30),
+            bitrate: Some(12_000_000),
+            max_edge: Some(1920),
+            ..game
+        };
+        assert_eq!(explicit.fps(), 30);
+        assert_eq!(explicit.h264_edge(), 1920);
+        assert_eq!(tuned_bitrate(explicit, 3840, 2160, 30), 12_000_000);
+        assert_eq!(
+            parse_posture("experimental-game"),
+            Some(Posture::ExperimentalGame)
+        );
+        assert!(Tune {
+            mode: Some(Posture::ExperimentalGame),
+            ..game
+        }
+        .game());
     }
 
     #[test]

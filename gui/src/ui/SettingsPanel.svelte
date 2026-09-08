@@ -15,6 +15,7 @@
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
   import CecSection from "./settings/CecSection.svelte";
   import DangerSection from "./settings/DangerSection.svelte";
+  import DevToolsSection from "./settings/DevToolsSection.svelte";
 
   const tabs = $derived<{ id: SettingsTab; label: string; icon: string }[]>([
     { id: "this_device", label: "This Device", icon: "💻" },
@@ -39,6 +40,7 @@
     // "About" (see UpdatesSection) - the nav entry matches.
     { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
     ...(!isMobile() ? [{ id: "danger" as SettingsTab, label: "Danger Zone", icon: "⚠️" }] : []),
+    ...(app.devMode && !isMobile() ? [{ id: "dev_tools" as SettingsTab, label: "Dev Tools", icon: "🛠️" }] : []),
   ]);
 
   function close() {
@@ -95,6 +97,8 @@
         <UpdatesSection />
       {:else if app.settingsTab === "danger" && !isMobile()}
         <DangerSection />
+      {:else if app.settingsTab === "dev_tools" && app.devMode && !isMobile()}
+        <DevToolsSection />
       {/if}
     </section>
   </div>

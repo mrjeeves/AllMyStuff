@@ -15,14 +15,15 @@
   // its menu opens up (default); the console's menu has room below so it
   // opens down — without forking the component.
 
-  type ModeKey = "balanced" | "game" | "studio" | "studio-ll";
+  type ModeKey = "balanced" | "game" | "experimental-game" | "studio" | "studio-ll";
 
   /** The postures in menu order, each with the one-line description the
    *  dropdown shows and whether it's a bandwidth-heavy tier (the Studio
    *  flavors, which gate behind the one-time warning). */
   const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean }> = [
     { key: "balanced", label: "Balanced", blurb: "2K/30 target, stability first", heavy: false },
-    { key: "game", label: "Game", blurb: "4K/60 target, latency first, GDR healing", heavy: false },
+    { key: "game", label: "Game", blurb: "Balanced algorithm · 25 Mbps · 4K/60 target", heavy: false },
+    { key: "experimental-game", label: "Experimental Game", blurb: "Previous Game algorithm · GDR and aggressive recovery", heavy: false },
     { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true },
     {
       key: "studio-ll",
@@ -34,20 +35,20 @@
   const MODE_LABEL: Record<ModeKey, string> = {
     balanced: "Balanced",
     game: "Game",
+    "experimental-game": "Experimental Game",
     studio: "Studio",
     "studio-ll": "Studio · LL",
   };
 
   /** The posture as it rides the wire (matches StreamTune["mode"] minus
    *  the "balanced" alias, which is expressed as undefined). */
-  type WireMode = "game" | "studio" | "studio-lossless" | undefined;
+  type WireMode = "game" | "experimental-game" | "studio" | "studio-lossless" | undefined;
 
   let {
     mode,
     game,
     onapply,
     experimental = false,
-    onexperimental,
     placement = "up",
   }: {
     /** The current wire posture ("studio-lossless" for the LL flavor). */
@@ -58,13 +59,8 @@
      *  "studio-lossless" for LL, else the key; `gameFlag` mirrors it for
      *  hosts that predate the tri-state. */
     onapply: (wireMode: WireMode, gameFlag: boolean | undefined) => void;
-    /** The Experimental (Labs) tier state — a toggle below the postures,
-     *  orthogonal to them (Experimental refines any posture; it is not a
-     *  fifth mode). Absent = the toggle isn't shown (a host that doesn't
-     *  wire Labs). */
+    /** Dev Tools' opt-in gate for experimental modes. */
     experimental?: boolean;
-    /** Flip the Experimental tier. When absent, the toggle row is hidden. */
-    onexperimental?: (on: boolean) => void;
     /** Which way the menu opens off the pill. "up" (default) suits a bar at
      *  the window's bottom edge; "down" suits a menu with room below. */
     placement?: "up" | "down";
@@ -99,8 +95,12 @@
     return next === "balanced" ? undefined : next === "studio-ll" ? "studio-lossless" : next;
   }
   function apply(next: ModeKey) {
-    onapply(toWire(next), next === "game" ? true : undefined);
+    onapply(toWire(next), next === "game" || next === "experimental-game" ? true : undefined);
   }
+
+  $effect(() => {
+    if (!experimental && mode === "experimental-game") apply("game");
+  });
 
   /** Pick a posture from the menu: the Studio tiers detour through the
    *  one-time bandwidth warning the first time; everything else applies now. */
@@ -193,7 +193,7 @@
     class:open
     aria-haspopup="menu"
     aria-expanded={open}
-    title="Balanced favors stability and quality; Game favors latency and instant recovery; Studio spends bandwidth on fidelity; Studio · Lossless is bit-exact (a capable pair both ends)"
+    title="Game uses Balanced's algorithm with 25 Mbps, native-up-to-4K and 60 fps defaults. Experimental modes require Dev Tools."
     onpointerdown={(e) => e.stopPropagation()}
     onpointerup={(e) => e.stopPropagation()}
     onclick={(e) => {
@@ -217,7 +217,7 @@
       onpointerup={(e) => e.stopPropagation()}
       onkeydown={onMenuKey}
     >
-      {#each MODES as m (m.key)}
+      {#each MODES.filter((m) => m.key !== "experimental-game" || experimental) as m (m.key)}
         <button
           class="mode-item"
           class:sel={modeKey() === m.key}
@@ -235,30 +235,6 @@
           </span>
         </button>
       {/each}
-      {#if onexperimental}
-        <!-- Experimental is a TOGGLE, not a fifth posture: it refines
-             whichever mode is active (Labs field trials — off by default,
-             every feature fails soft to today's behavior). A checkbox row
-             under a divider, so the Mode control owns it and no separate
-             control is ever needed. -->
-        <div class="mode-divider" role="separator"></div>
-        <button
-          class="mode-item"
-          class:sel={experimental}
-          role="menuitemcheckbox"
-          aria-checked={experimental}
-          onclick={(e) => {
-            e.stopPropagation();
-            onexperimental?.(!experimental);
-          }}
-        >
-          <span class="mi-check" aria-hidden="true">{experimental ? "✓" : ""}</span>
-          <span class="mi-text">
-            <span class="mi-label">Experimental{#if experimental}<span class="mi-tag labs">labs on</span>{/if}</span>
-            <span class="mi-blurb">Field-trial speedups: off by default, safe to toggle live</span>
-          </span>
-        </button>
-      {/if}
     </div>
   {/if}
 </span>

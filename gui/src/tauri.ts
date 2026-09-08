@@ -989,7 +989,7 @@ export interface StreamTune {
    *  bandwidth to spend; Studio-Lossless is its top shelf — bit-exact
    *  HEVC on NVIDIA hardware, falling soft to Studio anywhere the rung
    *  can't run (old hosts read it as no named ask). */
-  mode?: "balanced" | "game" | "studio" | "studio-lossless";
+  mode?: "balanced" | "game" | "experimental-game" | "studio" | "studio-lossless";
 }
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
@@ -1011,7 +1011,7 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
  *  real output geometry; `codec`/`encoderLabel` name the wire codec and the
  *  encoder rung. Bitrates are bits/s, `""` means "not reported yet". */
 export interface RouteDials {
-  posture: "balanced" | "game" | "studio" | "studio-lossless";
+  posture: "balanced" | "game" | "experimental-game" | "studio" | "studio-lossless";
   encoderLabel: string;
   codec: string;
   targetBitrateBps: number;

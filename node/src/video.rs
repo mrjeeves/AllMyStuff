@@ -2142,7 +2142,7 @@ fn pump_frames_with_stall<T, X>(
 where
     X: Fn(T) -> (Vec<u8>, u32, u32),
 {
-    let budget = Duration::from_secs(1) / fps.max(1);
+    let mut cadence = crate::video_frame_timing::FrameCadence::new(fps);
     let started = Instant::now();
     let from_screen = stall_state == VideoStatusState::DisplayAsleep;
     let mut got_any = false;
@@ -2316,7 +2316,11 @@ where
             };
             got_any = true;
             reporter.report(VideoStatusState::Ok, None);
-            let frame_start = Instant::now();
+            let wait = cadence.wait(Instant::now());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            cadence.admitted(Instant::now());
             while let Ok(newer) = frames.try_recv() {
                 frame = newer;
             }
@@ -2381,9 +2385,6 @@ where
                         local_spare.push(buf);
                     }
                 }
-            }
-            if let Some(rest) = budget.checked_sub(frame_start.elapsed()) {
-                std::thread::sleep(rest);
             }
         };
         // Hang up the stage so the encode side drains out, then surface its

@@ -2,6 +2,43 @@
 //! Matching AU identities let sender/receiver samples describe the same frame.
 use std::time::{Duration, Instant};
 
+/// Phase-locked sampling without replaying missed ticks. A relative sleep
+/// after each frame accumulates OS wakeup rounding (17ms becomes 58.8fps).
+/// Wait before selecting the freshest picture, not after converting it.
+pub(crate) struct FrameCadence {
+    period: Duration,
+    next: Option<Instant>,
+}
+
+impl FrameCadence {
+    pub(crate) fn new(fps: u32) -> Self {
+        Self {
+            period: Duration::from_secs(1) / fps.clamp(1, 240),
+            next: None,
+        }
+    }
+
+    pub(crate) fn wait(&self, now: Instant) -> Duration {
+        self.next
+            .map_or(Duration::ZERO, |next| next.saturating_duration_since(now))
+    }
+
+    pub(crate) fn admitted(&mut self, now: Instant) {
+        self.next = Some(match self.next {
+            Some(next) if now >= next => {
+                let missed = now.duration_since(next).as_nanos() / self.period.as_nanos();
+                // A long idle spell starts a fresh cadence, never a catch-up burst.
+                if missed > 240 {
+                    now + self.period
+                } else {
+                    next + self.period * (missed as u32 + 1)
+                }
+            }
+            _ => now + self.period,
+        });
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AssemblyClock {
     first: Instant,
@@ -56,6 +93,34 @@ pub(crate) fn periodic_sample(sequence: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cadence_does_not_accumulate_millisecond_wakeup_rounding() {
+        let start = Instant::now();
+        let mut cadence = FrameCadence::new(60);
+        let mut now = start;
+        cadence.admitted(now);
+        for _ in 0..60 {
+            let wait = cadence.wait(now);
+            now += Duration::from_millis(wait.as_micros().div_ceil(1000) as u64);
+            cadence.admitted(now);
+        }
+        assert!(now.duration_since(start) <= Duration::from_millis(1001));
+        // The former frame-relative 17ms sleeps take 1020ms for 60 intervals.
+        assert!(now.duration_since(start) < Duration::from_millis(1020));
+    }
+
+    #[test]
+    fn cadence_skips_late_slots_without_a_catchup_burst() {
+        let start = Instant::now();
+        let mut cadence = FrameCadence::new(60);
+        cadence.admitted(start);
+        let late = start + Duration::from_millis(107);
+        assert!(cadence.wait(late).is_zero());
+        cadence.admitted(late);
+        assert!(cadence.wait(late) > Duration::ZERO);
+        assert!(cadence.wait(late) <= Duration::from_secs(1) / 60);
+    }
 
     #[test]
     fn continuous_fragments_can_hide_a_slow_complete_frame() {

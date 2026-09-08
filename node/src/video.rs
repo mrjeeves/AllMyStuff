@@ -1351,7 +1351,7 @@ impl VideoBridge {
             .lock()
             .get(route_id)
             .map(|r| (r.tune.game(), r.tune.link != LinkClass::Lan, r.tune.fps()))
-            .unwrap_or((false, false, 60));
+            .unwrap_or((false, true, 60));
         let rate = route_rates()
             .lock()
             .get(route_id)

@@ -86,3 +86,26 @@ OS/runtime trace may still be required; these summaries do not prove its cause.
 
 Record the incident time and retain logs from both ends. Do not tune limits
 based only on an abandonment/overflow count or average throughput.
+# LAN frame-completion pacing (diagnostic branch)
+
+The matched CECWorkstation2 → Stream PC capture on 2026-09-08 showed a
+546,196-byte AU spending 224 ms in AMS send, including 222 ms of pacing sleep;
+the receiver assembled the same sequence/chunk count in 225 ms. Two further
+large AUs repeated this at roughly 215–221 ms. This is sender-imposed delay,
+not a measurement of NIC saturation or cross-host one-way latency.
+
+LAN pacing now uses the encoded AU size and requested FPS to provide a
+one-frame-interval drain target, bounded by a **shared 256 Mbps ceiling across
+paced LAN routes in the node**. The existing 96 KiB token allowance persists
+across AUs; each frame does not get a fresh burst. The shared reservation is
+made after the per-route wait, immediately before submitting the fragment.
+This ceiling is a safety bound, not an estimate of available network capacity.
+Oversized AUs or competing traffic may still miss the frame interval.
+
+WAN/unknown paths retain the rate-relative policy. Explicit diagnostic drain
+overrides remain route limits (LAN still has the shared ceiling). Existing
+unsplittable-AU bypass behavior is unchanged. No decode buffering, codec
+reference shedding, bitrate/resolution reduction, or wire change is involved.
+The AU send/assembly timing logs remain enabled through detailed logging for
+before/after comparison. This policy alone does not guarantee 60 unique source
+frames per second or remove capture, encoding, networking and display latency.

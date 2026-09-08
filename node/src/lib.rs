@@ -157,6 +157,7 @@ pub mod video;
 pub mod video_decode;
 pub(crate) mod video_frame_timing;
 pub(crate) mod video_handoff;
+pub(crate) mod video_pacing;
 /// Codec-valid metadata carried inside encoded video access units. Unlike
 /// capture, this wire contract is needed by receive-only builds too.
 pub(crate) mod video_wire;

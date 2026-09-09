@@ -1,5 +1,13 @@
 # Focused detailed-log capture for video stalls
 
+This branch now includes behavioral pipeline fixes as well as the original
+instrumentation: frame-completion pacing (below), clean-entry cancellation
+handling, phase-locked capture cadence, DXGI frame lifetime, and deferred
+route tuning/reconnect handling. Game uses the Balanced algorithm with
+25 Mbps/native-up-to-4K/60 fps defaults; the former Game algorithm and Studio
+modes are experimental choices behind Dev Mode. Statements below about
+unchanged policy refer to the timing hooks themselves, not the entire branch.
+
 Use the existing detailed-logging setting on both ends. No packet capture,
 new UI setting, timer task, or per-packet log is added. AMS enables the narrow
 MyOwnMesh timing targets when launching its daemon, unless an explicit
@@ -25,7 +33,8 @@ timing instrumentation; an older daemon simply has no matching log sites.
 
 For one viewer this is three periodic lines per five seconds, plus bounded
 slow-send warnings and extra fields on existing recovery warnings. No payloads
-are recorded and no queue, pacing, codec, recovery or quality policy changes.
+are recorded; these timing hooks do not change queue, pacing, codec, recovery
+or quality policy.
 
 ### Whole-frame timing
 

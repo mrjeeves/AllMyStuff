@@ -16,7 +16,7 @@
     </label>
     <label>
       <input type="checkbox" checked={app.labsTier} onchange={(e) => app.setLabsTier(e.currentTarget.checked)} />
-      <span><b>Experimental features</b><small>Enable Labs features and show Experimental Game (the previous Game algorithm) in video mode controls.</small></span>
+      <span><b>Experimental features</b><small>Enable Labs features and show Experimental Game, Studio, and Studio Lossless in video mode controls.</small></span>
     </label>
     <p>Game uses Balanced’s algorithm with 25 Mbps, native-up-to-4K and 60 fps defaults. Experimental Game retains the old GDR and aggressive recovery behavior.</p>
     <small>Turning Dev Mode off hides these controls and disables experimental features. Existing detailed logging stays unchanged until you turn it off here.</small>

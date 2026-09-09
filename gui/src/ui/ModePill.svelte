@@ -2,11 +2,10 @@
   // The stream-posture control, shared by the console strip and the
   // popped-out video bar so there is ONE Mode element, not two that drift
   // apart. It is a proper dropdown: the pill names the current posture and
-  // opens a menu of all four with one-line descriptions, the active one
-  // checked. Balanced (stability-first default), Game (latency-first — GDR,
-  // instant recovery), Studio (LAN fidelity), Studio · Lossless (bit-exact
-  // HEVC on a capable pair). The Studio flavors warn once about bandwidth
-  // before engaging.
+  // opens a menu with one-line descriptions and the active mode checked.
+  // Balanced and Game are always available; Experimental Game and both
+  // Studio flavors require the experimental opt-in. The Studio flavors
+  // also warn once about bandwidth before engaging.
   //
   // Presentational + self-contained: the caller owns where the tune lives
   // and how it's applied; this component only decides which posture is next
@@ -20,16 +19,17 @@
   /** The postures in menu order, each with the one-line description the
    *  dropdown shows and whether it's a bandwidth-heavy tier (the Studio
    *  flavors, which gate behind the one-time warning). */
-  const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean }> = [
-    { key: "balanced", label: "Balanced", blurb: "2K/30 target, stability first", heavy: false },
-    { key: "game", label: "Game", blurb: "Balanced algorithm · 25 Mbps · 4K/60 target", heavy: false },
-    { key: "experimental-game", label: "Experimental Game", blurb: "Previous Game algorithm · GDR and aggressive recovery", heavy: false },
-    { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true },
+  const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean; experimental: boolean }> = [
+    { key: "balanced", label: "Balanced", blurb: "2K/30 target, stability first", heavy: false, experimental: false },
+    { key: "game", label: "Game", blurb: "Balanced algorithm · 25 Mbps · 4K/60 target", heavy: false, experimental: false },
+    { key: "experimental-game", label: "Experimental Game", blurb: "Previous Game algorithm · GDR and aggressive recovery", heavy: false, experimental: true },
+    { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true, experimental: true },
     {
       key: "studio-ll",
       label: "Studio · Lossless",
       blurb: "Pixel-exact HEVC, needs a capable pair",
       heavy: true,
+      experimental: true,
     },
   ];
   const MODE_LABEL: Record<ModeKey, string> = {
@@ -95,10 +95,14 @@
     return next === "balanced" ? undefined : next === "studio-ll" ? "studio-lossless" : next;
   }
   function apply(next: ModeKey) {
+    if (!experimental && MODES.find((m) => m.key === next)?.experimental) return;
     onapply(toWire(next), next === "game" || next === "experimental-game" ? true : undefined);
   }
 
   $effect(() => {
+    // A setting change in another window must also cancel a pending Studio
+    // confirmation. Hiding Studio choices does not retune an active stream.
+    if (!experimental) studioPrompt = null;
     if (!experimental && mode === "experimental-game") apply("game");
   });
 
@@ -217,7 +221,7 @@
       onpointerup={(e) => e.stopPropagation()}
       onkeydown={onMenuKey}
     >
-      {#each MODES.filter((m) => m.key !== "experimental-game" || experimental) as m (m.key)}
+      {#each MODES.filter((m) => !m.experimental || experimental) as m (m.key)}
         <button
           class="mode-item"
           class:sel={modeKey() === m.key}

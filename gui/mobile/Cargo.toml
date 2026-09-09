@@ -10,7 +10,7 @@
 # control socket — iOS forbids the child process the desktop model needs.
 [workspace]
 
-# Dependency workspace patches are not inherited. The embedded v0.3.20
+# Dependency workspace patches are not inherited. The embedded Mesh
 # engine requires the same socket/repair hooks as the released daemon.
 # Keep these on the suite pin through scripts/sync-pinned-locks.sh.
 [patch.crates-io]

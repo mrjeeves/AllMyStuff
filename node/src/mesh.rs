@@ -21915,9 +21915,10 @@ mod tests {
         std::mem::forget(rt);
         // No daemon or active connection: exercise the production GUI handoff
         // with a local watcher and a deterministic old queue residence time.
-        let client = Arc::new(ControlClient::with_path(
-            std::env::temp_dir().join("ams-handoff-test-no-daemon.sock"),
-        ));
+        // Constructing the client does not connect. No session is started and
+        // this synthetic route has no peer, so recovery cannot issue an RPC.
+        // Use the portable constructor: with_path is intentionally Unix-only.
+        let client = Arc::new(ControlClient::new().expect("resolve control address"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));
         let route = "handoff-test";
         mesh.video_watch(route.into(), false, DecoderPreference::Automatic);

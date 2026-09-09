@@ -120,6 +120,8 @@ pub struct Mesh {
     /// across access units so every new frame cannot reset the route's burst
     /// allowance and turn a short recovery spike into sustained catch-up.
     video_pace: Mutex<HashMap<String, PaceRouteState>>,
+    /// One aggregate budget: multiple LAN routes must not multiply peak rate.
+    video_lan_pace: Mutex<Option<PaceRouteState>>,
     /// M3 + the chunk-train bandwidth estimator: per inbound video route,
     /// arrival dispersion of the pacer's own timed bursts → a bottleneck
     /// estimate and a one-way-delay trend, attached to every outbound
@@ -1794,6 +1796,7 @@ const VIDEO_REFRESH_QUIET: Duration = Duration::from_secs(1);
 /// behind a damaged reset stream. This matches the gate's quiet period, so a
 /// lost repair keyframe gets another chance without creating an IDR storm.
 const VIDEO_CLEAN_ENTRY_RETRY: Duration = Duration::from_secs(1);
+const VIDEO_REFRESH_DELIVERY_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct VideoRefreshGate {
@@ -1830,6 +1833,31 @@ impl VideoRefreshGate {
     }
 }
 
+/// Keep recovery single-flight, including cancellation, but do not let the
+/// daemon client's extra response grace park the next clean-entry request.
+struct VideoRefreshFlight<'a> {
+    gate: &'a Mutex<VideoRefreshGate>,
+    route: &'a str,
+}
+
+impl VideoRefreshFlight<'_> {
+    async fn deliver(
+        self,
+        budget: Duration,
+        send: impl std::future::Future<Output = Result<(), String>>,
+    ) -> Result<(), String> {
+        tokio::time::timeout(budget, send)
+            .await
+            .map_err(|_| "clean-entry delivery exceeded its recovery budget".to_string())?
+    }
+}
+
+impl Drop for VideoRefreshFlight<'_> {
+    fn drop(&mut self) {
+        self.gate.lock().finish(self.route);
+    }
+}
+
 /// Classify one route-local AU sequence without guessing from timestamps.
 /// Clean entries are allowed to reset a sender that restarted in place;
 /// duplicates/stale units never move the high-water mark backwards.
@@ -1855,110 +1883,10 @@ fn observe_au_sequence(
     }
 }
 
-/// A route may spend this much immediately before shaping begins. Four 24 KiB
-/// slices preserve a useful keyframe/scene-change kick without letting every
-/// captured frame become a fresh unbounded burst.
-const VIDEO_PACE_BURST_BYTES: u64 = 96 * 1024;
-/// Balanced's 4 Mbps congestion floor still needs enough drain headroom that a
-/// large recovery frame does not visibly drag across hundreds of milliseconds.
-const VIDEO_PACE_WAN_FLOOR_BPS: u64 = 8_000_000;
-const VIDEO_PACE_LAN_FLOOR_BPS: u64 = 16_000_000;
-/// For routes whose own target is below this value, recovery headroom stops
-/// here. A route explicitly targeting more is never shaped below its average.
-const VIDEO_PACE_RECOVERY_CEILING_BPS: u64 = 32_000_000;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PacePolicy {
-    drain_bps: u64,
-    burst_bytes: u64,
-}
-
-/// The production shaping policy is rate-relative rather than encoder-CBR:
-/// encoders retain the VBV/peak room that prevents blocky motion, while the
-/// transport drains that quality burst through one bounded bucket. A target
-/// above the recovery ceiling remains load-bearing — shaping below the stated
-/// average would only build an endless queue — but a normal Balanced route can
-/// no longer turn a 4 Mbps target into a repeated 50+ Mbps wall.
-fn pace_policy(game: bool, wan: bool, rate_bps: u32, override_mbps: u64) -> PacePolicy {
-    let drain_bps = if override_mbps > 0 {
-        override_mbps.max(8) * 1_000_000
-    } else if rate_bps == 0 {
-        if wan {
-            VIDEO_PACE_WAN_FLOOR_BPS
-        } else {
-            VIDEO_PACE_LAN_FLOOR_BPS
-        }
-    } else {
-        let rate = u64::from(rate_bps);
-        let headroom = if game {
-            rate.saturating_mul(5) / 4
-        } else {
-            rate.saturating_mul(3) / 2
-        };
-        let floor = if wan {
-            VIDEO_PACE_WAN_FLOOR_BPS
-        } else {
-            VIDEO_PACE_LAN_FLOOR_BPS
-        };
-        headroom
-            .max(floor)
-            .min(rate.max(VIDEO_PACE_RECOVERY_CEILING_BPS))
-    };
-    PacePolicy {
-        drain_bps,
-        burst_bytes: VIDEO_PACE_BURST_BYTES,
-    }
-}
+use crate::video_pacing::{frame_policy, pace_policy, PaceRouteState, LAN_AGGREGATE_POLICY};
 
 fn select_paced_video(is_video: bool, local_enabled: bool, peer_supports: bool) -> bool {
     is_video && local_enabled && peer_supports
-}
-
-#[derive(Debug)]
-struct PaceRouteState {
-    tokens: u64,
-    accounted_at: Instant,
-}
-
-impl PaceRouteState {
-    fn full(now: Instant, policy: PacePolicy) -> Self {
-        Self {
-            tokens: policy.burst_bytes,
-            accounted_at: now,
-        }
-    }
-
-    /// Reserve `bytes` against a token bucket and return how long the caller
-    /// must wait before sending them. `accounted_at` may sit in the future when
-    /// a prior reservation is outstanding, making consecutive calls preserve
-    /// the same drain schedule instead of each resetting at a frame boundary.
-    fn reserve(&mut self, now: Instant, bytes: usize, policy: PacePolicy) -> Duration {
-        if now >= self.accounted_at {
-            let elapsed_ns = now.duration_since(self.accounted_at).as_nanos();
-            let refill =
-                elapsed_ns.saturating_mul(u128::from(policy.drain_bps)) / 8_000_000_000u128;
-            self.tokens = self
-                .tokens
-                .saturating_add(refill.min(u128::from(u64::MAX)) as u64)
-                .min(policy.burst_bytes);
-            self.accounted_at = now;
-        }
-        self.tokens = self.tokens.min(policy.burst_bytes);
-        let bytes = bytes as u64;
-        if bytes <= self.tokens {
-            self.tokens -= bytes;
-            return Duration::ZERO;
-        }
-        let deficit = bytes - self.tokens;
-        self.tokens = 0;
-        let wait_us = u128::from(deficit)
-            .saturating_mul(8_000_000)
-            .div_ceil(u128::from(policy.drain_bps.max(1)))
-            .min(u128::from(u64::MAX)) as u64;
-        let base = self.accounted_at.max(now);
-        self.accounted_at = base + Duration::from_micros(wait_us);
-        self.accounted_at.saturating_duration_since(now)
-    }
 }
 
 const MAX_PACED_AU_CHUNKS: usize = 2048;
@@ -1970,6 +1898,7 @@ struct PacedInboundAu {
     key: bool,
     chunks: usize,
     data: Vec<u8>,
+    timing: Option<crate::video_frame_timing::AssemblyClock>,
 }
 
 impl PacedInboundAu {
@@ -1979,6 +1908,9 @@ impl PacedInboundAu {
             key,
             chunks: 1,
             data,
+            timing:
+                tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                    .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
         }
     }
 }
@@ -1988,6 +1920,8 @@ struct CompletePacedAu {
     rtp_timestamp: u32,
     key: bool,
     data: Vec<u8>,
+    chunks: usize,
+    timing: Option<(Duration, Duration)>,
 }
 
 fn accept_paced_fragment(
@@ -2010,6 +1944,8 @@ fn accept_paced_fragment(
                 rtp_timestamp: au.rtp_timestamp,
                 key: au.key,
                 data: au.data,
+                chunks: au.chunks,
+                timing: au.timing.map(|clock| clock.finish(Instant::now())),
             }),
             false,
         );
@@ -2025,6 +1961,9 @@ fn accept_paced_fragment(
                 return (None, true);
             }
             au.key |= key;
+            if let Some(clock) = &mut au.timing {
+                clock.observe(Instant::now());
+            }
             au.chunks += 1;
             au.data.extend_from_slice(&data);
         }
@@ -2158,6 +2097,7 @@ impl Mesh {
             video_decode: Arc::new(DecodeBridge::new()),
             pace_gaps: Mutex::new(PaceGapStats::default()),
             video_pace: Mutex::new(HashMap::new()),
+            video_lan_pace: Mutex::new(None),
             video_arrivals: Mutex::new(HashMap::new()),
             paced_video_in: Mutex::new(HashMap::new()),
             video_au_out_sequences: Mutex::new(HashMap::new()),
@@ -2516,8 +2456,9 @@ impl Mesh {
     /// decode — partial pictures are never a decoder input.
     ///
     /// The route-level token bucket intentionally allows a short 96 KiB
-    /// quality burst, then drains at a bounded rate relative to the route's
-    /// own target. Its state survives frame boundaries, which is the important
+    /// quality burst, then drains each LAN picture within its frame interval
+    /// where the shared 256 Mbps LAN ceiling permits. WAN keeps its existing
+    /// rate-relative policy. Its state survives frame boundaries, which is the important
     /// difference from the old one-frame deadline: a backed-up producer cannot
     /// spend a fresh burst allowance on every frame and peg the link. Encoder
     /// VBV/peak dials remain untouched, preserving the motion quality that a
@@ -2534,13 +2475,27 @@ impl Mesh {
         duration_us: u64,
         pace: (bool, bool, u32, u32),
     ) -> Result<bool, String> {
+        let timing_started =
+            tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                .then(Instant::now);
         let current = || self.video_generation_is_current(route_id, generation);
         if !self.paced_video_routes.lock().contains(route_id) {
             if !current() {
                 return Ok(false);
             }
+            let write_started = Instant::now();
             self.send_video_track(peer, route_id, lane, data, duration_us)
                 .await?;
+            self.note_video_au_send(
+                route_id,
+                data,
+                timing_started,
+                &[],
+                write_started.elapsed().as_micros() as u64,
+                1,
+                0,
+                "unpaced",
+            );
             return Ok(true);
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
@@ -2576,18 +2531,34 @@ impl Mesh {
                 .await?;
             write_us += tw.elapsed().as_micros() as u64;
             self.note_pace_gaps(&[], write_us, 2);
+            self.note_video_au_send(
+                route_id,
+                data,
+                timing_started,
+                &[],
+                write_us,
+                1,
+                0,
+                "unsplittable",
+            );
             return Ok(true);
         }
         // (game posture, WAN-class path, current send rate bps, fps) — the
         // shape `VideoBridge::route_pace` hands the forwarder.
-        let (game, wan, rate_bps, _fps) = pace;
+        let (game, wan, rate_bps, fps) = pace;
         static DRAIN_OVERRIDE_MBPS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
             std::env::var("ALLMYSTUFF_PACE_DRAIN_MBPS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
-        let policy = pace_policy(game, wan, rate_bps, *DRAIN_OVERRIDE_MBPS);
+        let policy = frame_policy(
+            pace_policy(game, wan, rate_bps, *DRAIN_OVERRIDE_MBPS),
+            wan,
+            *DRAIN_OVERRIDE_MBPS,
+            data.len().saturating_add(marker.len()),
+            fps,
+        );
         let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(chunks.len());
         // M1's pace+write split: gap time is the ledger above; this is
         // the daemon-pipe await itself — if the daemon ever backpressures
@@ -2613,6 +2584,7 @@ impl Mesh {
                 paced_gap(gap).await;
                 ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
             }
+            self.pace_lan_fragment(wan, range.len(), &mut ledger).await;
             if !current() {
                 return Ok(false);
             }
@@ -2635,6 +2607,7 @@ impl Mesh {
             paced_gap(gap).await;
             ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
         }
+        self.pace_lan_fragment(wan, marker.len(), &mut ledger).await;
         if !current() {
             return Ok(false);
         }
@@ -2644,7 +2617,70 @@ impl Mesh {
         write_us += tw.elapsed().as_micros() as u64;
         writes += 1;
         self.note_pace_gaps(&ledger, write_us, writes);
+        self.note_video_au_send(
+            route_id,
+            data,
+            timing_started,
+            &ledger,
+            write_us,
+            writes.saturating_sub(1),
+            policy.drain_bps,
+            "paced",
+        );
         Ok(true)
+    }
+
+    /// Reserve against the shared budget immediately before sending, after
+    /// any route-level wait. Never hold a lock across the sleep. Scheduling it
+    /// here prevents an early reservation being released as a late catch-up wall.
+    async fn pace_lan_fragment(&self, wan: bool, bytes: usize, ledger: &mut Vec<(u64, u64)>) {
+        if wan {
+            return;
+        }
+        let gap = {
+            let now = Instant::now();
+            self.video_lan_pace
+                .lock()
+                .get_or_insert_with(|| PaceRouteState::full(now, LAN_AGGREGATE_POLICY))
+                .reserve(now, bytes, LAN_AGGREGATE_POLICY)
+        };
+        if !gap.is_zero() {
+            let t0 = Instant::now();
+            paced_gap(gap).await;
+            ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
+        }
+    }
+
+    /// One deterministic AU sample per 60 pictures, plus one slow exception
+    /// per existing diagnostic interval. No payload or cross-host clock math.
+    #[allow(clippy::too_many_arguments)]
+    fn note_video_au_send(
+        &self,
+        route_id: &str,
+        data: &[u8],
+        started: Option<Instant>,
+        gaps: &[(u64, u64)],
+        write_us: u64,
+        chunks: u64,
+        drain_bps: u64,
+        mode: &str,
+    ) {
+        let Some(started) = started else { return };
+        let elapsed = started.elapsed();
+        let sequence = crate::video_wire::peek_au_identity_marker(data).map(|id| id.sequence);
+        if !crate::video_frame_timing::periodic_sample(sequence)
+            && !(elapsed >= Duration::from_millis(50)
+                && self.diag_ok(&format!("au-send-timing:{route_id}")))
+        {
+            return;
+        }
+        let total_us = elapsed.as_micros() as u64;
+        let split = crate::video_frame_timing::send_breakdown(total_us, gaps, write_us);
+        tracing::debug!(target: "allmystuff_node::video_timing",
+            route = route_id, ?sequence, bytes = data.len(), chunks, mode, drain_bps,
+            total_us, requested_us = split.requested_us, slept_us = split.slept_us,
+            daemon_write_us = write_us, other_us = split.other_us,
+            "video AU send timing");
     }
 
     /// Fold one delivered video sample into the route's arrival state:
@@ -5992,6 +6028,21 @@ impl Mesh {
                 );
             }
             if let Some(complete) = complete {
+                if let Some((elapsed, max_gap)) = complete.timing {
+                    let sequence = crate::video_wire::peek_au_identity_marker(&complete.data)
+                        .map(|id| id.sequence);
+                    if crate::video_frame_timing::periodic_sample(sequence)
+                        || (elapsed >= Duration::from_millis(50)
+                            && self.diag_ok(&format!("au-assembly-timing:{route_id}")))
+                    {
+                        tracing::debug!(target: "allmystuff_node::video_timing",
+                            route = %route_id, ?sequence, rtp_timestamp = complete.rtp_timestamp,
+                            bytes = complete.data.len(), chunks = complete.chunks,
+                            total_us = elapsed.as_micros() as u64,
+                            fragment_gap_max_us = max_gap.as_micros() as u64,
+                            "video AU assembly timing");
+                    }
+                }
                 self.deliver_video_au(
                     from,
                     &route_id,
@@ -17760,16 +17811,27 @@ impl Mesh {
             return Ok(());
         }
         tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
-        let result = self
-            .send_control_reliable(
-                &peer,
-                &ControlMessage::Route(RouteControl::Refresh {
-                    route_id: route_id.clone(),
-                }),
-                Duration::from_secs(2),
+        let started = Instant::now();
+        let flight = VideoRefreshFlight {
+            gate: &self.video_refresh,
+            route: &route_id,
+        };
+        let result = flight
+            .deliver(
+                VIDEO_REFRESH_DELIVERY_BUDGET,
+                self.send_control_reliable(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::Refresh {
+                        route_id: route_id.clone(),
+                    }),
+                    VIDEO_REFRESH_DELIVERY_BUDGET,
+                ),
             )
             .await;
-        self.video_refresh.lock().finish(&route_id);
+        tracing::debug!(target: "allmystuff_node::video_timing",
+            route = %route_id, elapsed_ms = started.elapsed().as_millis() as u64,
+            delivered = result.is_ok(), error = ?result.as_ref().err(),
+            "clean-entry delivery timing");
         result
     }
 
@@ -21857,6 +21919,39 @@ mod tests {
         );
         gate.teardown("r");
         assert!(gate.begin("r", start));
+    }
+
+    #[tokio::test]
+    async fn video_refresh_delivery_deadline_releases_single_flight() {
+        let gate = Mutex::new(VideoRefreshGate::default());
+        let start = Instant::now();
+        assert!(gate.lock().begin("r", start));
+        let result = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        }
+        .deliver(Duration::from_millis(10), std::future::pending())
+        .await;
+        assert!(result.unwrap_err().contains("recovery budget"));
+        assert!(!gate.lock().inflight.contains("r"));
+        assert!(gate.lock().begin("r", start + VIDEO_REFRESH_QUIET));
+        let result = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        }
+        .deliver(VIDEO_REFRESH_DELIVERY_BUDGET, async { Ok(()) })
+        .await;
+        assert!(result.is_ok());
+        assert!(!gate.lock().inflight.contains("r"));
+
+        assert!(gate.lock().begin("r", start + VIDEO_REFRESH_QUIET * 2));
+        let flight = VideoRefreshFlight {
+            gate: &gate,
+            route: "r",
+        };
+        let delivery = flight.deliver(VIDEO_REFRESH_DELIVERY_BUDGET, std::future::pending());
+        drop(delivery); // cancelled before polling must also release the gate
+        assert!(!gate.lock().inflight.contains("r"));
     }
 
     fn inventory_summary_with_free(id: &str, available_bytes: u64) -> InventorySummary {

@@ -155,7 +155,7 @@ impl HwEncoder {
         posture: crate::video::Posture,
     ) -> Result<MediaFoundationH264, String> {
         let name = self.name.clone();
-        let game = posture == crate::video::Posture::Game;
+        let game = posture == crate::video::Posture::ExperimentalGame;
         let studio = matches!(
             posture,
             crate::video::Posture::Studio | crate::video::Posture::StudioLossless

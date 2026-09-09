@@ -23,13 +23,13 @@ esac
 
 if [[ "$MODE" == "sync" ]]; then
   # `.myownmesh-rev` is the suite source of truth. A release must not rely
-  # on somebody remembering to edit the two mobile git dependencies by hand
+  # on somebody remembering to edit the mobile git dependencies and patches
   # after advancing it. Keep this rewrite deliberately narrow so it cannot
   # disturb unrelated manifest formatting or dependency options.
   tmp="${MANIFEST}.tmp.$$"
   trap 'rm -f "$tmp"' EXIT
   awk -v pin="$PIN" '
-    /^myownmesh(-core)? = .*tag = "/ {
+    /^(myownmesh(-core)?|interceptor|webrtc-util) = .*tag = "/ {
       sub(/tag = "[^"]+"/, "tag = \"" pin "\"")
     }
     { print }
@@ -38,7 +38,7 @@ if [[ "$MODE" == "sync" ]]; then
   trap - EXIT
 fi
 
-for package in myownmesh myownmesh-core; do
+for package in myownmesh myownmesh-core interceptor webrtc-util; do
   grep -Eq "^${package} = .*tag = \"${PIN}\"" "$MANIFEST" \
     || fail "$MANIFEST does not pin $package to .myownmesh-rev ($PIN)"
 done

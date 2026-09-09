@@ -95,6 +95,7 @@ struct InboundPacedAu {
     frame: InboundFrame,
     chunks: usize,
     updated: Instant,
+    timing: Option<crate::video_frame_timing::AssemblyClock>,
 }
 
 #[derive(Default)]
@@ -102,6 +103,7 @@ struct InboundVideoFreshness {
     recovering: HashMap<(String, u8), InboundRecoveryState>,
     recovery: HashMap<(String, u8), crate::video_wire::AuRecovery>,
     paced: HashMap<(String, u8), InboundPacedAu>,
+    last_slow_assembly_log: Option<Instant>,
 }
 
 fn canonical_media_peer(id: &str) -> &str {
@@ -187,6 +189,29 @@ impl InboundVideoFreshness {
                     tx,
                 );
             }
+            if let Some(clock) = pending.timing {
+                let now = Instant::now();
+                let (elapsed, max_gap) = clock.finish(now);
+                let sequence = crate::video_wire::peek_au_identity_marker(&pending.frame.data)
+                    .map(|id| id.sequence);
+                let periodic = crate::video_frame_timing::periodic_sample(sequence);
+                let slow = elapsed >= Duration::from_millis(50)
+                    && self
+                        .last_slow_assembly_log
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5));
+                if periodic || slow {
+                    if !periodic {
+                        self.last_slow_assembly_log = Some(now);
+                    }
+                    tracing::debug!(target: "allmystuff_node::video_timing",
+                        from = %pending.frame.from, lane = pending.frame.stream, ?sequence,
+                        rtp_timestamp = pending.frame.rtp_timestamp,
+                        bytes = pending.frame.data.len(), chunks = pending.chunks,
+                        total_us = elapsed.as_micros() as u64,
+                        fragment_gap_max_us = max_gap.as_micros() as u64,
+                        "video AU assembly timing");
+                }
+            }
             return self.forward(pending.frame, tx);
         }
 
@@ -216,6 +241,9 @@ impl InboundVideoFreshness {
                 pending.frame.data.extend_from_slice(&frame.data);
                 pending.chunks += 1;
                 pending.updated = Instant::now();
+                if let Some(clock) = &mut pending.timing {
+                    clock.observe(pending.updated);
+                }
             }
             Some(_) => {
                 self.paced.insert(
@@ -224,6 +252,8 @@ impl InboundVideoFreshness {
                         frame,
                         chunks: 1,
                         updated: Instant::now(),
+                        timing: tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                            .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
                     },
                 );
                 damaged = true;
@@ -235,6 +265,8 @@ impl InboundVideoFreshness {
                         frame,
                         chunks: 1,
                         updated: Instant::now(),
+                        timing: tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG)
+                            .then(|| crate::video_frame_timing::AssemblyClock::new(Instant::now())),
                     },
                 );
             }
@@ -562,11 +594,19 @@ impl ControlClient {
         video_framing: Arc<VideoFramingFn>,
     ) {
         let mut video_freshness = InboundVideoFreshness::default();
+        // Reuse the detailed-file toggle, sampled once per pipe. These are
+        // local monotonic spans, not one-way network latency estimates.
+        let detailed = crate::diagnostics::debug_logging_enabled();
+        let mut window = std::time::Instant::now();
+        let mut maxima = [std::time::Duration::ZERO; 4];
+        let (mut bodies, mut bytes) = (0u64, 0u64);
         loop {
+            let started = detailed.then(std::time::Instant::now);
             let mut len_buf = [0u8; 4];
             if reader.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
+            let header_read = started.map(|_| std::time::Instant::now());
             let len = u32::from_le_bytes(len_buf) as usize;
             if len > MAX_MEDIA_FRAME_BYTES {
                 tracing::warn!("media-source frame too large ({len} bytes) — closing pipe");
@@ -576,6 +616,7 @@ impl ControlClient {
             if reader.read_exact(&mut body).await.is_err() {
                 break;
             }
+            let body_read = started.map(|_| std::time::Instant::now());
             let Some(frame) = decode_inbound_frame(&body) else {
                 tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
                 continue;
@@ -604,6 +645,7 @@ impl ControlClient {
             if !keep_open {
                 break;
             }
+            let handled = started.map(|_| std::time::Instant::now());
             // A buffered read may complete synchronously many times in one
             // task poll. try_send does not yield: without this handoff a
             // ready consumer can lose a whole reference chain before it
@@ -615,6 +657,36 @@ impl ControlClient {
                 || audio_tx.capacity() < audio_tx.max_capacity()
             {
                 tokio::task::yield_now().await;
+            }
+            if let (Some(started), Some(header_read), Some(body_read), Some(handled)) =
+                (started, header_read, body_read, handled)
+            {
+                let now = std::time::Instant::now();
+                let spans = [
+                    header_read.duration_since(started),
+                    body_read.duration_since(header_read),
+                    handled.duration_since(body_read),
+                    now.duration_since(handled),
+                ];
+                for (max, span) in maxima.iter_mut().zip(spans) {
+                    *max = (*max).max(span);
+                }
+                bodies += 1;
+                bytes += len as u64;
+                if now.duration_since(window) >= std::time::Duration::from_secs(5) {
+                    tracing::debug!(target: "allmystuff_node::video_timing",
+                        window_ms = now.duration_since(window).as_millis() as u64, bodies, bytes,
+                        header_wait_max_ms = maxima[0].as_millis() as u64,
+                        body_read_max_ms = maxima[1].as_millis() as u64,
+                        handling_max_ms = maxima[2].as_millis() as u64,
+                        yield_max_ms = maxima[3].as_millis() as u64,
+                        video_queue_used = video_tx.max_capacity() - video_tx.capacity(),
+                        audio_queue_used = audio_tx.max_capacity() - audio_tx.capacity(),
+                        "media IPC reader timing");
+                    window = now;
+                    maxima = [std::time::Duration::ZERO; 4];
+                    (bodies, bytes) = (0, 0);
+                }
             }
         }
     }

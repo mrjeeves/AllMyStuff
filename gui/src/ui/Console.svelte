@@ -384,7 +384,7 @@
   // The shared control resolves the wire posture; fold it into the
   // console's per-source tune (the same shape the popout applies).
   function applyModeWire(
-    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    wireMode: "game" | "experimental-game" | "studio" | "studio-lossless" | undefined,
     gameFlag: boolean | undefined,
   ) {
     app.setConsoleTune({ mode: wireMode, game: gameFlag });
@@ -2710,8 +2710,7 @@
                     mode={app.consoleTune.mode}
                     game={app.consoleTune.game}
                     onapply={applyModeWire}
-                    experimental={app.labsTier}
-                    onexperimental={(on) => app.setLabsTier(on)}
+                    experimental={app.devMode && app.labsTier}
                     placement="down"
                   />
                 </div>

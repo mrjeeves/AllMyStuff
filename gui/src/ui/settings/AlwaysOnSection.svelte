@@ -44,7 +44,6 @@
   );
 
   const autostartOn = $derived(app.autostartEnabled === true);
-  const debugLoggingOn = $derived(app.debugLoggingEnabled === true);
 
   let armedUninstall = $state(false);
   function uninstall() {
@@ -65,7 +64,6 @@
     void app.loadServiceStatus();
     void app.loadWindowBehavior();
     void app.loadAutostart();
-    void app.loadDebugLogging();
   });
 </script>
 
@@ -189,27 +187,6 @@
       {/if}
     </section>
 
-    <!-- Local development diagnostics: deliberately opt-in and restart-scoped. -->
-    <section class="block">
-      <div class="title">Development diagnostics</div>
-      <label class="toggle">
-        <input
-          type="checkbox"
-          checked={debugLoggingOn}
-          onchange={(e) => void app.setDebugLogging(e.currentTarget.checked)}
-        />
-        <span>
-          <b>Write verbose debug logs</b>
-          <span class="hint">
-            Applies after the app or backend restarts.
-          </span>
-        </span>
-      </label>
-      <p class="fineprint">
-        Development logs can include device identifiers and connection diagnostics. Enable them
-        only while troubleshooting, then turn them back off.
-      </p>
-    </section>
   {/if}
 </div>
 

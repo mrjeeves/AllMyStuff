@@ -132,7 +132,11 @@ fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>
             Ok(Some(frame)) => {
                 // try_send: a full channel means the consumer is behind;
                 // dropping this frame just means the next one is fresher.
-                let _ = tx.try_send(frame);
+                let refused = tx.try_send(frame).is_err();
+                if let Some(diag) = &mut dup.diag {
+                    diag.frames += 1;
+                    diag.refused += u32::from(refused);
+                }
             }
             Ok(None) => {} // timeout (idle screen) or a mouse-only update
             Err(NextError::AccessLost) => {
@@ -212,6 +216,46 @@ fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>
                 return;
             }
         }
+        if let Some(diag) = &mut dup.diag {
+            diag.maybe_log(&dup.device_name);
+        }
+    }
+}
+
+/// One aggregate per five seconds in detailed logs, no per-frame output or
+/// payloads. Separates waiting for desktop updates from GPU/CPU readback.
+struct CaptureDiag {
+    since: Instant,
+    frames: u32,
+    refused: u32,
+    coalesced: u32,
+    wait_max: Duration,
+    readback_max: Duration,
+}
+
+impl CaptureDiag {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            refused: 0,
+            coalesced: 0,
+            wait_max: Duration::ZERO,
+            readback_max: Duration::ZERO,
+        }
+    }
+    fn maybe_log(&mut self, monitor: &str) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        tracing::debug!(target: "allmystuff_node::video_timing", monitor,
+            fps = self.frames as f64 / elapsed.as_secs_f64(),
+            refused = self.refused, coalesced = self.coalesced,
+            desktop_wait_max_us = self.wait_max.as_micros() as u64,
+            readback_max_us = self.readback_max.as_micros() as u64,
+            "capture cadence");
+        *self = Self::new();
     }
 }
 
@@ -338,9 +382,11 @@ struct CursorShape {
 }
 
 struct Duplication {
+    diag: Option<CaptureDiag>,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     dup: Option<IDXGIOutputDuplication>,
+    frame_held: bool,
     monitor_id: u32,
     device_name: String,
     /// CPU-readable copy target, reused across frames of the same size.
@@ -376,6 +422,18 @@ struct Duplication {
     reclaim: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
+impl Drop for Duplication {
+    fn drop(&mut self) {
+        if self.frame_held {
+            if let Some(dup) = &self.dup {
+                unsafe {
+                    let _ = dup.ReleaseFrame();
+                }
+            }
+        }
+    }
+}
+
 impl Duplication {
     fn new(monitor_id: u32) -> Result<Self, String> {
         Self::open(|device| unsafe { duplicate_output(device, monitor_id) })
@@ -407,9 +465,11 @@ impl Duplication {
             let context = context.ok_or("D3D11CreateDevice returned no context")?;
             let bound = bind(&device)?;
             Ok(Duplication {
+                diag: tracing::enabled!(target: "allmystuff_node::video_timing", tracing::Level::DEBUG).then(CaptureDiag::new),
                 device,
                 context,
                 dup: Some(bound.dup),
+                frame_held: false,
                 monitor_id: bound.monitor_id,
                 device_name: bound.device_name,
                 staging: None,
@@ -435,8 +495,22 @@ impl Duplication {
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| NextError::Fatal("duplication is not bound".into()))?;
+            // Minimize the unowned interval: while held, DXGI tracks damage
+            // instead of redundantly copying every desktop update. Complete
+            // readback first, release immediately before the next acquire.
+            // https://learn.microsoft.com/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-releaseframe
+            if std::mem::take(&mut self.frame_held) {
+                if let Err(e) = dup.ReleaseFrame() {
+                    return Err(if e.code() == DXGI_ERROR_ACCESS_LOST {
+                        NextError::AccessLost
+                    } else {
+                        NextError::Fatal(e.to_string())
+                    });
+                }
+            }
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
+            let acquired_at = self.diag.as_ref().map(|_| Instant::now());
             if let Err(e) = dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
                 return match e.code() {
                     c if c == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
@@ -444,9 +518,14 @@ impl Duplication {
                     _ => Err(NextError::Fatal(e.to_string())),
                 };
             }
+            self.frame_held = true;
+            if let (Some(diag), Some(start)) = (&mut self.diag, acquired_at) {
+                diag.wait_max = diag.wait_max.max(start.elapsed());
+                diag.coalesced += info.AccumulatedFrames.saturating_sub(1);
+            }
             // From here the frame is held. Pointer metadata must be read
-            // while it's held; so must the GPU copy be *queued*. Everything
-            // else happens after release.
+            // while it's held, as must the GPU copy. Retain ownership through
+            // readback; the next call releases immediately before acquiring.
             if info.PointerShapeBufferSize > 0 {
                 // A new pointer bitmap is available — cache it. Best-effort:
                 // a failed fetch keeps the previous shape, never breaks capture.
@@ -459,25 +538,25 @@ impl Duplication {
                 self.ptr_visible = p.Visible.as_bool();
             }
             if info.LastPresentTime == 0 {
-                // No new desktop pixels: release at once. If only the pointer
+                // No new desktop pixels. If only the pointer
                 // moved, re-emit the retained clean frame with the cursor at
                 // its new spot so it doesn't freeze on a static screen.
-                let _ = dup.ReleaseFrame();
                 return Ok(self.cursor_only_frame());
             }
             // New desktop pixels: queue the GPU copy into our reusable
-            // staging texture, then release the frame IMMEDIATELY — before
-            // the CPU map/swizzle. Holding it through the readback throttled
-            // the duplication itself (the compositor can't hand over the
-            // next frame until release); copy-then-release-then-map is the
-            // documented fast path, and `Map` still waits for the queued
-            // copy to complete.
+            // staging texture. Map waits for that copy while we still own
+            // the duplication surface; no encoder or network work is done
+            // on this capture thread before the next release/acquire pair.
+            let readback_at = self.diag.as_ref().map(|_| Instant::now());
             let queued = self.queue_copy(resource);
-            let _ = dup.ReleaseFrame();
-            match queued.map_err(NextError::Fatal)? {
+            let frame = match queued.map_err(NextError::Fatal)? {
                 Some((staging, w, h)) => self.read_back(&staging, w, h).map_err(NextError::Fatal),
                 None => Ok(None),
+            };
+            if let (Some(diag), Some(start)) = (&mut self.diag, readback_at) {
+                diag.readback_max = diag.readback_max.max(start.elapsed());
             }
+            frame
         }
     }
 
@@ -505,8 +584,8 @@ impl Duplication {
     }
 
     /// Queue the GPU copy of the held frame into the reusable staging
-    /// texture. Runs while the frame is held; the caller releases the frame
-    /// right after, before any CPU readback. `Ok(None)` = degenerate frame.
+    /// texture. Ownership lasts through readback until the next acquire.
+    /// `Ok(None)` = degenerate frame.
     unsafe fn queue_copy(
         &mut self,
         resource: Option<IDXGIResource>,

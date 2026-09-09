@@ -47,6 +47,13 @@
   <section class="danger">
     <div class="danger-row">
       <div>
+        <div class="danger-title">Dev Mode</div>
+        <div class="danger-desc">Show Dev Tools, detailed logging controls, and experimental video modes. Intended for testing.</div>
+      </div>
+      <label><input type="checkbox" checked={app.devMode} onchange={(e) => app.setDevMode(e.currentTarget.checked)} /> Enable Dev Mode</label>
+    </div>
+    <div class="danger-row">
+      <div>
         <div class="danger-title">Purge Files tombstones</div>
         <div class="danger-desc">
           Permanently remove {filesStatus?.tombstones ?? "saved"} deleted canvas records and advance the fleet epoch.

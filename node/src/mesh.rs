@@ -6231,17 +6231,29 @@ impl Mesh {
             // NOT latest_wins: H.264 deltas must all reach the decoder in
             // order — freshest-wins happens after decode (enqueue_decoded) or
             // at the GUI's paint slot instead.
-            let request_refresh =
-                self.enqueue_for_watcher(route_id, h264_ipc_bytes(ts_us, key, &data), false);
-            if request_refresh {
-                let mesh = self.clone();
-                let refresh_route = route_id.to_string();
-                crate::spawn(async move {
-                    let _ = mesh
-                        .request_video_recovery(refresh_route, Some(ts_us))
-                        .await;
-                });
-            }
+            self.enqueue_h264_for_watcher(route_id, ts_us, key, &data);
+        }
+    }
+
+    fn enqueue_h264_for_watcher(
+        self: &Arc<Self>,
+        route_id: &str,
+        ts_us: u64,
+        key: bool,
+        data: &[u8],
+    ) {
+        if self.enqueue_for_watcher(route_id, h264_ipc_bytes(ts_us, key, data), false) {
+            // Discarding a reference at the GUI handoff is real damage too.
+            // A one-shot request can be coalesced by the refresh gate, or its
+            // key can itself be lost/expire before the GUI resumes. Use the
+            // existing clean-entry fence and retry worker until media actually
+            // recovers; the gradual contract still asks for one GDR wave.
+            self.mark_video_discontinuity(
+                route_id,
+                "GUI handoff discarded a reference",
+                true,
+                Some(ts_us),
+            );
         }
     }
 
@@ -17855,42 +17867,49 @@ impl Mesh {
             .get(&route_id)
             .copied()
             .unwrap_or(crate::video_wire::AuRecovery::Reset);
-        let result = if recovery == crate::video_wire::AuRecovery::Gradual {
-            let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
-            tracing::debug!(
-                "reliably asking {} for a GDR convergence wave on {route_id}",
-                short_id(&peer)
-            );
-            self.send_control_reliable(
-                &peer,
-                &ControlMessage::Route(RouteControl::VideoFeedback {
-                    route_id: route_id.clone(),
-                    recv_fps: 0,
-                    decode_fails: 1,
-                    queue_depth: 0,
-                    lost_ts_us: lost_ts_us.or(Some(0)),
-                    ext: crate::video::PipelineFeedback {
-                        est_kbps,
-                        delay_trend_us_per_s,
-                    }
-                    .to_ext(),
-                }),
-                Duration::from_secs(2),
-            )
-            .await
-        } else {
-            tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
-            self.send_control_reliable(
-                &peer,
-                &ControlMessage::Route(RouteControl::Refresh {
-                    route_id: route_id.clone(),
-                }),
-                Duration::from_secs(2),
-            )
-            .await
+        let flight = VideoRefreshFlight {
+            gate: &self.video_refresh,
+            route: &route_id,
         };
-        self.video_refresh.lock().finish(&route_id);
-        result
+        let delivery = async {
+            if recovery == crate::video_wire::AuRecovery::Gradual {
+                let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
+                tracing::debug!(
+                    "reliably asking {} for a GDR convergence wave on {route_id}",
+                    short_id(&peer)
+                );
+                self.send_control_reliable(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::VideoFeedback {
+                        route_id: route_id.clone(),
+                        recv_fps: 0,
+                        decode_fails: 1,
+                        queue_depth: 0,
+                        lost_ts_us: lost_ts_us.or(Some(0)),
+                        ext: crate::video::PipelineFeedback {
+                            est_kbps,
+                            delay_trend_us_per_s,
+                        }
+                        .to_ext(),
+                    }),
+                    Duration::from_secs(2),
+                )
+                .await
+            } else {
+                tracing::debug!("reliably asking {} to re-key {route_id}", short_id(&peer));
+                self.send_control_reliable(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::Refresh {
+                        route_id: route_id.clone(),
+                    }),
+                    Duration::from_secs(2),
+                )
+                .await
+            }
+        };
+        flight
+            .deliver(VIDEO_REFRESH_DELIVERY_BUDGET, delivery)
+            .await
     }
 
     /// Ask the far end of an inbound display/camera route to stream with
@@ -21887,6 +21906,49 @@ mod tests {
             observe_au_sequence(Some(10), 9, false),
             AuSequenceObservation::DropDuplicateOrStale
         );
+    }
+
+    #[test]
+    fn handoff_reset_arms_recovery_until_a_clean_entry_not_just_request_delivery() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        crate::set_runtime(rt.handle().clone());
+        std::mem::forget(rt);
+        // No daemon or active connection: exercise the production GUI handoff
+        // with a local watcher and a deterministic old queue residence time.
+        // Constructing the client does not connect. No session is started and
+        // this synthetic route has no peer, so recovery cannot issue an RPC.
+        // Use the portable constructor: with_path is intentionally Unix-only.
+        let client = Arc::new(ControlClient::new().expect("resolve control address"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "handoff-test";
+        mesh.video_watch(route.into(), false, DecoderPreference::Automatic);
+        mesh.video_watchers
+            .lock()
+            .get_mut(route)
+            .unwrap()
+            .queue
+            .push_h264(
+                h264_ipc_bytes(0, true, &[0, 0, 1, 0x65]),
+                Instant::now() - Duration::from_millis(250),
+                false,
+            );
+        mesh.enqueue_h264_for_watcher(route, 16_667, false, &[0, 0, 1, 0x41]);
+        assert!(mesh.video_poll(route).is_empty());
+        assert!(
+            mesh.video_awaiting_entry.lock().contains(route),
+            "a local reference-chain discard needs the same retry fence as transport loss"
+        );
+        assert!(
+            mesh.video_refresh_retries.lock().contains(route),
+            "request delivery or a quiet-period rejection must not strand the viewer"
+        );
+        mesh.enqueue_h264_for_watcher(route, 33_333, false, &[0, 0, 1, 0x41]);
+        assert_eq!(
+            mesh.video_refresh_retries.lock().len(),
+            1,
+            "subsequent dependent deltas must not spawn more retry workers"
+        );
+        mesh.video_awaiting_entry.lock().remove(route);
     }
 
     #[test]

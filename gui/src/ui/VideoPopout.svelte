@@ -24,6 +24,7 @@
   import { ActiveStreamTune } from "../stream-tune";
   import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { chordedMouseButtonDown } from "../input-mouse";
   import { makeRelativeMotionForwarder } from "../relative-motion";
   import { app } from "../store.svelte";
   import {
@@ -577,6 +578,8 @@
   }
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
+    const buttonDown = chordedMouseButtonDown(e);
+    if (buttonDown !== null) onPointerButton(e, buttonDown);
     if ((pointerLocked || nativePointerLocked) && !kvmSource) {
       lockedMotion.forward(e, "pointer");
       return;
@@ -594,6 +597,10 @@
     send({ kind: "mouse_move", ...p, screen: controlScreen });
   }
   function onPointerButton(e: PointerEvent, down: boolean) {
+    // A chord transition can bubble as pointermove even when an overlay's
+    // pointerdown handler stopped propagation. Its controls own presses,
+    // but releases must still be able to lift a remote button.
+    if (down && (e.target as HTMLElement | null)?.closest?.("button, input, select")) return;
     if (!controlActive) return;
     // A click is the most reliable focus pin — land it on the stage so keys
     // forward even if the cursor was last over a hover-bar button.

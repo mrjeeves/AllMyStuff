@@ -19,7 +19,7 @@ webrtc-util = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.21" }
 
 [package]
 name = "allmystuff-mobile"
-version = "0.2.120"
+version = "0.2.121"
 description = "AllMyStuff mobile (iOS/Android) — a Tauri 2 shell around the shared Svelte UI, backed by the phone's embedded viewer/controller core."
 authors = ["Chris Paul"]
 license = "MIT"

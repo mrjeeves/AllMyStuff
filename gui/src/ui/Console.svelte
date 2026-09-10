@@ -27,6 +27,7 @@
   // tap-then-drag holds the button, and two fingers pinch-zoom the view.
   import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { chordedMouseButtonDown } from "../input-mouse";
   import { VideoStageStats } from "../video-stage-stats";
   import { DecodeProgress } from "../decode-progress";
   import { makeRelativeMotionForwarder } from "../relative-motion";
@@ -1816,6 +1817,8 @@
   // only time a mouse drag means the VIEW and not the remote.
   let panFrom: { x: number; y: number; vx: number; vy: number } | null = null;
   function onPointerMove(e: PointerEvent) {
+    const buttonDown = chordedMouseButtonDown(e);
+    if (buttonDown !== null) onPointerButton(e, buttonDown);
     if (e.pointerType === "touch") {
       touchMouse.move(e);
       return;

@@ -135,3 +135,58 @@ before the commit-time check and passed after it. The first sandboxed run
 blocked two unrelated OS watcher/socket tests; the complete rerun with those
 facilities available passed. Windows/Linux runtime checks and the multi-device
 campaign above remain outstanding.
+
+## Local dev run — October 13, 2026
+
+Built and launched `just dev` on this Mac with separate `MYOWNMESH_HOME`,
+`ALLMYSTUFF_USER_HOME`, and `ALLMYSTUFF_HOME` directories under
+`/private/tmp/amst-pr307-live`, `ALLMYSTUFF_AUTOUPDATE=0`, and the installed
+0.3.21 daemon explicitly selected through `MYOWNMESH_BIN`. The GUI build
+bundled the node from this checkout and attached to the running test node.
+The test profile was not claimed into the user's fleet. Test files and storage
+allocations were confined to that profile; the native mount used the app's
+normal Finder location.
+
+The live tests exercised the node control socket, actual filesystem watcher,
+SQLite ledger, immutable content store, and macOS WebDAV mount:
+
+| Check | Observed result |
+|---|---|
+| Enable 256 MiB on `disk:/System/Volumes/Data` | Succeeded in 0.165 s; storage created beneath the test state directory |
+| Burst of 100 small files and one 17,539,800-byte file | All 101 appeared in the logical namespace within 5.383 s |
+| Immutable large-file body | SHA-256 matched the original |
+| Edit and restore a previous version | Original bytes restored; three versions recorded |
+| Rename, delete, logical search | Passed |
+| Twenty directory listings | Median 23.77 ms, maximum 285.90 ms |
+| Allocation-warning loop during those operations | Zero allocation-failure warnings |
+| Clean node stop/start via dev GUI recovery | Allocation, namespace and restored content survived; daemon link live |
+| Read large file through Finder/WebDAV mount | SHA-256 matched the working copy |
+| Write through Finder/WebDAV mount | Correct bytes reached the working tree and logical namespace in 1.159 s |
+
+These are observations from one run, partly concurrent with GUI compilation,
+not throughput guarantees or a before/after benchmark. The GUI launched and
+attached, but click-through testing was not automated: the native automation
+surface did not expose the raw Tauri dev executable. No cross-device content
+replication was tested.
+
+### Additional runtime findings
+
+- The first start reported the native Finder location as already mounted.
+  Registration succeeded after restart; the later clean start logged stale
+  mount cleanup and successfully served the test files. Treat initial mount
+  recovery as a separate lifecycle test, not as proven reliable by this run.
+- `restart_self` with the explicit `MYOWNMESH_BIN` override reused the old
+  daemon just before it exited. Supervision respawned a daemon after its poll
+  delay, but channel subscriptions then logged `unknown client_id: c1` and
+  `channel is DARK`. A full node stop/start recovered a live link. File and
+  allocation persistence passed, but seamless in-process restart did not.
+  Reproduce this with a pinned daemon and validate fresh client registration
+  before resubscribing; restarting the daemon alone is insufficient evidence
+  of recovery.
+- Starting a duplicate node to check recovery truncated `node.log` before
+  rejecting the duplicate owner. The GUI's captured console retained the
+  running node's output. Log initialization should follow exclusive ownership
+  acquisition so a rejected second launch cannot erase diagnostic history.
+
+The runtime findings above are not fixed by this PR and must not be hidden by
+its passing storage tests.

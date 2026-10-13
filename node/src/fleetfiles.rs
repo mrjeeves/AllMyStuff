@@ -286,6 +286,15 @@ pub enum FleetfilesMessage {
     },
 }
 
+impl FleetfilesMessage {
+    pub(crate) fn needs_storage_setup(&self) -> bool {
+        matches!(
+            self,
+            Self::FileBegin { .. } | Self::Directory { .. } | Self::Delete { .. }
+        )
+    }
+}
+
 struct Inbound {
     path: String,
     version: VersionStamp,
@@ -2096,7 +2105,40 @@ impl FleetfilesReplica {
             let _ = std::fs::remove_file(&transfer.staging);
             return Err("this device has no Fleetfiles content allocation".into());
         }
-        if !transfer.materialize {
+        // The winner may have advanced while chunks were in flight. Hold the
+        // namespace lock through replacement and version commit so another
+        // completed transfer cannot be rolled back by this older body.
+        let connection = self.connection.lock();
+        let current = read_current(&connection, &transfer.path)?;
+        if let Some(current) = current
+            .as_ref()
+            .filter(|current| current.version == transfer.version)
+        {
+            ensure_same_metadata(
+                current,
+                &FleetfilesMetadata {
+                    operation: operation.to_string(),
+                    version: transfer.version.clone(),
+                    path: transfer.path.clone(),
+                    kind: "file".into(),
+                    size: transfer.size,
+                    sha256: Some(transfer.sha256.clone()),
+                    tombstone: false,
+                },
+            )?;
+        }
+        if !transfer.materialize
+            || current.is_some_and(|current| current.version > transfer.version)
+        {
+            append_version_history(
+                &connection,
+                &transfer.path,
+                &transfer.version,
+                "file",
+                transfer.size,
+                Some(&transfer.sha256),
+                false,
+            )?;
             let _ = std::fs::remove_file(&transfer.staging);
             return Ok(transfer.path);
         }
@@ -2107,7 +2149,7 @@ impl FleetfilesReplica {
         }
         replace_file(&transfer.staging, &target)?;
         put_version(
-            &self.connection.lock(),
+            &connection,
             &transfer.path,
             &transfer.version,
             "file",
@@ -2725,6 +2767,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_stream_only_resolves_storage_at_begin() {
+        let version = VersionStamp {
+            counter: 1,
+            actor: "sender".into(),
+        };
+        assert!(FleetfilesMessage::FileBegin {
+            operation: "transfer".into(),
+            version: version.clone(),
+            path: "file".into(),
+            size: 65536,
+            sha256: "a".repeat(64),
+            cache_only: false,
+        }
+        .needs_storage_setup());
+        for offset in 0..1024 {
+            assert!(!FleetfilesMessage::FileChunk {
+                operation: "transfer".into(),
+                offset,
+                data: vec![],
+            }
+            .needs_storage_setup());
+        }
+        assert!(!FleetfilesMessage::FileCommit {
+            operation: "transfer".into()
+        }
+        .needs_storage_setup());
+        assert!(FleetfilesMessage::Directory {
+            operation: "mkdir".into(),
+            version: version.clone(),
+            path: "dir".into(),
+        }
+        .needs_storage_setup());
+        assert!(FleetfilesMessage::Delete {
+            operation: "delete".into(),
+            version,
+            path: "file".into(),
+        }
+        .needs_storage_setup());
+    }
+
+    #[test]
     fn rejects_names_that_collide_across_operating_systems() {
         assert!(validate_portable_path("good/fleet file.txt").is_ok());
         assert!(validate_portable_path("../escape").is_err());
@@ -2844,6 +2927,63 @@ mod tests {
             request.len() + response.len() < 512,
             "equal ledgers must reconcile with a constant-size exchange"
         );
+    }
+
+    #[test]
+    fn older_inflight_commit_cannot_overwrite_a_newer_completed_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "amst-inflight-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let replica = FleetfilesReplica::memory(root.clone());
+        replica.set_storage_allocations(
+            vec![StorageAllocationRoot {
+                id: "test".into(),
+                root: root.join("allocated"),
+                quota_bytes: 1024,
+            }],
+            "local".into(),
+            30,
+        );
+        for (operation, counter, body) in [("old", 1, b"old"), ("new", 2, b"new")] {
+            let sha256 = format!("{:x}", Sha256::digest(body));
+            replica
+                .begin_file(
+                    "peer",
+                    operation.into(),
+                    VersionStamp {
+                        counter,
+                        actor: "peer".into(),
+                    },
+                    "file.txt".into(),
+                    (3, sha256),
+                    false,
+                )
+                .unwrap();
+            replica.write_chunk("peer", operation, 0, body).unwrap();
+        }
+        replica.commit_file("peer", "new").unwrap();
+        replica.commit_file("peer", "old").unwrap();
+        assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"new");
+        assert_eq!(
+            replica
+                .current_file_version("file.txt")
+                .unwrap()
+                .unwrap()
+                .0
+                .counter,
+            2
+        );
+        assert_eq!(
+            replica
+                .version_history("file.txt", None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

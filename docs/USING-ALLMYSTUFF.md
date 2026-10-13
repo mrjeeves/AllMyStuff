@@ -114,6 +114,15 @@ first, and uses available allocated space beyond the retention target when it
 can. A dot on the Files mode button warns when the fleet is low on protected
 usable Files space.
 
+On macOS, an allocation on the startup Data volume can use the app's writable
+state directory on that same volume when the volume root is protected. A
+failed allocation retries on later file operations with a delay that grows
+from 5 seconds to at most 5 minutes. The log reports the first failure, a
+changed error, and recovery rather than repeating the same warning for every
+file chunk. Changing the allocation lets it try again immediately.
+An older transfer finishing late cannot replace a newer committed version;
+its verified content remains available as history.
+
 The implementation and traffic budgets are documented in
 [Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md).
 

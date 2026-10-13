@@ -201,6 +201,7 @@ pub struct Mesh {
     /// Fleet-wide operational storage allocation and durability policy. This
     /// is intentionally separate from canvas layout metadata.
     storage_plan: StoragePlanStore,
+    storage_root_retries: Mutex<crate::fleetfiles_storage::StorageRootRetries>,
     /// OS-native drive letters/mounts backed by active Storage routes.
     drive_mounts: DriveMounts,
     /// Explicit inbound pull requests. A drive pushed at us needs owner/fleet
@@ -2118,6 +2119,7 @@ impl Mesh {
             namespace: NamespaceCatalog::load(),
             service_profiles: ServiceProfiles::load(),
             storage_plan: StoragePlanStore::load(),
+            storage_root_retries: Mutex::new(Default::default()),
             canvas: CanvasStore::load(),
             drive_mounts: DriveMounts::new(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
@@ -15791,36 +15793,14 @@ impl Mesh {
     }
 
     fn materialize_local_storage_root(&self, volume: &str) -> Result<PathBuf, String> {
-        let inventory = allmystuff_inventory::scan();
-        let resource = inventory
-            .storage
-            .into_iter()
-            .find(|candidate| candidate.id == volume)
+        let mounts = crate::fleetfiles_storage::storage_mounts();
+        let mount = mounts
+            .get(volume)
             .ok_or("that storage volume is no longer available")?;
-        let mount = PathBuf::from(
-            resource
-                .mount_point
-                .ok_or("that storage volume has no writable mount point")?,
-        );
-        let preferred = mount.join(".allmystuff-fleetfiles");
-        let root = match std::fs::create_dir_all(&preferred) {
-            Ok(()) => preferred,
-            Err(primary_error) => {
-                let fallback = allmystuff_protocol::myownmesh_state_dir()
-                    .filter(|state| state.starts_with(&mount))
-                    .map(|state| state.join(".allmystuff-fleetfiles"))
-                    .ok_or_else(|| format!("create Fleetfiles storage root: {primary_error}"))?;
-                std::fs::create_dir_all(&fallback).map_err(|fallback_error| {
-                    format!(
-                        "create Fleetfiles storage root: {primary_error}; fallback: {fallback_error}"
-                    )
-                })?;
-                fallback
-            }
-        };
-        crate::files::mark_internal_staging_hidden(&root)
-            .map_err(|error| format!("hide Fleetfiles storage root: {error}"))?;
-        Ok(root)
+        crate::fleetfiles_storage::materialize_root(
+            mount,
+            allmystuff_protocol::myownmesh_state_dir().as_deref(),
+        )
     }
 
     fn reconcile_local_storage_allocations(&self) {
@@ -15831,20 +15811,33 @@ impl Mesh {
         let usable_percent =
             u64::from(100_u8.saturating_sub(snapshot.policy.value.reserve_percent));
         let mut roots = Vec::new();
+        let mut retries = self.storage_root_retries.lock();
+        retries.retain(&snapshot.allocations);
+        let mut mounts = None;
+        let state = allmystuff_protocol::myownmesh_state_dir();
         for allocation in snapshot.allocations {
             if allocation.enabled && same_node(&allocation.device, &local) {
-                match self.materialize_local_storage_root(&allocation.volume) {
-                    Ok(root) => roots.push(StorageAllocationRoot {
+                let result = retries.resolve(&allocation, Instant::now(), || {
+                    let mounts =
+                        mounts.get_or_insert_with(crate::fleetfiles_storage::storage_mounts);
+                    let mount = mounts
+                        .get(&allocation.volume)
+                        .ok_or("that storage volume is no longer available")?;
+                    crate::fleetfiles_storage::materialize_root(mount, state.as_deref())
+                });
+                match result {
+                    Ok(Some(root)) => roots.push(StorageAllocationRoot {
                         id: allocation.id,
                         root,
                         quota_bytes: allocation.quota_bytes.saturating_mul(usable_percent) / 100,
                     }),
                     Err(error) => {
                         tracing::warn!(
-                            "could not materialize local Fleetfiles allocation {}: {error}",
+                            "could not materialize local Fleetfiles allocation {}: {error}; retrying with backoff (up to 5 minutes)",
                             allocation.id
                         );
                     }
+                    Ok(None) => {}
                 }
             }
         }
@@ -19134,12 +19127,19 @@ impl Mesh {
         }
         for target in &metadata_targets {
             self.fleetfiles.queue_metadata(target, &metadata)?;
+        }
+        let mut send_error = None;
+        for target in &metadata_targets {
             let online = evidence
                 .get(pubkey_part(target))
                 .is_some_and(|(online, _)| *online);
             if online && self.peer_supports_feature(target, FEATURE_FLEETFILES_LEDGER) {
-                self.send_fleetfiles_metadata(target, &metadata).await?;
-                self.fleetfiles.acknowledge_metadata(target, &metadata)?;
+                match self.send_fleetfiles_metadata(target, &metadata).await {
+                    Ok(()) => self.fleetfiles.acknowledge_metadata(target, &metadata)?,
+                    Err(error) => {
+                        send_error = Some(error);
+                    }
+                }
             }
         }
         for target in targets {
@@ -19147,12 +19147,18 @@ impl Mesh {
                 .get(pubkey_part(&target))
                 .is_some_and(|(online, _)| *online);
             if online {
-                self.send_fleetfiles_mutation(&target, &mutation).await?;
-                self.fleetfiles.record_replica_receipt(&target, &mutation)?;
-                self.fleetfiles.acknowledge(&target, &mutation)?;
+                match self.send_fleetfiles_mutation(&target, &mutation).await {
+                    Ok(()) => {
+                        self.fleetfiles.record_replica_receipt(&target, &mutation)?;
+                        self.fleetfiles.acknowledge(&target, &mutation)?;
+                    }
+                    Err(error) => {
+                        send_error = Some(error);
+                    }
+                }
             }
         }
-        Ok(())
+        send_error.map_or(Ok(()), Err)
     }
     /// Drain only when presence tells us the peer is reachable. The per-peer
     /// guard prevents duplicate presence frames from creating overlapping
@@ -19811,7 +19817,10 @@ impl Mesh {
             return;
         }
 
-        self.reconcile_local_storage_allocations();
+        // Resolve placement at operation boundaries, never for each chunk.
+        if message.needs_storage_setup() {
+            self.reconcile_local_storage_allocations();
+        }
         if !self.local_has_fleetfiles_allocation() {
             let reply = match &message {
                 FleetfilesMessage::FileBegin {

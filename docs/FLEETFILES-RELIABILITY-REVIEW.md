@@ -190,3 +190,41 @@ replication was tested.
 
 The runtime findings above are not fixed by this PR and must not be hidden by
 its passing storage tests.
+
+
+### Normal-profile follow-up
+
+The development app was subsequently run with the existing `~/.myownmesh`
+profile, normal home, and bundled pinned MyOwnMesh daemon (no test-profile or
+binary-path overrides). Auto-update alone was disabled for the dev session.
+
+This exposed an additional stall: `scan_self` ran synchronous inventory on a
+Tokio worker. A process sample showed disk enumeration blocked in
+`CFURLCopyResourcePropertiesForKeys` → CacheDelete available-space discovery
+→ `realpath`/`lstat`; local control requests timed out. sysinfo requested
+capacity before filtering remote mounts, including the app's own WebDAV mount.
+The patch now enumerates without capacity, refreshes capacity only for the
+filtered local disks, omits capacity entirely for storage-root discovery, and
+runs explicit inventory requests on the blocking pool.
+
+After a clean rebuild/start with the same normal profile and Fleetfiles mounted:
+
+| Check | Result |
+| --- | --- |
+| `scan_self` | 1.387 s |
+| `machine_specs` | 1.466 s |
+| Status requests concurrent with inventory | Maximum 0.012 s; link stayed live |
+| Logical root/Desktop listings | 0.002 / 0.001 s |
+| Native Finder mount listing | 0.007 s |
+| Signed fleet roster | Six members |
+
+The full node checks passed again (410 library + 2 binary tests); inventory
+checks passed (28 unit tests + 1 documentation test). These are read-only
+normal-profile checks; cross-device content replication remains unverified.
+
+Read-only roster queries on this Mac and the connected owner returned the same
+six member IDs and roles, but different labels. MyOwnMesh's roster membership
+hash intentionally excludes labels and local approval timestamps. Membership
+convergence therefore does not converge device names. This comparison does not
+establish the roster state of the other, currently unreachable members, and
+this PR does not implement fleet-wide name synchronization.

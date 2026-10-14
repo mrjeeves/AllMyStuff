@@ -126,6 +126,10 @@ its verified content remains available as history.
 The implementation and traffic budgets are documented in
 [Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md).
 
+On macOS, disk discovery skips capacity probes on network mounts, including
+the Fleetfiles Finder mount. Manual inventory scans run in the background so
+other control requests can continue while hardware discovery completes.
+
 Files also browses explicit remote-machine grants. Use those device/local-copy
 surfaces to inspect, preview, upload, download, rename, or remove files on a
 machine that has granted Files access.

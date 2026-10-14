@@ -75,7 +75,9 @@ impl StorageRootRetries {
 }
 
 pub(crate) fn storage_mounts() -> HashMap<String, PathBuf> {
-    sysinfo::Disks::new_with_refreshed_list()
+    // Mount identities need no capacity probes. In particular, avoid macOS
+    // querying available space on our own WebDAV mount during enumeration.
+    sysinfo::Disks::new_with_refreshed_list_specifics(sysinfo::DiskRefreshKind::nothing())
         .iter()
         .map(|disk| {
             let mount = disk.mount_point();

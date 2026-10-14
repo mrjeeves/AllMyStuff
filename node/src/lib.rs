@@ -76,6 +76,7 @@ pub mod diagnostics;
 pub mod drive_mount;
 pub mod files;
 pub mod fleetfiles;
+mod fleetfiles_storage;
 /// Which folders of this machine other people may open, and where they
 /// live. The id→path resolution a folder share turns on: the path never
 /// crosses the wire, so a peer names only the minted id.

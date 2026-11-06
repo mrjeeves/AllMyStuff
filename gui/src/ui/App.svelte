@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
+  import { FilesStorageAttentionState, type FilesStorageAttention } from "../files-storage-attention";
   import { isMobile } from "../tauri";
 
   // Runtime mobile tag on the root element: CSS can then target the real
@@ -77,42 +78,46 @@
   // The refresh button only spins briefly on click — the real progress lives in
   // the 3-step panel that floats over the graph (driven by app.restartFlow).
   let refreshSpin = $state(false);
-  let filesStorageAttention = $state<string | null>(null);
+  const filesStorageNotices = new FilesStorageAttentionState();
+  let filesStorageAttention = $state<FilesStorageAttention | null>(null);
+  let filesStorageReady = $state(false);
+  let storageRefreshVersion = 0;
+  const filesStorageScope = $derived.by(() => {
+    if (app.fleetNetworkId) return `fleet:${app.fleetNetworkId}`;
+    // Wait for ownership/identity before associating a dismissal with a fleet.
+    if (!app.ownedFleet || app.inFleet || app.localId === "this") return null;
+    return `local:${app.localId.replace(/-[0-9a-zA-Z]{5}$/, "")}`;
+  });
 
-  function applyFleetStorageHealth(status: Awaited<ReturnType<typeof fleetStorageStatus>>) {
-    const policy = status.plan.policy.value;
-    const enabled = status.plan.allocations.filter((allocation) => allocation.enabled);
-    const failureDomains = new Set(enabled.map((allocation) => allocation.device)).size;
-    const used = status.logicalUsedBytes ?? 0;
-    const capacity = status.protectedCapacityBytes ?? 0;
-    if (enabled.length === 0) {
-      filesStorageAttention = used > 0
-        ? "Fleetfiles has data but no protected fleet storage is allocated"
-        : null;
-      return;
-    }
-    if (failureDomains < policy.replicas) {
-      filesStorageAttention = `Fleetfiles needs ${policy.replicas} device copies; only ${failureDomains} storage target${failureDomains === 1 ? " is" : "s are"} available`;
-      return;
-    }
-    const remaining = Math.max(0, capacity - used);
-    if (capacity > 0 && used >= capacity) {
-      filesStorageAttention = "Fleetfiles protected capacity is full";
-    } else if (capacity > 0 && remaining / capacity <= 0.15) {
-      filesStorageAttention = "Fleetfiles protected capacity is running low";
-    } else {
-      filesStorageAttention = null;
-    }
+  $effect(() => {
+    const scope = filesStorageScope;
+    if (!filesStorageReady) return;
+    storageRefreshVersion++;
+    filesStorageNotices.setScope(scope);
+    filesStorageAttention = filesStorageNotices.visible;
+    if (scope) void refreshFleetStorageHealth();
+  });
+
+  function dismissFilesStorageAttention() {
+    filesStorageNotices.dismiss();
+    filesStorageAttention = filesStorageNotices.visible;
   }
 
   async function refreshFleetStorageHealth() {
+    const scope = filesStorageScope;
+    if (!filesStorageReady || !scope) return;
+    const version = ++storageRefreshVersion;
     try {
-      applyFleetStorageHealth(await fleetStorageStatus());
+      const status = await fleetStorageStatus();
+      if (!filesStorageReady || version !== storageRefreshVersion || scope !== filesStorageScope) return;
+      filesStorageNotices.update(scope, status);
+      filesStorageAttention = filesStorageNotices.visible;
     } catch {
-      // Backend startup and dedicated web previews can race this optional
-      // indicator. The next storage event or window focus refreshes it.
+      // An unavailable status is not evidence that a dismissed issue resolved.
+      // The next storage event, Files entry, or window focus refreshes it.
     }
   }
+
   function refresh() {
     refreshSpin = true;
     setTimeout(() => (refreshSpin = false), 650);
@@ -140,10 +145,17 @@
     // never empty.
     void app.init();
     let mounted = true;
+    filesStorageReady = true;
     let stopFleetStorage = () => {};
     const refreshStorageOnFocus = () => { void refreshFleetStorageHealth(); };
+    const syncStorageDismissal = (event: StorageEvent) => {
+      if (event.key === null || event.key === filesStorageNotices.storageKey) {
+        filesStorageNotices.syncDismissal();
+        filesStorageAttention = filesStorageNotices.visible;
+      }
+    };
     window.addEventListener("focus", refreshStorageOnFocus);
-    void refreshFleetStorageHealth();
+    window.addEventListener("storage", syncStorageDismissal);
     void onFleetStorage(() => {
       if (mounted) void refreshFleetStorageHealth();
     }).then((unlisten) => {
@@ -161,8 +173,11 @@
     });
     return () => {
       mounted = false;
+      filesStorageReady = false;
+      storageRefreshVersion++;
       stopFleetStorage();
       window.removeEventListener("focus", refreshStorageOnFocus);
+      window.removeEventListener("storage", syncStorageDismissal);
     };
   });
 
@@ -255,9 +270,12 @@
           class:lit={app.uiMode === choice[0]}
           class:fleet-low={choice[0] === "files" && filesStorageAttention !== null}
           aria-pressed={app.uiMode === choice[0]}
-          title={choice[0] === "files" && filesStorageAttention ? filesStorageAttention : choice[2]}
-          onclick={() => app.setUiMode(choice[0] as "normal" | "files" | "advanced")}
-        >{choice[1]}{#if choice[0] === "files" && filesStorageAttention}<span class="fleet-low-dot" aria-label={filesStorageAttention}></span>{/if}</button>
+          title={choice[0] === "files" && filesStorageAttention ? filesStorageAttention.message : choice[2]}
+          onclick={() => {
+            app.setUiMode(choice[0] as "normal" | "files" | "advanced");
+            if (choice[0] === "files") void refreshFleetStorageHealth();
+          }}
+        >{choice[1]}{#if choice[0] === "files" && filesStorageAttention}<span class="fleet-low-dot" aria-label={filesStorageAttention.message}></span>{/if}</button>
       {/each}
     </div>
 
@@ -300,7 +318,7 @@
 
   <main class="stage">
     {#if app.uiMode === "files"}
-      <FilesWorkspace />
+      <FilesWorkspace storageAttention={filesStorageAttention} onDismissStorageAttention={dismissFilesStorageAttention} />
     {:else}
       <Sidebar />
       <Graph />

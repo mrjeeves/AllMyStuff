@@ -29,8 +29,10 @@ jobs:
           # MyOwnLLM so users get the same portability promise across apps.
           - { name: linux-x86_64,   os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu, bundle_args: "" }
           - { name: linux-aarch64,  os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, bundle_args: "" }
-          - { name: macos-aarch64,  os: macos-14,         target: aarch64-apple-darwin, bundle_args: "" }
-          - { name: macos-x86_64,   os: macos-14,         target: x86_64-apple-darwin, bundle_args: "" }
+          # macOS 14 runners retired on 2026-11-02. Build each macOS target
+          # on its native architecture so native dependencies match the app.
+          - { name: macos-aarch64,  os: macos-15,         target: aarch64-apple-darwin, bundle_args: "" }
+          - { name: macos-x86_64,   os: macos-15-intel,   target: x86_64-apple-darwin, bundle_args: "" }
           # NSIS is the supported Windows installer: its install/uninstall
           # hooks provision the privileged interactive host. Do not also ship
           # an MSI that silently omits that required setup.
@@ -139,11 +141,10 @@ jobs:
             libpipewire-0.3-dev libxkbcommon-dev libgbm-dev
 
       # Match the repo's rust-toolchain.toml (channel = "stable") and ci.yml
-      # so the cross-compile target is added to the *same* toolchain cargo
+      # so the selected target is added to the *same* toolchain cargo
       # actually uses. Pinning a different version here (e.g. @1.88.0) adds
-      # the target to a toolchain rust-toolchain.toml then overrides, so the
-      # non-native target (x86_64-apple-darwin on the arm64 macOS runner)
-      # goes missing — "can't find crate for `core`".
+      # the target to a toolchain rust-toolchain.toml then overrides, leaving
+      # the selected build toolchain without that target.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform.target }}

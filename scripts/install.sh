@@ -124,26 +124,26 @@ install_serve_binary() {
 
 ensure_drive_mount_helper() {
   [ "$OS" = "linux" ] || return 0
-  if command -v mount.davfs >/dev/null 2>&1 || [ -x /sbin/mount.davfs ] || [ -x /usr/sbin/mount.davfs ]; then
+  if command -v rclone >/dev/null 2>&1 && { command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; }; then
     return 0
   fi
   if [ "$DRY_RUN" = "true" ]; then
-    log "(dry-run) would install davfs2 for native Linux drive mapping"
+    log "(dry-run) would install rclone and fuse3 for native Linux drive mapping"
     return 0
   fi
   if ! command -v apt-get >/dev/null 2>&1; then
-    warn "Native Linux drive mapping needs the davfs2 package. Install it with your package manager."
+    warn "Native Linux drive mapping needs rclone and FUSE. Install them with your package manager."
     return 0
   fi
-  log "Installing davfs2 for native Linux drive mapping…"
+  log "Installing rclone and fuse3 for native Linux drive mapping…"
   if [ "$(id -u)" -eq 0 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends davfs2 ||
-      warn "Couldn't install davfs2; native drive mapping will remain unavailable until it is installed."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rclone fuse3 ||
+      warn "Couldn't install rclone and fuse3; native drive mapping needs both packages."
   elif sudo -n true 2>/dev/null; then
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends davfs2 ||
-      warn "Couldn't install davfs2; native drive mapping will remain unavailable until it is installed."
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rclone fuse3 ||
+      warn "Couldn't install rclone and fuse3; native drive mapping needs both packages."
   else
-    warn "Native Linux drive mapping needs davfs2. Run: sudo apt-get install davfs2"
+    warn "Native Linux drive mapping needs rclone and fuse3. Run: sudo apt-get install rclone fuse3"
   fi
 }
 

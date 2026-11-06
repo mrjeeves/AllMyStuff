@@ -1927,13 +1927,23 @@ pub async fn dispatch(
         }
 
         // ---- CEC Support -------------------------------------------------
+        "device_support" => {
+            let node: String = try_arg!(opt(a, "node")).unwrap_or_else(|| "local".into());
+            let action: String = try_arg!(opt(a, "action")).unwrap_or_else(|| "status".into());
+            let technician: Option<String> = try_arg!(opt(a, "technician"));
+            let session_id: Option<String> = try_arg!(opt(a, "session_id"));
+            json_result(
+                mesh.device_support(node, action, technician, session_id)
+                    .await,
+            )
+        }
         // The verbatim node-control surface the CEC Support client app and this
         // app's CEC tab both depend on. Technician commands (`cec_dial_node`,
         // the raised-hand answer; `cec_dial`, the number fallback) and customer
         // commands (`cec_online`, the approve/deny/revoke flow) share the one
         // dispatch; the events (`cec://request|peer|session|grants`) ride the
-        // UiSink like every other engine event. Everything lives on the one
-        // support area — the per-number room ops are gone.
+        // UiSink like every other engine event. Discovery uses the public
+        // directory; actual sessions use each customer's isolated room.
         "cec_status" => json_result(mesh.cec_status().await),
         "cec_online" => json_result(mesh.cec_online().await),
         "cec_dial" => {

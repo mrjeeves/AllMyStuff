@@ -28,11 +28,11 @@ use crate::UiSink;
 use allmystuff_graph::{Capability, Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
-    DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
-    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
-    SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS,
-    CHANNEL_FLEETFILES, CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    DeviceSupportStatus, DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember,
+    OwnedRoster, OwnershipControl, Request, RoomMessage, RouteControl, ShareControl,
+    SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL,
+    CHANNEL_FILES_CANVAS, CHANNEL_FLEETFILES, CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA,
+    CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -550,6 +550,98 @@ pub struct Mesh {
     /// so a dialed technician's screen/input rides the very same engine, trusted
     /// by a live grant instead of owner/fleet. See [`crate::cec`].
     cec: crate::cec::Cec,
+    cec_customer_online: tokio::sync::Mutex<bool>,
+    device_support_replies: Mutex<HashMap<String, DeviceSupportReply>>,
+    device_support_request_cache: Mutex<HashMap<(String, String), DeviceSupportCachedReply>>,
+}
+
+struct DeviceSupportCachedReply {
+    expires: Instant,
+    reply: Option<AppControl>,
+}
+
+enum DeviceSupportRequestAdmission {
+    New,
+    Pending,
+    Cached(AppControl),
+    Busy,
+}
+
+fn begin_device_support_request(
+    cache: &mut HashMap<(String, String), DeviceSupportCachedReply>,
+    peer: &str,
+    request: &str,
+    now: Instant,
+) -> DeviceSupportRequestAdmission {
+    cache.retain(|_, cached| cached.expires > now);
+    let key = (pubkey_part(peer).to_string(), request.to_string());
+    if let Some(cached) = cache.get(&key) {
+        return match &cached.reply {
+            Some(reply) => DeviceSupportRequestAdmission::Cached(reply.clone()),
+            None => DeviceSupportRequestAdmission::Pending,
+        };
+    }
+    if cache.len() >= 64 {
+        return DeviceSupportRequestAdmission::Busy;
+    }
+    cache.insert(
+        key,
+        DeviceSupportCachedReply {
+            expires: now + Duration::from_secs(60),
+            reply: None,
+        },
+    );
+    DeviceSupportRequestAdmission::New
+}
+
+struct DeviceSupportReply {
+    peer: String,
+    tx: oneshot::Sender<Result<DeviceSupportStatus, String>>,
+}
+
+struct DeviceSupportRequestGuard {
+    mesh: std::sync::Weak<Mesh>,
+    request: String,
+}
+
+impl Drop for DeviceSupportRequestGuard {
+    fn drop(&mut self) {
+        if let Some(mesh) = self.mesh.upgrade() {
+            mesh.device_support_replies.lock().remove(&self.request);
+        }
+    }
+}
+
+fn take_device_support_reply(
+    replies: &mut HashMap<String, DeviceSupportReply>,
+    request: &str,
+    peer: &str,
+) -> Option<DeviceSupportReply> {
+    if replies
+        .get(request)
+        .is_some_and(|reply| same_node(&reply.peer, peer))
+    {
+        replies.remove(request)
+    } else {
+        None
+    }
+}
+
+fn validate_device_support_action(
+    action: &str,
+    technician: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(action, "status" | "arm" | "approve" | "deny") {
+        return Err("unknown device support action".into());
+    }
+    if matches!(action, "approve" | "deny")
+        && (technician.is_none_or(|value| value.is_empty() || value.len() > 512)
+            || session_id.is_none_or(|value| value.is_empty() || value.len() > 512))
+    {
+        return Err("choose a current support request before approving or declining it".into());
+    }
+    Ok(())
 }
 
 /// One captured-audio packet headed for the forwarder, in whichever
@@ -2208,6 +2300,9 @@ impl Mesh {
             route_networks: Mutex::new(RouteNetworkPins::default()),
             disabled_networks: Mutex::new(None),
             cec: crate::cec::Cec::new(crate::cec::consent_store_path()),
+            cec_customer_online: tokio::sync::Mutex::new(false),
+            device_support_replies: Mutex::new(HashMap::new()),
+            device_support_request_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3380,6 +3475,8 @@ impl Mesh {
     /// everything is re-established, and peers re-learn us from the fresh
     /// presence broadcast.
     async fn bring_up(self: &Arc<Self>, client_id: ClientId) {
+        *self.cec_customer_online.lock().await = false;
+        self.device_support_replies.lock().clear();
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
@@ -4053,6 +4150,7 @@ impl Mesh {
                     f.push(allmystuff_protocol::FEATURE_TERMINAL.to_string());
                     f.push(allmystuff_protocol::FEATURE_CAMERA.to_string());
                     f.push(allmystuff_protocol::FEATURE_CLIPBOARD_RECEIPTS.to_string());
+                    f.push(allmystuff_protocol::FEATURE_DEVICE_SUPPORT.to_string());
                 }
                 if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
                     f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
@@ -7998,22 +8096,13 @@ impl Mesh {
 
     // ---- CEC Support (technician + customer) --------------------------
     //
-    // CEC Support rides this exact engine, but its public Silent rooms are
-    // signaling directories, never data meshes. Customers announce in
-    // `cecsupport-clients`; technicians lurk listen-only. Raising a hand is
-    // joining `cecsupport-asking`, whose presence is the technicians' queue.
-    // The app suppresses those public sightings outside the support workflow.
-    // A technician answers a raised hand (or a phoned-in number) by joining
-    // the selected customer's `cec-<Support ID>` room and deliberately dialing
-    // them there — a direct session, with TURN as WebRTC's NAT fallback, never
-    // a mesh hop. From then on that customer is an
-    // ordinary AllMyStuff graph peer with the normal screen/control
-    // features. The only substitution is trust — a CEC route is authorized
-    // by the customer's live consent grant ([`crate::cec`]) rather than
-    // owner/fleet, checked per frame in [`Self::sender_may_drive`] so a
-    // revoke bites mid-session. Every command mirrors the node-control
-    // surface the CEC client app and this app's CEC tab both depend on
-    // verbatim.
+    // The node owns discovery, requests, consent, and session lifetime. The
+    // standalone Support app and AllMyStuff's device dialog are clients of
+    // this same API; neither UI needs to remain open for support to work.
+    // Customers announce in the discovery-only `cecsupport-clients` directory.
+    // A technician dials a support number into that customer's isolated room,
+    // then uses ordinary screen/control routes authorized by the node's live
+    // consent grant. Public directory membership never grants data access.
 
     /// This node's support number, public directory, and role.
     pub async fn cec_status(&self) -> Result<Value, String> {
@@ -8031,11 +8120,15 @@ impl Mesh {
     /// display: the digits a customer reads over the phone, derived from the
     /// device key.
     pub async fn cec_online(self: &Arc<Self>) -> Result<Value, String> {
+        let mut online = self.cec_customer_online.lock().await;
         let me = self
             .resolve_local_id()
             .await
             .ok_or_else(|| "this device has no mesh identity yet".to_string())?;
         let number = self.cec.own_number(Some(&me));
+        if *online {
+            return Ok(json!({ "number": number }));
+        }
         let (network_id, config) = crate::cec::help_network_config();
         self.cec_join_silent(&network_id, config).await?;
         self.cec_prepare_directory_area().await;
@@ -8050,7 +8143,142 @@ impl Mesh {
         tracing::info!(
             "CEC Support: discoverable on {network_id}; hosting isolated session room {session_network} as number {number}"
         );
+        *online = true;
         Ok(json!({ "number": number }))
+    }
+
+    /// Shared node API for the desktop UI and the thin support client. A
+    /// remote target is always an owned/fleet device, never a support grantee.
+    pub async fn device_support(
+        self: &Arc<Self>,
+        node: String,
+        action: String,
+        technician: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<Value, String> {
+        validate_device_support_action(&action, technician.as_deref(), session_id.as_deref())?;
+        let local = self
+            .resolve_local_id()
+            .await
+            .ok_or("this device has no mesh identity yet")?;
+        if node.is_empty() || matches!(node.as_str(), "this" | "local") || same_node(&node, &local)
+        {
+            return serde_json::to_value(
+                self.device_support_local(
+                    &action,
+                    technician.as_deref(),
+                    session_id.as_deref(),
+                    None,
+                )
+                .await?,
+            )
+            .map_err(|error| error.to_string());
+        }
+        if !self.sender_may_control(&node) {
+            return Err(
+                "only an owner or fleet member may manage this device's support approvals".into(),
+            );
+        }
+        if !self.peer_supports_feature(&node, allmystuff_protocol::FEATURE_DEVICE_SUPPORT) {
+            return Err(
+                "update AllMyStuff on that computer to manage its support number and approvals"
+                    .into(),
+            );
+        }
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request = format!(
+            "support-{}-{}-{}",
+            std::process::id(),
+            self.boot_id.load(Ordering::Relaxed),
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut replies = self.device_support_replies.lock();
+            if replies.len() >= 32 {
+                return Err("too many support requests are already pending".into());
+            }
+            replies.insert(
+                request.clone(),
+                DeviceSupportReply {
+                    peer: pubkey_part(&node).to_string(),
+                    tx,
+                },
+            );
+        }
+        let _cleanup = DeviceSupportRequestGuard {
+            mesh: Arc::downgrade(self),
+            request: request.clone(),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            self.send_control(
+                &node,
+                &ControlMessage::App(AppControl::DeviceSupport {
+                    request,
+                    action,
+                    technician,
+                    session_id,
+                }),
+            )
+            .await?;
+            rx.await
+                .map_err(|_| "support request was interrupted".to_string())?
+        })
+        .await
+        .map_err(|_| "that computer did not answer the support request in time".to_string())??;
+        serde_json::to_value(result).map_err(|error| error.to_string())
+    }
+
+    async fn device_support_local(
+        self: &Arc<Self>,
+        action: &str,
+        technician: Option<&str>,
+        session_id: Option<&str>,
+        requester: Option<&str>,
+    ) -> Result<DeviceSupportStatus, String> {
+        validate_device_support_action(action, technician, session_id)?;
+        tokio::time::timeout(Duration::from_secs(10), self.cec_online())
+            .await
+            .map_err(|_| "support discovery did not become ready in time".to_string())??;
+        if requester.is_some_and(|peer| !self.sender_may_control(peer)) {
+            return Err("support management authority was revoked".into());
+        }
+        match action {
+            "arm" => {
+                if let Some(request) = self
+                    .cec
+                    .arm_support(Instant::now(), crate::cec::now_secs())?
+                {
+                    self.cec_complete_approval(
+                        &request,
+                        allmystuff_cec_protocol::ApprovalScope::ThreeHours,
+                    );
+                }
+            }
+            "approve" => {
+                self.cec_approve(
+                    technician.unwrap().into(),
+                    "three_hours".into(),
+                    session_id.unwrap().into(),
+                    true,
+                )
+                .await?;
+            }
+            "deny" => {
+                self.cec_deny(technician.unwrap().into(), session_id.unwrap().into())
+                    .await?;
+            }
+            "status" => {}
+            _ => unreachable!("validated action"),
+        }
+        let local = self
+            .local_node_id()
+            .ok_or("this device identity is not ready")?;
+        Ok(self.cec.support_status(
+            self.cec.own_number(Some(&local)),
+            Instant::now(),
+            crate::cec::now_secs(),
+        ))
     }
 
     /// Rejoin and re-pin only the customers in this technician's durable CEC
@@ -8372,6 +8600,7 @@ impl Mesh {
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
         self.cec.set_session(&session_id, "requested");
+        self.cec.bind_session(&session_id, &canonical);
         let request = allmystuff_cec_protocol::ControlMessage::Connect(
             allmystuff_cec_protocol::ConnectControl::Request {
                 session_id: session_id.clone(),
@@ -8451,6 +8680,20 @@ impl Mesh {
                 if mesh.cec.transition_session(&sid, "requested", "ended") {
                     if cancelled {
                         tracing::info!("CEC Support: connect to {} cancelled", short_id(&peer));
+                        // Retire the customer's pending request as well. A
+                        // local cancellation alone leaves a later owner-side
+                        // "approve current" able to grant this abandoned dial.
+                        let end = allmystuff_cec_protocol::ControlMessage::Connect(
+                            allmystuff_cec_protocol::ConnectControl::End {
+                                session_id: sid.clone(),
+                            },
+                        );
+                        if let Err(error) = mesh
+                            .cec_send_control_acked(&net, &peer, &end, Duration::from_secs(5))
+                            .await
+                        {
+                            tracing::warn!("could not deliver support cancellation: {error}");
+                        }
                     } else {
                         tracing::warn!(
                             "CEC Support: connect request to {} was never delivered",
@@ -8499,15 +8742,21 @@ impl Mesh {
         want_control: bool,
     ) -> Result<Value, String> {
         let scope = crate::cec::parse_scope(&scope)?;
-        let agent_name = self.cec.pending_agent_name(&tech);
-        self.cec.approve(&tech, &agent_name, scope, want_control)?;
-        self.cec.set_session(&session_id, "active");
-        // Bind the session to this technician so the consent sweep can end
-        // exactly their sessions when the grant later lapses.
-        self.cec.bind_session(&session_id, &tech);
-        let canonical = crate::cec::pubkey_part(&tech).to_string();
-        if let Some(network_id) = self.network_for_peer(&tech) {
-            self.cec_send_approval(network_id, canonical.clone(), session_id.clone(), scope);
+        let request = self
+            .cec
+            .approve_pending(&tech, &session_id, scope, want_control)?;
+        self.cec_complete_approval(&request, scope);
+        Ok(Value::Null)
+    }
+
+    fn cec_complete_approval(
+        self: &Arc<Self>,
+        request: &crate::cec::PendingRequest,
+        scope: allmystuff_cec_protocol::ApprovalScope,
+    ) {
+        let canonical = crate::cec::pubkey_part(&request.tech).to_string();
+        if let Some(network_id) = self.network_for_peer(&request.tech) {
+            self.cec_send_approval(network_id, canonical, request.session_id.clone(), scope);
         }
         // Carry `tech`/`agent_name` on the event (like the auto-approve path
         // does), so the customer GUI can bind the session — and its chat — to
@@ -8515,14 +8764,13 @@ impl Mesh {
         self.sink.emit(
             "cec://session",
             json!({
-                "session_id": session_id,
+                "session_id": request.session_id,
                 "state": "active",
-                "tech": tech,
-                "agent_name": agent_name,
+                "tech": request.tech,
+                "agent_name": request.agent_name,
             }),
         );
         self.cec_emit_grants();
-        Ok(Value::Null)
     }
 
     /// `cec_deny` (customer): decline a pending request (no grant recorded).
@@ -8531,8 +8779,7 @@ impl Mesh {
         tech: String,
         session_id: String,
     ) -> Result<Value, String> {
-        self.cec.deny(&tech);
-        self.cec.set_session(&session_id, "denied");
+        self.cec.deny_pending(&tech, &session_id)?;
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
             self.cec_send_decision(
@@ -9069,6 +9316,13 @@ impl Mesh {
                     agent_name,
                     want_control,
                 } => {
+                    if !self.cec.session_belongs_to(&session_id, &from) {
+                        tracing::warn!(
+                            "CEC request from {} reused another technician's session",
+                            short_id(&from)
+                        );
+                        return;
+                    }
                     // The technician retransmits its Request every 2s until it
                     // sees an answer — because a single send can be dropped
                     // before the data channel is up (the very race the Request
@@ -9190,9 +9444,24 @@ impl Mesh {
                                     want_control,
                                     session_id: session_id.clone(),
                                     verification_code: verification_code.clone(),
+                                    requested_at: crate::cec::now_secs(),
                                 };
-                                self.cec.record_pending(req);
-                                if !already {
+                                let decision = self.cec.record_or_approve_armed(
+                                    req.clone(),
+                                    Instant::now(),
+                                    crate::cec::now_secs(),
+                                );
+                                if matches!(decision, Ok(true)) {
+                                    let scope = self.cec.active_scope_for(&from).unwrap_or(
+                                        allmystuff_cec_protocol::ApprovalScope::ThreeHours,
+                                    );
+                                    self.cec_complete_approval(&req, scope);
+                                } else if !already && self.cec.has_pending_session(&session_id) {
+                                    if let Err(error) = decision {
+                                        tracing::warn!(
+                                            "could not approve armed support request: {error}"
+                                        );
+                                    }
                                     self.sink.emit(
                                         "cec://request",
                                         json!({
@@ -9209,11 +9478,12 @@ impl Mesh {
                     }
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
-                    self.cec.set_session(&session_id, "active");
-                    // Bind the technician-side session as well. This is the
-                    // proof checked when the approved customer announces the
-                    // KVM physically attached to it.
-                    self.cec.bind_session(&session_id, &from);
+                    if !self.cec.accept_session_approval(&session_id, &from) {
+                        tracing::debug!(
+                            "ignoring approval for resolved or unrelated CEC session {session_id}"
+                        );
+                        return;
+                    }
                     // The customer just approved — this connection is now in
                     // active use. Stamp its `last_used` (and re-emit the peer so
                     // the CEC tab's time-since refreshes) so the technician's
@@ -9792,11 +10062,120 @@ impl Mesh {
         }
     }
 
+    /// Narrow support management never inherits a technician's screen/control
+    /// consent or an unrelated Files/share permission.
+    fn handle_device_support_control(self: &Arc<Self>, peer: &str, message: &AppControl) -> bool {
+        if !matches!(
+            message,
+            AppControl::DeviceSupport { .. } | AppControl::DeviceSupportResult { .. }
+        ) {
+            return false;
+        }
+        if !self.sender_may_control(peer) {
+            tracing::warn!(
+                "support management from {} refused: not owner/fleet",
+                short_id(peer)
+            );
+            return true;
+        }
+        match message {
+            AppControl::DeviceSupportResult {
+                request,
+                status,
+                error,
+            } => {
+                if let Some(reply) = take_device_support_reply(
+                    &mut self.device_support_replies.lock(),
+                    request,
+                    peer,
+                ) {
+                    let result = match (status, error) {
+                        (_, Some(error)) => Err(error.clone()),
+                        (Some(status), None) => Ok(status.clone()),
+                        (None, None) => Err("that computer returned no support status".into()),
+                    };
+                    let _ = reply.tx.send(result);
+                }
+            }
+            AppControl::DeviceSupport {
+                request,
+                action,
+                technician,
+                session_id,
+            } => {
+                if request.is_empty() || request.len() > 256 {
+                    return true;
+                }
+                let admission = begin_device_support_request(
+                    &mut self.device_support_request_cache.lock(),
+                    peer,
+                    request,
+                    Instant::now(),
+                );
+                let cached = match admission {
+                    DeviceSupportRequestAdmission::Pending => return true,
+                    DeviceSupportRequestAdmission::Cached(reply) => Some(reply),
+                    DeviceSupportRequestAdmission::Busy => Some(AppControl::DeviceSupportResult {
+                        request: request.clone(),
+                        status: None,
+                        error: Some("too many support requests are already pending".into()),
+                    }),
+                    DeviceSupportRequestAdmission::New => None,
+                };
+                let (mesh, peer, request, action, technician, session_id) = (
+                    self.clone(),
+                    peer.to_string(),
+                    request.clone(),
+                    action.clone(),
+                    technician.clone(),
+                    session_id.clone(),
+                );
+                crate::spawn(async move {
+                    let reply = if let Some(cached) = cached {
+                        cached
+                    } else {
+                        let result = mesh
+                            .device_support_local(
+                                &action,
+                                technician.as_deref(),
+                                session_id.as_deref(),
+                                Some(&peer),
+                            )
+                            .await;
+                        let (status, error) = match result {
+                            Ok(status) => (Some(status), None),
+                            Err(error) => (None, Some(error)),
+                        };
+                        let reply = AppControl::DeviceSupportResult {
+                            request: request.clone(),
+                            status,
+                            error,
+                        };
+                        mesh.device_support_request_cache.lock().insert(
+                            (pubkey_part(&peer).to_string(), request),
+                            DeviceSupportCachedReply {
+                                expires: Instant::now() + Duration::from_secs(60),
+                                reply: Some(reply.clone()),
+                            },
+                        );
+                        reply
+                    };
+                    let _ = mesh.send_control(&peer, &ControlMessage::App(reply)).await;
+                });
+            }
+            _ => unreachable!("support control variants checked"),
+        }
+        true
+    }
+
     /// Apply an inbound app-control command. These are fleet-only — a machine
     /// only acts on the say-so of its owner or a fleet co-member (the same
     /// rule a terminal/remote-control offer is screened by), so a command
     /// from anyone else is logged and dropped.
     async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
+        if self.handle_device_support_control(from.as_str(), &message) {
+            return;
+        }
         if let AppControl::KvmSupportAvailable { kvm, expires_in } = &message {
             // This announcement is meaningful only from a customer with whom
             // we have an active support session. It is not an authority claim:
@@ -10229,7 +10608,9 @@ impl Mesh {
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
-            AppControl::KvmSupportGrant { .. }
+            AppControl::DeviceSupport { .. }
+            | AppControl::DeviceSupportResult { .. }
+            | AppControl::KvmSupportGrant { .. }
             | AppControl::KvmSupportAvailable { .. }
             | AppControl::StageKvmMediaResult { .. }
             | AppControl::Unknown => {}
@@ -13473,7 +13854,13 @@ impl Mesh {
                     let target_node = to_node.clone();
                     crate::spawn(async move {
                         match mounts
-                            .mount(mesh.clone(), route_id.clone(), drive.label, drive.mount)
+                            .mount(
+                                mesh.clone(),
+                                route_id.clone(),
+                                drive.label,
+                                drive.mount,
+                                &mapping,
+                            )
                             .await
                         {
                             Ok(info) => {
@@ -22130,6 +22517,129 @@ mod tests {
     }
 
     use super::*;
+
+    fn test_device_support_status() -> DeviceSupportStatus {
+        DeviceSupportStatus {
+            enabled: true,
+            support_id: "123456789".into(),
+            approval_remaining_seconds: 0,
+            authorised: false,
+            grant_seconds: 10800,
+            pending: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn support_replies_require_the_expected_peer_and_are_consumed_once() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut replies = HashMap::from([(
+            "request".into(),
+            DeviceSupportReply {
+                peer: "expected".into(),
+                tx,
+            },
+        )]);
+        assert!(take_device_support_reply(&mut replies, "request", "stranger").is_none());
+        assert_eq!(replies.len(), 1);
+        let reply = take_device_support_reply(&mut replies, "request", "expected-ABCDE").unwrap();
+        reply.tx.send(Ok(test_device_support_status())).unwrap();
+        assert_eq!(rx.try_recv().unwrap().unwrap().support_id, "123456789");
+        assert!(take_device_support_reply(&mut replies, "request", "expected").is_none());
+    }
+
+    #[test]
+    fn support_request_replays_do_not_execute_an_arm_twice_and_cache_is_bounded() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        assert!(matches!(
+            begin_device_support_request(&mut cache, "owner", "request", now),
+            DeviceSupportRequestAdmission::New
+        ));
+        assert!(matches!(
+            begin_device_support_request(&mut cache, "owner-ABCDE", "request", now),
+            DeviceSupportRequestAdmission::Pending
+        ));
+        cache
+            .get_mut(&("owner".into(), "request".into()))
+            .unwrap()
+            .reply = Some(AppControl::DeviceSupportResult {
+            request: "request".into(),
+            status: Some(test_device_support_status()),
+            error: None,
+        });
+        assert!(matches!(
+            begin_device_support_request(&mut cache, "owner", "request", now),
+            DeviceSupportRequestAdmission::Cached(_)
+        ));
+        for index in 1..64 {
+            assert!(matches!(
+                begin_device_support_request(&mut cache, "owner", &index.to_string(), now),
+                DeviceSupportRequestAdmission::New
+            ));
+        }
+        assert!(matches!(
+            begin_device_support_request(&mut cache, "owner", "overflow", now),
+            DeviceSupportRequestAdmission::Busy
+        ));
+        assert!(matches!(
+            begin_device_support_request(
+                &mut cache,
+                "owner",
+                "later",
+                now + Duration::from_secs(61)
+            ),
+            DeviceSupportRequestAdmission::New
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn support_management_does_not_inherit_technician_consent_and_cancellation_cleans_waiters() {
+        let client = Arc::new(ControlClient::new().unwrap());
+        let mut mesh = Mesh::new(client, Arc::new(NoopSink));
+        Arc::get_mut(&mut mesh).unwrap().cec = crate::cec::Cec::new(None);
+        let tech = "external-support-technician-for-management-test";
+        mesh.cec
+            .approve(
+                tech,
+                "Technician",
+                allmystuff_cec_protocol::ApprovalScope::ThreeHours,
+                true,
+            )
+            .unwrap();
+        assert!(mesh.sender_may_drive(tech, DrivePlane::Input));
+        assert!(!mesh.sender_may_control(tech));
+        assert!(mesh.handle_device_support_control(
+            tech,
+            &AppControl::DeviceSupport {
+                request: "arm-request".into(),
+                action: "arm".into(),
+                technician: None,
+                session_id: None
+            }
+        ));
+        assert!(mesh.device_support_request_cache.lock().is_empty());
+        assert_eq!(
+            mesh.cec
+                .support_status("123456789".into(), Instant::now(), crate::cec::now_secs())
+                .approval_remaining_seconds,
+            0
+        );
+        let (tx, _rx) = oneshot::channel();
+        mesh.device_support_replies.lock().insert(
+            "cancelled".into(),
+            DeviceSupportReply {
+                peer: "owner".into(),
+                tx,
+            },
+        );
+        let guard = DeviceSupportRequestGuard {
+            mesh: Arc::downgrade(&mesh),
+            request: "cancelled".into(),
+        };
+        drop(guard);
+        assert!(mesh.device_support_replies.lock().is_empty());
+    }
 
     #[test]
     fn au_sequence_accepts_first_consecutive_and_wrapped_units() {

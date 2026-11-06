@@ -238,6 +238,7 @@ pub fn run() {
             commands::fleet_mfa_enroll,
             commands::fleet_mfa_disable,
             commands::forget_node,
+            commands::device_support,
             commands::cec_status,
             commands::cec_dial,
             commands::cec_dial_node,

@@ -37,6 +37,10 @@ pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
 
 use crate::mesh::Mesh;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_drive_mount.rs"]
+mod linux_drive_mount;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
     pub route: String,
@@ -48,6 +52,20 @@ pub struct NativeDriveInfo {
 struct ActiveMount {
     info: NativeDriveInfo,
     server: tokio::task::JoinHandle<()>,
+    #[cfg(target_os = "linux")]
+    helper: Option<linux_drive_mount::MountedHelper>,
+}
+
+#[cfg(target_os = "linux")]
+struct AbortMountStartup(Option<tokio::task::AbortHandle>);
+
+#[cfg(target_os = "linux")]
+impl Drop for AbortMountStartup {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            server.abort();
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -204,6 +222,8 @@ impl DriveMounts {
             ActiveMount {
                 info: info.clone(),
                 server,
+                #[cfg(target_os = "linux")]
+                helper: None,
             },
         );
         #[cfg(windows)]
@@ -247,6 +267,7 @@ impl DriveMounts {
         route: String,
         label: String,
         requested_mount: String,
+        _mapping: &str,
     ) -> Result<NativeDriveInfo, String> {
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(existing) = self.active.lock().get(&route) {
@@ -302,6 +323,8 @@ impl DriveMounts {
                 });
             }
         });
+        #[cfg(target_os = "linux")]
+        let mut startup = AbortMountStartup(Some(server_task.abort_handle()));
         #[cfg(windows)]
         let url = format!("http://localhost:{port}/");
         #[cfg(not(windows))]
@@ -330,7 +353,11 @@ impl DriveMounts {
         if let Err(error) = label_native(&mount, &label, &route, port).await {
             tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
         }
-        if let Err(error) = mount_native(&mount, &url, &label).await {
+        #[cfg(target_os = "linux")]
+        let native = linux_drive_mount::start(Path::new(&mount), &url, _mapping).await;
+        #[cfg(not(target_os = "linux"))]
+        let native = mount_native(&mount, &url, &label).await;
+        if let Err(error) = native {
             server_task.abort();
             // A native helper can report failure after creating a partial
             // mount. Remove it only when the OS still reports our exact
@@ -340,11 +367,17 @@ impl DriveMounts {
             }
             return Err(error);
         }
+        #[cfg(target_os = "linux")]
+        let helper = native.unwrap();
+        #[cfg(target_os = "linux")]
+        startup.0.take();
         self.active.lock().insert(
             route.clone(),
             ActiveMount {
                 info: info.clone(),
                 server: server_task,
+                #[cfg(target_os = "linux")]
+                helper: Some(helper),
             },
         );
         // Explorer can create or refresh its MountPoints2 entry while
@@ -370,12 +403,18 @@ impl DriveMounts {
             return;
         }
         crate::spawn(async move {
+            #[cfg(target_os = "linux")]
+            let mut active = active;
             // Keep the loopback endpoint alive while Windows verifies and
             // disconnects this exact mapping. Aborting it first can turn the
             // redirector into a disconnected/ambiguous state between these
             // two operations and strand a letter with no ownership marker.
             let released =
                 release_native_mount_if_owned(&active.info.mount, active.info.port).await;
+            #[cfg(target_os = "linux")]
+            if let Some(helper) = active.helper.take() {
+                helper.stop().await;
+            }
             active.server.abort();
             match released {
                 Ok(true) => {}
@@ -432,6 +471,10 @@ async fn choose_unix_mount(
     if !requested.trim().is_empty() {
         let mount = PathBuf::from(requested.trim());
         validate_unix_mount(&mount, active).await?;
+        #[cfg(target_os = "linux")]
+        let mount = std::fs::canonicalize(&mount).map_err(|error| {
+            format!("couldn't resolve mount point {}: {error}", mount.display())
+        })?;
         return Ok(mount.to_string_lossy().into_owned());
     }
 
@@ -451,6 +494,10 @@ async fn choose_unix_mount(
         };
         let mount = root.join(name);
         if validate_unix_mount(&mount, active).await.is_ok() {
+            #[cfg(target_os = "linux")]
+            let mount = std::fs::canonicalize(&mount).map_err(|error| {
+                format!("couldn't resolve mount point {}: {error}", mount.display())
+            })?;
             return Ok(mount.to_string_lossy().into_owned());
         }
     }
@@ -462,6 +509,14 @@ async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result
     if !mount.is_absolute() || mount.parent().is_none() {
         return Err("mount point must be an absolute folder path, not the filesystem root".into());
     }
+    #[cfg(target_os = "linux")]
+    if std::fs::symlink_metadata(mount).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("mount point cannot be a symbolic link".into());
+    }
+    #[cfg(target_os = "linux")]
+    let resolved = std::fs::canonicalize(mount).unwrap_or_else(|_| mount.to_path_buf());
+    #[cfg(target_os = "linux")]
+    let mount = resolved.as_path();
     if active.iter().any(|entry| Path::new(&entry.mount) == mount)
         || native_mount_is_active(&mount.to_string_lossy()).await?
     {
@@ -882,22 +937,13 @@ async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, Strin
 
 #[cfg(target_os = "linux")]
 async fn native_mount_matches_port(mount: &str, port: u16) -> Result<bool, String> {
-    let mounted = mount
-        .replace('\\', r"\134")
-        .replace(' ', r"\040")
-        .replace('\t', r"\011")
-        .replace('\n', r"\012");
-    let endpoint = format!("127.0.0.1:{port}");
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|error| format!("couldn't inspect Linux mounts: {error}"))?;
-    Ok(mounts.lines().any(|line| {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let separator = fields.iter().position(|field| *field == "-");
-        fields.get(4).is_some_and(|field| *field == mounted)
-            && separator
-                .and_then(|index| fields.get(index + 2))
-                .is_some_and(|source| source.contains(&endpoint))
-    }))
+    Ok(linux_drive_mount::owns_mount(
+        &mounts,
+        Path::new(mount),
+        port,
+    ))
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -974,11 +1020,18 @@ async fn release_native_mount_if_owned(mount: &str, port: u16) -> Result<bool, S
     if !native_mount_matches_port(mount, port).await? {
         clear_unowned_native_metadata(mount, Some(port)).await?;
         let _ = forget_native_mount(mount);
+        #[cfg(target_os = "linux")]
+        linux_drive_mount::forget_lease(Path::new(mount), port);
         return Ok(false);
     }
+    #[cfg(target_os = "linux")]
+    linux_drive_mount::unmount_owned(Path::new(mount), port).await?;
+    #[cfg(not(target_os = "linux"))]
     unmount_native(mount).await?;
     clear_native_label(mount, Some(port)).await?;
     forget_native_mount(mount)?;
+    #[cfg(target_os = "linux")]
+    linux_drive_mount::forget_lease(Path::new(mount), port);
     Ok(true)
 }
 
@@ -1007,7 +1060,7 @@ async fn wait_for_route(mesh: &Arc<Mesh>, route: &str) -> Result<(), String> {
     Err("the source accepted the drive but its file connection never became ready".into())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn command_result(output: std::process::Output, context: String) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
@@ -1024,18 +1077,9 @@ fn command_result(output: std::process::Output, context: String) -> Result<(), S
 
 #[cfg(target_os = "linux")]
 async fn native_mount_is_active(mount: &str) -> Result<bool, String> {
-    let mount = mount
-        .replace('\\', r"\134")
-        .replace(' ', r"\040")
-        .replace('\t', r"\011")
-        .replace('\n', r"\012");
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|error| format!("couldn't inspect Linux mounts: {error}"))?;
-    Ok(mounts.lines().any(|line| {
-        line.split_whitespace()
-            .nth(4)
-            .is_some_and(|mounted| mounted == mount)
-    }))
+    Ok(linux_drive_mount::is_mounted(&mounts, Path::new(mount)))
 }
 
 #[cfg(target_os = "macos")]
@@ -1158,29 +1202,6 @@ async fn mount_native(mount: &str, url: &str, label: &str) -> Result<(), String>
     )
 }
 
-#[cfg(target_os = "linux")]
-async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
-    let helper = ["/sbin/mount.davfs", "/usr/sbin/mount.davfs"]
-        .into_iter()
-        .find(|candidate| Path::new(candidate).is_file())
-        .unwrap_or("mount.davfs");
-    let output = crate::child_process::command(helper)
-        .args(["-o", "rw,noexec,nosuid,nodev", url, mount])
-        .output()
-        .await
-        .map_err(|error| {
-            format!(
-                "couldn't launch Linux drive mounting: {error}. Install the davfs2 package first"
-            )
-        })?;
-    command_result(
-        output,
-        format!(
-            "Linux couldn't mount the remote drive at {mount}. Install davfs2; a non-root user also needs permission to mount that path"
-        ),
-    )
-}
-
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 async fn mount_native(_mount: &str, _url: &str, _label: &str) -> Result<(), String> {
     Err("native drive mounting is not available on this operating system".into())
@@ -1200,7 +1221,7 @@ async fn unmount_native(mount: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 async fn unmount_native(mount: &str) -> Result<(), String> {
     if native_mount_is_active(mount).await? {
         let output = crate::child_process::command("/sbin/umount")

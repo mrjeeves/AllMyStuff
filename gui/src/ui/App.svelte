@@ -32,7 +32,7 @@
   import ClaimSheet from "./ClaimSheet.svelte";
   import FleetCodePrompt from "./FleetCodePrompt.svelte";
   import CecApprovalPrompt from "./CecApprovalPrompt.svelte";
-  import KvmSupportModal from "./KvmSupportModal.svelte";
+  import SupportModal from "./SupportModal.svelte";
   import KvmWifiModal from "./KvmWifiModal.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import ShareFlow from "./ShareFlow.svelte";
@@ -370,8 +370,8 @@
       </section>
     </div>
   {/if}
-  {#if app.kvmSupportFor}
-    {#key app.kvmSupportFor}<KvmSupportModal node={app.kvmSupportFor} />{/key}
+  {#if app.supportFor}
+    {#key app.supportFor}<SupportModal node={app.supportFor} />{/key}
   {/if}
   <CecApprovalPrompt />
   <Toasts />

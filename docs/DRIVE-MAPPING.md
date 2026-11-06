@@ -13,7 +13,7 @@ the result directly; it is not an AllMyStuff-only file browser.
 The receiving node runs a loopback-only WebDAV server that translates
 filesystem operations into the existing mesh file protocol. Windows mounts it
 with `net use`, macOS with its built-in `mount_webdav`, and Linux with
-`mount.davfs` from `davfs2`. The WebDAV server is never exposed to the LAN and
+an owned foreground `rclone mount` process over FUSE. The WebDAV server is never exposed to the LAN and
 the file bytes still travel only on the live AllMyStuff route (direct, STUN, or
 TURN).
 
@@ -143,11 +143,22 @@ computer. That invariant is enforced in both the picker and the node backend.
   source filesystem's used and available space.
 - macOS uses the operating system's built-in `mount_webdav` command and gives
   the volume the label selected in AllMyStuff.
-- Linux uses `mount.davfs`. Ubuntu and Debian packages install `davfs2` as a
-  dependency, and the portable installer attempts to install it through
-  `apt-get`. A headless AllMyStuff service normally has the privileges needed
-  for arbitrary mount points. A non-root process must have permission to mount
-  its selected path under the host's ordinary `davfs2` policy.
+- Linux uses `rclone mount` and FUSE as the signed-in user. Ubuntu and Debian
+  packages depend on `rclone` and `fuse3`; the portable installer attempts to
+  install them through `apt-get`. No per-URL `/etc/fstab` entry or root mount
+  privilege is needed. A restricted system service is still restricted:
+  desktop mounts belong in the interactive user node or a user service.
+- The node owns the Linux mount process and bounds startup and teardown.
+  Cleanup verifies the exact mount identity before unmounting, including after
+  a crash, rather than treating a reused mount path or a port prefix as ours.
+  Linux unmounts use `fusermount3` or `fusermount`.
+- Linux's write cache permits applications to seek while writing. Its private
+  configuration and cache are keyed to the logical mapping so a changed route
+  or loopback port does not change the cache identity. Closed writes are
+  uploaded promptly; interrupted, unsent cache data is retained rather than
+  removed during cleanup. The receiver must have space for buffered writes.
+  See the [rclone mount documentation](https://rclone.org/commands/rclone_mount/)
+  for the underlying FUSE and write-cache behavior.
 - WebDAV favors zero-install interoperability over perfect POSIX semantics.
   Windows applications get ordinary read/write/seek/rename/delete behavior;
   filesystem features WebDAV cannot represent (hard links, alternate streams,

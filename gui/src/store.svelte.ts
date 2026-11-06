@@ -1,4 +1,4 @@
-import type { KvmSupportStatus } from "./types";
+import type { DeviceSupportStatus, KvmSupportStatus } from "./types";
 // The single source of UI truth. Holds the graph catalog plus the
 // transient interaction state (what's selected, what's being dragged,
 // which sheet is open) as Svelte 5 runes, and exposes the verbs the
@@ -193,6 +193,7 @@ import {
   windowBehaviorGet,
   windowBehaviorSet,
   cecStatus,
+  deviceSupport,
   cecDial,
   cecDialNode,
   cecPending,
@@ -227,6 +228,7 @@ import {
   CAP_TAG_ALLMYSTUFF,
   displayName,
   FEATURE_CAMERA,
+  FEATURE_DEVICE_SUPPORT,
   FEATURE_FILES,
   FEATURE_KVM,
   FEATURE_ROOMS,
@@ -5765,10 +5767,41 @@ class AppStore {
     return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
   }
 
-  kvmSupportFor = $state<string | null>(null);
+  supportFor = $state<string | null>(null);
 
-  openKvmSupport(nodeId: string) {
-    if (this.kvmAllowed(this.node(nodeId))) this.kvmSupportFor = nodeId;
+  /** Managing consent requires this device's owner/fleet authority. A PC's
+   *  screen share or technician grant does not confer that authority. */
+  supportAllowed(node: MeshNode | null | undefined): boolean {
+    if (!node) return false;
+    return this.isKvm(node) ? this.kvmAllowed(node) : this.canRestartApp(node);
+  }
+
+  openSupport(nodeId: string) {
+    const node = this.machineByAnyId(nodeId);
+    if (this.supportAllowed(node)) this.supportFor = node!.id;
+  }
+
+  private supportTarget(nodeId: string): MeshNode {
+    const node = this.machineByAnyId(nodeId);
+    if (!node || !this.supportAllowed(node)) {
+      throw new Error("Only this device's owner or fleet can manage its support requests.");
+    }
+    if (!this.isKvm(node) && !this.isMe(node.id) && !(node.features ?? []).includes(FEATURE_DEVICE_SUPPORT)) {
+      throw new Error("Update AllMyStuff on this device to manage its support requests.");
+    }
+    return node;
+  }
+
+  async readSupport(nodeId: string, background = true): Promise<DeviceSupportStatus | null> {
+    const node = this.supportTarget(nodeId);
+    return this.isKvm(node) ? this.readKvmSupport(node.id, background) : deviceSupport(node.id);
+  }
+
+  async changeSupport(nodeId: string, action: "arm" | "approve" | "deny", technician?: string, sessionId?: string): Promise<DeviceSupportStatus | null> {
+    const node = this.supportTarget(nodeId);
+    return this.isKvm(node)
+      ? this.changeKvmSupport(node.id, action, technician, sessionId)
+      : deviceSupport(node.id, action, technician, sessionId);
   }
 
   async readKvmSupport(nodeId: string, background = true): Promise<KvmSupportStatus | null> {

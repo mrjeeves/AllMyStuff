@@ -19818,6 +19818,8 @@ impl Mesh {
         }
 
         // Resolve placement at operation boundaries, never for each chunk.
+        // Commit must refresh roots too: a disk can disappear while chunks
+        // are in flight, leaving its old mountpoint on another filesystem.
         if message.needs_storage_setup() {
             self.reconcile_local_storage_allocations();
         }

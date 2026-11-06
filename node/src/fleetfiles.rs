@@ -290,7 +290,10 @@ impl FleetfilesMessage {
     pub(crate) fn needs_storage_setup(&self) -> bool {
         matches!(
             self,
-            Self::FileBegin { .. } | Self::Directory { .. } | Self::Delete { .. }
+            Self::FileBegin { .. }
+                | Self::FileCommit { .. }
+                | Self::Directory { .. }
+                | Self::Delete { .. }
         )
     }
 }
@@ -2767,7 +2770,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_stream_only_resolves_storage_at_begin() {
+    fn file_stream_resolves_storage_at_begin_and_commit_but_not_per_chunk() {
         let version = VersionStamp {
             counter: 1,
             actor: "sender".into(),
@@ -2789,7 +2792,7 @@ mod tests {
             }
             .needs_storage_setup());
         }
-        assert!(!FleetfilesMessage::FileCommit {
+        assert!(FleetfilesMessage::FileCommit {
             operation: "transfer".into()
         }
         .needs_storage_setup());
@@ -2805,6 +2808,118 @@ mod tests {
             path: "file".into(),
         }
         .needs_storage_setup());
+    }
+
+    #[test]
+    fn commit_rechecks_allocation_after_volume_disappears_during_transfer() {
+        use std::cell::Cell;
+
+        let base = std::env::temp_dir().join(format!(
+            "allmystuff-fleetfiles-unmount-{}-{}",
+            std::process::id(),
+            CONTENT_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let visible = base.join("visible");
+        let mount = base.join("mounted-volume");
+        let allocation = StorageAllocationRoot {
+            id: "removable-volume".into(),
+            root: mount.join(".allmystuff-fleetfiles"),
+            quota_bytes: 1024,
+        };
+        std::fs::create_dir_all(&allocation.root).unwrap();
+        let replica = FleetfilesReplica::memory(visible.clone());
+        let mounted = Cell::new(true);
+        let discoveries = Cell::new(0);
+        // Exercise the same operation-boundary policy as the receive handler,
+        // with deterministic mount discovery instead of a privileged unmount.
+        let prepare_storage = |message: &FleetfilesMessage| {
+            if message.needs_storage_setup() {
+                discoveries.set(discoveries.get() + 1);
+                replica.set_storage_allocations(
+                    if mounted.get() {
+                        vec![allocation.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    "local".into(),
+                    30,
+                );
+            }
+        };
+        let body = b"verified transfer body";
+        let hash = format!("{:x}", Sha256::digest(body));
+        let version = VersionStamp {
+            counter: 1,
+            actor: "peer".into(),
+        };
+        prepare_storage(&FleetfilesMessage::FileBegin {
+            operation: "transfer".into(),
+            version: version.clone(),
+            path: "file.txt".into(),
+            size: body.len() as u64,
+            sha256: hash.clone(),
+            cache_only: false,
+        });
+        assert!(replica
+            .begin_file(
+                "peer",
+                "transfer".into(),
+                version,
+                "file.txt".into(),
+                (body.len() as u64, hash),
+                false,
+            )
+            .unwrap());
+        replica
+            .write_chunk("peer", "transfer", 0, &body[..8])
+            .unwrap();
+
+        // The volume's contents disappear, leaving a writable mountpoint on
+        // the underlying filesystem. A stale cached root would be recreated
+        // there by persist_verified_content and incorrectly acknowledged.
+        std::fs::rename(&mount, base.join("detached-volume")).unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        mounted.set(false);
+        prepare_storage(&FleetfilesMessage::FileChunk {
+            operation: "transfer".into(),
+            offset: 8,
+            data: body[8..].to_vec(),
+        });
+        replica
+            .write_chunk("peer", "transfer", 8, &body[8..])
+            .unwrap();
+        assert_eq!(discoveries.get(), 1, "chunks must not discover disks");
+
+        prepare_storage(&FleetfilesMessage::FileCommit {
+            operation: "transfer".into(),
+        });
+        let error = replica
+            .commit_file("peer", "transfer")
+            .expect_err("a removed allocation must not commit onto the underlying filesystem");
+        assert!(error.contains("no Fleetfiles content allocation"));
+        assert_eq!(
+            discoveries.get(),
+            2,
+            "commit must revalidate the allocation"
+        );
+        assert!(
+            !allocation.root.exists(),
+            "must not recreate storage on the underlying filesystem"
+        );
+        assert!(!visible.join("file.txt").exists());
+        assert!(replica.current_file_version("file.txt").unwrap().is_none());
+        assert_eq!(
+            replica
+                .connection
+                .lock()
+                .query_row("SELECT COUNT(*) FROM content_replicas", [], |row| row
+                    .get::<_, u64>(0),)
+                .unwrap(),
+            0,
+            "a rejected commit must not record a successful replica"
+        );
+        drop(replica);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

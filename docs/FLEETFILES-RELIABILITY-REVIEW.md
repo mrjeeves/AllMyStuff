@@ -12,9 +12,12 @@ before/after throughput number has been measured.
 - **macOS allocation fallback:** compare Unix filesystem device IDs instead of
   path prefixes. `/Users` and `/System/Volumes/Data` can refer to the same Data
   volume through firmlinks. A fallback on another filesystem is rejected.
-- **Transfer hot path:** resolve allocation roots at FileBegin/Directory/Delete,
-  not on FileChunk/FileCommit. Discover disks only, once per reconciliation,
-  rather than probing CPU, GPU, audio, cameras, USB and listening services.
+- **Transfer hot path:** resolve allocation roots at
+  FileBegin/FileCommit/Directory/Delete, not on FileChunk. Commit rechecks disk
+  presence so a volume removed during transfer cannot leave a stale allocation
+  path that is recreated on the underlying filesystem. Discover disks only,
+  once per reconciliation, rather than probing CPU, GPU, audio, cameras, USB
+  and listening services.
 - **Unavailable allocations:** exponential retry delays from 5 to 300 seconds
   on subsequent operations; log only the first/changed failure and recovery.
   A changed allocation resets the retry deadline. Successful roots are not
@@ -135,6 +138,16 @@ before the commit-time check and passed after it. The first sandboxed run
 blocked two unrelated OS watcher/socket tests; the complete rerun with those
 facilities available passed. Windows/Linux runtime checks and the multi-device
 campaign above remain outstanding.
+
+The commit-boundary regression simulates a volume disappearing between begin
+and commit while its mountpoint remains writable. It exercises the real
+replica, verified transfer bytes, and SQLite records: commit must reject the
+removed allocation without recreating storage on the underlying filesystem,
+materializing the file, or recording a successful replica. It failed before
+restoring commit-time reconciliation and passed afterward. All 21 Fleetfiles
+module tests passed in a single-job Windows Rust 1.88 harness using the actual
+replica source; only hidden-file attributes were stubbed. This focused check
+does not replace full-node CI or the real removable-volume acceptance test.
 
 ## Local dev run — October 13, 2026
 

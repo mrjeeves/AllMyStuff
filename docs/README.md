@@ -20,6 +20,7 @@ with the job in front of you.
 | Understand the process and crate boundaries | [Architecture](../ARCHITECTURE.md) |
 | Work on the desktop or mobile front end | [GUI guide](../gui/README.md) |
 | Understand the Fleet Computer product and release contract | [Fleet Computer Operation Promise](OPERATION-PROMISE.md) |
+| Review Fleetfiles reliability findings and remaining work | [Fleetfiles reliability review](FLEETFILES-RELIABILITY-REVIEW.md) |
 | Understand what Fleetfiles implements today | [Fleetfiles current implementation](FLEETFILES-IMPLEMENTATION.md) |
 | Finish the Fleetfiles implementation in the current PR | [Fleetfiles PR completion plan](FLEETFILES-COMPLETION-PLAN.md) |
 | Understand Files mode, identity, and fleet canvas convergence | [Files canvas](FILES-CANVAS.md) |

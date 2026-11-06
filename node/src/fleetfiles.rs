@@ -286,6 +286,18 @@ pub enum FleetfilesMessage {
     },
 }
 
+impl FleetfilesMessage {
+    pub(crate) fn needs_storage_setup(&self) -> bool {
+        matches!(
+            self,
+            Self::FileBegin { .. }
+                | Self::FileCommit { .. }
+                | Self::Directory { .. }
+                | Self::Delete { .. }
+        )
+    }
+}
+
 struct Inbound {
     path: String,
     version: VersionStamp,
@@ -2096,7 +2108,40 @@ impl FleetfilesReplica {
             let _ = std::fs::remove_file(&transfer.staging);
             return Err("this device has no Fleetfiles content allocation".into());
         }
-        if !transfer.materialize {
+        // The winner may have advanced while chunks were in flight. Hold the
+        // namespace lock through replacement and version commit so another
+        // completed transfer cannot be rolled back by this older body.
+        let connection = self.connection.lock();
+        let current = read_current(&connection, &transfer.path)?;
+        if let Some(current) = current
+            .as_ref()
+            .filter(|current| current.version == transfer.version)
+        {
+            ensure_same_metadata(
+                current,
+                &FleetfilesMetadata {
+                    operation: operation.to_string(),
+                    version: transfer.version.clone(),
+                    path: transfer.path.clone(),
+                    kind: "file".into(),
+                    size: transfer.size,
+                    sha256: Some(transfer.sha256.clone()),
+                    tombstone: false,
+                },
+            )?;
+        }
+        if !transfer.materialize
+            || current.is_some_and(|current| current.version > transfer.version)
+        {
+            append_version_history(
+                &connection,
+                &transfer.path,
+                &transfer.version,
+                "file",
+                transfer.size,
+                Some(&transfer.sha256),
+                false,
+            )?;
             let _ = std::fs::remove_file(&transfer.staging);
             return Ok(transfer.path);
         }
@@ -2107,7 +2152,7 @@ impl FleetfilesReplica {
         }
         replace_file(&transfer.staging, &target)?;
         put_version(
-            &self.connection.lock(),
+            &connection,
             &transfer.path,
             &transfer.version,
             "file",
@@ -2725,6 +2770,159 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_stream_resolves_storage_at_begin_and_commit_but_not_per_chunk() {
+        let version = VersionStamp {
+            counter: 1,
+            actor: "sender".into(),
+        };
+        assert!(FleetfilesMessage::FileBegin {
+            operation: "transfer".into(),
+            version: version.clone(),
+            path: "file".into(),
+            size: 65536,
+            sha256: "a".repeat(64),
+            cache_only: false,
+        }
+        .needs_storage_setup());
+        for offset in 0..1024 {
+            assert!(!FleetfilesMessage::FileChunk {
+                operation: "transfer".into(),
+                offset,
+                data: vec![],
+            }
+            .needs_storage_setup());
+        }
+        assert!(FleetfilesMessage::FileCommit {
+            operation: "transfer".into()
+        }
+        .needs_storage_setup());
+        assert!(FleetfilesMessage::Directory {
+            operation: "mkdir".into(),
+            version: version.clone(),
+            path: "dir".into(),
+        }
+        .needs_storage_setup());
+        assert!(FleetfilesMessage::Delete {
+            operation: "delete".into(),
+            version,
+            path: "file".into(),
+        }
+        .needs_storage_setup());
+    }
+
+    #[test]
+    fn commit_rechecks_allocation_after_volume_disappears_during_transfer() {
+        use std::cell::Cell;
+
+        let base = std::env::temp_dir().join(format!(
+            "allmystuff-fleetfiles-unmount-{}-{}",
+            std::process::id(),
+            CONTENT_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let visible = base.join("visible");
+        let mount = base.join("mounted-volume");
+        let allocation = StorageAllocationRoot {
+            id: "removable-volume".into(),
+            root: mount.join(".allmystuff-fleetfiles"),
+            quota_bytes: 1024,
+        };
+        std::fs::create_dir_all(&allocation.root).unwrap();
+        let replica = FleetfilesReplica::memory(visible.clone());
+        let mounted = Cell::new(true);
+        let discoveries = Cell::new(0);
+        // Exercise the same operation-boundary policy as the receive handler,
+        // with deterministic mount discovery instead of a privileged unmount.
+        let prepare_storage = |message: &FleetfilesMessage| {
+            if message.needs_storage_setup() {
+                discoveries.set(discoveries.get() + 1);
+                replica.set_storage_allocations(
+                    if mounted.get() {
+                        vec![allocation.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    "local".into(),
+                    30,
+                );
+            }
+        };
+        let body = b"verified transfer body";
+        let hash = format!("{:x}", Sha256::digest(body));
+        let version = VersionStamp {
+            counter: 1,
+            actor: "peer".into(),
+        };
+        prepare_storage(&FleetfilesMessage::FileBegin {
+            operation: "transfer".into(),
+            version: version.clone(),
+            path: "file.txt".into(),
+            size: body.len() as u64,
+            sha256: hash.clone(),
+            cache_only: false,
+        });
+        assert!(replica
+            .begin_file(
+                "peer",
+                "transfer".into(),
+                version,
+                "file.txt".into(),
+                (body.len() as u64, hash),
+                false,
+            )
+            .unwrap());
+        replica
+            .write_chunk("peer", "transfer", 0, &body[..8])
+            .unwrap();
+
+        // The volume's contents disappear, leaving a writable mountpoint on
+        // the underlying filesystem. A stale cached root would be recreated
+        // there by persist_verified_content and incorrectly acknowledged.
+        std::fs::rename(&mount, base.join("detached-volume")).unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        mounted.set(false);
+        prepare_storage(&FleetfilesMessage::FileChunk {
+            operation: "transfer".into(),
+            offset: 8,
+            data: body[8..].to_vec(),
+        });
+        replica
+            .write_chunk("peer", "transfer", 8, &body[8..])
+            .unwrap();
+        assert_eq!(discoveries.get(), 1, "chunks must not discover disks");
+
+        prepare_storage(&FleetfilesMessage::FileCommit {
+            operation: "transfer".into(),
+        });
+        let error = replica
+            .commit_file("peer", "transfer")
+            .expect_err("a removed allocation must not commit onto the underlying filesystem");
+        assert!(error.contains("no Fleetfiles content allocation"));
+        assert_eq!(
+            discoveries.get(),
+            2,
+            "commit must revalidate the allocation"
+        );
+        assert!(
+            !allocation.root.exists(),
+            "must not recreate storage on the underlying filesystem"
+        );
+        assert!(!visible.join("file.txt").exists());
+        assert!(replica.current_file_version("file.txt").unwrap().is_none());
+        assert_eq!(
+            replica
+                .connection
+                .lock()
+                .query_row("SELECT COUNT(*) FROM content_replicas", [], |row| row
+                    .get::<_, u64>(0),)
+                .unwrap(),
+            0,
+            "a rejected commit must not record a successful replica"
+        );
+        drop(replica);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn rejects_names_that_collide_across_operating_systems() {
         assert!(validate_portable_path("good/fleet file.txt").is_ok());
         assert!(validate_portable_path("../escape").is_err());
@@ -2844,6 +3042,63 @@ mod tests {
             request.len() + response.len() < 512,
             "equal ledgers must reconcile with a constant-size exchange"
         );
+    }
+
+    #[test]
+    fn older_inflight_commit_cannot_overwrite_a_newer_completed_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "amst-inflight-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let replica = FleetfilesReplica::memory(root.clone());
+        replica.set_storage_allocations(
+            vec![StorageAllocationRoot {
+                id: "test".into(),
+                root: root.join("allocated"),
+                quota_bytes: 1024,
+            }],
+            "local".into(),
+            30,
+        );
+        for (operation, counter, body) in [("old", 1, b"old"), ("new", 2, b"new")] {
+            let sha256 = format!("{:x}", Sha256::digest(body));
+            replica
+                .begin_file(
+                    "peer",
+                    operation.into(),
+                    VersionStamp {
+                        counter,
+                        actor: "peer".into(),
+                    },
+                    "file.txt".into(),
+                    (3, sha256),
+                    false,
+                )
+                .unwrap();
+            replica.write_chunk("peer", operation, 0, body).unwrap();
+        }
+        replica.commit_file("peer", "new").unwrap();
+        replica.commit_file("peer", "old").unwrap();
+        assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"new");
+        assert_eq!(
+            replica
+                .current_file_version("file.txt")
+                .unwrap()
+                .unwrap()
+                .0
+                .counter,
+            2
+        );
+        assert_eq!(
+            replica
+                .version_history("file.txt", None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

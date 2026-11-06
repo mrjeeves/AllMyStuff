@@ -125,17 +125,24 @@ pub fn memory(sys: &System) -> Memory {
 }
 
 pub fn storage() -> Vec<StorageVolume> {
-    let disks = Disks::new_with_refreshed_list();
+    // On macOS sysinfo asks CoreFoundation for capacity before it filters
+    // remote volumes. That can block on our own WebDAV mount (or an offline
+    // network drive). Enumerate first, then query capacity only for the local
+    // disks that survived sysinfo's filtering.
+    let mut disks = Disks::new_with_refreshed_list_specifics(
+        sysinfo::DiskRefreshKind::everything().without_storage(),
+    );
     // Dedupe by mount point — bind mounts and the like surface the same
     // volume several times.
     let mut by_mount: BTreeMap<String, StorageVolume> = BTreeMap::new();
-    for d in &disks {
+    for d in disks.list_mut() {
         let mount = d.mount_point().to_string_lossy().to_string();
         // Skip the usual pseudo / read-only system mounts that aren't
         // "storage you'd share."
         if is_pseudo_mount(&mount) {
             continue;
         }
+        d.refresh_specifics(sysinfo::DiskRefreshKind::nothing().with_storage());
         let name = d.name().to_string_lossy().to_string();
         let kind = if d.is_removable() {
             DiskKind::Removable

@@ -893,7 +893,9 @@ pub async fn dispatch(
                 .await
                 .unwrap_or_else(|| "this".to_string());
             let node = NodeId::from(me.as_str());
-            let inv = allmystuff_inventory::scan();
+            let inv = try_arg!(tokio::task::spawn_blocking(allmystuff_inventory::scan)
+                .await
+                .map_err(|e| format!("inventory scan failed: {e}")));
             DispatchOut::Json(json!({
                 "node_id": me,
                 "label": inv.host.hostname,
@@ -914,7 +916,9 @@ pub async fn dispatch(
         // often nothing on consumer Windows boards — and the card hides the
         // row rather than invent readings.
         "machine_specs" => {
-            let inv = allmystuff_inventory::scan();
+            let inv = try_arg!(tokio::task::spawn_blocking(allmystuff_inventory::scan)
+                .await
+                .map_err(|e| format!("inventory scan failed: {e}")));
             DispatchOut::Json(json!({
                 "hostname": inv.host.hostname,
                 "os": match &inv.host.os_version {

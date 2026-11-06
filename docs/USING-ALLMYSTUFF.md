@@ -114,6 +114,17 @@ first, and uses available allocated space beyond the retention target when it
 can. A dot on the Files mode button warns when the fleet is low on protected
 usable Files space.
 
+Fleet devices with enough space contribute **1 GB** (1 GiB) automatically on
+one local disk, without opening Settings. Setup leaves at least **5 GiB or 10%
+of that disk free**, whichever is larger, after the contribution. Removable,
+read-only, network, and virtual adapter volumes are not enrolled automatically.
+The contribution is a storage budget, not a preallocated file. Use
+**Settings > Files > Fleetfiles storage** to change the budget or turn it off;
+saved contributions and opt-outs take precedence, including choices that arrive
+later from an offline device. Devices without room can become eligible after
+space is freed. Automatic contributions are shared with upgraded fleet members;
+older app versions continue to use explicit storage allocations.
+
 On macOS, an allocation on the startup Data volume can use the app's writable
 state directory on that same volume when the volume root is protected. A
 failed allocation retries on later file operations with a delay that grows

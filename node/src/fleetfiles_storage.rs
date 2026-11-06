@@ -6,9 +6,181 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::storage_plan::StorageAllocation;
+use allmystuff_protocol::StorageSummary;
 
 const INITIAL_RETRY: Duration = Duration::from_secs(5);
 const MAX_RETRY: Duration = Duration::from_secs(300);
+
+pub(crate) const DEFAULT_CONTRIBUTION_BYTES: u64 = 1 << 30;
+const MIN_DEFAULT_FREE_BYTES: u64 = 5 << 30;
+
+struct DefaultVolume {
+    id: String,
+    mount: PathBuf,
+    filesystem: String,
+    removable: bool,
+    read_only: bool,
+}
+
+/// Choose one local volume already advertised by this device. Enumeration
+/// reads mount metadata only; capacity is queried freshly on the selected
+/// backing filesystem, never on every mounted network/adapter volume.
+///
+/// The caller must successfully materialize the allocation root before saving
+/// the automatic allocation. That write also establishes actual writability;
+/// filesystem flags alone cannot account for ACLs or a read-only bind mount.
+pub(crate) fn choose_default_volume(volumes: &[StorageSummary], state: &Path) -> Option<String> {
+    if volumes.is_empty() {
+        return None;
+    }
+    let state = state.canonicalize().ok()?;
+    let disks =
+        sysinfo::Disks::new_with_refreshed_list_specifics(sysinfo::DiskRefreshKind::nothing());
+    let candidates: Vec<_> = disks
+        .iter()
+        .map(|disk| DefaultVolume {
+            id: format!("disk:{}", disk.mount_point().to_string_lossy()),
+            mount: disk.mount_point().to_path_buf(),
+            filesystem: disk.file_system().to_string_lossy().into_owned(),
+            removable: disk.is_removable(),
+            read_only: disk.is_read_only(),
+        })
+        .collect();
+    choose_default_volume_with(volumes, &state, &candidates, same_filesystem, |_, state| {
+        Some((
+            fs2::total_space(state).ok()?,
+            fs2::available_space(state).ok()?,
+        ))
+    })
+}
+
+fn choose_default_volume_with(
+    volumes: &[StorageSummary],
+    state: &Path,
+    candidates: &[DefaultVolume],
+    mut backs_state: impl FnMut(&Path, &Path) -> bool,
+    capacity: impl FnOnce(&DefaultVolume, &Path) -> Option<(u64, u64)>,
+) -> Option<String> {
+    // A known network/virtual mount nested under a physical disk must not be
+    // mistaken for its parent. Reject it before touching the state's metadata.
+    let deepest_mount = candidates
+        .iter()
+        .filter_map(|volume| mount_specificity(state, &volume.mount).map(|depth| (depth, volume)))
+        .max_by_key(|(depth, _)| *depth);
+    if deepest_mount.is_some_and(|(_, volume)| !local_filesystem(&volume.filesystem)) {
+        return None;
+    }
+
+    // Identify the backing mount before applying eligibility rules. In
+    // particular an ineligible nested mount cannot fall back to an eligible
+    // parent. st_dev recognizes macOS Data-volume firmlinks even though their
+    // mount path is not a lexical prefix of the user's state directory.
+    let selected = candidates
+        .iter()
+        .filter(|volume| local_filesystem(&volume.filesystem))
+        .filter(|volume| backs_state(&volume.mount, state))
+        .max_by(|a, b| {
+            mount_specificity(state, &a.mount)
+                .cmp(&mount_specificity(state, &b.mount))
+                .then_with(|| {
+                    a.mount
+                        .components()
+                        .count()
+                        .cmp(&b.mount.components().count())
+                })
+                .then_with(|| b.id.cmp(&a.id))
+        })?;
+    if selected.removable || selected.read_only {
+        return None;
+    }
+    let mut summaries = volumes.iter().filter(|volume| volume.id == selected.id);
+    let summary = summaries.next()?;
+    if summaries.next().is_some()
+        || summary.removable
+        || summary.kind.eq_ignore_ascii_case("removable")
+    {
+        return None;
+    }
+    let (total, available) = capacity(selected, state)?;
+    can_afford_default(total, available).then(|| selected.id.clone())
+}
+
+fn can_afford_default(total: u64, available: u64) -> bool {
+    if total == 0 || available > total {
+        return false;
+    }
+    let reserve = MIN_DEFAULT_FREE_BYTES.max(total.div_ceil(10));
+    DEFAULT_CONTRIBUTION_BYTES
+        .checked_add(reserve)
+        .is_some_and(|required| available >= required)
+}
+
+fn local_filesystem(filesystem: &str) -> bool {
+    // Automatic enrollment is conservative. Unknown disk *kind* is fine (VMs
+    // commonly report it), but an unknown filesystem needs manual enrollment.
+    // Exact names exclude WebDAV, SMB/NFS, FUSE/WinFsp, RAM and adapter mounts.
+    matches!(
+        filesystem.to_ascii_lowercase().as_str(),
+        "apfs"
+            | "hfs"
+            | "hfs+"
+            | "hfsplus"
+            | "ext2"
+            | "ext3"
+            | "ext4"
+            | "btrfs"
+            | "xfs"
+            | "zfs"
+            | "ufs"
+            | "ufs2"
+            | "f2fs"
+            | "jfs"
+            | "reiserfs"
+            | "nilfs2"
+            | "bcachefs"
+            | "ntfs"
+            | "refs"
+            | "fat"
+            | "fat12"
+            | "fat16"
+            | "fat32"
+            | "vfat"
+            | "msdos"
+            | "exfat"
+    )
+}
+
+fn mount_specificity(state: &Path, mount: &Path) -> Option<usize> {
+    #[cfg(windows)]
+    {
+        windows_mount_specificity(&state.to_string_lossy(), &mount.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        state.starts_with(mount).then(|| mount.components().count())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_mount_specificity(state: &str, mount: &str) -> Option<usize> {
+    fn normalize(path: &str) -> String {
+        let path = path.replace('/', "\\");
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(&path)
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    let state = normalize(state);
+    let mount = normalize(mount);
+    if mount.is_empty() {
+        return None;
+    }
+    (state == mount
+        || state
+            .strip_prefix(&mount)
+            .is_some_and(|tail| tail.starts_with('\\')))
+    .then(|| mount.split('\\').filter(|part| !part.is_empty()).count())
+}
 
 struct FailedRoot {
     allocation: StorageAllocation,
@@ -133,9 +305,20 @@ fn same_filesystem(left: &Path, right: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn same_filesystem(left: &Path, right: &Path) -> bool {
-    // Preserve the existing fallback on platforms without Unix device IDs.
+    // Preserve the mount-prefix fallback on platforms without Unix device IDs.
+    // Windows final paths may differ in drive-letter case or verbatim prefix.
     match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => right.starts_with(left),
+        (Ok(left), Ok(right)) => {
+            #[cfg(windows)]
+            {
+                windows_mount_specificity(&right.to_string_lossy(), &left.to_string_lossy())
+                    .is_some()
+            }
+            #[cfg(not(windows))]
+            {
+                right.starts_with(left)
+            }
+        }
         _ => false,
     }
 }
@@ -145,6 +328,212 @@ mod tests {
     use super::*;
     use crate::storage_plan::PlanStamp;
 
+    fn default_candidate(id: &str, mount: &str, filesystem: &str) -> DefaultVolume {
+        DefaultVolume {
+            id: id.into(),
+            mount: mount.into(),
+            filesystem: filesystem.into(),
+            removable: false,
+            read_only: false,
+        }
+    }
+
+    fn storage_summary(id: &str) -> StorageSummary {
+        StorageSummary {
+            id: id.into(),
+            name: "Local disk".into(),
+            total_bytes: 100 << 30,
+            available_bytes: 100 << 30,
+            removable: false,
+            // VM disks need not identify themselves as HDD or SSD.
+            kind: "unknown".into(),
+        }
+    }
+
+    #[test]
+    fn default_contribution_leaves_both_absolute_and_relative_headroom() {
+        let gib = 1 << 30;
+        assert_eq!(DEFAULT_CONTRIBUTION_BYTES, gib);
+        assert!(can_afford_default(20 * gib, 6 * gib));
+        assert!(!can_afford_default(20 * gib, 6 * gib - 1));
+        assert!(can_afford_default(100 * gib, 11 * gib));
+        assert!(!can_afford_default(100 * gib, 11 * gib - 1));
+        // Round reserve upward so fractions of a byte never erode ten percent.
+        assert!(!can_afford_default(100 * gib + 1, 11 * gib));
+        assert!(can_afford_default(100 * gib + 1, 11 * gib + 1));
+        assert!(!can_afford_default(0, 0));
+        assert!(!can_afford_default(5 * gib, 5 * gib));
+        assert!(!can_afford_default(20 * gib, 21 * gib));
+        assert!(!can_afford_default(u64::MAX, 0));
+    }
+
+    #[test]
+    fn selector_uses_fresh_capacity_once_instead_of_the_advertised_free_space() {
+        let candidates = [
+            default_candidate("local", "disk", "ext4"),
+            default_candidate("network", "network", "nfs4"),
+        ];
+        let summaries = [storage_summary("local"), storage_summary("network")];
+        let mut queried = Vec::new();
+        let selected = choose_default_volume_with(
+            &summaries,
+            Path::new("disk/state"),
+            &candidates,
+            |mount, _| mount == Path::new("disk"),
+            |disk, state| {
+                queried.push(disk.id.clone());
+                assert_eq!(state, Path::new("disk/state"));
+                Some((100 << 30, 2 << 30))
+            },
+        );
+        assert_eq!(
+            selected, None,
+            "stale advertised capacity must not enroll a full disk"
+        );
+        assert_eq!(queried, ["local"]);
+        let mut stale_full = storage_summary("local");
+        stale_full.available_bytes = 0;
+        assert_eq!(
+            choose_default_volume_with(
+                &[stale_full],
+                Path::new("disk/state"),
+                &candidates,
+                |mount, _| mount == Path::new("disk"),
+                |_, _| Some((100 << 30, 11 << 30)),
+            ),
+            Some("local".into()),
+            "fresh free space and an unknown disk kind are eligible"
+        );
+    }
+
+    #[test]
+    fn selector_does_not_fall_back_from_an_ineligible_nested_volume() {
+        let mut nested = default_candidate("nested", "disk/mounted", "ext4");
+        nested.removable = true;
+        let candidates = [default_candidate("parent", "disk", "ext4"), nested];
+        let summaries = [storage_summary("parent"), storage_summary("nested")];
+        assert_eq!(
+            choose_default_volume_with(
+                &summaries,
+                Path::new("disk/mounted/state"),
+                &candidates,
+                |_, _| true,
+                |_, _| panic!("must not query capacity on an ineligible volume"),
+            ),
+            None
+        );
+        let mut read_only = candidates;
+        read_only[1].removable = false;
+        read_only[1].read_only = true;
+        assert_eq!(
+            choose_default_volume_with(
+                &summaries,
+                Path::new("disk/mounted/state"),
+                &read_only,
+                |_, _| true,
+                |_, _| panic!("must not query capacity on a read-only volume"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn network_and_adapter_backing_mounts_are_rejected_before_probing() {
+        for filesystem in [
+            "nfs4",
+            "cifs",
+            "webdav",
+            "fuse.davfs",
+            "WinFsp",
+            "tmpfs",
+            "",
+        ] {
+            let candidates = [
+                default_candidate("parent", "disk", "ext4"),
+                default_candidate("remote", "disk/mounted", filesystem),
+            ];
+            assert_eq!(
+                choose_default_volume_with(
+                    &[storage_summary("parent"), storage_summary("remote")],
+                    Path::new("disk/mounted/state"),
+                    &candidates,
+                    |_, _| panic!("must not stat network-backed state for {filesystem}"),
+                    |_, _| panic!("must not query network capacity for {filesystem}"),
+                ),
+                None
+            );
+        }
+        for filesystem in [
+            "APFS", "hfs+", "NTFS", "ReFS", "FAT32", "exFAT", "btrfs", "xfs",
+        ] {
+            assert!(local_filesystem(filesystem));
+        }
+    }
+
+    #[test]
+    fn selector_handles_firmlinked_state_without_a_mount_path_prefix() {
+        let candidates = [
+            default_candidate("system", "/", "apfs"),
+            default_candidate("data", "/System/Volumes/Data", "apfs"),
+        ];
+        assert_eq!(
+            choose_default_volume_with(
+                &[storage_summary("system"), storage_summary("data")],
+                Path::new("/Users/person/.myownmesh"),
+                &candidates,
+                |mount, _| mount == Path::new("/System/Volumes/Data"),
+                |disk, _| {
+                    assert_eq!(disk.id, "data");
+                    Some((100 << 30, 11 << 30))
+                },
+            ),
+            Some("data".into())
+        );
+    }
+
+    #[test]
+    fn missing_duplicate_or_removable_summary_cannot_enroll_a_volume() {
+        let candidates = [default_candidate("local", "disk", "ext4")];
+        let mut removable = storage_summary("local");
+        removable.removable = true;
+        for summaries in [
+            vec![],
+            vec![storage_summary("other")],
+            vec![storage_summary("local"), storage_summary("local")],
+            vec![removable],
+        ] {
+            assert_eq!(
+                choose_default_volume_with(
+                    &summaries,
+                    Path::new("disk/state"),
+                    &candidates,
+                    |_, _| true,
+                    |_, _| panic!("unadvertised or ineligible volume must not be probed"),
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn windows_mount_matching_ignores_case_and_honors_component_boundaries() {
+        let state = r"\\?\C:\Users\Person\Mounted\state";
+        assert_eq!(windows_mount_specificity(state, r"c:\"), Some(1));
+        assert_eq!(
+            windows_mount_specificity(state, r"c:\users\person\mounted\"),
+            Some(4)
+        );
+        assert_eq!(
+            windows_mount_specificity(state, r"C:\Users\Person\Mount"),
+            None
+        );
+        assert_eq!(windows_mount_specificity(state, r"D:\"), None);
+        assert_eq!(
+            windows_mount_specificity(r"C:/Users/state", r"c:\users"),
+            Some(2)
+        );
+    }
+
     fn allocation() -> StorageAllocation {
         StorageAllocation {
             id: "local-volume".into(),
@@ -152,6 +541,7 @@ mod tests {
             volume: "disk:test".into(),
             quota_bytes: 1024,
             enabled: true,
+            automatic: false,
             stamp: PlanStamp::default(),
         }
     }

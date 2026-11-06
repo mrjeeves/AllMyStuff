@@ -184,7 +184,11 @@ pub mod win_capture;
 pub mod win_privilege;
 // Wayland screen capture via the ScreenCast portal — Linux only.
 #[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) mod mutter_remote;
+#[cfg(all(target_os = "linux", feature = "host"))]
 pub mod wayland_capture;
+#[cfg(all(feature = "host", any(target_os = "linux", test)))]
+pub(crate) mod wayland_input;
 
 /// Where the node surfaces events. Every variant the engine emits
 /// (`allmystuff://session`, `…/video-ready`, `…/term-exit`, …) is a

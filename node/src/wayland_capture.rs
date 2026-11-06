@@ -86,11 +86,15 @@ pub struct RawFrame {
 pub struct WaylandSession {
     conn: Connection,
     session: OwnedObjectPath,
+    pipewire: Option<PipewireCapture>,
+}
+
+pub(crate) struct PipewireCapture {
     quit: Option<channel::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl Drop for WaylandSession {
+impl Drop for PipewireCapture {
     fn drop(&mut self) {
         if let Some(quit) = self.quit.take() {
             let _ = quit.send(());
@@ -98,8 +102,12 @@ impl Drop for WaylandSession {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        // Close the portal session now the stream is done with its node —
-        // not a moment before.
+    }
+}
+
+impl Drop for WaylandSession {
+    fn drop(&mut self) {
+        drop(self.pipewire.take());
         close_session(&self.conn, &self.session);
     }
 }
@@ -172,16 +180,9 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
         }
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<RawFrame>();
-    let (quit_tx, quit_rx) = channel::channel::<()>();
-    let thread = std::thread::Builder::new()
-        .name("wayland-screencast".into())
-        .spawn(move || {
-            if let Err(e) = pipewire_consume(node_id, pw_fd, tx, quit_rx) {
-                tracing::warn!("wayland screencast pipewire loop ended: {e}");
-            }
-        })
-        .map_err(|e| e.to_string())?;
+    let (pipewire, rx) = start_pipewire(node_id, Some(pw_fd)).inspect_err(|_| {
+        close_session(&conn, &session);
+    })?;
 
     Ok((
         WaylandSession {
@@ -189,6 +190,34 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
             // this call and stay up for the capture.
             conn,
             session,
+            pipewire: Some(pipewire),
+        },
+        rx,
+    ))
+}
+
+/// Mutter's native node belongs to the user's PipeWire graph. Portal nodes
+/// instead use OpenPipeWireRemote and must keep connecting to that exact fd.
+pub(crate) fn open_native(node_id: u32) -> Result<(PipewireCapture, Receiver<RawFrame>), String> {
+    start_pipewire(node_id, None)
+}
+
+fn start_pipewire(
+    node_id: u32,
+    remote: Option<std::os::fd::OwnedFd>,
+) -> Result<(PipewireCapture, Receiver<RawFrame>), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (quit_tx, quit_rx) = channel::channel();
+    let thread = std::thread::Builder::new()
+        .name("wayland-screencast".into())
+        .spawn(move || {
+            if let Err(error) = pipewire_consume(node_id, remote, tx, quit_rx) {
+                tracing::warn!("Wayland PipeWire capture ended: {error}");
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok((
+        PipewireCapture {
             quit: Some(quit_tx),
             thread: Some(thread),
         },
@@ -541,7 +570,7 @@ fn shm_buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String>
 /// stride-aware copy — compositors pad rows on some resolutions.
 fn pipewire_consume(
     node_id: u32,
-    pw_fd: std::os::fd::OwnedFd,
+    pw_fd: Option<std::os::fd::OwnedFd>,
     tx: Sender<RawFrame>,
     quit: channel::Receiver<()>,
 ) -> Result<(), String> {
@@ -551,9 +580,23 @@ fn pipewire_consume(
     let context = ContextRc::new(&main_loop, None).map_err(|e| e.to_string())?;
     // Connect to the portal's PipeWire remote (the fd from OpenPipeWireRemote),
     // not the default daemon — that's the only graph the screencast node is on.
-    let core = context
-        .connect_fd_rc(pw_fd, None)
-        .map_err(|e| e.to_string())?;
+    let core = match pw_fd {
+        Some(fd) => context.connect_fd_rc(fd, None),
+        None => context.connect_rc(None),
+    }
+    .map_err(|e| e.to_string())?;
+
+    // Cancellation must already be attached while waiting for the producer's
+    // registry entry, otherwise stopping a capture can hang in thread::join.
+    let cancelled = Rc::new(Cell::new(false));
+    let _attached = quit.attach(main_loop.loop_(), {
+        let main_loop = main_loop.clone();
+        let cancelled = cancelled.clone();
+        move |_| {
+            cancelled.set(true);
+            main_loop.quit();
+        }
+    });
 
     // The portal's node propagates onto this fresh connection asynchronously,
     // at a variable time. Binding the stream before it lands races it and
@@ -586,6 +629,9 @@ fn pipewire_consume(
             })
             .register();
         for _ in 0..40 {
+            if cancelled.get() {
+                return Ok(());
+            }
             if found.get() {
                 break;
             }
@@ -606,6 +652,10 @@ fn pipewire_consume(
             *MEDIA_TYPE => "Video",
             *MEDIA_CATEGORY => "Capture",
             *MEDIA_ROLE => "Screen",
+            // Native GNOME capture uses the user's whole PipeWire graph.
+            // A missing selected monitor must never become a default camera
+            // or another video source chosen by the session manager.
+            "node.dont-fallback" => "true",
         },
     )
     .map_err(|e| e.to_string())?;
@@ -876,16 +926,14 @@ fn pipewire_consume(
         .connect(
             Direction::Input,
             Some(node_id),
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT,
             &mut params,
         )
         .map_err(|e| e.to_string())?;
 
-    let _attached = quit.attach(main_loop.loop_(), {
-        let main_loop = main_loop.clone();
-        move |_| main_loop.quit()
-    });
-
+    if cancelled.get() {
+        return Ok(());
+    }
     main_loop.run();
     // A loop quit by the error listener (vs. the route's own quit
     // signal) ends the consumer with the compositor's reason; the

@@ -5326,7 +5326,21 @@ impl Mesh {
                         if route_ok
                             && (room_ok || self.sender_may_drive_admitted(&from, DrivePlane::Input))
                         {
-                            self.injector.apply(&ev.route, ev.action);
+                            let weak = Arc::downgrade(self);
+                            let peer = from.clone();
+                            let route = ev.route.clone();
+                            self.injector.apply(
+                                &ev.route,
+                                pubkey_part(&from),
+                                ev.action,
+                                Arc::new(move |reason, generation| {
+                                    if let Some(mesh) = weak.upgrade() {
+                                        mesh.reject_input_backend(
+                                            &peer, &route, reason, generation,
+                                        );
+                                    }
+                                }),
+                            );
                         } else {
                             // Refusing silently is how "controls just stopped
                             // working" went undiagnosable — say which gate
@@ -13232,7 +13246,15 @@ impl Mesh {
                         short_id(&to_node),
                         mode_label(mode),
                     );
-                    self.start_video_stream(route, &to_node, mode, VideoSource::Screen(monitor));
+                    self.start_video_stream(
+                        route,
+                        &to_node,
+                        mode,
+                        VideoSource::Screen {
+                            monitor,
+                            peer: pubkey_part(&to_node).to_string(),
+                        },
+                    );
                     // Tell the viewer the pinned lane (best-effort, off the
                     // sync start path; the pin is already assigned above).
                     let (mesh, rid, peer) = (self.clone(), route.id.clone(), to_node.clone());
@@ -13276,11 +13298,27 @@ impl Mesh {
                 }
             }
             MediaKind::Input => {
-                // The sink injects lazily per inbound event (behind the
-                // ownership gate); the source is driven by the console
-                // window via `send_input`. Nothing to start eagerly — but
-                // say the link is live, so "awaiting accept" is never the
-                // last word on a working control route.
+                // Allocate the route's input lifetime only at activation.
+                // An event racing teardown cannot recreate a retired lease.
+                if to_node == me {
+                    let state = self.state.lock();
+                    let active = state
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.route(&route.id))
+                        .is_some_and(|live| {
+                            live.state == RouteState::Active && live.route == *route
+                        });
+                    if !active {
+                        return;
+                    }
+                    // Hold the session lock through allocation so teardown
+                    // cannot retire the route immediately before begin_route.
+                    self.injector.begin_route(&route.id);
+                }
+                // The sink's OS backend starts lazily per inbound event
+                // behind the ownership gate; the source is driven by the
+                // console window via `send_input`.
                 if from_node == me {
                     tracing::info!(
                         "route {} active — keyboard/mouse control to {}",
@@ -17702,6 +17740,61 @@ impl Mesh {
         self.emit_snapshot();
     }
 
+    /// The OS refused input after the route's authorization checks passed.
+    /// Reject only that live input route, leaving its paired video stream up
+    /// so the viewer can still see the desktop and the actual failure reason.
+    fn reject_input_backend(
+        self: &Arc<Self>,
+        peer: &str,
+        route_id: &str,
+        reason: String,
+        generation: u64,
+    ) {
+        let mesh = self.clone();
+        let peer = peer.to_string();
+        let route_id = route_id.to_string();
+        crate::spawn(async move {
+            let message = ControlMessage::Route(RouteControl::Reject {
+                route_id: route_id.clone(),
+                reason: format!("keyboard & mouse unavailable: {reason}"),
+            });
+            let effects = {
+                let mut state = mesh.state.lock();
+                let Some(session) = state.session.as_mut() else {
+                    return;
+                };
+                // A delayed worker error must not reject a route that has
+                // already ended, or a route belonging to another peer/plane.
+                let Some(route) = session.route(&route_id) else {
+                    return;
+                };
+                if route.state != RouteState::Active
+                    || route.route.media != MediaKind::Input
+                    || pubkey_part(route.peer.as_str()) != pubkey_part(&peer)
+                    || !mesh.injector.is_current(&route_id, generation)
+                {
+                    return;
+                }
+                let route_peer = route.peer.clone();
+                session.handle(route_peer, message.clone())
+            };
+            tracing::warn!("input backend failed for {route_id}: {reason}");
+            let network = mesh.network_for_route(&route_id, &peer);
+            // StopMedia releases any keys this route held and retires the
+            // local input route before notifying the remote console.
+            mesh.process_effects(effects).await;
+            mesh.emit_snapshot();
+            if let Some(network) = network {
+                let _ = mesh
+                    .send_control_on_network(&peer, &network, &message)
+                    .await;
+            } else {
+                let _ = mesh.send_control(&peer, &message).await;
+            }
+            mesh.release_route_network_if_terminal(&route_id);
+        });
+    }
+
     /// An inbound input/clipboard frame failed a gate. Historically this was
     /// one rate-unlimited, cause-blind warn — which is exactly how "the mouse
     /// stopped working" became undiagnosable: the viewer's console looked
@@ -17721,7 +17814,29 @@ impl Mesh {
         if !self.diag_ok(&format!("refuse:{plane}:{route_id}")) {
             return;
         }
-        let reason = if route_ok {
+        // Input already in flight may arrive after an OS backend failure
+        // rejected its route. Preserve that diagnosis instead of replacing
+        // it with the generic missing-route message on the remote console.
+        let prior_input_refusal = if !route_ok && plane == "input" {
+            self.state
+                .lock()
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .filter(|route| {
+                    route.route.media == MediaKind::Input
+                        && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                })
+                .and_then(|route| match &route.state {
+                    RouteState::Rejected { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        let reason = if let Some(reason) = prior_input_refusal {
+            reason
+        } else if route_ok {
             if self.cec.knows_technician(from) {
                 // A CEC technician's authority is the customer's consent grant,
                 // not the fleet roster — when their frames die here it's the

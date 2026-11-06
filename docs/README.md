@@ -11,6 +11,7 @@ with the job in front of you.
 | Add computers, connect, share, or use a KVM | [Using AllMyStuff](USING-ALLMYSTUFF.md) |
 | Understand native drive mapping or KVM install media | [Native drive mapping](DRIVE-MAPPING.md) |
 | Run a machine without the desktop app | [Headless machines](USING-ALLMYSTUFF.md#headless-machines) |
+| Understand Linux screen control and unattended-access limits | [Linux remote desktop access](linux-remote-desktop.md) |
 
 ## Work on AllMyStuff
 

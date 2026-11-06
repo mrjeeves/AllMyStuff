@@ -25,7 +25,7 @@ pub enum VideoMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoSource {
     /// A monitor: `None` = the primary, `Some(id)` = an extra screen.
-    Screen(Option<u32>),
+    Screen { monitor: Option<u32>, peer: String },
     /// A camera, by inventory device id.
     Camera(String),
 }

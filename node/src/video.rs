@@ -90,7 +90,7 @@ pub enum VideoSource {
     /// A monitor: `None` = the primary (the synthetic `screen`
     /// capability), `Some(id)` = the monitor with that enumeration id
     /// (a `screen:<id>` capability — see [`extra_screens`]).
-    Screen(Option<u32>),
+    Screen { monitor: Option<u32>, peer: String },
     /// A camera, by the inventory device id its capability embeds
     /// (`cam:video0`) — resolved back to the OS device by
     /// [`crate::camera_capture`].
@@ -1146,7 +1146,7 @@ impl VideoBridge {
             let _timer = crate::os_perf::TimerResolutionGuard::hold();
             crate::os_perf::boost_media_thread();
             let what = match &src {
-                VideoSource::Screen(_) => "screen",
+                VideoSource::Screen { .. } => "screen",
                 VideoSource::Camera(_) => "camera",
             };
             if let Err(e) = run_capture(
@@ -1658,7 +1658,7 @@ fn run_capture(
         return result;
     }
     let monitor_id = match source {
-        VideoSource::Screen(id) => *id,
+        VideoSource::Screen { monitor, .. } => *monitor,
         VideoSource::Camera(_) => unreachable!("camera handled above"),
     };
 
@@ -1667,6 +1667,37 @@ fn run_capture(
     // back on — neither capture path can grab from a sleeping panel.
     let _awake = wake::DisplayAwake::hold("hosting a screen stream");
     wake::force_display_on();
+    // GNOME's native session pairs its actual captured monitor with input.
+    // It must run before xcap/XRandR discovery: a Wayland desktop need not
+    // expose usable XWayland monitor handles at all.
+    #[cfg(target_os = "linux")]
+    if wayland_session() {
+        match crate::mutter_remote::available() {
+            Ok(true) => {
+                let VideoSource::Screen { peer, .. } = source else {
+                    unreachable!()
+                };
+                return run_mutter_capture(
+                    stop,
+                    refresh,
+                    idr_ms,
+                    auto,
+                    route_id,
+                    mode,
+                    monitor_id,
+                    peer,
+                    tune,
+                    on_packet,
+                    &mut reporter,
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                reporter.report(VideoStatusState::GrabFailed, Some(error.clone()));
+                return Err(error);
+            }
+        }
+    }
     // The monitor up front: its resolution budgets the encoder's bitrate.
     // One retry after a beat: the wake may still be re-attaching outputs
     // (a deep-sleeping DisplayPort monitor detaches from the desktop
@@ -2031,10 +2062,66 @@ fn run_capture(
 /// Mirrors xcap's (private) `wayland_detect`, so our path choice matches
 /// the one xcap will take internally.
 #[cfg(target_os = "linux")]
-fn wayland_session() -> bool {
+pub(crate) fn wayland_session() -> bool {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
     session.eq_ignore_ascii_case("wayland") || display.to_lowercase().contains("wayland")
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_mutter_capture(
+    stop: &AtomicBool,
+    refresh: &Arc<AtomicBool>,
+    idr_ms: &Arc<AtomicU64>,
+    auto: &Arc<AutoAdapt>,
+    route_id: &str,
+    mode: VideoMode,
+    monitor_id: Option<u32>,
+    peer: &str,
+    tune: Tune,
+    on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
+    reporter: &mut StatusReporter,
+) -> Result<(), String> {
+    let result = (|| {
+        let native = crate::mutter_remote::open(monitor_id)?;
+        let (pipewire, frames) = crate::wayland_capture::open_native(native.node_id())?;
+        // Registered only for this capture's authenticated viewer. The guard
+        // is dropped before native so held keys/buttons can be released while
+        // its compositor session still exists.
+        let control = native.control();
+        let registration = crate::wayland_input::register(peer, monitor_id, control.clone());
+        let mut encoder = HealingEncoder::new(route_id, mode, (0, 0), tune, refresh, idr_ms, auto)?;
+        let mut stats = StreamStats::new(route_id, encoder.mode());
+        tracing::info!("GNOME Wayland capture and input started for {route_id}");
+        let result = pump_frames_with_source_state(
+            stop,
+            tune.fps(),
+            &frames,
+            |frame: crate::wayland_capture::RawFrame| {
+                native.set_size(frame.width, frame.height);
+                (frame.rgba, frame.width, frame.height)
+            },
+            on_packet,
+            &mut encoder,
+            &mut stats,
+            reporter,
+            VideoStatusState::GrabFailed,
+            Some(WAYLAND_FIRST_FRAME_DEADLINE),
+            None,
+            Some(&|| control.is_active()),
+        );
+        drop(registration);
+        drop(pipewire);
+        drop(native);
+        result
+    })();
+    if let Err(error) = &result {
+        if !stop.load(Ordering::SeqCst) {
+            reporter.report(VideoStatusState::GrabFailed, Some(error.clone()));
+        }
+    }
+    result
 }
 
 /// How long a just-started session may produce nothing before the
@@ -2138,6 +2225,40 @@ fn pump_frames_with_stall<T, X>(
     stall_state: VideoStatusState,
     first_frame_deadline: Option<Duration>,
     reclaim: Option<&dyn Fn(Vec<u8>)>,
+) -> Result<(), String>
+where
+    X: Fn(T) -> (Vec<u8>, u32, u32),
+{
+    pump_frames_with_source_state(
+        stop,
+        fps,
+        frames,
+        raw,
+        on_packet,
+        encoder,
+        stats,
+        reporter,
+        stall_state,
+        first_frame_deadline,
+        reclaim,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pump_frames_with_source_state<T, X>(
+    stop: &AtomicBool,
+    fps: u32,
+    frames: &mpsc::Receiver<T>,
+    raw: X,
+    on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
+    encoder: &mut HealingEncoder,
+    stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
+    stall_state: VideoStatusState,
+    first_frame_deadline: Option<Duration>,
+    reclaim: Option<&dyn Fn(Vec<u8>)>,
+    source_active: Option<&dyn Fn() -> bool>,
 ) -> Result<(), String>
 where
     X: Fn(T) -> (Vec<u8>, u32, u32),
@@ -2280,6 +2401,9 @@ where
         let captured: Result<(), String> = loop {
             if stop.load(Ordering::SeqCst) || encode_done.load(Ordering::SeqCst) {
                 break Ok(());
+            }
+            if source_active.is_some_and(|active| !active()) {
+                break Err("GNOME closed the shared desktop session (locked, logged out, or output removed)".into());
             }
             // A bounded wait keeps the stop flag responsive on idle screens.
             let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
@@ -3574,6 +3698,23 @@ fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
 /// enumeration ids: stable for this app run, and resolved back to the
 /// same monitor by [`select_monitor`] when a route starts.
 pub fn extra_screens() -> Vec<allmystuff_bridge::ScreenSource> {
+    #[cfg(target_os = "linux")]
+    if wayland_session() && crate::mutter_remote::available().unwrap_or(false) {
+        return match crate::mutter_remote::monitors() {
+            Ok(monitors) => monitors
+                .into_iter()
+                .filter(|monitor| !monitor.primary)
+                .map(|monitor| allmystuff_bridge::ScreenSource {
+                    id: monitor.id,
+                    label: monitor.label,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!("GNOME monitor discovery failed: {error}");
+                Vec::new()
+            }
+        };
+    }
     let Ok(monitors) = xcap::Monitor::all() else {
         return Vec::new();
     };
@@ -6725,7 +6866,10 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 thread: None,
                 mode: VideoMode::Mjpeg,
-                source: VideoSource::Screen(None),
+                source: VideoSource::Screen {
+                    monitor: None,
+                    peer: String::new(),
+                },
                 on_packet: Arc::new(|_| true),
                 on_status: Arc::new(|_, _| {}),
                 refresh: Arc::new(AtomicBool::new(false)),
@@ -6767,7 +6911,10 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 mode: VideoMode::Mjpeg,
-                source: VideoSource::Screen(None),
+                source: VideoSource::Screen {
+                    monitor: None,
+                    peer: String::new(),
+                },
                 on_packet: Arc::new(|_| true),
                 on_status: Arc::new(|_, _| {}),
                 refresh: Arc::new(AtomicBool::new(false)),

@@ -87,6 +87,7 @@ type ClipboardReceiptWaiters =
 /// sender is present in the daemon's local-claim peer list.
 const CHANNEL_LOCAL_CLAIM_PRESENCE: &str = "allmystuff/local-claim-presence/v1";
 const FEATURE_FLEETFILES_LEDGER: &str = "fleetfiles-ledger-v1";
+const FEATURE_FLEET_STORAGE_DEFAULTS: &str = "fleet-storage-defaults-v1";
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -3885,6 +3886,7 @@ impl Mesh {
                     mesh.advertise_capabilities().await;
                     mesh.emit_snapshot();
                 }
+                mesh.ensure_default_storage_allocation().await;
             }
         });
     }
@@ -4034,6 +4036,7 @@ impl Mesh {
                     allmystuff_protocol::FEATURE_ROOMS.to_string(),
                     allmystuff_protocol::FEATURE_SITES.to_string(),
                     FEATURE_FLEETFILES_LEDGER.to_string(),
+                    FEATURE_FLEET_STORAGE_DEFAULTS.to_string(),
                 ];
                 // The runtime kill switch withdraws the negotiated contract
                 // as well as disabling local sends. Advertising while sending
@@ -5455,15 +5458,12 @@ impl Mesh {
                         }
                     }
                     StoragePlanMessage::Digest { digest } => {
-                        if digest != self.storage_plan.digest() {
-                            let sender_may_manage =
-                                self.fleet_peer_may_manage(&network, &from).await;
-                            if self.local_may_manage_storage().await || !sender_may_manage {
-                                self.sync_storage_plan_to(&from, &network).await;
-                            } else {
-                                self.request_storage_plan_from(&from, &network).await;
-                            }
-                        }
+                        self.reconcile_storage_digest(&from, &network, &digest, false)
+                            .await;
+                    }
+                    StoragePlanMessage::EffectiveDigest { digest } => {
+                        self.reconcile_storage_digest(&from, &network, &digest, true)
+                            .await;
                     }
                     StoragePlanMessage::SyncRequest => {
                         self.sync_storage_plan_to(&from, &network).await;
@@ -11716,6 +11716,7 @@ impl Mesh {
         // see it connected-but-mesh-only — "online, not on AllMyStuff" — until
         // some unrelated network change happens to trigger a sync.
         self.sync_networks().await;
+        self.ensure_default_storage_allocation().await;
 
         // "Owner" for admit purposes is the **signed** role, not just the
         // structural key-holder: a device the founder granted the owner role is
@@ -15839,6 +15840,73 @@ impl Mesh {
             mount,
             allmystuff_protocol::myownmesh_state_dir().as_deref(),
         )
+    }
+
+    /// Seed one small local contribution without opening Settings. Explicit
+    /// allocations (including disabled ones) always take precedence, even when
+    /// they arrive from an offline peer after this device has started.
+    async fn ensure_default_storage_allocation(self: &Arc<Self>) {
+        if self.ownership.fleet_network_id().is_none() {
+            return;
+        }
+        let Some(local) = self
+            .local_node_id()
+            .filter(|id| !NodeId::from(id.as_str()).is_this())
+        else {
+            return;
+        };
+        let actor = pubkey_part(&local).to_string();
+        if self
+            .storage_plan
+            .snapshot()
+            .allocations
+            .iter()
+            .any(|a| same_node(&a.device, &actor))
+        {
+            return;
+        }
+        let Some(state_dir) = allmystuff_protocol::myownmesh_state_dir() else {
+            return;
+        };
+        let volumes = self
+            .state
+            .lock()
+            .profile
+            .as_ref()
+            .map(|profile| profile.summary.storage.clone())
+            .unwrap_or_default();
+        let mesh = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let Some(volume) =
+                crate::fleetfiles_storage::choose_default_volume(&volumes, &state_dir)
+            else {
+                return Ok(None);
+            };
+            // Prove the root is writable before advertising any capacity.
+            mesh.materialize_local_storage_root(&volume)?;
+            mesh.storage_plan.ensure_default_allocation(
+                &actor,
+                volume,
+                crate::fleetfiles_storage::DEFAULT_CONTRIBUTION_BYTES,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(allocation))) => {
+                self.reconcile_local_storage_allocations();
+                self.broadcast_storage_patch(None, vec![allocation], Vec::new())
+                    .await;
+                self.sink.emit(
+                    "allmystuff://fleet-storage",
+                    json!({ "plan": self.storage_plan.snapshot() }),
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("could not set up default Fleetfiles storage: {error}")
+            }
+            Err(error) => tracing::warn!("default Fleetfiles storage worker stopped: {error}"),
+        }
     }
 
     fn reconcile_local_storage_allocations(&self) {
@@ -20078,6 +20146,25 @@ impl Mesh {
         let Some(network) = self.ownership.fleet_network_id() else {
             return;
         };
+        // Old releases discard unknown fields and could relay an automatic
+        // allocation as an explicit choice. Send defaults only to peers that
+        // preserve their origin; ordinary user edits keep the legacy fan-out.
+        let default_peers = allocations
+            .iter()
+            .any(|allocation| allocation.automatic)
+            .then(|| {
+                self.state
+                    .lock()
+                    .session
+                    .as_ref()
+                    .map(|session| {
+                        session
+                            .peers()
+                            .map(|profile| profile.node.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
         let chunk_count = allocations
             .len()
             .max(device_intents.len())
@@ -20097,17 +20184,39 @@ impl Mesh {
             let Ok(payload) = serde_json::to_value(message) else {
                 continue;
             };
-            let response = self
-                .client
-                .request(&Request::ChannelSendAll {
-                    network: network.clone(),
-                    channel: CHANNEL_FLEET_STORAGE.into(),
-                    payload,
-                })
-                .await;
-            if !matches!(response, Ok(response) if response.ok) {
-                tracing::debug!("fleet storage patch will converge on reconnect");
-                break;
+            if let Some(peers) = &default_peers {
+                for peer in peers {
+                    if !self.sender_may_control(peer)
+                        || !self.peer_supports_feature(peer, FEATURE_FLEET_STORAGE_DEFAULTS)
+                    {
+                        continue;
+                    }
+                    let response = self
+                        .client
+                        .request(&Request::ChannelSendTo {
+                            network: network.clone(),
+                            channel: CHANNEL_FLEET_STORAGE.into(),
+                            peer: pubkey_part(peer).to_string(),
+                            payload: payload.clone(),
+                        })
+                        .await;
+                    if !matches!(response, Ok(response) if response.ok) {
+                        tracing::debug!("default fleet storage patch will converge on reconnect");
+                    }
+                }
+            } else {
+                let response = self
+                    .client
+                    .request(&Request::ChannelSendAll {
+                        network: network.clone(),
+                        channel: CHANNEL_FLEET_STORAGE.into(),
+                        payload,
+                    })
+                    .await;
+                if !matches!(response, Ok(response) if response.ok) {
+                    tracing::debug!("fleet storage patch will converge on reconnect");
+                    break;
+                }
             }
         }
     }
@@ -20133,6 +20242,13 @@ impl Mesh {
                 .filter(|allocation| allocation.device == local && allocation.stamp.actor == local)
                 .collect()
         };
+        let allocations = allocations
+            .into_iter()
+            .filter(|allocation| {
+                !allocation.automatic
+                    || self.peer_supports_feature(peer, FEATURE_FLEET_STORAGE_DEFAULTS)
+            })
+            .collect::<Vec<_>>();
         let device_intents = if may_manage {
             snapshot.device_intents
         } else {
@@ -20196,13 +20312,42 @@ impl Mesh {
             .await;
     }
 
+    async fn reconcile_storage_digest(
+        &self,
+        peer: &str,
+        network: &str,
+        digest: &str,
+        effective: bool,
+    ) {
+        let local_digest = if effective {
+            self.storage_plan.digest()
+        } else {
+            self.storage_plan.legacy_digest()
+        };
+        if digest != local_digest {
+            let sender_may_manage = self.fleet_peer_may_manage(network, peer).await;
+            if self.local_may_manage_storage().await || !sender_may_manage {
+                self.sync_storage_plan_to(peer, network).await;
+            } else {
+                self.request_storage_plan_from(peer, network).await;
+            }
+        }
+    }
+
     async fn probe_storage_plan_to(&self, peer: &str, network: &str) {
         if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
             return;
         }
-        let Ok(payload) = serde_json::to_value(StoragePlanMessage::Digest {
-            digest: self.storage_plan.digest(),
-        }) else {
+        let message = if self.peer_supports_feature(peer, FEATURE_FLEET_STORAGE_DEFAULTS) {
+            StoragePlanMessage::EffectiveDigest {
+                digest: self.storage_plan.digest(),
+            }
+        } else {
+            StoragePlanMessage::Digest {
+                digest: self.storage_plan.legacy_digest(),
+            }
+        };
+        let Ok(payload) = serde_json::to_value(message) else {
             return;
         };
         let _ = self

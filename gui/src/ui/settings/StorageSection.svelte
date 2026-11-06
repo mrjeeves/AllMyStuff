@@ -133,7 +133,7 @@
     error = "";
     try {
       const current = allocationFor(node, volume);
-      const quota = Math.max(1, Math.min(volume.total_bytes, quotaBytes ?? current?.quotaBytes ?? volume.available_bytes));
+      const quota = Math.max(1, Math.min(volume.total_bytes, quotaBytes ?? current?.quotaBytes ?? 1_073_741_824));
       await fleetStorageSetAllocation(node.id, volume.id, quota, enabled);
       status = await fleetStorageStatus();
     } catch (cause) {
@@ -163,7 +163,7 @@
   <div class="heading">
     <div>
       <h4>Fleetfiles storage</h4>
-      <p>Allocate capacity once. AllMyStuff places, verifies, and repairs managed data across the fleet.</p>
+      <p>Devices with enough free space contribute 1 GB automatically. Adjust or turn off contributions below.</p>
     </div>
     <button class="quiet" onclick={refresh} disabled={loading} title="Refresh device capacity">↻</button>
   </div>

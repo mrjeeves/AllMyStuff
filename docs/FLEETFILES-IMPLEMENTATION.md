@@ -73,7 +73,25 @@ The node persists these distinct responsibilities:
 | working-root outbound-v1/ | Exact queued body snapshots retained until all target queues acknowledge |
 
 The user-visible Fleetfiles root is a working materialization adapter, not the
-namespace authority and not automatically a durable storage allocation.
+namespace authority. Independently, a fleet device with no saved allocation
+choices receives a 1 GiB starter allocation on its state directory's local,
+writable, non-removable backing volume when that leaves at least 5 GiB and 10%
+of the volume free. Filesystem capacity is checked freshly on that one volume;
+this does not start an additional hardware scan or probe network adapters.
+Enrollment runs on fleet startup/adoption and is reconsidered on the existing
+inventory cadence when a constrained device later has space. The root must be
+writable before the contribution is persisted or advertised.
+
+Starter records carry an automatic origin. Any explicit allocation for the
+device, including a disabled allocation on another volume learned after startup,
+suppresses its starter. An explicit edit of the starter converts it to a manual
+allocation; a delayed automatic patch cannot resurrect it. Raw suppressed
+records remain persisted, while effective plan snapshots/digests omit them.
+The `fleet-storage-defaults-v1` presence feature gates starter records and the
+`effective_digest` probe, so older peers cannot drop the origin field and relay
+a default as a manual choice. Legacy `digest` messages retain their original
+hash representation. First manual enrollment also starts at 1 GiB; users can
+adjust individual contributions in Settings.
 
 ## Replication and reconnect recovery
 

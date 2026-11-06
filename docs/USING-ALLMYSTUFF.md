@@ -83,6 +83,11 @@ selected source does not create a durable grant.
 Camera access is separate from screen sharing. Sharing remote control does not
 silently share a camera.
 
+On Linux, keyboard and mouse control supports GNOME Wayland and X11. GNOME
+desktop access requires an existing, unlocked graphical session; Always On
+does not provide a login screen. See [Linux remote desktop access](linux-remote-desktop.md)
+for session requirements and unattended-access limits.
+
 If the computer has an attached KVM, the console can also expose its screen,
 power menu, and install-media controls when your relationship permits them.
 

@@ -7,6 +7,8 @@
 //! after the mesh's ownership gates — same call sites, no `enigo`, no
 //! thread.
 
+use std::sync::Arc;
+
 use allmystuff_session::InputAction;
 
 #[derive(Default)]
@@ -17,9 +19,23 @@ impl Injector {
         Self::default()
     }
 
-    /// Dropped — no display server, no injection API, nothing held down.
-    pub fn apply(&self, route: &str, _action: InputAction) {
-        tracing::debug!("input event for {route} dropped: capture-less build");
+    /// There is no host input lifetime to allocate in this build.
+    pub fn begin_route(&self, _route: &str) {}
+
+    /// Report the unavailable host input plane to the route's controller.
+    pub fn apply(
+        &self,
+        _route: &str,
+        _peer: &str,
+        _action: InputAction,
+        on_error: Arc<dyn Fn(String, u64) + Send + Sync>,
+    ) {
+        on_error("this build cannot host keyboard or mouse control".into(), 0);
+    }
+
+    /// A capture-less build never owns an input backend generation.
+    pub fn is_current(&self, _route: &str, _generation: u64) -> bool {
+        false
     }
 
     /// Nothing is ever pressed, so nothing needs lifting.

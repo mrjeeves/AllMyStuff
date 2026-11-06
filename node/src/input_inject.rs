@@ -44,7 +44,8 @@
 //! event and dies with the app.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -55,8 +56,35 @@ use parking_lot::Mutex;
 use allmystuff_session::InputAction;
 
 enum Cmd {
-    Event { route: String, action: InputAction },
-    ReleaseRoute(String),
+    Event {
+        route: String,
+        peer: String,
+        action: InputAction,
+        lease: Arc<RouteLease>,
+        on_error: Arc<dyn Fn(String, u64) + Send + Sync>,
+    },
+    ReleaseRoute {
+        route: String,
+        generation: u64,
+    },
+}
+
+struct RouteLease {
+    generation: u64,
+    active: AtomicBool,
+}
+
+impl RouteLease {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct WorkerSenders {
+    events: mpsc::SyncSender<Cmd>,
+    // Only one teardown per route incarnation enters this channel. It cannot
+    // be starved or dropped when the bounded event queue is full.
+    releases: mpsc::Sender<Cmd>,
 }
 
 /// AMS-06: the most input events queued for injection before excess is dropped.
@@ -72,7 +100,9 @@ const DESKTOP_CHECK_EVERY: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 pub struct Injector {
-    tx: Mutex<Option<mpsc::SyncSender<Cmd>>>,
+    tx: Mutex<Option<WorkerSenders>>,
+    leases: Mutex<HashMap<String, Arc<RouteLease>>>,
+    next_generation: AtomicU64,
 }
 
 impl Injector {
@@ -83,11 +113,29 @@ impl Injector {
     /// Queue one event for injection. Starts the injector thread on first
     /// use; if the platform refuses (no display server, missing
     /// permissions) the failure is logged once and events are dropped.
-    pub fn apply(&self, route: &str, action: InputAction) {
+    pub fn apply(
+        &self,
+        route: &str,
+        peer: &str,
+        action: InputAction,
+        on_error: Arc<dyn Fn(String, u64) + Send + Sync>,
+    ) {
+        let Some(lease) = self
+            .leases
+            .lock()
+            .get(route)
+            .filter(|lease| lease.is_active())
+            .cloned()
+        else {
+            return;
+        };
         self.send(
             Cmd::Event {
                 route: route.into(),
+                peer: peer.into(),
                 action,
+                lease,
+                on_error,
             },
             true,
         );
@@ -98,8 +146,60 @@ impl Injector {
     /// doesn't leave this machine with a stuck Ctrl. No-op for routes
     /// that never pressed anything.
     pub fn release_route(&self, route: &str) {
+        let lease = {
+            let mut leases = self.leases.lock();
+            let Some(lease) = leases.remove(route) else {
+                return;
+            };
+            lease.active.store(false, Ordering::Release);
+            lease
+        };
+        // Cancellation precedes queueing cleanup: even an event already held
+        // in the ten-second capture-start queue loses its right to inject.
         // Never spawns the thread: if it isn't running, nothing is held.
-        self.send(Cmd::ReleaseRoute(route.into()), false);
+        self.send(
+            Cmd::ReleaseRoute {
+                route: route.into(),
+                generation: lease.generation,
+            },
+            false,
+        );
+    }
+
+    pub fn is_current(&self, route: &str, generation: u64) -> bool {
+        self.leases
+            .lock()
+            .get(route)
+            .is_some_and(|lease| lease.generation == generation && lease.is_active())
+    }
+
+    /// Start exactly one admitted input incarnation. Events never create their
+    /// own lease: an event racing teardown cannot resurrect a retired route.
+    pub fn begin_route(&self, route: &str) {
+        let lease = Arc::new(RouteLease {
+            generation: self
+                .next_generation
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1),
+            active: AtomicBool::new(true),
+        });
+        let previous = {
+            let mut leases = self.leases.lock();
+            let previous = leases.insert(route.into(), lease);
+            if let Some(previous) = &previous {
+                previous.active.store(false, Ordering::Release);
+            }
+            previous
+        };
+        if let Some(previous) = previous {
+            self.send(
+                Cmd::ReleaseRoute {
+                    route: route.into(),
+                    generation: previous.generation,
+                },
+                false,
+            );
+        }
     }
 
     fn send(&self, cmd: Cmd, spawn: bool) {
@@ -111,11 +211,21 @@ impl Injector {
             // A *bounded* queue: a flood from an abusive controller drops excess
             // (below) rather than growing memory without limit (AMS-06).
             let (sender, rx) = mpsc::sync_channel::<Cmd>(INPUT_QUEUE_CAP);
-            std::thread::spawn(move || run_injector(rx));
-            *tx = Some(sender);
+            let (release_tx, releases) = mpsc::channel();
+            std::thread::spawn(move || run_injector(rx, releases));
+            *tx = Some(WorkerSenders {
+                events: sender,
+                releases: release_tx,
+            });
         }
         if let Some(t) = tx.as_ref() {
-            match t.try_send(cmd) {
+            if matches!(cmd, Cmd::ReleaseRoute { .. }) {
+                if t.releases.send(cmd).is_err() {
+                    *tx = None;
+                }
+                return;
+            }
+            match t.events.try_send(cmd) {
                 Ok(()) => {}
                 // Queue full — the injector can't keep up with the inbound rate.
                 // Drop the event; legitimate control never fills a queue this
@@ -129,14 +239,44 @@ impl Injector {
     }
 }
 
-fn run_injector(rx: mpsc::Receiver<Cmd>) {
+fn run_injector(rx: mpsc::Receiver<Cmd>, releases: mpsc::Receiver<Cmd>) {
     // Inbound control is what the user *feels* — keep the injector
     // responsive under exactly the load that made them reach for it.
     crate::os_perf::boost_media_thread();
+    #[cfg(target_os = "linux")]
+    if crate::video::wayland_session() {
+        run_wayland_injector(rx, releases);
+        return;
+    }
     let mut enigo = match Enigo::new(&injector_settings()) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("input injection unavailable on this machine: {e}");
+            let mut reported = std::collections::HashSet::new();
+            loop {
+                for release in releases.try_iter() {
+                    if let Cmd::ReleaseRoute { route, generation } = release {
+                        reported.remove(&(route, generation));
+                    }
+                }
+                match rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(Cmd::Event {
+                        route,
+                        on_error,
+                        lease,
+                        ..
+                    }) if lease.is_active()
+                        && reported.insert((route.clone(), lease.generation)) =>
+                    {
+                        on_error(
+                            format!("Keyboard/mouse backend unavailable: {e}"),
+                            lease.generation,
+                        );
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    _ => {}
+                }
+            }
             return;
         }
     };
@@ -144,7 +284,8 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
     // Each control route's keyboard state — held modifiers steer how the
     // next key resolves, and whatever is still down gets lifted when the
     // route goes away.
-    let mut keys: HashMap<String, KeyTracker> = HashMap::new();
+    let mut keys: HashMap<(String, u64), KeyTracker> = HashMap::new();
+    let mut buttons: HashMap<(String, u64), Vec<Button>> = HashMap::new();
     // Windows only: keeps this thread attached to whichever desktop is taking
     // input. Without it every synthesized event goes to the desktop the thread
     // started on, so the moment Windows switches to the secure desktop (a UAC
@@ -157,9 +298,28 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
     // per event burned them on every pixel of a drag; this bounds it to one
     // check per interval, which is imperceptible against a dialog appearing.
     let mut checked_desktop_at: Option<Instant> = None;
-    while let Ok(cmd) = rx.recv() {
-        let (route, action) = match cmd {
-            Cmd::Event { route, action } => {
+    loop {
+        for release in releases.try_iter() {
+            if let Cmd::ReleaseRoute { route, generation } = release {
+                release_native_route(&mut enigo, &mut keys, &mut buttons, &route, generation);
+            }
+        }
+        let cmd = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let (route, action, lease, on_error) = match cmd {
+            Cmd::Event {
+                route,
+                action,
+                lease,
+                on_error,
+                ..
+            } => {
+                if !lease.is_active() {
+                    continue;
+                }
                 let due = checked_desktop_at.is_none_or(|t| t.elapsed() >= DESKTOP_CHECK_EVERY);
                 if due {
                     checked_desktop_at = Some(Instant::now());
@@ -175,16 +335,10 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                         );
                     }
                 }
-                (route, action)
+                (route, action, lease, on_error)
             }
-            Cmd::ReleaseRoute(route) => {
-                if let Some(mut tracker) = keys.remove(&route) {
-                    for k in tracker.release_all() {
-                        if let Err(e) = enigo.key(k, Direction::Release) {
-                            tracing::debug!("releasing {k:?} after route end failed: {e}");
-                        }
-                    }
-                }
+            Cmd::ReleaseRoute { route, generation } => {
+                release_native_route(&mut enigo, &mut keys, &mut buttons, &route, generation);
                 continue;
             }
         };
@@ -198,6 +352,10 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
         ) {
             crate::wake::force_display_on_if_dark();
         }
+        if !lease.is_active() {
+            continue;
+        }
+        let state_key = (route, lease.generation);
         let result = match action {
             InputAction::MouseMove { x, y, screen } => {
                 let rect = screens.resolve(screen);
@@ -221,7 +379,16 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
                 .map_err(|e| e.to_string()),
             InputAction::MouseButton { button, down } => match dom_button(button) {
-                Some(b) => enigo.button(b, direction(down)).map_err(|e| e.to_string()),
+                Some(b) => enigo
+                    .button(b, direction(down))
+                    .map_err(|e| e.to_string())
+                    .map(|()| {
+                        let held = buttons.entry(state_key.clone()).or_default();
+                        held.retain(|button| *button != b);
+                        if down {
+                            held.push(b);
+                        }
+                    }),
                 None => Ok(()),
             },
             InputAction::Wheel { dx, dy } => {
@@ -243,7 +410,7 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 ref code,
                 down,
             } => {
-                let tracker = keys.entry(route).or_default();
+                let tracker = keys.entry(state_key).or_default();
                 let k = if down {
                     tracker.press(key, code.as_deref())
                 } else {
@@ -260,7 +427,167 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
             InputAction::Unknown => Ok(()),
         };
         if let Err(e) = result {
-            tracing::debug!("input injection event failed: {e}");
+            tracing::warn!("input injection event failed: {e}");
+            if lease.is_active() {
+                on_error(
+                    format!("Keyboard/mouse input failed: {e}"),
+                    lease.generation,
+                );
+            }
+        }
+    }
+}
+
+fn release_native_route(
+    enigo: &mut Enigo,
+    keys: &mut HashMap<(String, u64), KeyTracker>,
+    buttons: &mut HashMap<(String, u64), Vec<Button>>,
+    route: &str,
+    generation: u64,
+) {
+    let state_key = (route.to_string(), generation);
+    if let Some(mut tracker) = keys.remove(&state_key) {
+        for key in tracker.release_all() {
+            if let Err(error) = enigo.key(key, Direction::Release) {
+                tracing::warn!("releasing {key:?} after route end failed: {error}");
+            }
+        }
+    }
+    if let Some(buttons) = buttons.remove(&state_key) {
+        for button in buttons.into_iter().rev() {
+            if let Err(error) = enigo.button(button, Direction::Release) {
+                tracing::warn!("releasing {button:?} after route end failed: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_wayland_injector(rx: mpsc::Receiver<Cmd>, releases: mpsc::Receiver<Cmd>) {
+    struct Waiting {
+        started: Instant,
+        events: std::collections::VecDeque<Cmd>,
+    }
+    let mut injector = crate::wayland_input::Injector::new();
+    let mut failed = std::collections::HashSet::new();
+    let mut pending: HashMap<(String, u64), Waiting> = HashMap::new();
+    let mut current: HashMap<String, u64> = HashMap::new();
+    loop {
+        // Teardowns have a separate reliable channel and run even when the
+        // event queue is idle/full. A delayed old teardown cannot clear the
+        // state belonging to a same-id replacement generation.
+        for release in releases.try_iter() {
+            if let Cmd::ReleaseRoute { route, generation } = release {
+                if current.get(&route) == Some(&generation) {
+                    injector.release_route(&route);
+                    current.remove(&route);
+                }
+                failed.remove(&(route.clone(), generation));
+                pending.remove(&(route, generation));
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(event @ Cmd::Event { .. }) => {
+                let Cmd::Event {
+                    ref route,
+                    ref on_error,
+                    ref lease,
+                    ..
+                } = event
+                else {
+                    unreachable!()
+                };
+                let incarnation = (route.clone(), lease.generation);
+                if !lease.is_active() || failed.contains(&incarnation) {
+                    continue;
+                }
+                // Capture startup runs on another thread. Hold a bounded set
+                // of early events in order, including keyups and teardown,
+                // while its matching compositor session becomes ready.
+                let queued: usize = pending.values().map(|waiting| waiting.events.len()).sum();
+                if queued >= INPUT_QUEUE_CAP {
+                    let error =
+                        "Wayland input startup queue is full; reconnect control".to_string();
+                    if current.get(route) == Some(&lease.generation) {
+                        injector.release_route(route);
+                        current.remove(route);
+                    }
+                    pending.remove(&incarnation);
+                    failed.insert(incarnation);
+                    if lease.is_active() {
+                        on_error(error, lease.generation);
+                    }
+                    continue;
+                }
+                pending
+                    .entry(incarnation)
+                    .or_insert_with(|| Waiting {
+                        started: Instant::now(),
+                        events: Default::default(),
+                    })
+                    .events
+                    .push_back(event);
+            }
+            Ok(Cmd::ReleaseRoute { route, generation }) => {
+                if current.get(&route) == Some(&generation) {
+                    injector.release_route(&route);
+                    current.remove(&route);
+                }
+                failed.remove(&(route.clone(), generation));
+                pending.remove(&(route, generation));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        for (incarnation, mut waiting) in std::mem::take(&mut pending) {
+            let (route, generation) = &incarnation;
+            while let Some(event) = waiting.events.pop_front() {
+                let Cmd::Event {
+                    ref peer,
+                    ref action,
+                    ref on_error,
+                    ref lease,
+                    ..
+                } = event
+                else {
+                    unreachable!()
+                };
+                // Revocation is synchronous; do not replay even the first
+                // event after a compositor-start wait once its lease ended.
+                if !lease.is_active() {
+                    if current.get(route) == Some(generation) {
+                        injector.release_route(route);
+                        current.remove(route);
+                    }
+                    break;
+                }
+                if current.get(route).is_some_and(|old| old != generation) {
+                    injector.release_route(route);
+                    current.remove(route);
+                }
+                current.insert(route.clone(), *generation);
+                match injector.apply(route, peer, action.clone()) {
+                    Ok(()) => {}
+                    Err(error)
+                        if crate::wayland_input::is_pending(&error)
+                            && waiting.started.elapsed() < Duration::from_secs(10) =>
+                    {
+                        waiting.events.push_front(event);
+                        pending.insert(incarnation.clone(), waiting);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!("Wayland input unavailable for {route}: {error}");
+                        injector.release_route(route);
+                        current.remove(route);
+                        failed.insert(incarnation.clone());
+                        if lease.is_active() {
+                            on_error(error, *generation);
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -554,8 +881,8 @@ fn dom_button(button: u8) -> Option<Button> {
 /// keyup releases exactly what its keydown pressed even when the
 /// modifiers (and so the DOM `key` value) changed in between, and a dying
 /// route can lift everything it still holds.
-#[derive(Default)]
-struct KeyTracker {
+#[derive(Clone, Default)]
+pub(crate) struct KeyTracker {
     /// (identity, injected key) per held key — identity is the physical
     /// `code` when the sender knew it, else the `key` value itself.
     pressed: Vec<(String, Key)>,
@@ -574,7 +901,7 @@ impl KeyTracker {
     }
 
     /// A keydown: resolve what to inject and remember it as held.
-    fn press(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
+    pub(crate) fn press(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
         let k = self.resolve(key, code)?;
         let id = Self::identity(key, code);
         // Auto-repeat arrives as a burst of re-presses (the remote OS won't
@@ -588,7 +915,7 @@ impl KeyTracker {
     /// A keyup: release exactly the key the matching keydown pressed. For
     /// a down we never saw (an older sender, a mid-stream subscribe),
     /// fall back to resolving fresh.
-    fn release(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
+    pub(crate) fn release(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
         let id = Self::identity(key, code);
         if let Some(i) = self.pressed.iter().position(|(i, _)| *i == id) {
             return Some(self.pressed.remove(i).1);
@@ -598,7 +925,7 @@ impl KeyTracker {
 
     /// Everything still held, in reverse press order (chords unwind the
     /// way they wound up: the letter lifts before its modifier).
-    fn release_all(&mut self) -> Vec<Key> {
+    pub(crate) fn release_all(&mut self) -> Vec<Key> {
         self.pressed.drain(..).rev().map(|(_, k)| k).collect()
     }
 
@@ -749,6 +1076,190 @@ fn map_named(key: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_injector(capacity: usize) -> (Injector, mpsc::Receiver<Cmd>, mpsc::Receiver<Cmd>) {
+        let injector = Injector::new();
+        let (events, event_rx) = mpsc::sync_channel(capacity);
+        let (releases, release_rx) = mpsc::channel();
+        *injector.tx.lock() = Some(WorkerSenders { events, releases });
+        (injector, event_rx, release_rx)
+    }
+
+    fn queue_event(injector: &Injector, route: &str) {
+        injector.apply(route, "peer", InputAction::Unknown, Arc::new(|_, _| {}));
+    }
+
+    #[test]
+    fn revocation_cancels_events_and_delivers_cleanup_even_when_queue_is_full() {
+        let (injector, events, releases) = queued_injector(INPUT_QUEUE_CAP);
+        injector.begin_route("r");
+        for _ in 0..=INPUT_QUEUE_CAP {
+            queue_event(&injector, "r");
+        }
+        let lease = injector.leases.lock().get("r").unwrap().clone();
+        assert!(lease.is_active());
+        injector.release_route("r");
+        assert!(
+            !lease.is_active(),
+            "cancellation does not wait for the worker"
+        );
+        assert!(!injector.is_current("r", lease.generation));
+        assert!(
+            matches!(releases.try_recv(), Ok(Cmd::ReleaseRoute { route, generation })
+            if route == "r" && generation == lease.generation)
+        );
+        let queued: Vec<_> = events.try_iter().collect();
+        assert_eq!(queued.len(), INPUT_QUEUE_CAP);
+        for event in queued {
+            let Cmd::Event { lease, .. } = event else {
+                panic!("release used bounded queue")
+            };
+            assert!(!lease.is_active(), "no queued event may outlive its grant");
+        }
+    }
+
+    #[test]
+    fn same_id_reconnect_has_a_new_generation_and_old_callbacks_are_stale() {
+        let (injector, events, releases) = queued_injector(4);
+        injector.begin_route("r");
+        queue_event(&injector, "r");
+        let Cmd::Event { lease: old, .. } = events.recv().unwrap() else {
+            panic!()
+        };
+        injector.release_route("r");
+        injector.begin_route("r");
+        queue_event(&injector, "r");
+        let Cmd::Event { lease: new, .. } = events.recv().unwrap() else {
+            panic!()
+        };
+        assert_ne!(old.generation, new.generation);
+        assert!(!old.is_active());
+        assert!(!injector.is_current("r", old.generation));
+        assert!(injector.is_current("r", new.generation));
+        let Cmd::ReleaseRoute { generation, .. } = releases.recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            generation, old.generation,
+            "delayed cleanup identifies its old incarnation"
+        );
+        assert!(injector.is_current("r", new.generation));
+    }
+
+    #[test]
+    fn releasing_an_unstarted_route_never_spawns_or_enqueues_work() {
+        let injector = Injector::new();
+        injector.release_route("missing");
+        assert!(injector.tx.lock().is_none());
+        assert!(injector.leases.lock().is_empty());
+    }
+
+    #[test]
+    fn an_event_after_retirement_cannot_recreate_its_route_lease() {
+        let (injector, events, _) = queued_injector(4);
+        injector.begin_route("r");
+        queue_event(&injector, "r");
+        injector.release_route("r");
+        queue_event(&injector, "r");
+        assert!(injector.leases.lock().is_empty());
+        assert_eq!(
+            events.try_iter().count(),
+            1,
+            "late input was never admitted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn revoked_startup_events_are_never_replayed_when_capture_later_registers() {
+        struct Control(mpsc::Sender<(u32, bool)>);
+        impl crate::wayland_input::DesktopControl for Control {
+            fn absolute(&self, _: f64, _: f64) -> Result<(), String> {
+                Ok(())
+            }
+            fn relative(&self, _: f64, _: f64) -> Result<(), String> {
+                Ok(())
+            }
+            fn button(&self, _: i32, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn key(&self, key: u32, down: bool) -> Result<(), String> {
+                self.0.send((key, down)).map_err(|error| error.to_string())
+            }
+            fn wheel(&self, _: f64, _: f64) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_active(&self) -> bool {
+                true
+            }
+        }
+        let (injector, events, releases) = queued_injector(8);
+        let worker = std::thread::spawn(move || run_wayland_injector(events, releases));
+        let (barrier_tx, barrier_rx) = mpsc::channel();
+        let barrier: Arc<dyn crate::wayland_input::DesktopControl> = Arc::new(Control(barrier_tx));
+        let _barrier_guard =
+            crate::wayland_input::register("startup-barrier", None, barrier.clone());
+        let (target_tx, target_rx) = mpsc::channel();
+        let target: Arc<dyn crate::wayland_input::DesktopControl> = Arc::new(Control(target_tx));
+        let event = |key: &str, down| InputAction::Key {
+            key: key.into(),
+            code: None,
+            down,
+        };
+        let (error_tx, errors) = mpsc::channel();
+        let on_error: Arc<dyn Fn(String, u64) + Send + Sync> =
+            Arc::new(move |error, generation| {
+                let _ = error_tx.send((error, generation));
+            });
+        injector.begin_route("waiting");
+        injector.apply(
+            "waiting",
+            "startup-target",
+            event("a", true),
+            on_error.clone(),
+        );
+        injector.begin_route("barrier");
+        injector.apply(
+            "barrier",
+            "startup-barrier",
+            event("b", true),
+            on_error.clone(),
+        );
+        assert_eq!(
+            barrier_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (u32::from('b'), true)
+        );
+        // FIFO admission of the barrier proves the earlier target event has
+        // reached the worker's capture-start queue, rather than just its input
+        // channel. Revoke it before making the missing capture available.
+        injector.release_route("waiting");
+        let _target_guard = crate::wayland_input::register("startup-target", None, target.clone());
+        injector.apply(
+            "barrier",
+            "startup-barrier",
+            event("b", false),
+            on_error.clone(),
+        );
+        assert_eq!(
+            barrier_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (u32::from('b'), false)
+        );
+        assert!(
+            target_rx.try_recv().is_err(),
+            "revoked 'a' was never injected"
+        );
+        injector.begin_route("waiting");
+        injector.apply("waiting", "startup-target", event("c", true), on_error);
+        assert_eq!(
+            target_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (u32::from('c'), true)
+        );
+        assert!(errors.try_recv().is_err());
+        injector.release_route("waiting");
+        injector.release_route("barrier");
+        drop(injector);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn captured_mouse_uses_native_windows_relative_motion() {

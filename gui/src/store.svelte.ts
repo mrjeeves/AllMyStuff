@@ -1742,7 +1742,7 @@ class AppStore {
     // same person wondering why their other device's console stopped typing.
     await onControlRefused((e) => {
       const who = this.node(e.from)?.label ?? shortId(e.from);
-      this.toast("warn", `Refused ${e.plane} from ${who}: not on this machine's fleet roster`);
+      this.toast("warn", `Refused ${e.plane} from ${who}: ${e.reason}`);
     });
     // A fleet peer asked this machine to reboot: tell whoever is sitting
     // here why the OS is about to go down.

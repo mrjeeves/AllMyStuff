@@ -7,6 +7,7 @@ import type {
   Capability,
   CheckOutcome,
   ComponentStatus,
+  DeviceSupportStatus,
   FileEvent,
   Grant,
   RoomWireMessage,
@@ -2370,6 +2371,16 @@ export type CecScope = "once" | "three_hours" | "forever";
 /** This node's CEC status. Null in web mode. */
 export function cecStatus(): Promise<CecStatus | null> {
   return tryInvoke<CecStatus>("cec_status");
+}
+
+/** Read or approve support on the selected device, including a remote PC. */
+export function deviceSupport(
+  node: string,
+  action: "status" | "arm" | "approve" | "deny" = "status",
+  technician?: string,
+  sessionId?: string,
+): Promise<DeviceSupportStatus> {
+  return requiredInvoke<DeviceSupportStatus>("device_support", { node, action, technician, sessionId });
 }
 
 /** Resolve the customer's support number in the public directory, then request access. */

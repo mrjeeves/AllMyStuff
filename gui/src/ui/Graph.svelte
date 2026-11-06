@@ -1645,9 +1645,11 @@
         <button class="cbtn room-action" data-tip="Private room" aria-label="Open a private room with {displayName(n)}"
           onclick={(e) => { e.stopPropagation(); app.openDirectRoom(n.id); }}>{@render cicon("room")}<span class="action-label">Room</span></button>
       {/if}
-      {#if app.kvmAllowed(n)}
+      {#if app.supportAllowed(n)}
         <button class="cbtn" data-tip="Support number and approvals" aria-label="Support for {displayName(n)}"
-          onclick={(e) => { e.stopPropagation(); app.openKvmSupport(n.id); }}><span aria-hidden="true">#</span><span class="action-label">Support</span></button>
+          onclick={(e) => { e.stopPropagation(); app.openSupport(n.id); }}><span aria-hidden="true">#</span><span class="action-label">Support</span></button>
+      {/if}
+      {#if app.kvmAllowed(n)}
         <!-- Advanced-only appliance controls. Sites lives in the settings gear
              in both modes; Normal also keeps these lower-frequency actions in
              that menu. -->

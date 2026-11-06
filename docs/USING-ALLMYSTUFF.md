@@ -161,8 +161,11 @@ If the source sleeps or changes networks, the mapping becomes unavailable and
 reconnects when the source returns. Removing a mapping removes the relationship
 from both devices and clears the native mount. See
 [Native drive mapping](DRIVE-MAPPING.md) for implementation and compatibility
-details. Ubuntu and Debian installations use `davfs2`; the `.deb` package and
-the AllMyStuff installer include it as a drive-mapping dependency.
+details. Ubuntu and Debian installations use `rclone` and FUSE; the `.deb`
+package and the AllMyStuff installer include `rclone` and `fuse3` as mapping
+dependencies. Desktop mappings run as your signed-in user, without `/etc/fstab`
+entries. A restricted system service must hand desktop work to a user node;
+its sandbox is not relaxed to allow mounting.
 
 ## Share with another person
 
@@ -283,9 +286,17 @@ Incoming requests on this computer appear in the main window with the technician
 name and verification code. Approve once, approve for three hours, or decline.
 Existing standing-grant controls remain in CEC settings.
 
-For a KVM you own, choose **Support** on its device card (also available in the
-KVM details drawer). Read its number, approve or decline a pending request, or
-choose **Approve current or next request**. With no request pending this opens a
-five-minute wait for one request. Pressing again refreshes that wait; one request
-consumes it and receives three hours of access. The appliance web UI, CECSupport
-KVM card, and physical KVM button use the same approval window.
+Choose **# Support** on this computer or a PC or KVM in your fleet, in Normal
+or Advanced mode (also available in the device details drawer). The dialog
+shows **that device's number**. Read it to your technician, approve or decline
+a pending request, or choose **Approve current or next request**. With no
+request pending this opens a five-minute wait for one request. Pressing again
+refreshes that wait; one request consumes it and receives three hours of
+access. Older PCs need an AllMyStuff update to manage their approvals remotely.
+
+Support runs in the AllMyStuff node. The standalone support app is a thin
+client of that same service: discovery, requests, consent, and sessions do not
+require its window to be open. Managing another PC's approvals requires owner
+or fleet authority; a technician's support grant or an ordinary share does not
+give permission to approve further access. The KVM web UI, support card, and
+physical KVM button continue to use the appliance's shared approval window.

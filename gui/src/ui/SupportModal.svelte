@@ -1,20 +1,23 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import type { KvmSupportStatus } from "../types";
+  import { displayName, type DeviceSupportStatus } from "../types";
   let { node }: { node: string } = $props();
-  let status = $state<KvmSupportStatus | null>(null);
+  let status = $state<DeviceSupportStatus | null>(null);
   let loading = $state(true);
   let busy = $state(false);
+  let error = $state("");
   let observedAt = $state(0);
   let now = $state(performance.now());
   let inFlight = false;
   let revision = 0;
+  const target = $derived(app.machineByAnyId(node));
   const seconds = $derived(Math.max(0, Math.ceil((status?.approvalRemainingSeconds ?? 0) - (now - observedAt) / 1000)));
   const countdown = $derived(`${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`);
   const number = $derived(status?.supportId.replace(/(\d{3})(?=\d)/g, "$1 "));
-  function update(value: KvmSupportStatus | null) {
+  function update(value: DeviceSupportStatus | null, reason = "") {
     status = value;
+    error = reason;
     observedAt = now = performance.now();
     loading = false;
   }
@@ -22,16 +25,16 @@
     if (inFlight || busy) return;
     inFlight = true;
     const version = revision;
-    try { const value = await app.readKvmSupport(node, background); if (version === revision) update(value); }
-    catch { if (version === revision) update(null); }
+    try { const value = await app.readSupport(node, background); if (version === revision) update(value); }
+    catch (reason) { if (version === revision) update(null, reason instanceof Error ? reason.message : String(reason)); }
     finally { inFlight = false; }
   }
   async function decide(action: "arm" | "approve" | "deny", technician?: string, sessionId?: string) {
     if (busy) return;
     busy = true;
     revision++;
-    try { update(await app.changeKvmSupport(node, action, technician, sessionId)); }
-    catch { update(null); app.toast("warn", "Couldn’t update KVM support approval."); }
+    try { update(await app.changeSupport(node, action, technician, sessionId)); }
+    catch (reason) { update(null, reason instanceof Error ? reason.message : String(reason)); }
     finally { busy = false; }
   }
   onMount(() => {
@@ -42,14 +45,14 @@
   });
 </script>
 
-<svelte:window onkeydown={(event) => { if (event.key === "Escape") app.kvmSupportFor = null; }} />
+<svelte:window onkeydown={(event) => { if (event.key === "Escape") app.supportFor = null; }} />
 <div class="scrim">
-  <div class="card modal support" role="dialog" aria-modal="true" aria-labelledby="kvm-support-title">
-    <header><h2 id="kvm-support-title">KVM support · {app.node(node)?.label || "KVM"}</h2><button class="btn ghost small" onclick={() => app.kvmSupportFor = null}>Close</button></header>
+  <div class="card modal support" role="dialog" aria-modal="true" aria-labelledby="support-title">
+    <header><h2 id="support-title">Support · {target ? displayName(target) : "Device"}</h2><button class="btn ghost small" onclick={() => app.supportFor = null}>Close</button></header>
     {#if loading}
       <p>Reading support status…</p>
     {:else if !status?.enabled}
-      <p class="err">Couldn't read support status. Check that the KVM is online.</p>
+      <p class="err">{error || "Couldn't read support status. Check that this device is online."}</p>
       <button class="btn" disabled={busy} onclick={() => void refresh(false)}>Try again</button>
     {:else}
       <div><p>Support number</p><strong class="number">{number || "Starting…"}</strong></div>
@@ -61,7 +64,7 @@
         </button>
         <p>Wait up to 5 minutes for one support-number request, then grant 3 hours of access. Press again to refresh the wait.</p>
       {:else}
-        <p>Update this KVM to enable support-request approvals here.</p>
+        <p>Update this device to enable support-request approvals here.</p>
       {/if}
       {#if status.authorised}<p>A technician has an active access grant.</p>{/if}
       {#each status.pending ?? [] as request (request.technician + request.sessionId)}

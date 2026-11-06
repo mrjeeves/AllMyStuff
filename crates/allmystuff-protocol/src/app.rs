@@ -215,6 +215,10 @@ pub const FEATURE_PACED_VIDEO: &str = "paced-video-v1";
 /// just sees an ordinary app node.
 pub const FEATURE_KVM: &str = "kvm";
 
+/// Owner/fleet management of a computer's support number and bounded approval
+/// window. A technician's support consent does not authorize these commands.
+pub const FEATURE_DEVICE_SUPPORT: &str = "device-support-v1";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
@@ -743,6 +747,24 @@ pub enum SiteControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControl {
+    /// Manage support on the authenticated recipient, never an arbitrary
+    /// third-party node. The receiver requires owner/fleet authority.
+    DeviceSupport {
+        request: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        technician: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Only the expected peer may complete an outstanding support request.
+    DeviceSupportResult {
+        request: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<DeviceSupportStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Ask this machine to expose one user-selected folder as a native drive
     /// on the authenticated requester. The source validates/canonicalizes the
     /// path locally and accepts this only under the Files authorization gate
@@ -901,6 +923,28 @@ pub enum AppControl {
     /// than failing the enclosing [`ControlMessage`].
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSupportStatus {
+    pub enabled: bool,
+    pub support_id: String,
+    pub approval_remaining_seconds: u64,
+    pub authorised: bool,
+    pub grant_seconds: u64,
+    pub pending: Vec<DeviceSupportPending>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSupportPending {
+    pub technician: String,
+    pub session_id: String,
+    pub agent_name: String,
+    pub verification_code: String,
+    pub want_control: bool,
+    pub requested_at: u64,
 }
 
 /// A KVM appliance's binding, carried in [`NodeProfile::kvm`] when the node
@@ -1368,6 +1412,53 @@ pub enum OwnershipControl {
 mod tests {
     use super::*;
     use allmystuff_graph::{Flow, GrantRole, MediaKind};
+
+    #[test]
+    fn computer_support_request_and_status_round_trip_with_modal_field_names() {
+        let request = ControlMessage::App(AppControl::DeviceSupport {
+            request: "request-1".into(),
+            action: "approve".into(),
+            technician: Some("technician".into()),
+            session_id: Some("session-1".into()),
+        });
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ControlMessage>(encoded).unwrap(),
+            request
+        );
+        let status = DeviceSupportStatus {
+            enabled: true,
+            support_id: "123456789".into(),
+            approval_remaining_seconds: 300,
+            authorised: false,
+            grant_seconds: 10800,
+            pending: vec![DeviceSupportPending {
+                technician: "technician".into(),
+                session_id: "session-1".into(),
+                agent_name: "Alex".into(),
+                verification_code: "1234".into(),
+                want_control: true,
+                requested_at: 42,
+            }],
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["supportId"], "123456789");
+        assert_eq!(value["approvalRemainingSeconds"], 300);
+        assert_eq!(value["grantSeconds"], 10800);
+        assert_eq!(value["pending"][0]["sessionId"], "session-1");
+        assert_eq!(value["pending"][0]["requestedAt"], 42);
+        assert_eq!(value["pending"][0]["wantControl"], true);
+        let result = ControlMessage::App(AppControl::DeviceSupportResult {
+            request: "request-1".into(),
+            status: Some(status),
+            error: None,
+        });
+        assert_eq!(
+            serde_json::from_value::<ControlMessage>(serde_json::to_value(&result).unwrap())
+                .unwrap(),
+            result
+        );
+    }
 
     /// RFC 4648 base32 vector ("hello" → NBSWY3DP), lowercased — the
     /// hand-rolled encoder must match what NanoKVM's Go stdlib

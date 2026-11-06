@@ -3300,6 +3300,30 @@ async fn fleet_mfa_disable(state: State<'_, AppState>, code: String) -> Result<V
 // `cec://*` events reach the frontend through the existing event pump, which
 // forwards every `UiSink::emit` by name.
 
+/// Manage support consent on the selected device, locally or over the mesh.
+#[tauri::command]
+async fn device_support(
+    state: State<'_, AppState>,
+    node: String,
+    action: Option<String>,
+    technician: Option<String>,
+    session_id: Option<String>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "device_support",
+            json!({
+                "node": node,
+                "action": action.unwrap_or_else(|| "status".into()),
+                "technician": technician,
+                "session_id": session_id,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// This node's CEC snapshot: its support number, Silent room, role, hosting.
 #[tauri::command]
 async fn cec_status(state: State<'_, AppState>) -> Result<Value, String> {
@@ -5132,6 +5156,7 @@ fn main() {
             fleet_mfa_status,
             fleet_mfa_enroll,
             fleet_mfa_disable,
+            device_support,
             cec_status,
             cec_dial,
             cec_dial_node,

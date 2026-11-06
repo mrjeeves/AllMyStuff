@@ -47,7 +47,7 @@
     },
     "linux": {
       "deb": {
-        "depends": ["davfs2"]
+        "depends": ["rclone", "fuse3"]
       }
     },
     "windows": {

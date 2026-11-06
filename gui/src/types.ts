@@ -284,6 +284,9 @@ export const FEATURE_SITES = "sites";
  *  ordinary app node. */
 export const FEATURE_KVM = "kvm";
 
+/** The node accepts owner/fleet support-number status and approval commands. */
+export const FEATURE_DEVICE_SUPPORT = "device-support-v1";
+
 // ---- sites (the reverse-proxy plane) ----------------------------------
 
 /** One site a node exposes — a TCP service it reverse-proxies over the mesh
@@ -980,8 +983,8 @@ export function humanBytes(bytes: number): string {
   return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
 }
 
-/** Current appliance-owned support consent; durations work before its clock is set. */
-export interface KvmSupportStatus {
+/** Device-owned support consent; durations work before its clock is set. */
+export interface DeviceSupportStatus {
   enabled: boolean;
   supportId: string;
   approvalRemainingSeconds?: number;
@@ -990,3 +993,6 @@ export interface KvmSupportStatus {
   grantSeconds: number;
   pending?: Array<{ technician: string; sessionId: string; agentName: string; verificationCode: string; wantControl: boolean; requestedAt: number }>;
 }
+
+/** KVM HTTP responses use the same device-owned support contract. */
+export type KvmSupportStatus = DeviceSupportStatus;

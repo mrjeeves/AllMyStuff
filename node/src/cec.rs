@@ -41,6 +41,10 @@ use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
 use allmystuff_cec_protocol::{
     format_support_id, support_id_from_device, ApprovalScope, ChatMessage, Role,
 };
+use allmystuff_protocol::{DeviceSupportPending, DeviceSupportStatus};
+
+pub const SUPPORT_APPROVAL_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub const SUPPORT_GRANT_SECONDS: u64 = 3 * 60 * 60;
 
 /// Where the customer's consent store lives:
 /// `~/.myownmesh/cec-consent.json`, honouring `MYOWNMESH_HOME` — the same home
@@ -78,6 +82,7 @@ pub struct PendingRequest {
     /// A short, human-comparable code the customer can read back to confirm the
     /// technician out-of-band before approving.
     pub verification_code: String,
+    pub requested_at: u64,
 }
 
 impl PendingRequest {
@@ -88,6 +93,7 @@ impl PendingRequest {
             "want_control": self.want_control,
             "session_id": self.session_id,
             "verification_code": self.verification_code,
+            "requested_at": self.requested_at,
         })
     }
 }
@@ -231,6 +237,9 @@ struct CecInner {
     consent: ConsentStore,
     /// Inbound connect-requests awaiting the customer's decision.
     pending: Vec<PendingRequest>,
+    /// A local/fleet user's approval of exactly one current or future request.
+    /// Never persisted, so a restart cannot reopen an unattended approval door.
+    support_approval_until: Option<Instant>,
     /// Every client machine this technician has *attempted* (number digits →
     /// record) — a permanent directory row exists from the moment of the dial,
     /// whether or not the customer ever answered. `node` is filled in once
@@ -306,6 +315,7 @@ impl Cec {
                 agent_name: String::new(),
                 consent,
                 pending: Vec::new(),
+                support_approval_until: None,
                 dialed,
                 sessions: HashMap::new(),
                 session_tech: HashMap::new(),
@@ -607,9 +617,131 @@ impl Cec {
     /// stack duplicates.
     pub fn record_pending(&self, req: PendingRequest) {
         let mut inner = self.inner.lock();
-        let tech = pubkey_part(&req.tech).to_string();
-        inner.pending.retain(|p| pubkey_part(&p.tech) != tech);
-        inner.pending.push(req);
+        record_pending_locked(&mut inner, req);
+    }
+
+    pub fn support_status(
+        &self,
+        number: String,
+        now: Instant,
+        wall_now: u64,
+    ) -> DeviceSupportStatus {
+        let mut inner = self.inner.lock();
+        let remaining = inner
+            .support_approval_until
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+        if remaining.is_zero() {
+            inner.support_approval_until = None;
+        }
+        DeviceSupportStatus {
+            enabled: true,
+            support_id: number,
+            approval_remaining_seconds: remaining.as_secs()
+                + u64::from(remaining.subsec_nanos() != 0),
+            authorised: !inner.consent.active_grants(wall_now).is_empty(),
+            grant_seconds: SUPPORT_GRANT_SECONDS,
+            pending: inner
+                .pending
+                .iter()
+                .map(|request| DeviceSupportPending {
+                    technician: request.tech.clone(),
+                    session_id: request.session_id.clone(),
+                    agent_name: request.agent_name.clone(),
+                    verification_code: request.verification_code.clone(),
+                    want_control: request.want_control,
+                    requested_at: request.requested_at,
+                })
+                .collect(),
+        }
+    }
+
+    /// Approve a pending request immediately, or arm one five-minute
+    /// window. Both grant creation and consumption happen under the same lock.
+    pub fn arm_support(
+        &self,
+        now: Instant,
+        wall_now: u64,
+    ) -> Result<Option<PendingRequest>, String> {
+        let mut inner = self.inner.lock();
+        if let Some(request) = inner.pending.first().cloned() {
+            approve_request_locked(&mut inner, &request, ApprovalScope::ThreeHours, wall_now)?;
+            inner.support_approval_until = None;
+            return Ok(Some(request));
+        }
+        inner.support_approval_until = Some(now + SUPPORT_APPROVAL_WINDOW);
+        Ok(None)
+    }
+
+    /// New inbound requests atomically compete for the single armed window.
+    /// A failed durable grant never consumes it or authorizes the session.
+    pub fn record_or_approve_armed(
+        &self,
+        request: PendingRequest,
+        now: Instant,
+        wall_now: u64,
+    ) -> Result<bool, String> {
+        let mut inner = self.inner.lock();
+        if inner
+            .session_tech
+            .get(&request.session_id)
+            .is_some_and(|owner| pubkey_part(owner) != pubkey_part(&request.tech))
+        {
+            return Err("that support session belongs to another technician".into());
+        }
+        match inner.sessions.get(&request.session_id).map(String::as_str) {
+            Some("active") => return Ok(true),
+            Some("denied" | "ended") => return Err("that support request has already ended".into()),
+            _ => {}
+        }
+        if inner
+            .support_approval_until
+            .is_some_and(|until| now < until)
+        {
+            record_pending_locked(&mut inner, request.clone());
+            approve_request_locked(&mut inner, &request, ApprovalScope::ThreeHours, wall_now)?;
+            inner.support_approval_until = None;
+            return Ok(true);
+        }
+        inner.support_approval_until = None;
+        record_pending_locked(&mut inner, request);
+        Ok(false)
+    }
+
+    pub fn approve_pending(
+        &self,
+        tech: &str,
+        session_id: &str,
+        scope: ApprovalScope,
+        want_control: bool,
+    ) -> Result<PendingRequest, String> {
+        let mut inner = self.inner.lock();
+        let mut request = pending_request(&inner, tech, session_id)?;
+        // A caller can narrow a request to viewing, never widen it to control.
+        request.want_control &= want_control;
+        approve_request_locked(&mut inner, &request, scope, now_secs())?;
+        inner.support_approval_until = None;
+        Ok(request)
+    }
+
+    pub fn deny_pending(&self, tech: &str, session_id: &str) -> Result<PendingRequest, String> {
+        let mut inner = self.inner.lock();
+        let request = pending_request(&inner, tech, session_id)?;
+        inner.pending.retain(|pending| {
+            pending.session_id != session_id || pubkey_part(&pending.tech) != pubkey_part(tech)
+        });
+        inner
+            .sessions
+            .insert(session_id.to_string(), "denied".into());
+        inner.support_approval_until = None;
+        Ok(request)
+    }
+
+    pub fn session_belongs_to(&self, session_id: &str, peer: &str) -> bool {
+        self.inner
+            .lock()
+            .session_tech
+            .get(session_id)
+            .is_none_or(|owner| pubkey_part(owner) == pubkey_part(peer))
     }
 
     /// The customer's pending connect-requests, for `cec_pending`.
@@ -863,6 +995,9 @@ impl Cec {
         // technician binding — drop it so the sweep's `session_tech` map can't
         // accumulate stale rows across a technician's reconnects.
         if matches!(state, "ended" | "denied") {
+            inner
+                .pending
+                .retain(|request| request.session_id != session_id);
             inner.session_tech.remove(session_id);
             inner.kvm_support_ready.remove(session_id);
         }
@@ -883,9 +1018,37 @@ impl Cec {
             .sessions
             .insert(session_id.to_string(), state.to_string());
         if matches!(state, "ended" | "denied") {
+            inner
+                .pending
+                .retain(|request| request.session_id != session_id);
             inner.session_tech.remove(session_id);
             inner.kvm_support_ready.remove(session_id);
         }
+        true
+    }
+
+    /// Accept an approval only for a live dial, atomically with its peer binding.
+    /// A delayed reply must not revive a dial that cancellation already ended.
+    pub fn accept_session_approval(&self, session_id: &str, peer: &str) -> bool {
+        let mut inner = self.inner.lock();
+        if !matches!(
+            inner.sessions.get(session_id).map(String::as_str),
+            Some("requested" | "active")
+        ) {
+            return false;
+        }
+        let canonical = pubkey_part(peer);
+        if inner
+            .session_tech
+            .get(session_id)
+            .is_some_and(|bound| bound != canonical)
+        {
+            return false;
+        }
+        inner.sessions.insert(session_id.into(), "active".into());
+        inner
+            .session_tech
+            .insert(session_id.into(), canonical.into());
         true
     }
 
@@ -992,6 +1155,83 @@ impl Cec {
     pub fn retire_once(&self, tech: &str) -> bool {
         self.inner.lock().consent.revoke_once(tech)
     }
+}
+
+fn pending_request(
+    inner: &CecInner,
+    tech: &str,
+    session_id: &str,
+) -> Result<PendingRequest, String> {
+    inner
+        .pending
+        .iter()
+        .find(|request| {
+            request.session_id == session_id && pubkey_part(&request.tech) == pubkey_part(tech)
+        })
+        .cloned()
+        .ok_or_else(|| "that support request is no longer pending; refresh and try again".into())
+}
+
+fn record_pending_locked(inner: &mut CecInner, mut request: PendingRequest) {
+    let tech = pubkey_part(&request.tech);
+    if let Some(prior) = inner
+        .pending
+        .iter()
+        .find(|prior| pubkey_part(&prior.tech) == tech && prior.session_id == request.session_id)
+    {
+        request.requested_at = prior.requested_at;
+    }
+    inner
+        .pending
+        .retain(|prior| pubkey_part(&prior.tech) != tech);
+    if inner.pending.len() >= 64 {
+        inner.pending.remove(0);
+    }
+    inner.pending.push(request);
+}
+
+fn approve_request_locked(
+    inner: &mut CecInner,
+    request: &PendingRequest,
+    scope: ApprovalScope,
+    wall_now: u64,
+) -> Result<(), String> {
+    if request.tech.is_empty() || request.session_id.is_empty() || request.session_id.len() > 512 {
+        return Err("invalid support request identity".into());
+    }
+    if inner
+        .sessions
+        .get(&request.session_id)
+        .is_some_and(|state| matches!(state.as_str(), "ended" | "denied"))
+    {
+        return Err("that support request has already ended".into());
+    }
+    let tech = pubkey_part(&request.tech).to_string();
+    if inner
+        .session_tech
+        .get(&request.session_id)
+        .is_some_and(|owner| owner != &tech)
+    {
+        return Err("that support session belongs to another technician".into());
+    }
+    inner
+        .consent
+        .approve(
+            &tech,
+            &request.agent_name,
+            capabilities_for(request.want_control),
+            scope,
+            wall_now,
+        )
+        .map_err(|error| error.to_string())?;
+    inner
+        .pending
+        .retain(|pending| pubkey_part(&pending.tech) != tech);
+    inner
+        .sessions
+        .insert(request.session_id.clone(), "active".into());
+    inner.session_tech.insert(request.session_id.clone(), tech);
+    Ok(())
 }
 
 /// The customer-facing scope word for a grant (the `cec_grants` shape) —
@@ -1140,6 +1380,196 @@ pub fn is_cec_network(network: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn support_request(tech: &str, session: &str, control: bool) -> PendingRequest {
+        PendingRequest {
+            tech: tech.into(),
+            agent_name: "Technician".into(),
+            want_control: control,
+            session_id: session.into(),
+            verification_code: verification_code(tech, session),
+            requested_at: now_secs(),
+        }
+    }
+
+    #[test]
+    fn support_window_expires_without_granting_a_later_request() {
+        let cec = Cec::new(None);
+        let now = Instant::now();
+        let wall = now_secs();
+        assert!(cec.arm_support(now, wall).unwrap().is_none());
+        assert_eq!(
+            cec.support_status("123456789".into(), now, wall)
+                .approval_remaining_seconds,
+            300
+        );
+        assert!(!cec
+            .record_or_approve_armed(
+                support_request("tech-a", "late", true),
+                now + SUPPORT_APPROVAL_WINDOW,
+                wall + 300
+            )
+            .unwrap());
+        let status = cec.support_status(
+            "123456789".into(),
+            now + SUPPORT_APPROVAL_WINDOW,
+            wall + 300,
+        );
+        assert_eq!(status.approval_remaining_seconds, 0);
+        assert!(!status.authorised);
+        assert_eq!(status.pending.len(), 1);
+    }
+
+    #[test]
+    fn support_window_is_atomically_consumed_by_only_one_concurrent_request() {
+        let cec = Arc::new(Cec::new(None));
+        let now = Instant::now();
+        let wall = now_secs();
+        cec.arm_support(now, wall).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let attempts = ["tech-a", "tech-b"].map(|tech| {
+            let cec = cec.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                cec.record_or_approve_armed(support_request(tech, tech, true), now, wall)
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(|approved| *approved)
+                .count(),
+            1
+        );
+        let status = cec.support_status("123456789".into(), now, wall);
+        assert_eq!(status.approval_remaining_seconds, 0);
+        assert!(status.authorised);
+        assert_eq!(status.pending.len(), 1);
+        let inner = cec.inner.lock();
+        let grants = inner.consent.active_grants(wall);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].scope, ApprovalScope::ThreeHours);
+        assert_eq!(grants[0].expires_at, Some(wall + SUPPORT_GRANT_SECONDS));
+    }
+
+    #[test]
+    fn arming_current_request_grants_it_without_opening_a_second_window() {
+        let cec = Cec::new(None);
+        let now = Instant::now();
+        let wall = now_secs();
+        cec.record_pending(support_request("tech-a", "current", false));
+        let approved = cec.arm_support(now, wall).unwrap().unwrap();
+        assert_eq!(approved.session_id, "current");
+        assert_eq!(cec.session_state("current").as_deref(), Some("active"));
+        assert!(!cec.is_allowed("tech-a", Capability::Control));
+        assert_eq!(
+            cec.support_status("123456789".into(), now, wall)
+                .approval_remaining_seconds,
+            0
+        );
+        assert!(!cec
+            .record_or_approve_armed(support_request("tech-b", "next", true), now, wall)
+            .unwrap());
+        assert_eq!(cec.pending().len(), 1);
+    }
+
+    #[test]
+    fn support_decisions_require_exact_pending_technician_and_session() {
+        let cec = Cec::new(None);
+        cec.record_pending(support_request("tech-a", "current", false));
+        assert!(cec
+            .approve_pending("tech-b", "current", ApprovalScope::ThreeHours, true)
+            .is_err());
+        assert!(cec
+            .approve_pending("tech-a", "old-session", ApprovalScope::ThreeHours, true)
+            .is_err());
+        assert!(cec.deny_pending("tech-a", "old-session").is_err());
+        assert_eq!(cec.pending().len(), 1);
+        assert!(cec.grants().is_empty());
+        cec.approve_pending("tech-a", "current", ApprovalScope::ThreeHours, true)
+            .unwrap();
+        assert!(cec.is_allowed("tech-a", Capability::ScreenView));
+        assert!(!cec.is_allowed("tech-a", Capability::Control));
+        assert!(!cec.session_belongs_to("current", "tech-b"));
+    }
+
+    #[test]
+    fn ended_pending_request_cannot_consume_a_later_support_window() {
+        let cec = Cec::new(None);
+        let now = Instant::now();
+        let wall = now_secs();
+        cec.record_pending(support_request("tech-a", "cancelled", true));
+        cec.set_session("cancelled", "ended");
+        assert!(cec.pending().is_empty());
+        assert!(cec
+            .approve_pending("tech-a", "cancelled", ApprovalScope::ThreeHours, true)
+            .is_err());
+        assert!(cec.arm_support(now, wall).unwrap().is_none());
+        assert!(!cec.is_allowed("tech-a", Capability::ScreenView));
+        assert!(cec
+            .record_or_approve_armed(support_request("tech-b", "fresh", true), now, wall)
+            .unwrap());
+        assert!(cec.is_allowed("tech-b", Capability::Control));
+        // Even a stale pending record cannot bypass the terminal-state guard.
+        cec.record_pending(support_request("tech-a", "cancelled", true));
+        assert!(cec
+            .approve_pending("tech-a", "cancelled", ApprovalScope::ThreeHours, true)
+            .is_err());
+        assert!(!cec.is_allowed("tech-a", Capability::ScreenView));
+    }
+
+    #[test]
+    fn duplicate_approved_request_does_not_consume_a_new_window_or_reprompt() {
+        let cec = Cec::new(None);
+        let now = Instant::now();
+        let wall = now_secs();
+        let request = support_request("tech-a", "session-a", true);
+        cec.arm_support(now, wall).unwrap();
+        assert!(cec
+            .record_or_approve_armed(request.clone(), now, wall)
+            .unwrap());
+        cec.arm_support(now, wall).unwrap();
+        assert!(cec.record_or_approve_armed(request, now, wall).unwrap());
+        assert_eq!(
+            cec.support_status("123456789".into(), now, wall)
+                .approval_remaining_seconds,
+            300
+        );
+        assert!(cec.pending().is_empty());
+    }
+
+    #[test]
+    fn failed_armed_grant_stays_pending_and_never_authorises_or_consumes_window() {
+        let directory = std::env::temp_dir().join(format!(
+            "amst-support-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocked = directory.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let cec = Cec::new(Some(blocked.join("consent.json")));
+        let now = Instant::now();
+        let wall = now_secs();
+        cec.arm_support(now, wall).unwrap();
+        assert!(cec
+            .record_or_approve_armed(support_request("tech-a", "session-a", true), now, wall)
+            .is_err());
+        let status = cec.support_status("123456789".into(), now, wall);
+        assert_eq!(status.approval_remaining_seconds, 300);
+        assert!(!status.authorised);
+        assert_eq!(status.pending.len(), 1);
+        assert!(cec.session_state("session-a").is_none());
+        drop(cec);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn support_directory_and_session_have_separate_admission() {
         // The standing area is a Silent discovery-only directory with mesh
@@ -1186,6 +1616,7 @@ mod tests {
             want_control: true,
             session_id: "s1".into(),
             verification_code: verification_code(TECH, "s1"),
+            requested_at: now_secs(),
         });
         assert_eq!(cec.pending().len(), 1);
         assert!(!cec.is_allowed(TECH, Capability::Control));
@@ -1228,6 +1659,28 @@ mod tests {
         cec.set_session("answered", "active");
         assert!(!cec.transition_session("answered", "requested", "ended"));
         assert_eq!(cec.session_state("answered").as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn late_approval_cannot_revive_a_cancelled_dial() {
+        let cec = Cec::new(None);
+        cec.set_session("cancelled", "requested");
+        cec.bind_session("cancelled", TECH);
+        assert!(cec.transition_session("cancelled", "requested", "ended"));
+        assert!(!cec.accept_session_approval("cancelled", TECH));
+        assert_eq!(cec.session_state("cancelled").as_deref(), Some("ended"));
+        assert!(!cec.accept_session_approval("unknown", TECH));
+
+        cec.set_session("approved-first", "requested");
+        cec.bind_session("approved-first", TECH);
+        assert!(!cec.accept_session_approval("approved-first", TECH_B));
+        assert!(cec.accept_session_approval("approved-first", TECH));
+        assert!(cec.accept_session_approval("approved-first", TECH));
+        assert!(!cec.transition_session("approved-first", "requested", "ended"));
+        assert_eq!(
+            cec.session_state("approved-first").as_deref(),
+            Some("active")
+        );
     }
 
     #[test]

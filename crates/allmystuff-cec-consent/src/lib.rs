@@ -214,12 +214,18 @@ impl ConsentStore {
 
         // A technician can only have one live grant; a new decision replaces
         // any prior one in either tier.
+        let previous_ephemeral = self.ephemeral.clone();
+        let previous_persistent = self.persistent.clone();
         self.ephemeral.retain(|g| g.technician != key);
         self.persistent.retain(|g| g.technician != key);
 
         if scope.persists() {
             self.persistent.push(grant);
-            self.save()?; // roll back in memory if the durable write fails
+            if let Err(error) = self.save() {
+                self.ephemeral = previous_ephemeral;
+                self.persistent = previous_persistent;
+                return Err(error);
+            }
         } else {
             self.ephemeral.push(grant);
         }
@@ -357,6 +363,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ConsentStore::load(dir.path().join("consent.json"));
         (dir, store)
+    }
+
+    #[test]
+    fn failed_persistent_approval_never_grants_access_or_replaces_prior_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        let mut store = ConsentStore::in_memory();
+        store.path = Some(blocked.join("consent.json"));
+        assert!(store
+            .approve(
+                TECH,
+                "New",
+                capabilities_for(true),
+                ApprovalScope::ThreeHours,
+                T0
+            )
+            .is_err());
+        assert!(!store.is_allowed(TECH, Capability::ScreenView, T0));
+        store
+            .approve(
+                TECH,
+                "Existing",
+                capabilities_for(false),
+                ApprovalScope::Once,
+                T0,
+            )
+            .unwrap();
+        let previous = store.active_grants(T0);
+        assert!(store
+            .approve(
+                TECH,
+                "Replacement",
+                capabilities_for(true),
+                ApprovalScope::ThreeHours,
+                T0 + 1
+            )
+            .is_err());
+        assert_eq!(store.active_grants(T0 + 1), previous);
+        assert!(!store.is_allowed(TECH, Capability::Control, T0 + 1));
     }
 
     #[test]

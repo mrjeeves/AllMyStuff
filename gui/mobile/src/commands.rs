@@ -871,6 +871,29 @@ pub async fn room_unshare(app: tauri::AppHandle, tokens: Vec<String>) {
 // approve/deny + revoke as a customer, and the queue/dial/chat verbs a
 // technician answering from a phone needs.
 
+/// Manage support consent on the selected device, locally or over the mesh.
+#[tauri::command]
+pub async fn device_support(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    node: String,
+    action: Option<String>,
+    technician: Option<String>,
+    session_id: Option<String>,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "device_support",
+            json!({
+                "node": node,
+                "action": action.unwrap_or_else(|| "status".into()),
+                "technician": technician,
+                "session_id": session_id,
+            }),
+        )
+        .await
+}
+
 /// This node's CEC snapshot: its support number, role, hosting.
 #[tauri::command]
 pub async fn cec_status(

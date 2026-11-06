@@ -2719,17 +2719,43 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
   const win = getCurrentWindow();
   const next = !(await win.isFullscreen());
   await win.setFullscreen(next);
+  window.dispatchEvent(new Event("allmystuff:window-fullscreen"));
   return next;
 }
 
-/** The window's REAL fullscreen state — the OS can flip it without our
- *  ⛶ (Win+Up, taskbar, a shell gesture), and pointer-lock/fit logic
- *  keys off the flag, so callers re-query on resize instead of trusting
- *  their last click. Web mode reports the Fullscreen API instead. */
+/** Actual OS fullscreen, separate from a maximized window or expanded stage.
+ *  Web mode reports the browser Fullscreen API instead. */
 export async function isWindowFullscreen(): Promise<boolean> {
   if (!isTauri()) return document.fullscreenElement != null;
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   return getCurrentWindow().isFullscreen();
+}
+
+/** Observe actual fullscreen, including exits outside the console controls.
+ *  Ignore old replies when native queries overlap during a transition. */
+export function observeWindowFullscreen(onChange: (fullscreen: boolean) => void): () => void {
+  let disposed = false;
+  let revision = 0;
+  const sync = () => {
+    const current = ++revision;
+    void isWindowFullscreen().then(
+      (fullscreen) => { if (!disposed && current === revision) onChange(fullscreen); },
+      () => { if (!disposed && current === revision) onChange(false); },
+    );
+  };
+  window.addEventListener("resize", sync);
+  window.addEventListener("focus", sync);
+  window.addEventListener("allmystuff:window-fullscreen", sync);
+  document.addEventListener("fullscreenchange", sync);
+  sync();
+  return () => {
+    disposed = true;
+    revision++;
+    window.removeEventListener("resize", sync);
+    window.removeEventListener("focus", sync);
+    window.removeEventListener("allmystuff:window-fullscreen", sync);
+    document.removeEventListener("fullscreenchange", sync);
+  };
 }
 
 // ---- video popouts (one stream in its own OS window) -------------------

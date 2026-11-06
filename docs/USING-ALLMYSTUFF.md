@@ -117,7 +117,11 @@ fleet member when necessary, then creates a new current version rather than
 destroying later history. History defaults to 30 days, keeps current files
 first, and uses available allocated space beyond the retention target when it
 can. A dot on the Files mode button warns when the fleet is low on protected
-usable Files space.
+usable Files space. Open **Files** to read the matching notice below its toolbar.
+Choose **Manage storage** to review contributions and copy settings, or
+**Dismiss** to hide both the notice and the navigation dot for that issue.
+Dismissal is remembered on this device; a changed warning or a recurrence after
+recovery can notify you again.
 
 Fleet devices with enough space contribute **1 GB** (1 GiB) automatically on
 one local disk, without opening Settings. Setup leaves at least **5 GiB or 10%

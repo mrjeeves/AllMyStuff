@@ -40,6 +40,7 @@
     isMobile,
     isTauri,
     onNativeFileDrag,
+    observeWindowFullscreen,
     onThisWindowClose,
     refreshRoute,
     setMacRelativePointerCapture,
@@ -138,13 +139,19 @@
   // corner: on touch there is no hover), and Esc exits while control is
   // off; with control on every key belongs to the remote.
   let theater = $state(false);
+  // Expanding the in-page stage or maximizing its window is not fullscreen.
+  let fullscreen = $state(false);
+  $effect(() => observeWindowFullscreen((value) => {
+    fullscreen = value;
+    if (windowed) theater = value;
+  }));
 
   async function flipTheater() {
-    theater = !theater;
+    if (windowed) await toggleWindowFullscreen();
+    else theater = !theater;
     // The in-page card grows/shrinks to the viewport — a dragged bar must
     // re-clamp into the new bounds (measured after the layout lands).
     requestAnimationFrame(clampBarPos);
-    if (windowed) await toggleWindowFullscreen();
     // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
     // onblur), and claimFocus won't re-pin once the window itself holds focus —
     // so with control on, re-pin here or keyboard forwarding silently stops
@@ -1642,40 +1649,26 @@
     if (!app.consoleControl) untrack(() => touchMouse.reset());
   });
 
-  // ---- pointer lock (theater mouse capture) --------------------------
-  // The popout's game-aiming path, brought to the console: in THEATER
-  // with control live, a click captures the mouse and RELATIVE deltas
-  // stream to the host (`mouse_move_rel`) — FPS camera control instead
-  // of a cursor pinned to the stage edge, which is exactly the
-  // "fullscreen game doesn't capture the cursor" field report. Esc (the
-  // browser's own gesture) releases; leaving theater or control drops it.
+  // ---- pointer lock (automatic fullscreen or explicit mouse capture) --
+  // Actual OS/browser fullscreen enables capture on a stage click. The
+  // explicit Relative mouse button also works in any window mode.
   let pointerLocked = $state(false);
   let nativePointerLocked = $state(false);
-  // Relative mouse, asked for deliberately rather than inferred from theater.
-  //
-  // A remote fullscreen app or game captures the mouse on ITS machine: it
-  // warps the cursor to centre each frame and reads the delta. Absolute
-  // coordinates fight that — every move we send yanks the cursor back to
-  // where our pointer is, so aiming is unusable — and it doesn't matter one
-  // bit whether the *viewer* happens to be fullscreen. Tying capture to
-  // theater meant the only way to drive such an app was to also give up your
-  // own screen, so this is its own switch.
-  //
-  // Turning it on grabs the pointer on the next click (pointer lock needs a
-  // user gesture); Esc — the browser's own gesture — releases the lock, and
-  // the effect below turns the mode off with it, so one press hands your
-  // cursor back rather than leaving a mode armed to re-grab.
+  // Escape releases manual capture; expanding the stage alone never arms it.
   let relativeMouse = $state(false);
   function lockChanged() {
     pointerLocked = document.pointerLockElement === stageEl;
+    if (pointerLocked && !wantsCapture) {
+      document.exitPointerLock();
+      pointerLocked = false;
+    }
     lockedMotion.reset();
     if (pointerLocked && nativePointerLocked) void releaseNativePointerLock(false);
     if (!pointerLocked && !nativePointerLocked) relativeMouse = false;
   }
-  /** Whether capture is wanted at all right now — theater as before, or an
-   *  explicit relative-mouse session. Control over a real desktop either way;
-   *  a KVM source has no pointer to capture. */
-  const wantsCapture = $derived((theater || relativeMouse) && stagePointerActive && !kvmSource);
+  /** Automatic capture requires real fullscreen. Manual capture remains
+   *  available while windowed/maximized; ordinary mouse control is separate. */
+  const wantsCapture = $derived((fullscreen || relativeMouse) && stagePointerActive && !kvmSource);
   let pointerLockPending = false;
   async function maybePointerLock(relativeIntent = relativeMouse) {
     const target = stageEl;
@@ -1683,7 +1676,7 @@
     // gating this user-activation call only through `wantsCapture` could still
     // see the pre-click false value and silently spend the one valid gesture.
     const captureWanted =
-      (theater || relativeIntent) &&
+      (fullscreen || relativeIntent) &&
       app.consoleControl &&
       selected?.media === "display" &&
       !kvmSource;
@@ -1707,11 +1700,15 @@
         return;
       }
       await target.requestPointerLock();
+      if (!wantsCapture && document.pointerLockElement === target) {
+        document.exitPointerLock();
+        return;
+      }
       // Older WKWebView builds return `void` before they report success or
       // failure. If no pointerlock event follows, use the native macOS grab
       // instead of leaving a permanently-lit but uncaptured switch.
       setTimeout(() => {
-        if (relativeMouse && !pointerLocked && !nativePointerLocked) {
+        if (wantsCapture && !pointerLocked && !nativePointerLocked) {
           void activateNativePointerLock(target);
         }
       }, 150);
@@ -1727,7 +1724,7 @@
   }
   let nativePointerLockPending = false;
   async function activateNativePointerLock(target = stageEl) {
-    if (!target || pointerLocked || nativePointerLocked || nativePointerLockPending) return;
+    if (!wantsCapture || !target || target !== stageEl || !target.isConnected || pointerLocked || nativePointerLocked || nativePointerLockPending) return;
     nativePointerLockPending = true;
     try {
       const rect = target.getBoundingClientRect();
@@ -1738,7 +1735,9 @@
       if (!captured) return;
       if (
         pointerLocked ||
-        !relativeMouse ||
+        !wantsCapture ||
+        target !== stageEl ||
+        !target.isConnected ||
         !app.consoleControl ||
         selected?.media !== "display" ||
         kvmSource
@@ -1789,8 +1788,8 @@
     };
   });
   $effect(() => {
-    // Losing control (or the desktop under it) releases the capture, and
-    // leaving theater releases it only when relative mouse isn't holding it.
+    // Leaving actual fullscreen releases automatic capture. A deliberate
+    // manual session may keep its lock while the window is restored.
     if (!wantsCapture) {
       if (pointerLocked) document.exitPointerLock();
       if (nativePointerLocked) void releaseNativePointerLock();

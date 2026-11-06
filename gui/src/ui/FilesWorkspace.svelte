@@ -84,8 +84,14 @@
     type FilesView,
     type SharedFilesystemKind,
   } from "../files-canvas";
+  import type { FilesStorageAttention } from "../files-storage-attention";
+  import FilesStorageNotice from "./FilesStorageNotice.svelte";
 
-  let { initialLocation = null }: { initialLocation?: string | null } = $props();
+  let { initialLocation = null, storageAttention = null, onDismissStorageAttention = () => {} }: {
+    initialLocation?: string | null;
+    storageAttention?: FilesStorageAttention | null;
+    onDismissStorageAttention?: () => void;
+  } = $props();
 
 
   type WorkspaceBinding =
@@ -4180,7 +4186,7 @@ function newTransferId(): string {
 
 <svelte:window onpointerdowncapture={dismissTransientMenus} onblur={() => dismissTransientMenus()} />
 
-<section class="files-workspace" class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={() => {
+<section class="files-workspace" class:storage-attention={storageAttention !== null} class:places-hidden={!placesOpen} class:preview-hidden={!previewOpen || !app.filesSettings.showPreview} style={`--places-width:${placesWidth}px;--preview-width:${previewWidth}px`} role="application" aria-label="Files workspace" oncontextmenu={(event) => event.preventDefault()} onpointerdown={() => {
   cancelPendingItemRename();
 }}>
   <nav class="filebar" aria-label="File commands">
@@ -4240,6 +4246,10 @@ function newTransferId(): string {
       <button class="workspace-menu-button" class:active={workspaceContext !== null} aria-haspopup="menu" aria-expanded={workspaceContext !== null} onclick={showWorkspaceMenuFromToolbar} title="More file commands">···</button>
     {/if}
   </nav>
+
+  {#if storageAttention}
+    <FilesStorageNotice attention={storageAttention} ondismiss={onDismissStorageAttention} />
+  {/if}
 
   <aside class="places" class:collapsed={!placesOpen}>
     <button class="resize-edge places-edge" aria-label="Resize Navigator" onpointerdown={(event) => resizeSidebar(event, "places")}></button>
@@ -4788,6 +4798,7 @@ function newTransferId(): string {
 
 <style>
   .files-workspace { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template: auto 1fr / var(--places-width, 14rem) minmax(20rem, 1fr) var(--preview-width, 18rem); background: var(--bg); overflow: hidden; }
+  .files-workspace.storage-attention { grid-template-rows: auto auto minmax(0, 1fr); }
   .files-workspace.preview-hidden { grid-template-columns: var(--places-width, 14rem) minmax(20rem, 1fr) 2.5rem; }
   .files-workspace.places-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) var(--preview-width, 18rem); }
   .files-workspace.places-hidden.preview-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) 2.5rem; }

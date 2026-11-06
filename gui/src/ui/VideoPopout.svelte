@@ -30,7 +30,7 @@
   import {
     clientLog,
     focusThisWindow,
-    isWindowFullscreen,
+    observeWindowFullscreen,
     onThisWindowClose,
     sendInput,
     setMacRelativePointerCapture,
@@ -176,7 +176,7 @@
   let fullscreen = $state(false);
 
   async function flipFullscreen() {
-    fullscreen = await toggleWindowFullscreen();
+    await toggleWindowFullscreen();
     // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
     // onblur); re-pin focus so keyboard forwarding resumes without a click back
     // into the picture.
@@ -186,23 +186,11 @@
     }
   }
 
-  // The OS can flip fullscreen without our ⛶ (Win+Up, a shell gesture) —
-  // and pointer lock engages off this flag, which is exactly the field's
-  // "fullscreen game doesn't capture the cursor": the flag said windowed,
-  // so the click never locked. Re-query the REAL state on every resize.
-  $effect(() => {
-    let alive = true;
-    const sync = () =>
-      void isWindowFullscreen().then((v) => {
-        if (alive) fullscreen = v;
-      });
-    sync();
-    window.addEventListener("resize", sync);
-    return () => {
-      alive = false;
-      window.removeEventListener("resize", sync);
-    };
-  });
+  // Automatic capture follows actual fullscreen, including OS/browser changes.
+  // Maximizing does not count; the relative-mouse button remains independent.
+  $effect(() => observeWindowFullscreen((value) => {
+    fullscreen = value;
+  }));
 
   // ---- quality pills (streams this window owns) ----------------------
   type PillChoice = { label: string; value: number | null };
@@ -452,8 +440,8 @@
   // Game-mode aiming: in fullscreen control, a click captures the mouse
   // and RELATIVE deltas stream to the host (`mouse_move_rel`) — FPS
   // camera control instead of a cursor pinned to the window edge. Esc
-  // (the browser's own gesture) releases it; leaving fullscreen or
-  // control drops it too.
+  // (the browser's own gesture) releases it. Automatic capture follows
+  // fullscreen; an explicit relative-mouse session can also run windowed.
   let pointerLocked = $state(false);
   let nativePointerLocked = $state(false);
   // Relative mouse — the console's switch, in the popped-out window. See the

@@ -8096,22 +8096,13 @@ impl Mesh {
 
     // ---- CEC Support (technician + customer) --------------------------
     //
-    // CEC Support rides this exact engine, but its public Silent rooms are
-    // signaling directories, never data meshes. Customers announce in
-    // `cecsupport-clients`; technicians lurk listen-only. Raising a hand is
-    // joining `cecsupport-asking`, whose presence is the technicians' queue.
-    // The app suppresses those public sightings outside the support workflow.
-    // A technician answers a raised hand (or a phoned-in number) by joining
-    // the selected customer's `cec-<Support ID>` room and deliberately dialing
-    // them there — a direct session, with TURN as WebRTC's NAT fallback, never
-    // a mesh hop. From then on that customer is an
-    // ordinary AllMyStuff graph peer with the normal screen/control
-    // features. The only substitution is trust — a CEC route is authorized
-    // by the customer's live consent grant ([`crate::cec`]) rather than
-    // owner/fleet, checked per frame in [`Self::sender_may_drive`] so a
-    // revoke bites mid-session. Every command mirrors the node-control
-    // surface the CEC client app and this app's CEC tab both depend on
-    // verbatim.
+    // The node owns discovery, requests, consent, and session lifetime. The
+    // standalone Support app and AllMyStuff's device dialog are clients of
+    // this same API; neither UI needs to remain open for support to work.
+    // Customers announce in the discovery-only `cecsupport-clients` directory.
+    // A technician dials a support number into that customer's isolated room,
+    // then uses ordinary screen/control routes authorized by the node's live
+    // consent grant. Public directory membership never grants data access.
 
     /// This node's support number, public directory, and role.
     pub async fn cec_status(&self) -> Result<Value, String> {

@@ -176,12 +176,24 @@ fn private_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("couldn't protect private drive state: {error}"))
 }
 
+struct CacheLock(File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // A concurrent fork can copy this open-file description before its
+        // CLOEXEC takes effect. Closing only our File would retain flock until
+        // that unrelated child execs. Explicit unlock releases our ownership
+        // immediately, including across those inherited descriptor copies.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 struct PreparedMount {
     remote: String,
     config: PathBuf,
     cache: PathBuf,
     log: PathBuf,
-    lock: File,
+    lock: CacheLock,
 }
 
 fn prepare(root: &Path, mapping: &str, url: &str) -> Result<PreparedMount, String> {
@@ -205,6 +217,7 @@ fn prepare(root: &Path, mapping: &str, url: &str) -> Result<PreparedMount, Strin
         "this drive's write cache is already in use; wait for its previous mount to stop"
             .to_string()
     })?;
+    let lock = CacheLock(lock);
     let cache = directory.join("cache");
     private_directory(&cache)?;
     let remote = format!("allmystuff_{mapping_id}");
@@ -255,23 +268,31 @@ fn mount_args(prepared: &PreparedMount, mount: &Path) -> Vec<OsString> {
 /// kills our child, and never signals a PID obtained from a stale file.
 pub(super) struct MountedHelper {
     child: Option<Child>,
-    lock: Option<File>,
+    lock: Option<CacheLock>,
 }
 
-async fn reap(child: &mut Child) {
-    if tokio::time::timeout(STOP_TIMEOUT, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(STOP_TIMEOUT, child.wait()).await;
+async fn reap(child: &mut Child) -> bool {
+    if matches!(
+        tokio::time::timeout(STOP_TIMEOUT, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return true;
     }
+    let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(STOP_TIMEOUT, child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 impl MountedHelper {
     pub(super) async fn stop(mut self) {
-        if let Some(mut child) = self.child.take() {
-            reap(&mut child).await;
+        // Keep the child inside this guard across awaits. If stop is cancelled,
+        // Drop must still transfer both it and the cache lock to the reaper.
+        if let Some(child) = self.child.as_mut() {
+            if reap(child).await {
+                self.child.take();
+            }
         }
     }
 }
@@ -285,7 +306,10 @@ impl Drop for MountedHelper {
             let lock = self.lock.take();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
-                    reap(&mut child).await;
+                    // The caller's bounded stop has already returned; retain
+                    // the lock in this background reaper until the owned child
+                    // exits, even if a killed process takes time to be reaped.
+                    let _ = child.wait().await;
                     drop(lock);
                 });
             }
@@ -636,6 +660,23 @@ mod tests {
     }
 
     #[test]
+    fn an_inherited_descriptor_cannot_retain_a_released_cache_lock() {
+        let root = TestDirectory::new();
+        let first = prepare(&root.0, "mapping", "http://127.0.0.1:1234/").unwrap();
+        // dup and fork share an open-file description, hence the same flock.
+        // Keep that copy open to deterministically model another thread's
+        // fork-to-exec window without forking the multithreaded test runner.
+        let inherited = first.lock.0.try_clone().unwrap();
+        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:2345/").is_err());
+        drop(first);
+        let second = prepare(&root.0, "mapping", "http://127.0.0.1:2345/").unwrap();
+        drop(inherited);
+        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:3456/").is_err());
+        drop(second);
+        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:3456/").is_ok());
+    }
+
+    #[test]
     fn mount_arguments_support_stock_rclone_without_changing_cache_identity() {
         let root = TestDirectory::new();
         let prepared = prepare(&root.0, "mapping", "http://127.0.0.1:1234/").unwrap();
@@ -710,6 +751,19 @@ mod tests {
         panic!("helper {pid} survived startup cleanup");
     }
 
+    async fn assert_cache_released(root: &Path) {
+        // Reaping and unlocking run together in a background task. Observing
+        // ESRCH on another runtime thread can precede that task's next unlock
+        // instruction, so wait for the actual cleanup completion condition.
+        for _ in 0..100 {
+            if prepare(root, "mapping", "http://127.0.0.1:2345/").is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("helper cleanup retained the cache lock");
+    }
+
     #[tokio::test]
     async fn startup_timeout_kills_and_reaps_our_helper() {
         let root = TestDirectory::new();
@@ -731,7 +785,7 @@ mod tests {
         .unwrap();
         assert!(error.contains("did not create the filesystem"), "{error}");
         assert_reaped(wait_for_pid(&pid_path).await).await;
-        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:2345/").is_ok());
+        assert_cache_released(&root.0).await;
     }
 
     #[tokio::test]
@@ -758,6 +812,29 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_reaped(pid).await;
-        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:2345/").is_ok());
+        assert_cache_released(&root.0).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_child_and_cache_lock_in_the_cleanup_guard() {
+        let root = TestDirectory::new();
+        let prepared = prepare(&root.0, "mapping", "http://127.0.0.1:1234/").unwrap();
+        let child = crate::child_process::command("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let helper = MountedHelper {
+            child: Some(child),
+            lock: Some(prepared.lock),
+        };
+        let task = tokio::spawn(helper.stop());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(prepare(&root.0, "mapping", "http://127.0.0.1:2345/").is_err());
+        task.abort();
+        let _ = task.await;
+        assert_reaped(pid).await;
+        assert_cache_released(&root.0).await;
     }
 }

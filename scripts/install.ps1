@@ -55,6 +55,42 @@ $meshAsset = "myownmesh-windows-$arch.zip"
 # Set by Build-FromSource so amst can build from the same checkout/clone.
 $script:RepoDir = $null
 
+# The pinned mesh daemon can import VCRUNTIME140.dll even when AllMyStuff's
+# own binaries use a static CRT. Provision it before running any installed exe.
+function Ensure-VisualCppRuntime {
+    $runtimeArch = switch ($arch) {
+        'x86_64' { 'x64' }
+        'aarch64' { 'arm64' }
+        default { throw "Unsupported Windows runtime architecture: $arch" }
+    }
+    if ($DryRun) {
+        Log "(dry-run) would install the Microsoft Visual C++ runtime ($runtimeArch)"
+        return
+    }
+    $runtimeDir = Join-Path $env:TEMP "allmystuff-vcredist-$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $runtimeDir | Out-Null
+    $installer = Join-Path $runtimeDir "vc_redist.$runtimeArch.exe"
+    try {
+        Log "Installing the Microsoft Visual C++ runtime ($runtimeArch)"
+        Invoke-WebRequest -Uri "https://aka.ms/vc14/vc_redist.$runtimeArch.exe" -OutFile $installer -UseBasicParsing
+        $signature = Get-AuthenticodeSignature -LiteralPath $installer
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
+            throw 'The Visual C++ runtime installer does not have a valid Microsoft signature.'
+        }
+        $process = Start-Process -FilePath $installer -ArgumentList '/install', '/quiet', '/norestart' `
+            -WindowStyle Hidden -Wait -PassThru
+        switch ($process.ExitCode) {
+            0 { Log 'Visual C++ runtime is ready.' }
+            1638 { Log 'A newer Visual C++ runtime is already installed.' }
+            3010 { Warn 'Visual C++ runtime installed. Restart Windows to finish setup.' }
+            default { throw "Visual C++ runtime installation failed (code $($process.ExitCode))." }
+        }
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $runtimeDir -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Extract a release zip over $Prefix, retrying briefly. Windows can keep a file
 # lock for a moment after a process exits, so a just-stopped .exe may not have
 # released yet; a few retries beat a spurious "Access ... denied".
@@ -610,6 +646,7 @@ function Build-FromSource {
 # Stop a running app/node/daemon (and the Always-On service) first, so we never
 # try to overwrite a locked, in-use .exe. Skipped on a dry run.
 $serviceWasRunning = $false
+Ensure-VisualCppRuntime
 if (-not $DryRun) {
     $serviceWasRunning = Stop-AllMyStuff
 }

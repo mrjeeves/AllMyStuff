@@ -63,6 +63,11 @@ just gui-build    # installable desktop bundle
 When working only on the Svelte front end, `pnpm test`, `pnpm check`, and
 `pnpm build` are also available from this directory.
 
+On Windows, `just gui-build` also stages Microsoft's signed runtime installer
+and builds the supported NSIS bundle. When invoking Tauri directly, first run
+`scripts/download-windows-runtime.ps1 -Destination gui/src-tauri/windows/vc_redist.x64.exe`
+from the repository root, then use `pnpm tauri build --bundles nsis` in `gui`.
+
 The front-end is the part that builds anywhere. The Tauri backend links the
 system webview, so building the desktop app on Linux needs `libgtk-3-dev` and
 `libwebkit2gtk-4.1-dev`; macOS and Windows use their built-in webviews. The

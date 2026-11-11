@@ -56,6 +56,7 @@ mod backend_recovery;
 #[allow(dead_code)] // parsers for the other desktop OSes are exercised by this module's tests
 mod host_wifi;
 mod local_file_operations;
+mod secondary_window;
 #[cfg(windows)]
 mod shell_icon;
 mod window_behavior;
@@ -917,7 +918,7 @@ async fn terminal_sessions(
 /// through here so the identity step can't be forgotten: `aumid` is a required
 /// argument (see [`set_taskbar_identity`]), applied to each new window at
 /// creation. A future window kind just calls this with its own `AUMID_*`.
-fn open_secondary_window(
+async fn open_secondary_window(
     app: &tauri::AppHandle,
     label: &str,
     url: String,
@@ -926,57 +927,94 @@ fn open_secondary_window(
     min_inner_size: (f64, f64),
     aumid: &'static str,
 ) -> Result<(), String> {
+    // Repeated clicks must not build two webviews with the same stable label.
+    // A failed launch for one machine must not block a different machine.
+    let launch = secondary_window::launch_lock(label);
+    let _launch = launch.lock().await;
     if let Some(existing) = app.get_webview_window(label) {
-        // A secondary window can outlive its native HWND in Tauri's window
-        // registry after a renderer or WebView failure. `set_focus()` on that
-        // orphan returns an error; ignoring it made every later click look
-        // successful while no window appeared. Probe the native window, make
-        // a healthy one visible again, and discard a stale entry so the build
-        // below can recreate it under the same stable label.
-        match (existing.is_visible(), existing.is_minimized()) {
-            (Ok(_), Ok(minimized)) => {
-                let shown = existing.show();
-                let restored = if minimized {
-                    existing.unminimize()
-                } else {
-                    Ok(())
-                };
-                if shown.is_ok() && restored.is_ok() {
-                    // Windows may refuse a foreground-stealing focus request;
-                    // the window is still visible, so that is not a launch
-                    // failure and must not make us destroy it.
-                    let _ = existing.set_focus();
-                    return Ok(());
-                }
-                tracing::warn!(
-                    window = label,
-                    show_error = ?shown.err(),
-                    restore_error = ?restored.err(),
-                    "secondary window could not be restored; recreating it"
-                );
-            }
-            (visible, minimized) => {
-                tracing::warn!(
-                    window = label,
-                    visible_error = ?visible.err(),
-                    minimized_error = ?minimized.err(),
-                    "secondary window registry entry is stale; recreating it"
-                );
-            }
+        // A live HWND does not prove that its renderer still works. Ask the
+        // page to answer before treating this click as a successful refocus.
+        if secondary_window::wait_until_ready(|| webview_ready(&existing), Duration::from_secs(2))
+            .await
+            .is_ok()
+            && existing.unminimize().is_ok()
+            && existing.show().is_ok()
+        {
+            let _ = existing.set_focus();
+            return Ok(());
         }
-        let _ = existing.destroy();
+        tracing::warn!(
+            window = label,
+            "secondary window is unresponsive; recreating it"
+        );
+        destroy_secondary_window(app, &existing).await?;
     }
-    let window = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
-        .title(title)
+
+    // Building a webview waits synchronously for the native event loop. Keep
+    // that work off the async runtime so other commands keep making progress.
+    let build_app = app.clone();
+    let build_label = label.to_string();
+    let build_title = title.to_string();
+    let window = tauri::async_runtime::spawn_blocking(move || {
+        tauri::WebviewWindowBuilder::new(
+            &build_app,
+            build_label,
+            tauri::WebviewUrl::App(url.into()),
+        )
+        .title(build_title)
         .inner_size(inner_size.0, inner_size.1)
         .min_inner_size(min_inner_size.0, min_inner_size.1)
-        .visible(true)
+        // Do not flash a native window that has no working app inside it.
+        .visible(false)
         .build()
-        .map_err(|e| e.to_string())?;
-    window.show().map_err(|e| e.to_string())?;
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        tracing::warn!(window = label, error = %e, "secondary window creation failed");
+        e.to_string()
+    })?;
+
+    let ready =
+        secondary_window::wait_until_ready(|| webview_ready(&window), Duration::from_secs(15))
+            .await;
+    if let Err(error) = ready.and_then(|()| window.show().map_err(|e| e.to_string())) {
+        tracing::warn!(window = label, %error, "secondary window startup failed");
+        destroy_secondary_window(app, &window).await?;
+        return Err(error);
+    }
     let _ = window.set_focus();
     set_taskbar_identity(app, label, aumid);
     Ok(())
+}
+
+async fn webview_ready(window: &tauri::WebviewWindow) -> Result<bool, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = Mutex::new(Some(tx));
+    window
+        .eval_with_callback("window.__ALLMYSTUFF_READY__ === true", move |value| {
+            if let Some(tx) = tx.lock().take() {
+                let _ = tx.send(value == "true");
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())
+}
+
+async fn destroy_secondary_window(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    window.destroy().map_err(|e| e.to_string())?;
+    // destroy() only queues an event. Reusing the label before Tauri removes
+    // it from its registry races with destruction and fails every later open.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.get_webview_window(window.label()).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "The previous window is still closing. Please try again.".to_string())
 }
 
 /// Open (or focus) the dedicated terminal window for `node` — one OS
@@ -1014,6 +1052,7 @@ async fn open_terminal_window(
         (480.0, 320.0),
         AUMID_TERMINAL,
     )
+    .await
 }
 
 // ---- files (the mesh-native file manager) -------------------------------
@@ -2704,6 +2743,7 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
         (480.0, 320.0),
         AUMID_FILES,
     )
+    .await
 }
 
 #[tauri::command]
@@ -2729,6 +2769,7 @@ async fn open_files_workspace_window(
         (640.0, 420.0),
         AUMID_FILES,
     )
+    .await
 }
 
 // ---- sites (the reverse proxy) -----------------------------------------
@@ -2857,6 +2898,7 @@ async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), 
         (560.0, 380.0),
         AUMID_CONSOLE,
     )
+    .await
 }
 
 /// Open (or focus) the dedicated window for one virtual room — the call
@@ -2874,6 +2916,7 @@ async fn open_room_window(app: tauri::AppHandle, room: String) -> Result<(), Str
         (640.0, 440.0),
         AUMID_ROOM,
     )
+    .await
 }
 
 /// Open (or focus) the popout window for one video stream — a console
@@ -2910,6 +2953,7 @@ async fn open_video_window(
         (380.0, 260.0),
         AUMID_VIDEO,
     )
+    .await
 }
 
 /// Pop the CEC Support console out into its own window (`?cec=1`). A single
@@ -2927,6 +2971,7 @@ async fn open_cec_window(app: tauri::AppHandle) -> Result<(), String> {
         (420.0, 480.0),
         AUMID_CEC,
     )
+    .await
 }
 
 /// Open (or focus) the pop-out chat window for one CEC customer (`?chat=<peer>`)
@@ -2948,6 +2993,7 @@ async fn open_chat_window(app: tauri::AppHandle, peer: String) -> Result<(), Str
         (320.0, 420.0),
         AUMID_CHAT,
     )
+    .await
 }
 
 /// A node id reduced to the characters Tauri allows in a window label —

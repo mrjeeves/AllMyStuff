@@ -16,3 +16,9 @@
 # audiopus_sys ships a fixed CMakeLists.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Ship the MSVC runtime inside our binaries, including the node's native media
+# libraries. Portable archives and self-updates must not introduce a new VC++
+# prerequisite. The installer still provisions it for the prebuilt mesh daemon.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

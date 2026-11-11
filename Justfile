@@ -63,7 +63,8 @@ gui-build:
 [windows]
 [doc("Build the desktop bundle.")]
 gui-build:
-    @cd gui; pnpm install --silent; pnpm tauri build
+    @./scripts/download-windows-runtime.ps1 -Destination gui/src-tauri/windows/vc_redist.x64.exe
+    @cd gui; pnpm install --silent; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm tauri build --bundles nsis
 
 # Scan this machine from the CLI.
 scan:

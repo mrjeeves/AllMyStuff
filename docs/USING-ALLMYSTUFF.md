@@ -31,6 +31,11 @@ detail sidebar belongs to Advanced mode.
 Install and open AllMyStuff on both computers while they are on the same local
 network.
 
+The Windows installer includes Microsoft's signed Visual C++ runtime package
+for the mesh daemon and installs it automatically. The PowerShell installer
+downloads and verifies the same prerequisite. The app and node binaries also
+include their C/C++ runtime, including in portable downloads and self-updates.
+
 1. On the computer being added, find its **This Device** card.
 2. Choose **Make claimable**.
 3. On a computer already in your fleet, select the device under **Ready to
@@ -69,6 +74,11 @@ or moving between monitors does not require another share.
 
 Use **Rooms** when sharing an individual monitor or app for a session. A room's
 selected source does not create a durable grant.
+
+On desktop, Remote Control opens a window once its interface is ready. Selecting
+the same machine again restores its existing window or replaces an unresponsive
+one. If startup fails, the main window shows the error; choose Remote Control
+again to retry.
 
 - Use the screen list to move between monitors.
 - Pop a monitor into its own native window. You can pop out several monitors

@@ -190,6 +190,11 @@ jobs:
         working-directory: gui
         run: pnpm install --frozen-lockfile
 
+      - name: Stage signed Windows runtime prerequisite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/download-windows-runtime.ps1 -Destination gui/src-tauri/windows/vc_redist.x64.exe
+
       # Build the headless CLI first. The bundle step below ships it
       # alongside the GUI installer so users get a `scan`/`capabilities`
       # binary too, and the self-updater can fetch it as its own asset.
@@ -243,6 +248,19 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.platform.target }} ${{ matrix.platform.bundle_args }}
+
+      # Hosted Windows runners already have VC++ installed, so simply launching
+      # a binary there cannot catch the missing-DLL failure on a fresh PC.
+      - name: Verify Windows binaries do not require the VC++ Redistributable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/check-windows-runtime.ps1 -BinaryPaths @(
+            'target/${{ matrix.platform.target }}/release/allmystuff.exe',
+            'target/${{ matrix.platform.target }}/release/amst.exe',
+            'node/target/${{ matrix.platform.target }}/release/allmystuff-serve.exe',
+            'gui/src-tauri/target/${{ matrix.platform.target }}/release/allmystuff-gui.exe'
+          )
 
       # Package the portable CLI binary as a tarball / zip so users who
       # don't want the GUI installer can `curl | tar` it, and the

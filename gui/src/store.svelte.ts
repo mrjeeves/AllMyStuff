@@ -3622,7 +3622,9 @@ class AppStore {
   private openConsoleResolved(nodeId: string, node: MeshNode | undefined) {
     if (!this.consoleAllowed(node, nodeId)) return;
     if (isTauri() && !isMobile()) {
-      void openConsoleWindow(nodeId);
+      void openConsoleWindow(nodeId).catch((error) => {
+        this.toast("warn", `Couldn't open Remote Control: ${String(error)}`);
+      });
       return;
     }
     this.openConsoleHere(nodeId);

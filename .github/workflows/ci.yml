@@ -21,6 +21,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Windows runtime installer regression tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-runtime.tests.ps1
       # `just release` runs this with the OS-provided shell. macOS still ships
       # Bash 3.2, so execute the real pin/lock guard there in CI rather than
       # discovering Bash-4-only builtins while cutting a release.
@@ -72,7 +76,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ffmpeg-next 6.1 requires FFmpeg 6 headers. Ubuntu 26.04 ships
+        # FFmpeg 8, which removed avfft.h; migrate the bindings deliberately
+        # before changing this reference platform.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # The Opus bundled by `audiopus_sys` (via the `opus` crate) declares an
     # ancient `cmake_minimum_required`, which CMake 4.x on the runners refuses
@@ -94,15 +101,24 @@ jobs:
       # input (enigo, xcb) crates link against. The GUI backend job gets these
       # transitively through webkit/gtk; the headless node has to ask for them.
       - name: Linux media deps
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
             libgbm-dev libudev-dev libgtk-3-dev libwayland-dev \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libavdevice-dev libswscale-dev libswresample-dev
+      - name: Verify FFmpeg binding compatibility
+        if: runner.os == 'Linux'
+        run: |
+          version=$(pkg-config --modversion libavcodec)
+          echo "libavcodec version: $version (ffmpeg-next 6.1 expects major 60)"
+          if [[ "$version" != 60.* ]]; then
+            echo "::error::FFmpeg headers do not match ffmpeg-next 6.1; use an FFmpeg 6 runner."
+            exit 1
+          fi
       - name: rustfmt
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         working-directory: node
         run: cargo fmt --check
       # clippy on the Linux reference platform only. This engine is the former
@@ -111,7 +127,7 @@ jobs:
       # target there, so the platform-specific capture/input code is verified;
       # `-D warnings` lint policy stays on Linux, matching that history.
       - name: clippy
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         working-directory: node
         run: cargo clippy --all-targets -- -D warnings
       # Lint + build the hardware-encode path too (FFmpeg dev libs installed
@@ -119,7 +135,7 @@ jobs:
       # list is the only platform-specific part. The default build above stays
       # software-only so the macOS/Windows jobs need no FFmpeg toolchain.
       - name: clippy (hwenc)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         working-directory: node
         run: cargo clippy --all-targets --features hwenc -- -D warnings
       # The capture-less path the iOS/Android app links: `mesh.rs` is shared
@@ -130,14 +146,14 @@ jobs:
       # API added to the host path but not the stub — used to surface only on
       # the developer's `tauri ios` build. This check catches it in CI.
       - name: check capture-less stub (mobile config)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         working-directory: node
         run: cargo check --no-default-features
       - name: test
         working-directory: node
         run: cargo test
       - name: test (hwenc)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         working-directory: node
         run: cargo test --features hwenc
 

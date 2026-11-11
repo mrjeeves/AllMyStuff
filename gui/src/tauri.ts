@@ -1396,7 +1396,10 @@ export function sessionSnapshot(): Promise<SessionSnapshot | null> {
  *  the web preview keeps its in-page console. */
 export async function openConsoleWindow(node: string): Promise<void> {
   if (!isTauri()) return;
-  await tryInvoke("open_console_window", { node });
+  // A launch failure must reach the graph's toast instead of becoming a
+  // successful-looking null result (and a button that appears to do nothing).
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_console_window", { node });
 }
 
 /** Which machine this window is a console for, when the window was opened

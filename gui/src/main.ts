@@ -1,4 +1,4 @@
-import { mount } from "svelte";
+import { mount, tick } from "svelte";
 import App from "./ui/App.svelte";
 import "./app.css";
 
@@ -31,6 +31,11 @@ window.addEventListener("unhandledrejection", (e) =>
 let app: ReturnType<typeof mount> | undefined;
 try {
   app = mount(App, { target: document.getElementById("app")! });
+  // The native launcher keeps new windows hidden until their app has mounted.
+  // A native HWND alone can survive a failed or terminated webview renderer.
+  void tick().then(() => {
+    (window as Window & { __ALLMYSTUFF_READY__?: boolean }).__ALLMYSTUFF_READY__ = true;
+  });
 } catch (e) {
   showFatal("App mount failed", e);
   throw e;

@@ -13,6 +13,8 @@ gui/src-tauri/gen/schemas
 # (binaries/myownmesh-<triple>{.exe}); it's a build artefact — the pinned
 # source rev lives in .myownmesh-rev.
 gui/src-tauri/binaries/
+# Verified Microsoft runtime prerequisite staged by the release workflow.
+gui/src-tauri/windows/vc_redist.*.exe
 
 # Editor / OS
 .DS_Store

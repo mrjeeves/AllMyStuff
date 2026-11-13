@@ -173,6 +173,9 @@ pub mod videotoolbox;
 pub mod wake;
 #[cfg(windows)]
 pub(crate) mod windows_fleetfiles;
+
+#[cfg(windows)]
+pub(crate) mod windows_cloud_files;
 // Windows screen capture (in-house DXGI). Declared on every target — the
 // module is internally `cfg`-gated to a stub off Windows, exactly as it was
 // when it lived in the GUI binary.

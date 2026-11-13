@@ -2766,8 +2766,8 @@ impl Mesh {
         let Some(started) = started else { return };
         let elapsed = started.elapsed();
         let sequence = crate::video_wire::peek_au_identity_marker(data).map(|id| id.sequence);
-        if !crate::video_frame_timing::periodic_sample(sequence)
-            && !(elapsed >= Duration::from_millis(50)
+        if !(crate::video_frame_timing::periodic_sample(sequence)
+            || elapsed >= Duration::from_millis(50)
                 && self.diag_ok(&format!("au-send-timing:{route_id}")))
         {
             return;
@@ -16170,6 +16170,218 @@ impl Mesh {
         Ok(json!({ "path": self.fleetfiles.materialize(&path)? }))
     }
 
+    #[cfg(windows)]
+    pub(crate) async fn cloud_fleetfiles_read(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, String> {
+        let (version, size, hash) = self
+            .fleetfiles
+            .current_file_version(path)?
+            .ok_or("that Fleetfiles file no longer exists")?;
+        self.fetch_fleetfiles_body(path, &version, size, &hash)
+            .await?;
+        let source = self
+            .fleetfiles
+            .local_body_source(&hash, size)?
+            .ok_or("the verified Fleetfiles body is unavailable")?;
+        let length = length.min(size.saturating_sub(offset)).min(1024 * 1024);
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(source).map_err(|error| error.to_string())?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| error.to_string())?;
+            let mut bytes = vec![0; length as usize];
+            file.read_exact(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            Ok(bytes)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn cloud_fleetfiles_changed(
+        self: &Arc<Self>,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.clone().replicate_fleetfiles_change(path).await
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn cloud_fleetfiles_namespace(
+        self: &Arc<Self>,
+        from: String,
+        to: Option<String>,
+    ) -> Result<(), String> {
+        let _permit = self
+            .fleetfiles_transfer_gate
+            .acquire()
+            .await
+            .map_err(|_| "Fleetfiles scheduler stopped")?;
+        let local = self
+            .resolve_local_id()
+            .await
+            .ok_or("Fleetfiles identity is not ready")?;
+        let actor = pubkey_part(&local).to_string();
+        let roster = self.fleet_roster_value().await;
+        let mut targets = self
+            .ownership
+            .fleet_member_ids()
+            .into_iter()
+            .map(|device| pubkey_part(&device).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for member in roster
+            .get("members")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(device) = member.get("device").and_then(Value::as_str) {
+                targets.insert(pubkey_part(device).to_string());
+            }
+        }
+        targets.retain(|device| !device.is_empty() && !same_node(device, &local));
+        let targets = targets.into_iter().collect::<Vec<_>>();
+        let queued_targets = targets.clone();
+        let replica = self.fleetfiles.clone();
+        tokio::task::spawn_blocking(move || {
+            replica.native_namespace_change(&from, to.as_deref(), &actor, &queued_targets)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        for target in targets {
+            self.schedule_fleetfiles_drain(&target);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn cloud_test_source(&self, root: PathBuf) {
+        self.files
+            .map_root(crate::drive_mount::FLEETFILES_ROUTE, root);
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn cloud_watch_directory(
+        self: &Arc<Self>,
+        route: &str,
+        path: &str,
+    ) -> Result<(u64, tokio::sync::mpsc::UnboundedReceiver<FileEvent>), String> {
+        let req = self.next_file_request_id();
+        let rx = self.files.begin_rpc(route, req);
+        if let Err(error) = self
+            .file_send(
+                route.to_string(),
+                FileEvent::WatchDirectory {
+                    req,
+                    path: path.to_string(),
+                },
+            )
+            .await
+        {
+            self.files.cancel_rpc(route, req);
+            return Err(error);
+        }
+        Ok((req, rx))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn cloud_cancel_watch(self: &Arc<Self>, route: &str, watch_req: u64) {
+        self.files.cancel_rpc(route, watch_req);
+        let route = route.to_string();
+        let mesh = self.clone();
+        crate::spawn(async move {
+            let req = mesh.next_file_request_id();
+            let _ = mesh
+                .file_send(route, FileEvent::UnwatchDirectory { req, watch_req })
+                .await;
+        });
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn cloud_upload_file(
+        self: &Arc<Self>,
+        route: &str,
+        path: &str,
+        file: &mut std::fs::File,
+    ) -> Result<(), String> {
+        use std::io::Read;
+        #[cfg(test)]
+        if route == crate::drive_mount::FLEETFILES_ROUTE {
+            let mut offset = 0;
+            let mut bytes = vec![0; crate::files::CHUNK_BYTES];
+            loop {
+                let count = file.read(&mut bytes).map_err(|error| error.to_string())?;
+                for event in self
+                    .drive_file_request(
+                        route,
+                        FileEvent::WriteRange {
+                            req: self.next_file_request_id(),
+                            path: path.to_string(),
+                            offset,
+                            data: bytes[..count].to_vec(),
+                            truncate: offset == 0,
+                        },
+                    )
+                    .await?
+                {
+                    if let FileEvent::Err { reason, .. } = event {
+                        return Err(reason);
+                    }
+                }
+                if count == 0 {
+                    break;
+                }
+                offset += count as u64;
+            }
+            return Ok(());
+        }
+        let req = self.next_file_request_id();
+        let mut replies = self.files.begin_rpc(route, req);
+        let total = file.metadata().map_err(|error| error.to_string())?.len();
+        let result = async {
+            let mut sent = 0_u64;
+            let mut bytes = vec![0_u8; crate::files::CHUNK_BYTES];
+            loop {
+                let count = file.read(&mut bytes).map_err(|error| error.to_string())?;
+                let eof = sent + count as u64 >= total;
+                self.file_send(
+                    route.to_string(),
+                    FileEvent::Write {
+                        req,
+                        path: path.to_string(),
+                        data: bytes[..count].to_vec(),
+                        append: sent > 0,
+                        create_new: false,
+                        eof,
+                    },
+                )
+                .await?;
+                sent += count as u64;
+                if eof {
+                    break;
+                }
+                if count == 0 {
+                    return Err("the local upload ended before its declared length".to_string());
+                }
+                if let Ok(FileEvent::Err { reason, .. }) = replies.try_recv() {
+                    return Err(reason);
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(60), replies.recv()).await {
+                Ok(Some(FileEvent::Ok { .. })) => Ok(()),
+                Ok(Some(FileEvent::Err { reason, .. })) => Err(reason),
+                _ => Err("the source did not acknowledge the shared-drive upload".into()),
+            }
+        }
+        .await;
+        self.files.cancel_rpc(route, req);
+        result
+    }
+
     pub async fn fleetfiles_restore_version(
         &self,
         path: String,
@@ -19916,6 +20128,8 @@ impl Mesh {
                     for metadata in entries {
                         self.fleetfiles.apply_metadata(&metadata)?;
                     }
+                    #[cfg(windows)]
+                    self.drive_mounts.refresh_fleetfiles();
                     after = next_cursor;
                     if after.is_none() {
                         break;
@@ -20320,6 +20534,8 @@ impl Mesh {
                     .iter()
                     .try_for_each(|metadata| self.fleetfiles.apply_metadata(metadata).map(|_| ()))
             };
+            #[cfg(windows)]
+            self.drive_mounts.refresh_fleetfiles();
             let _ = self
                 .send_fleetfiles_message(
                     from,
@@ -20335,6 +20551,8 @@ impl Mesh {
 
         if let FleetfilesMessage::Metadata { metadata } = message {
             let result = self.fleetfiles.apply_metadata(&metadata);
+            #[cfg(windows)]
+            self.drive_mounts.refresh_fleetfiles();
             let _ = self
                 .send_fleetfiles_message(
                     from,
@@ -20467,6 +20685,8 @@ impl Mesh {
             }
             FleetfilesMessage::FileCommit { operation } => {
                 let result = self.fleetfiles.commit_file(from, &operation);
+                #[cfg(windows)]
+                self.drive_mounts.refresh_fleetfiles();
                 let _ = self
                     .send_fleetfiles_message(
                         from,
@@ -20484,6 +20704,8 @@ impl Mesh {
                 path,
             } => {
                 let result = self.fleetfiles.apply_directory(version, &path);
+                #[cfg(windows)]
+                self.drive_mounts.refresh_fleetfiles();
                 let _ = self
                     .send_fleetfiles_message(
                         from,
@@ -20501,6 +20723,8 @@ impl Mesh {
                 path,
             } => {
                 let result = self.fleetfiles.apply_delete(version, &path);
+                #[cfg(windows)]
+                self.drive_mounts.refresh_fleetfiles();
                 let _ = self
                     .send_fleetfiles_message(
                         from,

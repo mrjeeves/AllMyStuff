@@ -312,6 +312,7 @@ fn run_injector(rx: mpsc::Receiver<Cmd>, releases: mpsc::Receiver<Cmd>) {
         let (route, action, lease, on_error) = match cmd {
             Cmd::Event {
                 route,
+                peer: _peer,
                 action,
                 lease,
                 on_error,

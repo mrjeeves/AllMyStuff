@@ -104,8 +104,12 @@ fn metadata(entry: &FileEntry) -> Result<CF_FS_METADATA, String> {
 }
 
 fn attr_file(path: &Path) -> std::io::Result<File> {
+    metadata_file(path, FILE_READ_ATTRIBUTES)
+}
+
+fn metadata_file(path: &Path, access: u32) -> std::io::Result<File> {
     OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
@@ -154,12 +158,15 @@ pub(crate) fn is_in_sync(path: &Path) -> bool {
 }
 
 fn mark_synced(path: &Path, identity: &str) -> Result<(), String> {
-    let file = attr_file(path).map_err(|error| error.to_string())?;
-    mark_synced_handle(&file, path, identity)
+    let file =
+        metadata_file(path, FILE_READ_ATTRIBUTES | WRITE_DAC).map_err(|error| error.to_string())?;
+    mark_synced_handle(&file, identity)
 }
 
-fn mark_synced_handle(file: &File, path: &Path, identity: &str) -> Result<(), String> {
-    if !is_placeholder(path) {
+fn mark_synced_handle(file: &File, identity: &str) -> Result<(), String> {
+    // Callers request WRITE_DAC when opening this exact file. Conversion
+    // requires it, and retaining the handle preserves identity across renames.
+    if !is_placeholder_handle(file) {
         check(
             unsafe {
                 CfConvertToPlaceholder(
@@ -167,7 +174,7 @@ fn mark_synced_handle(file: &File, path: &Path, identity: &str) -> Result<(), St
                     identity.as_ptr().cast(),
                     identity.len() as u32,
                     CF_CONVERT_FLAG_MARK_IN_SYNC
-                        | if path.is_dir() {
+                        | if file.metadata().map_err(|error| error.to_string())?.is_dir() {
                             CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION
                         } else {
                             0
@@ -195,24 +202,22 @@ fn mark_synced_handle(file: &File, path: &Path, identity: &str) -> Result<(), St
 }
 
 fn is_placeholder(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| {
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            && attr_file(path).is_ok_and(|file| {
-                let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
-                (unsafe {
-                    GetFileInformationByHandleEx(
-                        file.as_raw_handle() as _,
-                        FileAttributeTagInfo,
-                        (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
-                        std::mem::size_of_val(&info) as u32,
-                    )
-                }) != 0
-                    && unsafe {
-                        CfGetPlaceholderStateFromAttributeTag(info.FileAttributes, info.ReparseTag)
-                    } & CF_PLACEHOLDER_STATE_PLACEHOLDER
-                        != 0
-            })
-    })
+    attr_file(path).is_ok_and(|file| is_placeholder_handle(&file))
+}
+
+fn is_placeholder_handle(file: &File) -> bool {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    (unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    }) != 0
+        && unsafe { CfGetPlaceholderStateFromAttributeTag(info.FileAttributes, info.ReparseTag) }
+            & CF_PLACEHOLDER_STATE_PLACEHOLDER
+            != 0
 }
 
 #[derive(Clone, Copy)]
@@ -382,8 +387,15 @@ impl Journal {
         let rows = query
             .query_map([], |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+        let mut paths = rows
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|error| error.to_string())?;
+        // A fresh journal has no previously populated directory. Always seed
+        // the namespace root so initial registration exposes its real entries.
+        if !paths.iter().any(|path| path.is_empty()) {
+            paths.insert(0, String::new());
+        }
+        Ok(paths)
     }
     fn populated(&self, path: &str) -> Result<(), String> {
         self.0
@@ -643,7 +655,7 @@ impl Provider {
             }
             Err("the source did not return a directory page".into())
         } else {
-            let page = mesh.fleetfiles_logical_list(path.to_string(), cursor, 256)?;
+            let page = mesh.cloud_fleetfiles_list(path, cursor.as_deref(), 256)?;
             Ok((
                 page.entries
                     .into_iter()
@@ -1156,6 +1168,7 @@ impl Provider {
             .map_err(|error| error.to_string())??;
         let mut file = OpenOptions::new()
             .read(true)
+            .access_mode(FILE_GENERIC_READ | WRITE_DAC)
             .share_mode(FILE_SHARE_READ)
             .open(local)
             .map_err(|error| error.to_string())?;
@@ -1184,7 +1197,7 @@ impl Provider {
                     self.journal.record(path, &actual)?;
                     self.journal.clear_receipt(path)?;
                     if bytes == before.len() && modified == before.last_write_time() {
-                        mark_synced_handle(&file, local, path)?;
+                        mark_synced_handle(&file, path)?;
                         return Ok(());
                     }
                 }
@@ -1265,7 +1278,7 @@ impl Provider {
         if before.len() != after.len() || before.last_write_time() != after.last_write_time() {
             return Err("the local file changed before upload acknowledgement".into());
         }
-        mark_synced_handle(&file, local, path)?;
+        mark_synced_handle(&file, path)?;
         Ok(())
     }
 }
@@ -1645,6 +1658,12 @@ impl CloudConnection {
             .watch(&connection.provider.root, RecursiveMode::Recursive)
             .map_err(|error| error.to_string())?;
         connection.watcher = Some(watcher);
+        // Fleetfiles already has real local directories. Enable their native
+        // population before reporting the provider ready, rather than leaving
+        // the first open racing a background conversion of Desktop.
+        if connection.provider.route.is_none() {
+            connection.provider.populate(None, "").await?;
+        }
         connection.refresh();
         Ok(connection)
     }
@@ -1671,6 +1690,144 @@ impl Drop for CloudConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "uses the real Windows Cloud Files filter and Explorer registration"]
+    async fn native_fleetfiles_populates_and_hydrates_its_own_namespace() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("allmystuff_node=debug")
+            .try_init();
+        use crate::fleetfiles::{FleetfilesMetadata, VersionStamp};
+        use sha2::{Digest, Sha256};
+        struct Sink;
+        impl crate::UiSink for Sink {
+            fn emit(&self, _: &str, _: serde_json::Value) {}
+            fn restart(&self) -> ! {
+                panic!("test node must not restart")
+            }
+        }
+        let mesh = Mesh::new(
+            Arc::new(crate::control_client::ControlClient::new().unwrap()),
+            Arc::new(Sink),
+        );
+        let replica = mesh.cloud_test_fleetfiles_replica();
+        let version = VersionStamp {
+            counter: 1,
+            actor: "test-source".into(),
+        };
+        replica.apply_directory(version.clone(), "Desktop").unwrap();
+        let desktop = PathBuf::from(replica.materialize("Desktop").unwrap().unwrap());
+        let root = desktop.parent().unwrap().to_path_buf();
+        let journal = allmystuff_protocol::myownmesh_state_dir()
+            .unwrap()
+            .join("cloud-provider")
+            .join(format!(
+                "{:x}.sqlite3",
+                Sha256::digest(root.to_string_lossy().as_bytes())
+            ));
+        let account = format!("Test-Fleetfiles-{}", std::process::id());
+        struct Cleanup {
+            connection: Option<CloudConnection>,
+            root: PathBuf,
+            account: String,
+            journal: PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.connection.take();
+                let _ = crate::windows_fleetfiles::unregister_test_root(self.account.clone());
+                let expected_prefix =
+                    format!("allmystuff-fleetfiles-mesh-test-{}-", std::process::id());
+                if let (Ok(root), Ok(temp)) = (
+                    std::fs::canonicalize(&self.root),
+                    std::fs::canonicalize(std::env::temp_dir()),
+                ) {
+                    if root.parent() == Some(temp.as_path())
+                        && root.file_name() == self.root.file_name()
+                        && root.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(&expected_prefix)
+                        })
+                    {
+                        let _ = std::fs::remove_dir_all(root);
+                    }
+                }
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", self.journal.display()));
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            connection: None,
+            root: root.clone(),
+            account: account.clone(),
+            journal,
+        };
+        let text = b"Fleetfiles native hydration works";
+        let hash = format!("{:x}", Sha256::digest(text));
+        replica
+            .apply_metadata(&FleetfilesMetadata {
+                operation: "native-hydration".into(),
+                version: version.clone(),
+                path: "Desktop/report.txt".into(),
+                kind: "file".into(),
+                size: text.len() as u64,
+                sha256: Some(hash.clone()),
+                tombstone: false,
+            })
+            .unwrap();
+        replica
+            .begin_file(
+                "source",
+                "native-hydration".into(),
+                version,
+                "Desktop/report.txt".into(),
+                (text.len() as u64, hash),
+                true,
+            )
+            .unwrap();
+        replica
+            .write_chunk("source", "native-hydration", 0, text)
+            .unwrap();
+        replica.commit_file("source", "native-hydration").unwrap();
+        assert!(!root.join("Desktop/report.txt").exists());
+        cleanup.connection = Some(
+            CloudConnection::connect(
+                mesh.clone(),
+                root.clone(),
+                None,
+                account,
+                "AllMyStuff Fleetfiles native test".into(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Unlike the scoped-drive integration test, this provider lists the
+        // very ledger and cloud namespace that Windows is currently populating.
+        let listing_mesh = mesh.clone();
+        let list = tokio::task::spawn_blocking(move || {
+            listing_mesh.fleetfiles_logical_list("Desktop".into(), None, 10)
+        });
+        let page = tokio::time::timeout(Duration::from_secs(20), list)
+            .await
+            .expect("Fleetfiles listing re-entered its own provider")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "report.txt");
+        assert_external_text(
+            &desktop.join("report.txt"),
+            std::str::from_utf8(text).unwrap(),
+        )
+        .await;
+        cleanup.connection.take();
+        drop(replica);
+        drop(cleanup);
+        assert!(
+            !root.exists(),
+            "native Fleetfiles test data was not removed"
+        );
+    }
 
     async fn assert_external_text(path: &Path, expected: &str) {
         // Provider processes deliberately block their own implicit hydration.

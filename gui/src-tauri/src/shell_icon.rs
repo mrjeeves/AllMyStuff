@@ -346,8 +346,13 @@ mod tests {
 
     #[test]
     fn filesystem_folder_icon_is_a_png() {
-        let encoded =
-            filesystem_icon(&std::env::temp_dir()).expect("Windows Shell returned no folder icon");
+        // GetTempPath can include a trailing separator that SHGetFileInfo
+        // rejects on hosted runners. Exercise a resolved filesystem folder,
+        // including the existing verbatim-path normalization, like the UI.
+        let folder = std::env::temp_dir()
+            .canonicalize()
+            .expect("existing temporary directory");
+        let encoded = filesystem_icon(&folder).expect("Windows Shell returned no folder icon");
         let decoded = STANDARD.decode(encoded).expect("base64 PNG");
         assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
     }

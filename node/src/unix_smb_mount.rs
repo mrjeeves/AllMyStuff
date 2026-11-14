@@ -113,6 +113,10 @@ pub(crate) fn ensure_supported() -> Result<(), String> {
 
 async fn helper(request: &Request) -> Result<Option<String>, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    let exe = std::env::var_os("ALLMYSTUFF_TEST_NATIVE_SMB_HELPER")
+        .map(PathBuf::from)
+        .unwrap_or(exe);
     let mut command;
     #[cfg(target_os = "linux")]
     {
@@ -610,6 +614,17 @@ fn unmount_native(lease: &Lease) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn native_operation(request: Request) -> Result<Option<String>, String> {
+        if std::env::var_os("ALLMYSTUFF_TEST_NATIVE_SMB_HELPER").is_some() {
+            return helper(&request).await;
+        }
+        #[cfg(target_os = "macos")]
+        return Err("set ALLMYSTUFF_TEST_NATIVE_SMB_HELPER to the built node executable; NetFS must run in its main-thread helper".into());
+        #[cfg(target_os = "linux")]
+        tokio::task::spawn_blocking(move || execute(&request))
+            .await
+            .map_err(|e| e.to_string())?
+    }
     fn lease() -> Lease {
         Lease {
             mount: PathBuf::from("/home/user/AMS share"),
@@ -722,19 +737,15 @@ mod tests {
             root: root.clone(),
             lease: spec.clone(),
         };
-        let mounted = tokio::task::spawn_blocking(move || {
-            execute(&Request {
-                lease: spec.clone(),
-                password: Some(endpoint.password),
-            })
-            .map(|identity| {
-                spec.identity = identity;
-                spec
-            })
+        println!("mounting the isolated native SMB fixture");
+        spec.identity = native_operation(Request {
+            lease: spec.clone(),
+            password: Some(endpoint.password),
         })
         .await
-        .unwrap()
         .unwrap();
+        let mounted = spec;
+        println!("checking native file operations above 4 GiB");
         let offset = 4 * 1024 * 1024 * 1024 + 73;
         let source_copy = source.clone();
         let mount_copy = mount.clone();
@@ -774,14 +785,12 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::task::spawn_blocking(move || {
-            execute(&Request {
-                lease: mounted,
-                password: None,
-            })
+        println!("unmounting and removing the native SMB fixture");
+        native_operation(Request {
+            lease: mounted,
+            password: None,
         })
         .await
-        .unwrap()
         .unwrap();
         assert!(observed(&cleanup.lease).unwrap().is_none());
         hosts.stop("native-client-test");

@@ -1132,18 +1132,30 @@ fn win_install(log: Option<String>) -> Result<()> {
     })?;
     win_harden_service_dir(&service_dir)?;
 
-    // `sc create` refuses to clobber an existing service. Only after a complete
-    // replacement payload is safely prepared do we stop and remove its record,
-    // promote the files, and recreate it with the current arguments.
+    // An existing service keeps its SCM record for the whole repair. It used
+    // to be deleted *before* the files were promoted: when promotion then
+    // failed (the old image was still mapped by an exiting node or by Windows
+    // Error Reporting), the install returned an error with no service left at
+    // all, and Always On silently stopped. Now the record is only ever
+    // reconfigured, and a failed promotion restarts the previous payload.
     let replacing = win_installed();
     if replacing {
         let _ = capture(&sc_stop());
         win_wait_stopped(Duration::from_secs(10));
-        win_run_checked(&sc_delete())?;
-        win_wait_absent(Duration::from_secs(5));
     }
-    win_promote_payload(&next_exec, &staged_exec)?;
-    win_promote_payload(&next_mesh, &staged_mesh)?;
+    if let Err(error) = win_promote_payloads(&[
+        (next_exec.as_path(), staged_exec.as_path()),
+        (next_mesh.as_path(), staged_mesh.as_path()),
+    ]) {
+        if replacing {
+            let _ = capture(&sc_start());
+        }
+        return Err(error.context(if replacing {
+            "the existing AllMyStuff service and its previous binaries were kept"
+        } else {
+            "the AllMyStuff service was not installed"
+        }));
+    }
 
     let profile_home = std::env::var_os("ALLMYSTUFF_SERVICE_HOME")
         .map(PathBuf::from)
@@ -1157,7 +1169,11 @@ fn win_install(log: Option<String>) -> Result<()> {
         client_sid.as_deref(),
         Some(staged_mesh.as_path()),
     );
-    win_run_checked(&sc_create(&binpath))?;
+    if replacing {
+        win_run_checked(&sc_config(&binpath))?;
+    } else {
+        win_run_checked(&sc_create(&binpath))?;
+    }
     // Description + automatic restart-on-failure are nice-to-haves: best-effort
     // so a quirky `sc` build can't fail the install over cosmetics. The
     // restart-on-failure also doubles as the node's self-update relaunch hook —
@@ -1182,14 +1198,91 @@ fn win_install(log: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn win_promote_payload(prepared: &Path, live: &Path) -> Result<()> {
-    match std::fs::remove_file(live) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("replace {}", live.display())),
+/// Promote every `(prepared, live)` pair, or none of them.
+///
+/// Each live file is first side-renamed to `<name>.prev`. Windows refuses to
+/// *delete* an executable whose image is still mapped (a node that is still
+/// exiting, or Windows Error Reporting collecting its crash) but allows the
+/// rename, so the old remove-then-rename could fail half way and strand the
+/// service with no binary. Transient sharing violations are retried briefly;
+/// any failure restores every file already moved.
+fn win_promote_payloads(pairs: &[(&Path, &Path)]) -> Result<()> {
+    let mut done: Vec<(&Path, PathBuf, bool)> = Vec::new();
+    for &(prepared, live) in pairs {
+        match promote_one(prepared, live) {
+            Ok(had_live) => done.push((live, previous_payload_path(live), had_live)),
+            Err(error) => {
+                for (live, previous, had_live) in done.into_iter().rev() {
+                    let _ = std::fs::remove_file(live);
+                    if had_live {
+                        let _ = std::fs::rename(&previous, live);
+                    }
+                }
+                return Err(error);
+            }
+        }
     }
-    std::fs::rename(prepared, live)
-        .with_context(|| format!("promote {} as {}", prepared.display(), live.display()))
+    for (_, previous, had_live) in done {
+        if had_live {
+            // Best effort: a still-mapped image is removed on the next repair.
+            let _ = std::fs::remove_file(previous);
+        }
+    }
+    Ok(())
+}
+
+/// Move `live` aside and `prepared` into its place, returning whether a live
+/// file existed. On failure `live` is left exactly as it was found.
+fn promote_one(prepared: &Path, live: &Path) -> Result<bool> {
+    let previous = previous_payload_path(live);
+    let had_live = live.exists();
+    if had_live {
+        match std::fs::remove_file(&previous) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("clear {}", previous.display()));
+            }
+        }
+        retry_sharing_violation(|| std::fs::rename(live, &previous))
+            .with_context(|| format!("move {} aside", live.display()))?;
+    }
+    if let Err(error) = retry_sharing_violation(|| std::fs::rename(prepared, live)) {
+        if had_live {
+            let _ = std::fs::rename(&previous, live);
+        }
+        return Err(error)
+            .with_context(|| format!("promote {} as {}", prepared.display(), live.display()));
+    }
+    Ok(had_live)
+}
+
+fn previous_payload_path(live: &Path) -> PathBuf {
+    let mut name = live.file_name().unwrap_or_default().to_os_string();
+    name.push(".prev");
+    live.with_file_name(name)
+}
+
+/// Retry `op` for up to ~5 s while it fails with a permission/sharing error,
+/// the transient state of an image Windows has not finished releasing.
+fn retry_sharing_violation(mut op: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt + 1 < ATTEMPTS && is_sharing_violation(&e) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
+    error.kind() == ErrorKind::PermissionDenied || matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 fn win_lifecycle(life: Lifecycle) -> Result<()> {
@@ -1235,6 +1328,7 @@ fn win_uninstall() -> Result<()> {
     let _ = capture(&sc_stop());
     win_wait_stopped(Duration::from_secs(10));
     win_run_checked(&sc_delete())?;
+    win_wait_absent(Duration::from_secs(5));
     // The binary runs in place (the installer owns it), so there's nothing of
     // ours to delete — uninstall just removes the SCM record.
     println!("Uninstalled the Windows service.");
@@ -1334,6 +1428,22 @@ fn sc(args: &[&str]) -> Vec<String> {
 fn sc_create(binpath: &str) -> Vec<String> {
     sc(&[
         "create",
+        WINDOWS_SERVICE_NAME,
+        "binPath=",
+        binpath,
+        "start=",
+        "auto",
+        "DisplayName=",
+        WINDOWS_DISPLAY_NAME,
+    ])
+}
+
+/// `sc config <name> binPath= "<...>" start= auto DisplayName= "<...>"`:
+/// update an existing record in place, so a repair never has a window with no
+/// service registered.
+fn sc_config(binpath: &str) -> Vec<String> {
+    sc(&[
+        "config",
         WINDOWS_SERVICE_NAME,
         "binPath=",
         binpath,
@@ -2449,6 +2559,73 @@ mod tests {
         assert_eq!(sc_delete(), vec!["sc", "delete", "AllMyStuff"]);
         assert_eq!(sc_query(), vec!["sc", "query", "AllMyStuff"]);
         assert_eq!(sc_qc(), vec!["sc", "qc", "AllMyStuff"]);
+    }
+
+    #[test]
+    fn sc_config_updates_the_existing_record_in_place() {
+        assert_eq!(
+            sc_config("\"C:\\svc\\allmystuff-serve.exe\" --service"),
+            vec![
+                "sc",
+                "config",
+                "AllMyStuff",
+                "binPath=",
+                "\"C:\\svc\\allmystuff-serve.exe\" --service",
+                "start=",
+                "auto",
+                "DisplayName=",
+                "AllMyStuff Mesh Node",
+            ]
+        );
+    }
+
+    fn promote_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "allmystuff-service-promote-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn promoting_a_payload_replaces_every_live_file() {
+        let dir = promote_fixture("ok");
+        let (next_a, live_a) = (dir.join("a.next"), dir.join("a"));
+        let (next_b, live_b) = (dir.join("b.next"), dir.join("b"));
+        std::fs::write(&next_a, "new a").unwrap();
+        std::fs::write(&live_a, "old a").unwrap();
+        std::fs::write(&next_b, "new b").unwrap();
+
+        win_promote_payloads(&[(&next_a, &live_a), (&next_b, &live_b)]).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&live_a).unwrap(), "new a");
+        assert_eq!(std::fs::read_to_string(&live_b).unwrap(), "new b");
+        assert!(!next_a.exists() && !next_b.exists());
+        assert!(!previous_payload_path(&live_a).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_promotion_restores_every_previous_file() {
+        // The second payload is missing, so its promotion fails after the
+        // first has already been swapped. The first must be rolled back: a
+        // service restarted on the previous payload needs the previous pair.
+        let dir = promote_fixture("rollback");
+        let (next_a, live_a) = (dir.join("a.next"), dir.join("a"));
+        let (next_b, live_b) = (dir.join("b.next"), dir.join("b"));
+        std::fs::write(&next_a, "new a").unwrap();
+        std::fs::write(&live_a, "old a").unwrap();
+        std::fs::write(&live_b, "old b").unwrap();
+
+        assert!(win_promote_payloads(&[(&next_a, &live_a), (&next_b, &live_b)]).is_err());
+
+        assert_eq!(std::fs::read_to_string(&live_a).unwrap(), "old a");
+        assert_eq!(std::fs::read_to_string(&live_b).unwrap(), "old b");
+        assert!(!previous_payload_path(&live_a).exists());
+        assert!(!previous_payload_path(&live_b).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- windows: sc output parsers ----

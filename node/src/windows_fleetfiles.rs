@@ -70,6 +70,27 @@ pub(crate) fn unregister_test_root(account: String) -> Result<(), String> {
     })
 }
 
+/// Whether `root` is this user's registered `AllMyStuff!<sid>!Fleetfiles`
+/// sync root. Such a folder is AllMyStuff's even while its root marker cannot
+/// be seen: with no provider connected yet (the node that *is* the provider
+/// is still starting), Windows may refuse to enumerate or open the sync
+/// root's contents. Answers `false` on any doubt.
+pub(crate) fn is_registered_fleetfiles_root(root: &Path) -> bool {
+    let root = root.to_string_lossy().into_owned();
+    crate::win_privilege::interactive_user_call("ams-fleetfiles-root-probe", move || {
+        let _apartment = ComApartment::enter()?;
+        let sid = crate::win_privilege::effective_user_sid()?;
+        let id = HSTRING::from(format!("{PROVIDER_NAME}!{sid}!Fleetfiles"));
+        let registered = StorageProviderSyncRootManager::GetSyncRootInformationForId(&id)
+            .and_then(|info| info.Path())
+            .and_then(|folder| folder.Path())
+            .map_err(|error| error.to_string())?
+            .to_string();
+        Ok(same_windows_path(&registered, &root))
+    })
+    .unwrap_or(false)
+}
+
 /// Remove only a previous mapped-folder registration; never Fleetfiles or
 /// its local contents. The caller checks that its upload journal is empty.
 pub(crate) fn unregister_mapped_root(root: PathBuf, account: String) -> Result<(), String> {

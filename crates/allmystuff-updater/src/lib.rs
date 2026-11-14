@@ -531,6 +531,11 @@ fn parse_pending_artifacts(doc: &serde_json::Value) -> Vec<StagedArtifact> {
 }
 
 fn apply_pending() -> Result<Option<String>> {
+    // Another product's bundled runtime shares this updater home but is not
+    // this install; it must leave the manifest untouched for its owner.
+    if runs_as_bundled_foreign_runtime() {
+        return Ok(None);
+    }
     // GUI, CLI, and service roles share one updater home. Serialize manifest
     // mutation so each role can acknowledge only the artifacts it can
     // actually reach without racing another role's rewrite.
@@ -551,6 +556,10 @@ fn apply_pending() -> Result<Option<String>> {
     // A loose desktop install requires the complete suite.
     artifacts.sort_by_key(|a| if artifact_required_here(a.kind) { 0 } else { 1 });
 
+    // Only the user's own install retires artifacts. A machine service copy
+    // may bring *its own running binary* forward, but every artifact stays in
+    // the manifest until the install it was staged for has taken it.
+    let owner = owns_shared_manifest();
     let mut applied: Vec<&'static str> = Vec::new();
     let mut remaining = Vec::new();
     for art in artifacts {
@@ -558,15 +567,34 @@ fn apply_pending() -> Result<Option<String>> {
         // behind, so a stale marker can't roll one back and a half that
         // lagged a previous partial update still catches up.
         if !artifact_needs_apply(art.kind, &target_version) {
+            if !owner {
+                // "Current here" says nothing about the user's install: the
+                // service copy being current used to retire the serve
+                // artifact while the copy the next reinstall reads stayed old.
+                remaining.push(art);
+            }
+            continue;
+        }
+        if !owner && !artifact_target_is_running_binary(art.kind) {
+            // A service copy reaches the user's binaries only through PATH;
+            // swapping them from here is how a service updated half an
+            // install. Leave them for the install's own roles.
+            remaining.push(art);
             continue;
         }
         match apply_one(&art) {
             Ok(true) => {
                 applied.push(art.kind.as_str());
-                // Stamp the version we just installed for the half that has
-                // no version we can read back (the GUI/node binaries), so a
-                // later check knows they're current.
-                record_artifact_version(art.kind, &target_version);
+                if owner {
+                    // Stamp the version we just installed for the half that
+                    // has no version we can read back (the GUI/node binaries),
+                    // so a later check knows they're current.
+                    record_artifact_version(art.kind, &target_version);
+                } else {
+                    // The markers describe the user's install; binding one to
+                    // a service copy's hash would hide that install's lag.
+                    remaining.push(art);
+                }
             }
             // This role cannot resolve the target (most importantly, the
             // protected service seeing a per-user GUI artifact). Leave that
@@ -982,17 +1010,60 @@ fn artifact_needs_update(kind: ArtifactKind, latest: &str) -> bool {
 // Check + stage.
 // ---------------------------------------------------------------------------
 
-/// Run one check. With `force`, ignore the interval cooldown. Stages a
-/// permitted update; never applies (that happens on next launch).
+/// What started a check. Skipping the interval cooldown and overriding the
+/// user's "automatic updates off" preference are different permissions: a
+/// process coming up may do the first, only a person asking may do the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckTrigger {
+    /// The recurring background interval tick.
+    Scheduled,
+    /// The automatic check a GUI or node runs once as it starts. Ignores the
+    /// cooldown, but is still automatic: it must honour `enabled = false`.
+    Launch,
+    /// Someone asked: `allmystuff update check`, Settings → Updates → Check now.
+    UserRequested,
+}
+
+impl CheckTrigger {
+    fn skips_cooldown(self) -> bool {
+        !matches!(self, Self::Scheduled)
+    }
+
+    fn is_user_requested(self) -> bool {
+        matches!(self, Self::UserRequested)
+    }
+}
+
+/// Run one user-facing check. With `force` (the CLI's `update check` and the
+/// GUI's Check now) the person asked, so the cooldown and the automatic-update
+/// preference are both ignored; without it this is an ordinary scheduled
+/// check. Stages a permitted update; never applies (that happens on next
+/// launch).
 pub async fn check_now(force: bool) -> Result<CheckOutcome> {
-    let au = load_auto_update();
-    // `force` is an attended check (startup, header Refresh, or Check now).
-    // The preference disables the background ticker, not the user's ability
-    // to discover a release. An explicit environment kill switch still wins.
-    if check_is_disabled(au.enabled, force, env_disabled()) {
+    check(if force {
+        CheckTrigger::UserRequested
+    } else {
+        CheckTrigger::Scheduled
+    })
+    .await
+}
+
+async fn check(trigger: CheckTrigger) -> Result<CheckOutcome> {
+    // A runtime another product bundles (CEC Support's fallback node) shares
+    // this updater home but not this install. It must never stage into, or
+    // apply from, AllMyStuff's manifest; its owner updates it.
+    if runs_as_bundled_foreign_runtime() {
         return Ok(CheckOutcome::Disabled);
     }
-    if !force && !is_due(au.check_interval_hours) {
+    let au = load_auto_update();
+    // Only a person asking overrides the preference. Launch checks used to
+    // pass `force = true` here too, so turning automatic updates off still
+    // staged — and, on the unattended service node, applied and relaunched —
+    // a release every time a GUI or node started.
+    if check_is_disabled(au.enabled, trigger.is_user_requested(), env_disabled()) {
+        return Ok(CheckOutcome::Disabled);
+    }
+    if !trigger.skips_cooldown() && !is_due(au.check_interval_hours) {
         return Ok(CheckOutcome::NotDue);
     }
 
@@ -1054,10 +1125,84 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     Ok(CheckOutcome::Staged { version: latest })
 }
 
-/// Automatic-update preference gates only unattended ticks. The environment
-/// switch is an operator kill switch and therefore also gates attended checks.
-fn check_is_disabled(auto_enabled: bool, force: bool, disabled_by_env: bool) -> bool {
-    disabled_by_env || (!auto_enabled && !force)
+/// The automatic-update preference gates every check nobody asked for
+/// (scheduled and launch checks alike). The environment switch is an operator
+/// kill switch and therefore also gates user-requested checks.
+fn check_is_disabled(auto_enabled: bool, user_requested: bool, disabled_by_env: bool) -> bool {
+    disabled_by_env || (!auto_enabled && !user_requested)
+}
+
+/// The process environment CEC Support sets on the AllMyStuff node it bundles
+/// (mirrors `allmystuff_node::node_control::RUNTIME_OWNER_ENV`, which this
+/// crate cannot depend on).
+const RUNTIME_OWNER_ENV: &str = "ALLMYSTUFF_RUNTIME_OWNER";
+
+/// Whether this process is another product's bundled copy of an AllMyStuff
+/// binary. CEC Support points `ALLMYSTUFF_HOME` at the user's real
+/// `~/.allmystuff`, so without this guard its fallback node consumed the
+/// AllMyStuff install's `pending.json`, swapped only its own copies, and the
+/// installed app never received the release.
+fn runs_as_bundled_foreign_runtime() -> bool {
+    std::env::var(RUNTIME_OWNER_ENV).as_deref() == Ok("cec-support-bundled")
+}
+
+/// True when `path` lies inside `root`, compared component-wise and (because
+/// this guards Windows paths) case-insensitively. Only the Windows service-copy
+/// check calls it outside tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let mut path = path.components();
+    for root_part in root.components() {
+        match path.next() {
+            Some(part)
+                if part
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&root_part.as_os_str().to_string_lossy()) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the running binary is a machine-wide service copy rather than the
+/// user's install. On Windows both AllMyStuff's Always On service
+/// (`%ProgramData%\AllMyStuff\service`) and CEC Support's service run copies
+/// staged *from* an install. Such a copy may keep itself current, but it does
+/// not own the shared manifest: retiring an artifact there is what left the
+/// user's install (and therefore the next service reinstall) on the old build.
+fn runs_from_machine_service_copy() -> bool {
+    #[cfg(windows)]
+    {
+        let (Ok(exe), Some(program_data)) =
+            (std::env::current_exe(), std::env::var_os("ProgramData"))
+        else {
+            return false;
+        };
+        path_is_within(&exe, Path::new(&program_data))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether this process may retire artifacts from the shared manifest and
+/// stamp the shared version markers: only the user's own install may.
+fn owns_shared_manifest() -> bool {
+    !runs_as_bundled_foreign_runtime() && !runs_from_machine_service_copy()
+}
+
+/// Whether `kind`'s install target, as this process resolves it, is the
+/// running executable itself.
+fn artifact_target_is_running_binary(kind: ArtifactKind) -> bool {
+    let (Some(target), Ok(current)) = (artifact_target_path(kind), std::env::current_exe()) else {
+        return false;
+    };
+    match (target.canonicalize(), current.canonicalize()) {
+        (Ok(target), Ok(current)) => target == current,
+        _ => target == current,
+    }
 }
 
 /// Which installed halves do not have a verified marker for `latest`.
@@ -1070,13 +1215,13 @@ fn wanted_artifacts(latest: &str) -> Vec<ArtifactKind> {
 
 /// One attended check: log the outcome, then hand it to `notify` so the app
 /// can surface it. Shared by the launch check and every interval tick of
-/// [`tick_forever`]. `force` skips only the interval cooldown ([`is_due`]);
-/// the enabled flag inside [`check_now`] still applies, so a forced launch
-/// check no-ops cleanly when auto-update is off. A package-managed or
-/// unwritable install still checks — it reports
-/// [`CheckOutcome::ManualUpdateAvailable`] rather than staging.
-async fn run_attended_check(force: bool, notify: &(dyn Fn(&CheckOutcome) + Send + Sync)) {
-    match check_now(force).await {
+/// [`tick_forever`]. A [`CheckTrigger::Launch`] skips only the interval
+/// cooldown ([`is_due`]); the enabled flag still applies, so a launch check
+/// no-ops cleanly when auto-update is off. A package-managed or unwritable
+/// install still checks — it reports [`CheckOutcome::ManualUpdateAvailable`]
+/// rather than staging.
+async fn run_attended_check(trigger: CheckTrigger, notify: &(dyn Fn(&CheckOutcome) + Send + Sync)) {
+    match check(trigger).await {
         Ok(outcome) => {
             log_check_outcome(&outcome);
             notify(&outcome);
@@ -1173,12 +1318,12 @@ where
     // [`claim_launch_check`]. Then the interval timer takes over for the rest
     // of the run.
     if claim_launch_check() {
-        run_attended_check(true, &notify).await;
+        run_attended_check(CheckTrigger::Launch, &notify).await;
     }
     loop {
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
-        run_attended_check(false, &notify).await;
+        run_attended_check(CheckTrigger::Scheduled, &notify).await;
     }
 }
 
@@ -1213,14 +1358,14 @@ pub async fn tick_forever_unattended(relaunch: fn() -> !) {
     // alongside this node doesn't fetch the same feed twice), then the
     // recurring interval.
     if claim_launch_check() {
-        run_unattended_check(true, relaunch).await;
+        run_unattended_check(CheckTrigger::Launch, relaunch).await;
     } else {
         adopt_launch_stage(relaunch).await;
     }
     loop {
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
-        run_unattended_check(false, relaunch).await;
+        run_unattended_check(CheckTrigger::Scheduled, relaunch).await;
     }
 }
 
@@ -1241,6 +1386,12 @@ async fn adopt_launch_stage(relaunch: fn() -> !) {
     // rather than a tick later. Nothing is lost if it's still mid-stage — the
     // interval tick catches it, exactly as it would have before.
     tokio::time::sleep(Duration::from_secs(120)).await;
+    // Adopting is still automatic: with automatic updates off (or in another
+    // product's bundled runtime) a manifest someone staged by hand waits for
+    // that person's own relaunch instead of being applied here.
+    if runs_as_bundled_foreign_runtime() || !load_auto_update().enabled || env_disabled() {
+        return;
+    }
     let Some(version) = staged_version() else {
         return;
     };
@@ -1258,10 +1409,10 @@ async fn adopt_launch_stage(relaunch: fn() -> !) {
 /// One unattended check: stage, then *apply + relaunch* immediately (the
 /// "always on, always current" half — a service box has no one to click
 /// "relaunch"). Shared by the launch check and every interval tick of
-/// [`tick_forever_unattended`]. `force` skips only the interval cooldown;
-/// enabled / package-manager gating inside [`check_now`] still applies.
-async fn run_unattended_check(force: bool, relaunch: fn() -> !) {
-    match check_now(force).await {
+/// [`tick_forever_unattended`]. A [`CheckTrigger::Launch`] skips only the
+/// interval cooldown; enabled / package-manager gating still applies.
+async fn run_unattended_check(trigger: CheckTrigger, relaunch: fn() -> !) {
+    match check(trigger).await {
         Ok(CheckOutcome::Staged { version }) => {
             tracing::info!("self-update staged {version}; applying now (unattended node)");
             match apply_now() {
@@ -1680,14 +1831,48 @@ async fn stage_release(
     // the shared manifest write with apply so neither observes or removes a
     // half-written ownership document.
     let _pending_lock = lock_pending_state()?;
+    let pending = updates_dir()?.join("pending.json");
+    let existing = std::fs::read_to_string(&pending)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let manifest = merge_pending_manifest(existing.as_ref(), version, manifest);
     std::fs::write(
-        updates_dir()?.join("pending.json"),
+        pending,
         serde_json::to_string_pretty(&serde_json::json!({
             "version": version,
             "artifacts": manifest,
         }))?,
     )?;
     Ok(staged)
+}
+
+/// Combine a fresh stage with a manifest already waiting for the same
+/// version. Each role stages only the halves *it* can see, so overwriting the
+/// file let a service (which cannot see the per-user GUI) silently discard the
+/// GUI and CLI artifacts another role had staged moments earlier. Entries for
+/// an older version are superseded, and a kind staged again keeps its newest
+/// archive path.
+fn merge_pending_manifest(
+    existing: Option<&serde_json::Value>,
+    version: &str,
+    fresh: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut merged = fresh;
+    let Some(existing) = existing.filter(|doc| doc["version"].as_str() == Some(version)) else {
+        return merged;
+    };
+    for entry in existing["artifacts"].as_array().into_iter().flatten() {
+        let Some(kind) = entry["kind"].as_str() else {
+            continue;
+        };
+        if !merged
+            .iter()
+            .any(|fresh| fresh["kind"].as_str() == Some(kind))
+        {
+            merged.push(entry.clone());
+        }
+    }
+    merged
 }
 
 /// Find the expected SHA-256 for `asset_name`: a `<asset>.sha256` sidecar
@@ -2188,6 +2373,158 @@ mod tests {
             arts[2].archive,
             std::path::PathBuf::from("/u/0.1.16/allmystuff-serve")
         );
+    }
+
+    #[test]
+    fn only_a_person_asking_overrides_the_automatic_update_preference() {
+        // A launch check skips the cooldown, but it is still automatic.
+        assert!(CheckTrigger::Launch.skips_cooldown());
+        assert!(!CheckTrigger::Launch.is_user_requested());
+        assert!(!CheckTrigger::Scheduled.skips_cooldown());
+        assert!(CheckTrigger::UserRequested.skips_cooldown());
+        assert!(CheckTrigger::UserRequested.is_user_requested());
+        assert!(check_is_disabled(
+            false,
+            CheckTrigger::Launch.is_user_requested(),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_launch_check_with_automatic_updates_off_never_reaches_the_feed() {
+        // The regression: every GUI or node launch passed `force = true`, which
+        // bypassed `enabled = false` and staged (and on the service, applied)
+        // a release the person had opted out of. `Disabled` returns before
+        // any fetch, so this needs no network.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+        std::env::remove_var("ALLMYSTUFF_AUTOUPDATE");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string(&json!({ "auto_update": { "enabled": false } })).unwrap(),
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for trigger in [CheckTrigger::Launch, CheckTrigger::Scheduled] {
+            let outcome = runtime.block_on(check(trigger)).unwrap();
+            assert!(
+                matches!(outcome, CheckOutcome::Disabled),
+                "{trigger:?} must honour automatic updates being off, got {outcome:?}"
+            );
+        }
+        assert!(!tmp.path().join("updates").join("last_check.json").exists());
+
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
+    fn a_bundled_foreign_runtime_leaves_the_manifest_for_the_install() {
+        // CEC Support's fallback node shares ~/.allmystuff. It used to apply
+        // serve to its own copy and retire the whole manifest, so the
+        // installed AllMyStuff never received the release.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+        std::env::set_var(RUNTIME_OWNER_ENV, "cec-support-bundled");
+
+        let updates = tmp.path().join("updates");
+        std::fs::create_dir_all(&updates).unwrap();
+        let pending = updates.join("pending.json");
+        let doc = serde_json::to_string_pretty(&json!({
+            "version": "0.2.125",
+            "artifacts": [
+                { "kind": "serve", "path": updates.join("0.2.125/serve.zip") },
+                { "kind": "gui", "path": updates.join("0.2.125/gui.zip") },
+            ],
+        }))
+        .unwrap();
+        std::fs::write(&pending, &doc).unwrap();
+
+        assert_eq!(apply_pending().unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&pending).unwrap(), doc);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            runtime
+                .block_on(check(CheckTrigger::UserRequested))
+                .unwrap(),
+            CheckOutcome::Disabled
+        ));
+
+        std::env::remove_var(RUNTIME_OWNER_ENV);
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
+    fn staging_keeps_same_version_artifacts_another_role_staged() {
+        let existing = json!({
+            "version": "0.2.125",
+            "artifacts": [
+                { "kind": "cli", "path": "/u/0.2.125/cli.zip" },
+                { "kind": "gui", "path": "/u/0.2.125/gui.zip" },
+                { "kind": "serve", "path": "/u/0.2.125/old-serve.zip" },
+            ],
+        });
+        let fresh = vec![json!({ "kind": "serve", "path": "/u/0.2.125/serve.zip" })];
+        let merged = merge_pending_manifest(Some(&existing), "0.2.125", fresh);
+        let kinds = merged
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["serve", "cli", "gui"]);
+        assert_eq!(merged[0]["path"], "/u/0.2.125/serve.zip");
+
+        // A newer release supersedes an older manifest outright.
+        let fresh = vec![json!({ "kind": "serve", "path": "/u/0.2.126/serve.zip" })];
+        let merged = merge_pending_manifest(Some(&existing), "0.2.126", fresh);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merge_pending_manifest(None, "0.2.126", Vec::new()).len(), 0);
+    }
+
+    #[test]
+    fn path_containment_is_component_wise() {
+        assert!(path_is_within(
+            Path::new("/srv/data/app/bin"),
+            Path::new("/srv/data")
+        ));
+        assert!(path_is_within(
+            Path::new("/srv/data"),
+            Path::new("/srv/data")
+        ));
+        assert!(!path_is_within(
+            Path::new("/srv/database/bin"),
+            Path::new("/srv/data")
+        ));
+        assert!(!path_is_within(Path::new("/srv"), Path::new("/srv/data")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn machine_service_copies_are_recognised_by_path() {
+        let program_data = Path::new("C:\\ProgramData");
+        assert!(path_is_within(
+            Path::new("C:\\ProgramData\\AllMyStuff\\service\\allmystuff-serve.exe"),
+            program_data
+        ));
+        assert!(path_is_within(
+            Path::new("c:\\programdata\\Critical Error Computing\\CEC Support\\service\\allmystuff-serve.exe"),
+            program_data
+        ));
+        assert!(!path_is_within(
+            Path::new("C:\\Users\\u\\AppData\\Local\\Programs\\AllMyStuff\\allmystuff-serve.exe"),
+            program_data
+        ));
+        assert!(!path_is_within(
+            Path::new("C:\\ProgramDataX\\AllMyStuff\\allmystuff-serve.exe"),
+            program_data
+        ));
     }
 
     #[test]

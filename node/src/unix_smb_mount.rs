@@ -722,7 +722,13 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.root);
             }
         }
-        let root = std::env::temp_dir().join(format!(
+        // Exercise the same user-home mount location as the Mac app. NetFS
+        // applies different policy to per-user /private/var temporary trees.
+        #[cfg(target_os = "macos")]
+        let fixture_parent = dirs::home_dir().expect("native mount user's home");
+        #[cfg(not(target_os = "macos"))]
+        let fixture_parent = std::env::temp_dir();
+        let root = fixture_parent.join(format!(
             "ams-native-smb-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -731,7 +737,7 @@ mod tests {
                 .as_nanos()
         ));
         let source = root.join("source");
-        let mount = root.join("mount");
+        let mount = root.join("native mount");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir(&mount).unwrap();
         let mut cleanup = Cleanup {

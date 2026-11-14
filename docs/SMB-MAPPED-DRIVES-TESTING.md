@@ -7,6 +7,10 @@ targets: Windows x64, macOS ARM64/x64, and Linux ARM64/x64 (Ubuntu 22.04 floor).
 It exercises unit tests and loopback SMB negotiation. Unix jobs also mount with
 the native SMB client and verify sparse data beyond 4 GiB, mutation and cleanup.
 Windows drive creation still needs the manual check below.
+Install matching node and desktop builds on both endpoints. The GUI reuses an
+already-running Always On node, so opening a development GUI alone does not
+replace that node. Update/restart the installed node through the normal AMS
+controls before testing; record the running node build as well as the GUI build.
 Use the following matrix for manual runtime acceptance; record the exact build,
 OS version, package type, and CPU for both endpoints. A passing build does not
 mark a runtime row as passed.

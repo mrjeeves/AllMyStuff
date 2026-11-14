@@ -188,7 +188,17 @@ jobs:
             sudo modprobe cifs
             sudo env ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture
           else
-            ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture
+              if ! ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture; then
+                id
+                stat -f 'Console owner: %Su (%u)' /dev/console
+                ls -l /dev/nsmb* 2>/dev/null || true
+                # Only this disposable fixture runs here. Redact generated
+                # credentials if an OS diagnostic happens to include one.
+                sudo /usr/bin/log show --last 1m --style compact --info --debug \
+                  --predicate '(process == "kernel" OR process == "NetAuthSysAgent" OR process == "NetAuthAgent" OR process == "allmystuff-serve") AND (eventMessage CONTAINS[c] "smb" OR eventMessage CONTAINS[c] "mount")' \
+                  | sed -E 's/[[:xdigit:]]{64}/<redacted>/g' | tail -80 || true
+                exit 1
+              fi
           fi
       - name: test (hwenc)
         if: matrix.os == 'ubuntu-24.04'

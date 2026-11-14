@@ -722,8 +722,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.root);
             }
         }
-        // Exercise the same user-home mount location as the Mac app. NetFS
-        // applies different policy to per-user /private/var temporary trees.
+        // Exercise the same user-home mount location as the Mac app.
         #[cfg(target_os = "macos")]
         let fixture_parent = dirs::home_dir().expect("native mount user's home");
         #[cfg(not(target_os = "macos"))]

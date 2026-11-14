@@ -99,14 +99,14 @@ impl SmbHosts {
 
 /// Separate loopback identities avoid Windows' per-server credential collision
 /// between simultaneous mappings. No network adapter or host-file entry needed.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 pub(crate) fn client_address(mapping: &str) -> std::net::Ipv4Addr {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(mapping.as_bytes());
     std::net::Ipv4Addr::new(127, 64 + (hash[0] & 63), hash[1], 1 + hash[2] % 254)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub(crate) async fn client_listener(mapping: &str) -> Result<tokio::net::TcpListener, String> {
     tokio::net::TcpListener::bind((client_address(mapping), 0))
         .await

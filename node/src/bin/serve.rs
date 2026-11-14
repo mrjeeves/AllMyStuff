@@ -216,6 +216,9 @@ fn render_update_now(outcome: &allmystuff_updater::UpdateNowOutcome) -> String {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = allmystuff_node::native_smb_helper_if_requested() {
+        return code;
+    }
     // One-shot CLI verbs (`--version`, `update`) run before we touch logging or
     // the control socket, and exit with their own code.
     if let Some(code) = run_cli_verb() {

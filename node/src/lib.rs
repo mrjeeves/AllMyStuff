@@ -140,6 +140,18 @@ pub mod service_profiles;
 pub mod shares;
 pub mod sites;
 pub(crate) mod smb_drives;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_smb_mount;
+
+/// Dispatch the one-shot native mount operation before starting a desktop node.
+pub fn native_smb_helper_if_requested() -> Option<std::process::ExitCode> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix_smb_mount::run_helper_if_requested()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
 pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —

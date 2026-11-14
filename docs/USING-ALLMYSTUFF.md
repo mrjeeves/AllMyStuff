@@ -183,13 +183,17 @@ storage on the receiving fleet device.
 in Windows, a mounted volume on macOS, or a filesystem mount point on Linux.
 Native applications use it like other storage on that computer.
 
-On Windows, mapped and shared folders use the built-in SMB client over AMS.
-They appear as network drives, support files larger than 4 GB, and report the
+Mapped and shared folders use native SMB over AMS on Windows, macOS and Linux.
+Windows uses its built-in redirector, macOS uses NetFS, and Linux uses the
+kernel CIFS client. On Windows they appear as network drives, support files
+larger than 4 GB, and report the
 source volume's capacity. Reads and writes go to the source over the mesh;
 keep the source online while using its drive. No additional filesystem driver,
 WinFsp, or rclone is required. The receiving computer needs Windows 11 24H2 or
 Windows Server 2025 or later and the installed AMS service (or an elevated node).
-Both endpoints must run an AMS version with SMB drive support. Fleetfiles
+Linux mounts need OS authorization through polkit/pkexec and must run in the
+desktop user session. No rclone or FUSE mount helper is used. Both endpoints
+must run an AMS version with SMB drive support. Fleetfiles
 continues to use Cloud Files for its separate on-demand synchronized namespace.
 
 Auto selects the next available drive letter, searching from Z: through A:.
@@ -216,11 +220,10 @@ If the source sleeps or changes networks, the mapping becomes unavailable and
 reconnects when the source returns. Removing a mapping removes the relationship
 from both devices and clears the native mount. See
 [Native drive mapping](DRIVE-MAPPING.md) for implementation and compatibility
-details. Ubuntu and Debian installations use `rclone` and FUSE; the `.deb`
-package and the AllMyStuff installer include `rclone` and `fuse3` as mapping
-dependencies. Desktop mappings run as your signed-in user, without `/etc/fstab`
-entries. A restricted system service must hand desktop work to a user node;
-its sandbox is not relaxed to allow mounting.
+details. Linux packages provide polkit/pkexec mount authorization; portable
+installations need that host facility too. Desktop mappings run in your user
+session, without `/etc/fstab` entries. A restricted system service must hand
+desktop work to a user node; its sandbox is not relaxed to allow mounting.
 
 ## Share with another person
 

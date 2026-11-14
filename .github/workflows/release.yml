@@ -181,6 +181,15 @@ jobs:
       - name: Build node serve binary
         run: cargo build --locked --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target ${{ matrix.platform.target }}
 
+      - name: Verify and stage SMB license notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --manifest-path node/Cargo.toml --format-version 1 --filter-platform "${{ matrix.platform.target }}" |
+            python scripts/check-smb-licenses.py --check-notices docs/THIRD-PARTY-SMB-NOTICES.txt
+          mkdir -p dist-bin
+          cp docs/THIRD-PARTY-SMB-NOTICES.txt dist-bin/THIRD-PARTY-SMB-NOTICES.txt
+
       # Leave tauri-action a single, unambiguous app. `gui/mobile` is a second,
       # self-contained Tauri project (its own `[workspace]`, its own
       # tauri.conf.json) that shares `projectPath: gui`. tauri-action discovers
@@ -244,11 +253,11 @@ jobs:
           NAME="allmystuff-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
           else
             cp "$BIN" "dist-bin/allmystuff"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
@@ -268,11 +277,11 @@ jobs:
           NAME="amst-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/amst.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" amst.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" amst.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
           else
             cp "$BIN" "dist-bin/amst"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin amst
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin amst THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
@@ -295,12 +304,12 @@ jobs:
           NAME="allmystuff-gui-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff-gui.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-gui.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-gui.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
             rm -f dist-bin/allmystuff-gui.exe
           else
             cp "$BIN" "dist-bin/allmystuff-gui"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-gui
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-gui THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
             rm -f dist-bin/allmystuff-gui
           fi
@@ -321,12 +330,12 @@ jobs:
           NAME="allmystuff-serve-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff-serve.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-serve.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-serve.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
             rm -f dist-bin/allmystuff-serve.exe
           else
             cp "$BIN" "dist-bin/allmystuff-serve"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-serve
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-serve THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
             rm -f dist-bin/allmystuff-serve
           fi

@@ -135,6 +135,26 @@ fn digest(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
+pub(super) fn check_migration_cache(mapping: &str) -> Result<(), String> {
+    let cache = state_root()?.join(digest(mapping.as_bytes())).join("cache");
+    fn contains_files(path: &Path) -> std::io::Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || contains_files(&entry.path())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    if contains_files(&cache).map_err(|e| e.to_string())? {
+        return Err(format!("Recover the previous Linux drive cache before switching this mapping to native SMB: {}. AMS retained all cached files; unsent writes must not be discarded.", cache.display()));
+    }
+    Ok(())
+}
+
 fn lease_path(mount: &Path) -> Result<PathBuf, String> {
     use std::os::unix::ffi::OsStrExt;
     Ok(state_root()?

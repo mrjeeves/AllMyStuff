@@ -152,6 +152,29 @@ jobs:
       - name: test
         working-directory: node
         run: cargo test --locked
+      - name: SMB dependency licenses and distribution notices
+        working-directory: node
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo metadata --locked --format-version 1 --filter-platform "$host" |
+            python ../scripts/check-smb-licenses.py --check-notices ../docs/THIRD-PARTY-SMB-NOTICES.txt
+      - name: native SMB client interoperability (sparse files beyond 4 GiB)
+        if: runner.os != 'Windows'
+        working-directory: node
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary=$(cargo test --locked --lib --no-run --message-format=json |
+            python3 -c 'import sys,json; rows=[json.loads(line) for line in sys.stdin]; print(next(row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("profile",{}).get("test") and row.get("target",{}).get("kind")==["lib"] and row.get("executable")))')
+          test_name=unix_smb_mount::tests::native_smb_client_reads_and_writes_beyond_four_gib
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo modprobe cifs
+            sudo "$test_binary" --exact "$test_name" --ignored --test-threads=1
+          else
+            "$test_binary" --exact "$test_name" --ignored --test-threads=1
+          fi
       - name: test (hwenc)
         if: matrix.os == 'ubuntu-24.04'
         working-directory: node

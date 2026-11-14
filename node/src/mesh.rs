@@ -15557,7 +15557,7 @@ impl Mesh {
             .saturating_add(1)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     pub(crate) fn stop_smb_tunnel(&self, route: &str) {
         self.sites.stop_route(route);
     }
@@ -15571,7 +15571,7 @@ impl Mesh {
             .is_some_and(|live| live.is_active() && is_mapped_drive_route(&live.route))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     pub(crate) async fn smb_drive_tunnel(
         self: &Arc<Self>,
         route: &str,

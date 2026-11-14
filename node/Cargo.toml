@@ -85,7 +85,6 @@ host = [
     "dep:zbus",
     "dep:pipewire",
     "dep:xcb",
-    "dep:core-foundation",
 ]
 
 # The audio plane alone — split out of `host` because it's the one capture
@@ -219,7 +218,7 @@ xcb = { version = "1", features = ["dpms"], optional = true }
 
 # IOKit power assertions (NoDisplaySleep) while hosting a screen stream.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = { version = "0.10", optional = true }
+core-foundation = "0.10"
 # `diskutil info -plist` is the stable machine-readable bridge from a mounted
 # USB volume (`/Volumes/Windows`) to its whole raw disk (`/dev/rdiskN`).
 plist = "1"

@@ -4,12 +4,14 @@
 
 CI covers the shared node and desktop backend on all five native release
 targets: Windows x64, macOS ARM64/x64, and Linux ARM64/x64 (Ubuntu 22.04 floor).
-It exercises unit tests and loopback SMB negotiation, not an actual OS mapping.
+It exercises unit tests and loopback SMB negotiation. Unix jobs also mount with
+the native SMB client and verify sparse data beyond 4 GiB, mutation and cleanup.
+Windows drive creation still needs the manual check below.
 Use the following matrix for manual runtime acceptance; record the exact build,
 OS version, package type, and CPU for both endpoints. A passing build does not
 mark a runtime row as passed.
 
-| Source | Windows receiver (SMB) | macOS receiver (WebDAV) | Linux receiver (rclone/FUSE) |
+| Source | Windows receiver (SMB) | macOS receiver (SMB) | Linux receiver (SMB) |
 | --- | --- | --- | --- |
 | Windows | Manual | Manual | Manual |
 | macOS | Manual | Manual | Manual |
@@ -17,14 +19,16 @@ mark a runtime row as passed.
 
 For each receiving OS, cover both shipped CPU architectures where applicable.
 On Linux, include a `.deb` installation, an RPM installation on an RPM-based
-distribution, and AppImage/portable installation. Debian/RPM package managers
-must install `rclone` and `fuse3`; AppImage/portable users must have the helpers
-and `/dev/fuse` access. Check the missing-helper failure instructions too.
-Use a disposable subfolder for native read/write/seek/rename/delete, reconnect,
-revocation, remote capacity where supported, and a >4 GiB round trip with hash
-comparison. WebDAV representations have separate limits; record any failure
-instead of inferring that a passing Windows SMB transfer proves those paths.
-Clean each pair's test copies before moving to the next pair.
+distribution, and AppImage/portable installation. The kernel CIFS client must
+be available. Debian/RPM packages must provide polkit/pkexec; portable users need
+the same host authorization facility. Authorize the one-shot mount from the
+user node. A hardened service's private mount namespace must fail clearly
+instead of reporting an invisible desktop mount. New mappings use no rclone or
+FUSE helper. Check missing kernel/client authorization errors too.
+Use a disposable subfolder for read/write/seek/rename/delete, reconnect,
+revocation, source capacity, and a >4 GiB round trip with hash comparison. Clean
+each pair's test copies before moving on. A successful sparse large-offset test
+is not a full multi-gigabyte two-machine transfer result.
 
 Windows 10, Windows 11 before 24H2, and a non-elevated receiver without the AMS
 service must return a clear compatibility/privilege error before migrating an

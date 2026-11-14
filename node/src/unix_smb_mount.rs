@@ -50,6 +50,20 @@ fn valid_endpoint(lease: &Lease) -> bool {
         && lease.mount.parent().is_some()
 }
 
+fn canonical_mount(mount: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(mount) {
+        Ok(path) => Ok(path),
+        #[cfg(target_os = "macos")]
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && mount.parent() == Some(Path::new("/Volumes")) =>
+        {
+            Ok(mount.to_path_buf())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn state_file() -> Result<PathBuf, String> {
     allmystuff_protocol::myownmesh_state_dir()
         .map(|root| root.join("allmystuff-smb-mounts.json"))
@@ -190,7 +204,7 @@ impl NativeSmbMount {
         let mut random = [0u8; 16];
         getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
         let mut lease = Lease {
-            mount: std::fs::canonicalize(mount).map_err(|e| e.to_string())?,
+            mount: canonical_mount(mount)?,
             server,
             share: endpoint.share,
             port: address.port(),
@@ -344,21 +358,31 @@ fn execute(request: &Request) -> Result<Option<String>, String> {
     }
     let existing = observed(lease)?;
     if let Some(password) = &request.password {
-        if std::fs::canonicalize(&lease.mount).map_err(|e| e.to_string())? != lease.mount {
+        if canonical_mount(&lease.mount)? != lease.mount {
             return Err("the mount directory changed before setup".into());
         }
         if existing.is_some() {
             return Err("the mount point is already assigned".into());
         }
-        let metadata = std::fs::symlink_metadata(&lease.mount).map_err(|e| e.to_string())?;
-        if !metadata.is_dir()
-            || metadata.uid() != caller
-            || std::fs::read_dir(&lease.mount)
-                .map_err(|e| e.to_string())?
-                .next()
-                .is_some()
-        {
-            return Err("the mount point must be an empty directory owned by the caller".into());
+        match std::fs::symlink_metadata(&lease.mount) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.uid() != caller
+                    || std::fs::read_dir(&lease.mount)
+                        .map_err(|e| e.to_string())?
+                        .next()
+                        .is_some()
+                {
+                    return Err(
+                        "the mount point must be an empty directory owned by the caller".into(),
+                    );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && lease.mount.parent() == Some(Path::new("/Volumes")) => {}
+            Err(error) => return Err(error.to_string()),
         }
         if password.len() != 64 || !password.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid SMB credential".into());
@@ -719,10 +743,13 @@ mod tests {
                     Ok(None) => {}
                     _ => return, // Preserve a replacement or uninspectable mount.
                 }
+                // NetFS may leave its now-empty, user-owned volume directory.
+                #[cfg(target_os = "macos")]
+                let _ = std::fs::remove_dir(&self.lease.mount);
                 let _ = std::fs::remove_dir_all(&self.root);
             }
         }
-        // Exercise the same user-home mount location as the Mac app.
+        // Source data stays in a disposable user-owned tree on both platforms.
         #[cfg(target_os = "macos")]
         let fixture_parent = dirs::home_dir().expect("native mount user's home");
         #[cfg(not(target_os = "macos"))]
@@ -736,13 +763,20 @@ mod tests {
                 .as_nanos()
         ));
         let source = root.join("source");
+        #[cfg(target_os = "macos")]
+        let mount = Path::new("/Volumes").join(format!(
+            "{} native mount",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        #[cfg(target_os = "linux")]
         let mount = root.join("native mount");
         std::fs::create_dir_all(&source).unwrap();
+        #[cfg(target_os = "linux")]
         std::fs::create_dir(&mount).unwrap();
         let mut cleanup = Cleanup {
             root: root.clone(),
             lease: Lease {
-                mount: std::fs::canonicalize(&mount).unwrap(),
+                mount: canonical_mount(&mount).unwrap(),
                 ..lease()
             },
         };
@@ -778,7 +812,7 @@ mod tests {
             }
         }));
         let mut spec = lease();
-        spec.mount = std::fs::canonicalize(&mount).unwrap();
+        spec.mount = canonical_mount(&mount).unwrap();
         spec.server = match address.ip() {
             std::net::IpAddr::V4(ip) => ip,
             _ => unreachable!(),

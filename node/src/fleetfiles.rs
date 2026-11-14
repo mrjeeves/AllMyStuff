@@ -345,6 +345,18 @@ impl FleetfilesReplica {
         Self::with_connection(root, Connection::open_in_memory().unwrap())
     }
 
+    /// A replica that shares nothing with the real one: an in-memory ledger
+    /// over a `root` that is never created. Used when the canonical
+    /// Fleetfiles root cannot be prepared, so the node still runs everything
+    /// else instead of crash-looping, and the durable ledger is never pointed
+    /// at a folder whose (empty) contents it would record as deletions.
+    pub(crate) fn detached(root: PathBuf) -> Self {
+        Self::with_connection(
+            root,
+            Connection::open_in_memory().expect("an in-memory SQLite database must open"),
+        )
+    }
+
     fn with_connection(root: PathBuf, connection: Connection) -> Self {
         connection
             .execute_batch(

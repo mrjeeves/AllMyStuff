@@ -184,6 +184,10 @@ pub struct Mesh {
     /// Transactional version table, bounded watcher, and verified inbound
     /// staging for the canonical Fleetfiles namespace.
     fleetfiles: Arc<FleetfilesReplica>,
+    /// False when the canonical Fleetfiles root couldn't be prepared at start.
+    /// The node then neither advertises the ledger nor accepts Fleetfiles
+    /// transactions, so peers never count this machine as holding a replica.
+    fleetfiles_available: bool,
     fleetfiles_transfer_gate: Arc<Semaphore>,
     fleetfiles_waiters: Mutex<HashMap<(String, String), oneshot::Sender<FleetfilesMessage>>>,
     fleetfiles_draining: Mutex<HashSet<String>>,
@@ -868,6 +872,40 @@ fn remove_empty_legacy_fleetfiles_container(legacy_desktop: &std::path::Path) {
     }
 }
 
+/// Whether `root` is this user's registered Fleetfiles sync root. Only
+/// Windows registers one (a Cloud Files root whose provider is this node).
+fn is_registered_fleetfiles_sync_root(root: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::windows_fleetfiles::is_registered_fleetfiles_root(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        false
+    }
+}
+
+/// Whether an existing root that lacks a *visible* marker still belongs to
+/// AllMyStuff. `marker_visible` is `None` when the marker's presence could
+/// not be determined at all. A registered sync root is always ours: before
+/// its provider (this node) connects, Windows can hide or refuse the marker
+/// even though the folder is listed as occupied, which used to be misread as
+/// a foreign folder and crash every start.
+fn unmarked_root_is_ours(
+    marker_visible: Option<bool>,
+    occupied: impl FnOnce() -> Result<bool, String>,
+    registered_sync_root: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    if marker_visible == Some(true) || registered_sync_root() {
+        return Ok(true);
+    }
+    match marker_visible {
+        Some(_) => Ok(!occupied()?),
+        None => Ok(false),
+    }
+}
+
 fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
     const ROOT_MARKER: &str = ".allmystuff-fleetfiles-root";
 
@@ -876,24 +914,51 @@ fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
     let marker = root.join(ROOT_MARKER);
     let legacy = legacy_fleetfiles_desktop();
 
-    if root.exists() && !marker.exists() {
-        let occupied = std::fs::read_dir(&root)
-            .map_err(|error| format!("inspect {}: {error}", root.display()))?
-            .next()
-            .is_some();
-        if occupied {
-            return Err(format!(
-                "{} already exists and was not created by AllMyStuff",
-                root.display()
-            ));
+    let mut registered = None;
+    if root.exists() {
+        let marker_visible = marker.try_exists().ok();
+        let ours = unmarked_root_is_ours(
+            marker_visible,
+            || {
+                Ok(std::fs::read_dir(&root)
+                    .map_err(|error| format!("inspect {}: {error}", root.display()))?
+                    .next()
+                    .is_some())
+            },
+            || *registered.insert(is_registered_fleetfiles_sync_root(&root)),
+        )?;
+        if !ours {
+            return Err(if marker_visible.is_none() {
+                format!(
+                    "couldn't check {} for its Fleetfiles marker, and it is not this user's registered Fleetfiles sync root",
+                    root.display()
+                )
+            } else {
+                format!(
+                    "{} already exists and was not created by AllMyStuff",
+                    root.display()
+                )
+            });
         }
     }
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("create {}: {error}", root.display()))?;
     if !marker.exists() {
-        std::fs::write(&marker, b"Fleetfiles root v1\n")
-            .map_err(|error| format!("mark {} as Fleetfiles: {error}", root.display()))?;
-        let _ = crate::files::mark_internal_staging_hidden(&marker);
+        if let Err(error) = std::fs::write(&marker, b"Fleetfiles root v1\n") {
+            // A registered sync root may refuse writes until its provider
+            // connects; it is ours regardless, and the provider connection
+            // that follows is what makes it writable again.
+            if !registered.unwrap_or_else(|| is_registered_fleetfiles_sync_root(&root)) {
+                return Err(format!("mark {} as Fleetfiles: {error}", root.display()));
+            }
+            tracing::warn!(
+                root = %root.display(),
+                %error,
+                "couldn't rewrite the Fleetfiles marker in the registered sync root; continuing"
+            );
+        } else {
+            let _ = crate::files::mark_internal_staging_hidden(&marker);
+        }
     }
 
     if let Some(legacy) = legacy.as_ref().filter(|path| path.exists()) {
@@ -950,21 +1015,42 @@ fn prepare_fleetfiles_root() -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// The Fleetfiles replica, plus whether Fleetfiles is usable on this machine.
+///
+/// A root that can't be prepared used to `expect()` here, aborting the node
+/// (`0xc0000409` on Windows) on every start. The service then crash-looped
+/// and the whole machine left the mesh over one folder. Now the node keeps
+/// running everything else on a detached replica and Fleetfiles stays off
+/// until the folder is fixed.
 #[cfg(not(test))]
-fn fleetfiles_replica() -> FleetfilesReplica {
-    FleetfilesReplica::load(
-        prepare_fleetfiles_root().expect("the user's Fleetfiles root must be available"),
-    )
+fn fleetfiles_replica() -> (FleetfilesReplica, bool) {
+    fleetfiles_replica_from(prepare_fleetfiles_root())
+}
+
+fn fleetfiles_replica_from(prepared: Result<PathBuf, String>) -> (FleetfilesReplica, bool) {
+    match prepared {
+        Ok(root) => (FleetfilesReplica::load(root), true),
+        Err(error) => {
+            tracing::error!(
+                "Fleetfiles is unavailable on this machine, continuing without it: {error}"
+            );
+            let detached = std::env::temp_dir().join(format!(
+                "allmystuff-fleetfiles-unavailable-{}",
+                std::process::id()
+            ));
+            (FleetfilesReplica::detached(detached), false)
+        }
+    }
 }
 
 #[cfg(test)]
-fn fleetfiles_replica() -> FleetfilesReplica {
+fn fleetfiles_replica() -> (FleetfilesReplica, bool) {
     let root = std::env::temp_dir().join(format!(
         "allmystuff-fleetfiles-mesh-test-{}-{}",
         std::process::id(),
         fresh_boot_id()
     ));
-    FleetfilesReplica::memory(root)
+    (FleetfilesReplica::memory(root), true)
 }
 
 fn drive_reconnect_store_path() -> Option<PathBuf> {
@@ -2199,6 +2285,7 @@ impl Mesh {
         let mut drive_relationships = load_drive_relationships(&drive_relationship_path);
         let drive_forget_path = drive_forget_store_path();
         let drive_forgets = load_drive_forgets(&drive_forget_path);
+        let (fleetfiles, fleetfiles_available) = fleetfiles_replica();
         // Upgrade receiver-only records from older builds into the shared
         // display model immediately. The source learns the same id on the next
         // reconnect offer; until then this side can still explain its OS drive.
@@ -2256,7 +2343,8 @@ impl Mesh {
             drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
             drive_reconnect_path,
-            fleetfiles: Arc::new(fleetfiles_replica()),
+            fleetfiles: Arc::new(fleetfiles),
+            fleetfiles_available,
             fleetfiles_transfer_gate: Arc::new(Semaphore::new(2)),
             fleetfiles_waiters: Mutex::new(HashMap::new()),
             fleetfiles_draining: Mutex::new(HashSet::new()),
@@ -3354,19 +3442,29 @@ impl Mesh {
         // Native mount recovery can take Windows tens of seconds while its
         // redirector releases a stale WebDAV drive, so serialize that work in
         // the background instead of holding the node control socket hostage.
-        let fleetfiles = match prepare_fleetfiles_root() {
-            Ok(root) => {
-                self.files
-                    .map_root(crate::drive_mount::FLEETFILES_ROUTE, root.clone());
-                Some(root)
+        let fleetfiles = if self.fleetfiles_available {
+            match prepare_fleetfiles_root() {
+                Ok(root) => {
+                    self.files
+                        .map_root(crate::drive_mount::FLEETFILES_ROUTE, root.clone());
+                    Some(root)
+                }
+                Err(error) => {
+                    tracing::warn!("couldn't prepare Fleetfiles: {error}");
+                    None
+                }
             }
-            Err(error) => {
-                tracing::warn!("couldn't prepare Fleetfiles: {error}");
-                None
-            }
+        } else {
+            None
         };
         let native_startup = self.drive_mounts.begin_startup().await;
-        match self.fleetfiles.start_watcher() {
+        // A detached replica has no folder worth watching.
+        let watcher = if self.fleetfiles_available {
+            self.fleetfiles.start_watcher()
+        } else {
+            Err("Fleetfiles is unavailable on this machine".to_string())
+        };
+        match watcher {
             Ok(changes) => {
                 let mesh = self.clone();
                 let _ = std::thread::Builder::new()
@@ -4169,10 +4267,14 @@ impl Mesh {
                     allmystuff_protocol::FEATURE_FILES.to_string(),
                     allmystuff_protocol::FEATURE_ROOMS.to_string(),
                     allmystuff_protocol::FEATURE_SITES.to_string(),
-                    FEATURE_FLEETFILES_LEDGER.to_string(),
                     FEATURE_FLEET_STORAGE_DEFAULTS.to_string(),
                     crate::smb_drives::FEATURE.to_string(),
                 ];
+                // Without a usable Fleetfiles root this node must not invite
+                // ledger traffic it would only hold in memory.
+                if self.fleetfiles_available {
+                    f.push(FEATURE_FLEETFILES_LEDGER.to_string());
+                }
                 // The runtime kill switch withdraws the negotiated contract
                 // as well as disabling local sends. Advertising while sending
                 // whole AUs would make an upgraded receiver wait for markers
@@ -5607,6 +5709,13 @@ impl Mesh {
                 }
             }
             CHANNEL_FLEETFILES => {
+                if !self.fleetfiles_available {
+                    tracing::debug!(
+                        "ignoring Fleetfiles transaction from {}: Fleetfiles is unavailable here",
+                        short_id(&from)
+                    );
+                    return;
+                }
                 if !self.is_fleet_network(&network) || !self.sender_may_control(&from) {
                     tracing::warn!(
                         "ignoring Fleetfiles transaction from {} outside the authenticated fleet",
@@ -16137,6 +16246,9 @@ impl Mesh {
     }
 
     fn fleetfiles_capacity(&self) -> u64 {
+        if !self.fleetfiles_available {
+            return 0;
+        }
         let snapshot = self.storage_plan.snapshot();
         let enabled = snapshot
             .allocations
@@ -23087,6 +23199,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_registered_sync_root_is_ours_even_when_its_marker_is_hidden() {
+        // The crash: provider offline, so Windows hid the marker while still
+        // listing the root as occupied. That read as a foreign folder.
+        let occupied = || Ok(true);
+        assert!(unmarked_root_is_ours(Some(false), occupied, || true).unwrap());
+        assert!(unmarked_root_is_ours(None, occupied, || true).unwrap());
+        // An unreadable root is fine too when the registration vouches for it.
+        assert!(unmarked_root_is_ours(Some(false), || Err("denied".into()), || true).unwrap());
+    }
+
+    #[test]
+    fn an_unregistered_occupied_folder_is_still_refused() {
+        assert!(!unmarked_root_is_ours(Some(false), || Ok(true), || false).unwrap());
+        assert!(unmarked_root_is_ours(Some(false), || Ok(false), || false).unwrap());
+        assert!(unmarked_root_is_ours(Some(true), || Ok(true), || false).unwrap());
+        // Unknown marker state and no registration: not provably ours.
+        assert!(!unmarked_root_is_ours(None, || Ok(false), || false).unwrap());
+        assert!(unmarked_root_is_ours(Some(false), || Err("denied".into()), || false).is_err());
+    }
+
+    #[test]
+    fn an_unpreparable_fleetfiles_root_degrades_instead_of_aborting() {
+        let (replica, available) =
+            fleetfiles_replica_from(Err("C:\\Users\\u\\Fleetfiles already exists".into()));
+        assert!(!available);
+        assert_eq!(replica.logical_used_bytes(), 0);
+    }
 
     fn test_device_support_status() -> DeviceSupportStatus {
         DeviceSupportStatus {

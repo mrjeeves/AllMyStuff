@@ -92,14 +92,26 @@ fn forget(expected: &Lease) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn ensure_supported() -> Result<(), String> {
+fn ensure_visible_mount_namespace() -> Result<(), String> {
     // ProtectSystem/PrivateMounts create a service-only mount namespace. A
     // successful mount there would still be invisible to desktop applications.
+    // Reading PID 1's namespace requires ptrace permission. Ordinary users
+    // defer this check to their authorized helper, which inherits their mount
+    // namespace and can inspect it as root before performing any mount.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
     let own = std::fs::read_link("/proc/self/ns/mnt").map_err(|e| e.to_string())?;
     let init = std::fs::read_link("/proc/1/ns/mnt").map_err(|e| e.to_string())?;
     if own != init {
         return Err("Native SMB drives need the desktop mount namespace. Run AMS in your user session; a hardened system service cannot expose this mount to desktop applications.".into());
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_supported() -> Result<(), String> {
+    ensure_visible_mount_namespace()?;
     if unsafe { libc::geteuid() } != 0 && !Path::new("/usr/bin/pkexec").is_file() {
         return Err("Native Linux SMB drives need mount authorization. Install your distribution's polkit/pkexec package, then map from the AMS user session.".into());
     }
@@ -326,6 +338,8 @@ fn execute(request: &Request) -> Result<Option<String>, String> {
     if !valid_endpoint(lease) {
         return Err("invalid SMB mount request".into());
     }
+    #[cfg(target_os = "linux")]
+    ensure_visible_mount_namespace()?;
     let caller = unsafe { libc::geteuid() };
     #[cfg(target_os = "linux")]
     let caller = if caller == 0 {
@@ -633,6 +647,15 @@ fn unmount_native(lease: &Lease) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_user_preflight_does_not_need_pid_one_ptrace_access() {
+        // Hosted CI runs these unit tests as the desktop user; the separate
+        // native CIFS test exercises the root helper's namespace validation.
+        if unsafe { libc::geteuid() } != 0 {
+            ensure_visible_mount_namespace().unwrap();
+        }
+    }
     async fn native_operation(request: Request) -> Result<Option<String>, String> {
         if std::env::var_os("ALLMYSTUFF_TEST_NATIVE_SMB_HELPER").is_some() {
             return helper(&request).await;

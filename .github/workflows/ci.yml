@@ -177,6 +177,10 @@ jobs:
             codesign --force --sign - "$helper_binary"
             codesign --force --sign - "$test_binary"
             codesign --verify --strict "$helper_binary"
+            # Fresh headless VMs may not have loaded Apple's built-in SMB
+            # filesystem yet. Load the OS component, as Linux does for cifs;
+            # the actual mount still runs as the unprivileged desktop user.
+            sudo /usr/bin/kmutil load --bundle-identifier com.apple.filesystems.smbfs
             sudo /usr/bin/kmutil showloaded --bundle-identifier com.apple.filesystems.smbfs
           fi
           test_name=unix_smb_mount::tests::native_smb_client_reads_and_writes_beyond_four_gib

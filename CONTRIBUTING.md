@@ -23,6 +23,8 @@ of the build.
 The toolchain is:
 
 - Rust stable, pinned by `rust-toolchain.toml`.
+- The node and desktop/mobile shell workspaces require Rust 1.95 or later for
+  the embedded SMB server; the root model workspace retains its own minimum.
 - Node 22 and pnpm 10 for the Svelte front end.
 - Tauri's native webview and audio dependencies.
 - Xcode command-line tools on macOS, WebView2 and MSVC on Windows, or the

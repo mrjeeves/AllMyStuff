@@ -17,7 +17,7 @@ description = "AllMyStuff headless mesh node — runs this machine on the mesh (
 authors = ["Chris Paul"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 
 # The engine, linked by both the GUI and the serve binary.
 [lib]
@@ -126,6 +126,7 @@ futures-util = "0.3"
 fs2 = "0.4"
 tokio-tungstenite = "0.30"
 dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
+smb-server = { version = "=0.10.0", default-features = false, features = ["localfs"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

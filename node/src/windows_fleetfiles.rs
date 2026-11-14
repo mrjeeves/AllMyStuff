@@ -70,6 +70,33 @@ pub(crate) fn unregister_test_root(account: String) -> Result<(), String> {
     })
 }
 
+/// Remove only a previous mapped-folder registration; never Fleetfiles or
+/// its local contents. The caller checks that its upload journal is empty.
+pub(crate) fn unregister_mapped_root(root: PathBuf, account: String) -> Result<(), String> {
+    if !account.starts_with("Drive-") {
+        return Err("refusing to unregister a non-drive sync root".into());
+    }
+    crate::win_privilege::interactive_user_call("ams-cloud-drive-migrate", move || {
+        let _apartment = ComApartment::enter()?;
+        let sid = crate::win_privilege::effective_user_sid()?;
+        let id = HSTRING::from(format!("{PROVIDER_NAME}!{sid}!{account}"));
+        let Ok(existing) = StorageProviderSyncRootManager::GetSyncRootInformationForId(&id) else {
+            return Ok(());
+        };
+        let registered = existing
+            .Path()
+            .and_then(|folder| folder.Path())
+            .map_err(|error| error.to_string())?
+            .to_string();
+        if !same_windows_path(&registered, &root.to_string_lossy()) {
+            return Err(
+                "the previous sync-root path changed; its registration was preserved".into(),
+            );
+        }
+        StorageProviderSyncRootManager::Unregister(&id).map_err(|error| error.to_string())
+    })
+}
+
 fn register_for_current_user(
     root: &Path,
     icon: &Path,

@@ -24,7 +24,7 @@ description = "AllMyStuff mobile (iOS/Android) — a Tauri 2 shell around the sh
 authors = ["Chris Paul"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 
 # Tauri's mobile targets link the app as a library (the platform shell — an
 # Android `NativeActivity` / an iOS view controller — calls `run()` through

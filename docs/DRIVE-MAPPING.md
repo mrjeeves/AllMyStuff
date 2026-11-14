@@ -10,12 +10,13 @@ drive. Windows receives an ordinary drive letter, macOS receives a mounted
 volume, and Linux receives a filesystem mount point. Native applications use
 the result directly; it is not an AllMyStuff-only file browser.
 
-Windows uses the built-in Cloud Files API. Each mapping has a durable local
-sync root, with a drive-letter alias in the signed-in user's namespace.
-Directory placeholders and on-demand reads translate into the existing scoped
-mesh file protocol. Byte sizes and offsets remain 64-bit; Windows WebClient's
-50 MB default and 4 GiB setting ceiling do not apply. No additional filesystem
-driver or mounting executable is used on Windows.
+Windows uses its built-in SMB client. The source starts a private SMB3 server
+confined to the granted folder, and AMS tunnels its TCP stream across the live
+Storage route. The receiver maps a private loopback endpoint with Windows'
+SMB alternate-port support. Windows WebClient's file-size ceiling does not
+apply. Fleetfiles keeps its existing Cloud Files provider. No additional
+filesystem driver, Windows account, OS file share, firewall change, WinFsp,
+or rclone is required for Windows mapped folders.
 
 On macOS and Linux the receiving node runs a loopback-only WebDAV server that
 translates filesystem operations into the same mesh file protocol. macOS
@@ -56,8 +57,8 @@ source machine                                      receiving machine
 ┌─────────────────────────────┐                    ┌──────────────────────────┐
 │ selected local folder       │                    │ Explorer / Finder / apps │
 │ route-id → canonical root   │                    │ X:\ or native mount      │
-│             │               │                    │ Windows Cloud Files      │
-│ scoped FileEvent host       │◄══ mesh route ═══►│ or Unix loopback WebDAV │
+│             │               │                    │ Windows SMB client       │
+│ scoped SMB / FileEvent host │◄══ mesh route ═══►│ or Unix loopback WebDAV │
 └─────────────────────────────┘  direct/STUN/TURN  │ scoped native adapter    │
                                                    └──────────────────────────┘
 ```
@@ -81,39 +82,45 @@ The native adapter adds metadata and random-access read/write operations to
 waiter instead of the GUI Files queue. Existing whole-machine Files sessions,
 room shared-file downloads, and their permissions remain separate.
 
-On Windows the native adapter is a Cloud Files provider, shared with Fleetfiles.
-An explicit mapping keeps its own sync root and authorization route; it does not
-add the shared folder to the fleet namespace. The drive letter points to that
-root, while the registered Explorer location retains cached files when the
-source or node is offline.
+For Windows mappings the scoped files RPC negotiates a per-route SMB endpoint.
+The source uses the pinned `smb-server` library's capability-confined local
+filesystem backend. Every endpoint binds to loopback, serves one granted root,
+and requires a fresh random password, SMB signing, and SMB3 encryption. No
+credentials enter session snapshots or persistent lease files; debug formatting
+redacts them. SMB leases are disabled because source applications can modify
+the same files outside SMB.
 
-Windows writes land locally first. A durable SQLite journal retains pending
-creates, edits, renames, and deletions across reconnects. Closed file bodies
-stream to a private source-side staging sibling before publication by rename.
-Replacements keep the previous body in a verified backup sibling until the new
-body is published; the target name can be briefly absent between those renames.
-A receipt retains the staged body's native
-identity so reconnect can recognize a commit whose acknowledgement was lost.
-Observed conflicting source changes leave the local edit pending. Cached file
-content and the pending journal are retained when a mapping disconnects.
+The receiver's private loopback identity separates simultaneous SMB sessions.
+Only the source's recorded endpoint port can be opened on that exact active
+Storage route by that route's authenticated peer. General Sites grants and
+arbitrary source ports are not exposed. Windows maps the endpoint through
+`New-SmbGlobalMapping`, nonpersistently, restricted to the signed-in user's
+account and LocalSystem. Credentials pass to PowerShell through stdin, never
+through command arguments or disk. The source filesystem reports capacity and
+handles file I/O directly; there is no separate mapped-folder sync cache.
+
+Route teardown closes the SMB endpoint and all its tunnel connections. Existing
+mapping relationships supply reconnect intent. Migration checks the previous
+Cloud Files mapped-drive journal: unsent edits prevent that mapping's migration.
+Old cache directories and journals are retained for recovery, never deleted.
 
 ## Lifecycle
 
 1. Source selects and canonicalizes a folder, binds it to a fresh route id,
    and offers the Storage route with `DriveRouteOffer` metadata.
 2. The receiver accepts under the normal Files authorization gate.
-3. On activation, Windows connects the Cloud Files provider to its mapping's
-   stable local root and creates a drive-letter alias. It selects the next free
-   letter from Z down to D when Auto. Only a recorded, exact alias target can
-   be reclaimed; unrelated SMB or other drive assignments are preserved.
+3. On activation, Windows negotiates the private source SMB endpoint, starts
+   its mesh tunnel, and creates a native SMB network mapping. It selects the
+   next free letter from Z down to D when Auto. Exact owned endpoint leases
+   gate cleanup; unrelated SMB or other drive assignments are preserved.
    macOS and Linux bind an ephemeral listener to `127.0.0.1:0`, build
    `RemoteDavFs`, and choose a native destination. macOS uses
    `~/AllMyStuff Drives/<name>`. A Linux system service uses
    `/mnt/allmystuff/<name>`; a user process uses
    `~/AllMyStuff Drives/<name>`. An explicit absolute mount point overrides
    those defaults.
-4. Windows population and hydration callbacks become scoped FileEvents over
-   the active route. macOS/Linux WebDAV operations use that same protocol.
+4. Windows SMB bytes travel in bounded SiteFrames over the active Storage route.
+   macOS/Linux WebDAV operations use scoped FileEvents over that route.
 5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and
    unmounts the native destination, but retains the relationship and reconnect
    intent. Both interfaces show it as unavailable until the peer returns.
@@ -164,16 +171,14 @@ computer. That invariant is enforced in both the picker and the node backend.
 
 ## Compatibility and tradeoffs
 
-- Windows requires Cloud Files support and an NTFS local cache volume. Native
-  applications read through normal file APIs, including seeks past 4 GiB.
-  Hydration has bounded, aligned range buffers and directory population uses
-  bounded source pages. Recovery enumerates only on-disk entries, avoiding
-  implicit downloads of the remote tree. The receiving volume must have space
-  for hydrated files and pending edits; drive free space reflects that cache
-  volume. Filesystem limits and actual free space still apply.
-- Native Cloud Files writes synchronize after applications close their files.
-  This is local sync-folder behavior: a successful local save can precede the
-  source acknowledgement. Explorer's in-sync state is set after publication.
+- Windows receivers require Windows 11 24H2 / Server 2025 or later, an installed
+  AMS service or elevated node, and an interactive user. Alternate SMB ports
+  are required; older Windows versions receive an explicit compatibility error.
+  The source must advertise `smb-drives-v1`; older sources need an AMS update.
+  Windows, macOS, and Linux source folders use the same private SMB backend.
+- Mapped-drive files follow network-filesystem behavior: the source must be
+  reachable for I/O. Interrupted operations fail rather than becoming offline
+  sync edits. Filesystem limits, source permissions, and free space still apply.
 - Upgrade recovery recognizes legacy AMS WebDAV leases by their exact recorded
   endpoint. It never disconnects an unrelated SMB mapping to obtain a letter.
 - macOS uses the operating system's built-in `mount_webdav` command and gives
@@ -194,7 +199,7 @@ computer. That invariant is enforced in both the picker and the node backend.
   removed during cleanup. The receiver must have space for buffered writes.
   See the [rclone mount documentation](https://rclone.org/commands/rclone_mount/)
   for the underlying FUSE and write-cache behavior.
-- The shared file protocol does not preserve all source filesystem features.
+- The macOS/Linux file RPC adapter does not preserve all source filesystem features.
   Hard links, alternate streams, and POSIX ownership are outside this mapping
   contract. macOS/Linux additionally have their WebDAV representation limits.
 - Remote-source selection uses the already-authorized mesh Files session.

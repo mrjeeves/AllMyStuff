@@ -139,6 +139,7 @@ pub mod reboot;
 pub mod service_profiles;
 pub mod shares;
 pub mod sites;
+pub(crate) mod smb_drives;
 pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —

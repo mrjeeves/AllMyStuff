@@ -1,8 +1,8 @@
 //! Native drive mounts backed by a live mesh Storage route.
 //!
-//! Windows uses native Cloud Files callbacks; Unix uses a loopback-only
-//! WebDAV listener. Both adapters turn filesystem operations into scoped
-//! FileEvent RPCs across the encrypted mesh route. No WebDAV listener is
+//! Windows mapped folders use SMB over the mesh; Fleetfiles uses Cloud Files.
+//! Unix uses a loopback-only WebDAV listener with scoped FileEvent RPCs.
+//! SMB bytes and FileEvent RPCs use the encrypted mesh route. No listener is
 //! exposed to the LAN and no local source path is disclosed to the receiver.
 
 use std::collections::HashMap;
@@ -46,13 +46,13 @@ pub(crate) fn test_cloud_alias(
     mount: Option<&str>,
 ) -> Result<String, String> {
     if let Some(mount) = mount {
-        windows_drive_mount::alias(mount, root, true)?;
+        windows_cloud_alias::alias(mount, root, true)?;
         return Ok(mount.to_string());
     }
     let mask = windows_logical_drive_mask()?
         | crate::win_privilege::interactive_user_logical_drive_mask()?;
     let mount = select_windows_mount(None, |mount| !drive_letter_reserved(mount, mask))?;
-    windows_drive_mount::alias(&mount, root, false)?;
+    windows_cloud_alias::alias(&mount, root, false)?;
     Ok(mount)
 }
 
@@ -62,6 +62,9 @@ use crate::mesh::Mesh;
 #[path = "linux_drive_mount.rs"]
 mod linux_drive_mount;
 
+#[cfg(windows)]
+#[path = "windows_cloud_alias.rs"]
+mod windows_cloud_alias;
 #[cfg(windows)]
 #[path = "windows_drive_mount.rs"]
 mod windows_drive_mount;
@@ -80,7 +83,7 @@ struct ActiveMount {
     #[cfg(target_os = "linux")]
     helper: Option<linux_drive_mount::MountedHelper>,
     #[cfg(windows)]
-    cloud_drive: Option<windows_drive_mount::NativeCloudDrive>,
+    smb_drive: Option<windows_drive_mount::NativeSmbDrive>,
     #[cfg(windows)]
     cloud_provider: Option<crate::windows_cloud_files::CloudConnection>,
 }
@@ -193,7 +196,11 @@ impl DriveMounts {
         cleanup_stale_native_mounts().await;
         #[cfg(windows)]
         if let Err(error) = windows_drive_mount::cleanup() {
-            tracing::warn!(%error,"couldn't recover native Cloud Files aliases");
+            tracing::warn!(%error,"couldn't recover AMS SMB mappings");
+        }
+        #[cfg(windows)]
+        if let Err(error) = windows_cloud_alias::cleanup() {
+            tracing::warn!(%error,"couldn't migrate previous Cloud Files drive aliases");
         }
     }
 
@@ -271,7 +278,7 @@ impl DriveMounts {
                 #[cfg(target_os = "linux")]
                 helper: None,
                 #[cfg(windows)]
-                cloud_drive: None,
+                smb_drive: None,
                 #[cfg(windows)]
                 cloud_provider: Some(cloud_provider),
             },
@@ -306,6 +313,9 @@ impl DriveMounts {
             if windows_drive_mount::remove_known(mount)? {
                 return Ok(());
             }
+            if windows_cloud_alias::remove_known(mount)? {
+                return Ok(());
+            }
             remove_known_native_mount(mount).await
         }
         #[cfg(not(windows))]
@@ -328,6 +338,8 @@ impl DriveMounts {
         }
         let active = self.list();
         #[cfg(windows)]
+        windows_cloud_alias::migrate(_mapping)?;
+        #[cfg(windows)]
         if let Some(requested) = normalize_requested_mount(&requested_mount)? {
             // A reconnect is allowed to reclaim only a letter carrying our
             // private lease marker. This is the half-open state produced when
@@ -345,26 +357,36 @@ impl DriveMounts {
         wait_for_route(&mesh, &route).await?;
         #[cfg(windows)]
         {
-            let cloud_drive = windows_drive_mount::NativeCloudDrive::start(
-                mesh,
-                route.clone(),
-                mount.clone(),
-                label.clone(),
-                _mapping,
-            )
-            .await?;
+            let (endpoint, address, server) = mesh.smb_drive_tunnel(&route, _mapping).await?;
+            let smb_drive =
+                match windows_drive_mount::NativeSmbDrive::start(&mount, &label, address, endpoint)
+                    .await
+                {
+                    Ok(drive) => drive,
+                    Err(error) => {
+                        server.abort();
+                        mesh.stop_smb_tunnel(&route);
+                        return Err(error);
+                    }
+                };
+            if !mesh.smb_route_active(&route) {
+                drop(smb_drive);
+                server.abort();
+                mesh.stop_smb_tunnel(&route);
+                return Err("the drive grant ended while Windows was connecting".into());
+            }
             let info = NativeDriveInfo {
                 route: route.clone(),
                 label,
                 mount,
-                port: 0,
+                port: address.port(),
             };
             self.active.lock().insert(
                 route,
                 ActiveMount {
                     info: info.clone(),
-                    server: tokio::spawn(std::future::pending()),
-                    cloud_drive: Some(cloud_drive),
+                    server,
+                    smb_drive: Some(smb_drive),
                     cloud_provider: None,
                 },
             );
@@ -467,7 +489,7 @@ impl DriveMounts {
             return;
         };
         #[cfg(windows)]
-        if active.cloud_drive.is_some() || active.cloud_provider.is_some() {
+        if active.smb_drive.is_some() || active.cloud_provider.is_some() {
             active.server.abort();
             drop(active);
             return;

@@ -12,7 +12,7 @@ description = "AllMyStuff GUI — Tauri shell: scans this machine and talks to t
 authors = ["Chris Paul"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 
 [[bin]]
 name = "allmystuff-gui"

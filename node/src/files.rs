@@ -400,7 +400,8 @@ impl FilesPlane {
         let key = (route_id.to_string(), req);
         let terminal = matches!(
             event,
-            FileEvent::Entries { .. }
+            FileEvent::SmbEndpoint { .. }
+                | FileEvent::Entries { .. }
                 | FileEvent::VolumeList { .. }
                 | FileEvent::QuotaInfo { .. }
                 | FileEvent::Exists { .. }

@@ -205,6 +205,7 @@ pub struct Mesh {
     storage_root_retries: Mutex<crate::fleetfiles_storage::StorageRootRetries>,
     /// OS-native drive letters/mounts backed by active Storage routes.
     drive_mounts: DriveMounts,
+    smb_hosts: crate::smb_drives::SmbHosts,
     /// Explicit inbound pull requests. A drive pushed at us needs owner/fleet
     /// trust or a live CEC Control grant; this token is what lets a Files
     /// share/support source answer a pull in the opposite direction.
@@ -2250,6 +2251,7 @@ impl Mesh {
             storage_root_retries: Mutex::new(Default::default()),
             canvas: CanvasStore::load(),
             drive_mounts: DriveMounts::new(),
+            smb_hosts: crate::smb_drives::SmbHosts::default(),
             drive_pull_tokens: Mutex::new(HashMap::new()),
             drive_pull_waiters: Mutex::new(HashMap::new()),
             drive_reconnects: Mutex::new(drive_reconnects),
@@ -4169,6 +4171,7 @@ impl Mesh {
                     allmystuff_protocol::FEATURE_SITES.to_string(),
                     FEATURE_FLEETFILES_LEDGER.to_string(),
                     FEATURE_FLEET_STORAGE_DEFAULTS.to_string(),
+                    crate::smb_drives::FEATURE.to_string(),
                 ];
                 // The runtime kill switch withdraws the negotiated contract
                 // as well as disabling local sends. Advertising while sending
@@ -8062,6 +8065,7 @@ impl Mesh {
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
         self.drive_mounts.stop(&route_id);
+        self.smb_hosts.stop(&route_id);
         // The unmapping (client) side gets no local StopMedia effect — only
         // the wire Teardown goes out — so close the listener + connections
         // here, or they'd leak (the port stays bound, the accept loop runs).
@@ -10084,6 +10088,7 @@ impl Mesh {
                     self.term_in_seq.lock().remove(&id);
                     self.files.stop(&id);
                     self.drive_mounts.stop(&id);
+                    self.smb_hosts.stop(&id);
                     // A site route ending closes its local listener (client
                     // side) and every tunneled connection it carried.
                     self.sites.stop_route(&id);
@@ -15245,6 +15250,30 @@ impl Mesh {
                 return;
             }
             match &frame.event {
+                FileEvent::SmbMount { req } => {
+                    let mesh = self.clone();
+                    let (route, peer, req) = (frame.route.clone(), from.to_string(), *req);
+                    crate::spawn(async move {
+                        let result = match root {
+                            Some(ref root) if mapped => mesh.smb_hosts.start(&route, root).await,
+                            _ => Err("SMB is only available on a granted drive route".to_string()),
+                        };
+                        // A revocation may have raced endpoint startup. Do not
+                        // leave a server or credentials alive for a dead grant.
+                        if mapped
+                            && (!mesh.smb_route_active(&route)
+                                || mesh.files.mapped_root(&route).is_none())
+                        {
+                            mesh.smb_hosts.stop(&route);
+                            return;
+                        }
+                        let event = match result {
+                            Ok(endpoint) => FileEvent::SmbEndpoint { req, endpoint },
+                            Err(reason) => FileEvent::Err { req, reason },
+                        };
+                        mesh.send_file_event(route, peer, event);
+                    });
+                }
                 // Upload pieces are applied inline: pieces of one upload
                 // must land in arrival order (the viewer sends them
                 // sequentially), and a piece is one small append.
@@ -15302,6 +15331,9 @@ impl Mesh {
             }
         } else if views_here {
             if self.files.deliver_rpc(&frame.route, &frame.event) {
+                return;
+            }
+            if matches!(frame.event, FileEvent::SmbEndpoint { .. }) {
                 return;
             }
             // A chunk of a registered download streams to disk, not to
@@ -15523,6 +15555,79 @@ impl Mesh {
         self.file_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn stop_smb_tunnel(&self, route: &str) {
+        self.sites.stop_route(route);
+    }
+
+    pub(crate) fn smb_route_active(&self, route: &str) -> bool {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route))
+            .is_some_and(|live| live.is_active() && is_mapped_drive_route(&live.route))
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn smb_drive_tunnel(
+        self: &Arc<Self>,
+        route: &str,
+        mapping: &str,
+    ) -> Result<
+        (
+            allmystuff_session::SmbEndpoint,
+            std::net::SocketAddr,
+            tokio::task::JoinHandle<()>,
+        ),
+        String,
+    > {
+        let peer = self
+            .route_peer(route)
+            .ok_or("the drive route is no longer available")?;
+        if !self.peer_supports_feature(&peer, crate::smb_drives::FEATURE) {
+            return Err(
+                "Update AllMyStuff on the source computer to support SMB mapped drives".into(),
+            );
+        }
+        let events = self
+            .drive_file_request(
+                route,
+                FileEvent::SmbMount {
+                    // Native-only responses never pass through JavaScript.
+                    // Keep them separate from a Files window's small ids if
+                    // that window is also browsing this mapped route.
+                    req: self.next_file_request_id() | (1_u64 << 63),
+                },
+            )
+            .await?;
+        let endpoint = events
+            .into_iter()
+            .find_map(|event| match event {
+                FileEvent::SmbEndpoint { endpoint, .. } => Some(Ok(endpoint)),
+                FileEvent::Err { reason, .. } => Some(Err(reason)),
+                _ => None,
+            })
+            .ok_or("the source did not return an SMB endpoint")??;
+        if endpoint.port == 0
+            || endpoint.share.is_empty()
+            || endpoint.share.len() > 80
+            || !endpoint
+                .share
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+            || endpoint.username != "ams"
+            || endpoint.password.len() > 256
+            || endpoint.password.is_empty()
+        {
+            return Err("the source returned invalid SMB connection details".into());
+        }
+        let listener = crate::smb_drives::client_listener(mapping).await?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let task = self.spawn_site_accept(route.to_string(), peer, endpoint.port, listener);
+        Ok((endpoint, address, task))
     }
     fn publish_file_operations(&self, snapshot: Vec<OperationRecord>) {
         self.sink.emit(
@@ -17310,23 +17415,34 @@ impl Mesh {
         let peer_s = peer.to_string();
         let reader = crate::spawn(async move {
             if let Some(port) = open_port {
-                mesh.send_site_event(&peer_s, &rid, SiteEvent::Open { conn, port })
-                    .await;
+                if mesh
+                    .send_site_event_checked(&peer_s, &rid, SiteEvent::Open { conn, port })
+                    .await
+                    .is_err()
+                {
+                    mesh.sites.close_conn(&rid, conn);
+                    return;
+                }
             }
             let mut buf = vec![0u8; SITE_CHUNK_BYTES];
             loop {
                 match read_half.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        mesh.send_site_event(
-                            &peer_s,
-                            &rid,
-                            SiteEvent::Data {
-                                conn,
-                                data: buf[..n].to_vec(),
-                            },
-                        )
-                        .await;
+                        if mesh
+                            .send_site_event_checked(
+                                &peer_s,
+                                &rid,
+                                SiteEvent::Data {
+                                    conn,
+                                    data: buf[..n].to_vec(),
+                                },
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -17341,13 +17457,21 @@ impl Mesh {
     /// Send one `SiteEvent` to `peer` on the media channel, fire-and-forget
     /// (a send failure is logged; the route's teardown handles the rest).
     async fn send_site_event(self: &Arc<Self>, peer: &str, route_id: &str, event: SiteEvent) {
+        if let Err(error) = self.send_site_event_checked(peer, route_id, event).await {
+            tracing::debug!(%error, "tunnel frame could not be delivered");
+        }
+    }
+
+    async fn send_site_event_checked(
+        self: &Arc<Self>,
+        peer: &str,
+        route_id: &str,
+        event: SiteEvent,
+    ) -> Result<(), String> {
         let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
         let frame = SiteFrame::new(route_id, seq, event);
-        if let Ok(payload) = serde_json::to_value(&frame) {
-            if let Err(e) = self.send_media_value(peer, payload).await {
-                tracing::debug!("site frame to {} failed: {e}", short_id(peer));
-            }
-        }
+        let payload = serde_json::to_value(&frame).map_err(|error| error.to_string())?;
+        self.send_media_value(peer, payload).await
     }
 
     /// One inbound site frame. Which side we are comes from the route: a
@@ -17365,19 +17489,24 @@ impl Mesh {
             match st.session.as_ref().and_then(|s| s.route(&frame.route)) {
                 Some(r)
                     if r.is_active()
-                        && is_site_route(&r.route)
+                        && (is_site_route(&r.route) || is_mapped_drive_route(&r.route))
                         && pubkey_part(r.peer.as_str()) == pubkey_part(from) =>
                 {
                     Some((
                         route_sources_on(&r.route, &me),
                         route_sinks_on(&r.route, &me),
-                        site_route_port(&r.route),
+                        if is_mapped_drive_route(&r.route) {
+                            self.smb_hosts.port(&frame.route)
+                        } else {
+                            site_route_port(&r.route)
+                        },
+                        is_mapped_drive_route(&r.route),
                     ))
                 }
                 _ => None,
             }
         };
-        let Some((hosts_here, views_here, route_port)) = placement else {
+        let Some((hosts_here, views_here, route_port, smb)) = placement else {
             tracing::debug!(
                 "site frame for {} refused (route not live here)",
                 frame.route
@@ -17402,7 +17531,11 @@ impl Mesh {
         if hosts_here {
             // The proxy *into* this machine — as privileged as the terminal,
             // so the same owner/fleet gate, re-cleared per frame.
-            if !self.sender_may_drive(from, DrivePlane::Sites(route_port)) {
+            if if smb {
+                route_port.is_none() || self.files.mapped_root(&frame.route).is_none()
+            } else {
+                !self.sender_may_drive(from, DrivePlane::Sites(route_port))
+            } {
                 tracing::warn!(
                     "dropped site frame from {}: not an authorized controller",
                     short_id(from)
@@ -17414,9 +17547,12 @@ impl Mesh {
                     // The load-bearing control: dial only a port *we* expose,
                     // never the client's free choice. Over the per-route cap,
                     // or unexposed → refuse with a `Close`.
-                    let rx = if route_port.is_none_or(|granted| granted == port)
-                        && self.sites.is_port_exposed(port)
-                    {
+                    let rx = if if smb {
+                        route_port == Some(port)
+                    } else {
+                        route_port.is_none_or(|granted| granted == port)
+                            && self.sites.is_port_exposed(port)
+                    } {
                         self.sites.open_conn(&frame.route, conn)
                     } else {
                         tracing::warn!(
@@ -17473,6 +17609,14 @@ impl Mesh {
         };
         if tx.try_send(data).is_err() {
             self.sites.close_conn(route_id, conn);
+            if let Some(peer) = self.route_peer(route_id) {
+                let mesh = self.clone();
+                let route = route_id.to_string();
+                crate::spawn(async move {
+                    mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
+                        .await;
+                });
+            }
         }
     }
 
@@ -22594,7 +22738,8 @@ fn committed_result(message: FleetfilesMessage) -> Result<(), String> {
 fn completes_file_rpc(event: &FileEvent) -> bool {
     matches!(
         event,
-        FileEvent::Entries { .. }
+        FileEvent::SmbEndpoint { .. }
+            | FileEvent::Entries { .. }
             | FileEvent::VolumeList { .. }
             | FileEvent::QuotaInfo { .. }
             | FileEvent::Watching { .. }
@@ -22609,7 +22754,8 @@ fn completes_file_rpc(event: &FileEvent) -> bool {
 fn is_viewer_file_request(event: &FileEvent) -> bool {
     matches!(
         event,
-        FileEvent::Quota { .. }
+        FileEvent::SmbMount { .. }
+            | FileEvent::Quota { .. }
             | FileEvent::Volumes { .. }
             | FileEvent::WatchDirectory { .. }
             | FileEvent::UnwatchDirectory { .. }

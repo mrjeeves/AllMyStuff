@@ -183,13 +183,19 @@ storage on the receiving fleet device.
 in Windows, a mounted volume on macOS, or a filesystem mount point on Linux.
 Native applications use it like other storage on that computer.
 
-On Windows, mapped folders use the built-in Cloud Files service. Files appear
-as placeholders and download when opened, including files larger than 4 GB.
-Edits are saved locally and synchronize back to the source; pending edits remain
-on this computer if the connection is interrupted. The local NTFS cache needs
-space for the files you open or change. No additional filesystem driver is
-required. If a requested drive letter belongs to another mapping, AMS preserves
-it and chooses a free letter.
+On Windows, mapped and shared folders use the built-in SMB client over AMS.
+They appear as network drives, support files larger than 4 GB, and report the
+source volume's capacity. Reads and writes go to the source over the mesh;
+keep the source online while using its drive. No additional filesystem driver,
+WinFsp, or rclone is required. The receiving computer needs Windows 11 24H2 or
+Windows Server 2025 or later and the installed AMS service (or an elevated node).
+Both endpoints must run an AMS version with SMB drive support. Fleetfiles
+continues to use Cloud Files for its separate on-demand synchronized namespace.
+
+Auto selects the next free drive letter from Z downward. If Z: already belongs
+to an SMB share, AMS preserves it and uses Y: when that letter is free. An
+occupied requested letter is also preserved. Previous Cloud Files mapped-drive
+caches are retained; unsent edits block migration until they are recovered.
 
 To map something from another device:
 

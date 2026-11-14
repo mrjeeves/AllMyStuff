@@ -265,6 +265,15 @@ pub struct FileVolume {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FileEvent {
+    /// Negotiate the private SMB endpoint for this already-authorized drive.
+    SmbMount {
+        req: u64,
+    },
+    /// Consumed by the native mount RPC; never published in session snapshots.
+    SmbEndpoint {
+        req: u64,
+        endpoint: SmbEndpoint,
+    },
     /// Query filesystem usage for a scoped native-drive route. Answered with
     /// `QuotaInfo` or `Err`.
     Quota {
@@ -449,13 +458,36 @@ pub enum FileEvent {
     Unknown,
 }
 
+/// Per-route credentials carried only over the authenticated mesh connection.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmbEndpoint {
+    pub port: u16,
+    pub share: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SmbEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SmbEndpoint")
+            .field("port", &self.port)
+            .field("share", &self.share)
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+
 impl FileEvent {
     /// The request id this event belongs to, whatever its kind. An
     /// unrecognised (newer-build) event belongs to no request we track, so
     /// it reads as `0` — it is dropped before this is consulted anyway.
     pub fn req(&self) -> u64 {
         match self {
-            FileEvent::Quota { req }
+            FileEvent::SmbMount { req }
+            | FileEvent::SmbEndpoint { req, .. }
+            | FileEvent::Quota { req }
             | FileEvent::Volumes { req }
             | FileEvent::List { req, .. }
             | FileEvent::WatchDirectory { req, .. }
@@ -1704,5 +1736,24 @@ mod tests {
         // contract (a brand-new media *plane* is ignored, never an error).
         let v = serde_json::json!({ "t": "hologram", "route": "r", "seq": 0 });
         assert!(MediaPayload::decode(v).is_none());
+    }
+
+    #[test]
+    fn smb_endpoint_roundtrips_without_disclosing_credentials_in_debug() {
+        let endpoint = super::SmbEndpoint {
+            port: 23456,
+            share: "ams0123456789abcdef".into(),
+            username: "ams".into(),
+            password: "private-session-password".into(),
+        };
+        let event = super::FileEvent::SmbEndpoint { req: 72, endpoint };
+        assert_eq!(event.req(), 72);
+        assert!(!format!("{event:?}").contains("private-session-password"));
+        let wire = serde_json::to_vec(&event).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<super::FileEvent>(&wire).unwrap(),
+            event
+        );
+        assert_eq!(super::FileEvent::SmbMount { req: 73 }.req(), 73);
     }
 }

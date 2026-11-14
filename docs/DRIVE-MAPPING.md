@@ -18,7 +18,7 @@ keeps Cloud Files and macOS keeps its existing local Fleetfiles presentation.
 | Receiving platform | Native client | Requirements |
 | --- | --- | --- |
 | Windows x64 | Built-in SMB redirector | Windows 11 24H2 / Server 2025 or later; AMS service or elevated node; signed-in user |
-| macOS ARM64 / x64 | Built-in NetFS/SMB filesystem | Desktop user session; available volume directly under `/Volumes` |
+| macOS ARM64 / x64 | Built-in NetFS/SMB filesystem | Desktop user session; native mount authorization |
 | Linux ARM64 / x64 | Kernel CIFS/SMB3 filesystem | Kernel CIFS support; desktop user session; polkit/pkexec mount authorization or root |
 | iOS / Android | No native drive mount | Mobile remains a file browser/controller; no desktop mount is promised |
 
@@ -48,7 +48,10 @@ a newer local resolution from hiding an incompatible committed lockfile.
 
 Unix native-client tests mount a private share, read/write sparse data beyond
 4 GiB, exercise mutation, and remove the mount and fixtures. They run with
-mount privileges on Linux and through NetFS on macOS. They do not replace real
+mount privileges on Linux and through NetFS as an ordinary macOS user. Mac CI
+prepares an empty, user-owned mount directory under `/Volumes` to avoid an
+unattended consent dialog; the application allows NetFS's normal authorization
+UI for custom locations. They do not replace real
 two-machine/package tests in the [platform matrix](SMB-MAPPED-DRIVES-TESTING.md).
 Windows Explorer mapping, every Linux distro, and mobile's embedded engine still
 need runtime acceptance; Android CI checks only the shell without that engine.
@@ -111,9 +114,8 @@ only the route's authenticated peer can tunnel to its recorded SMB port.
 
 Windows uses nonpersistent `New-SmbGlobalMapping`, restricted to the signed-in
 account and LocalSystem. macOS uses `NetFSMountURLSync` with separate in-memory
-credentials, loopback permission and an exact mount directory under `/Volumes`.
-NetFS creates that volume directory; AMS does not ask the user to make the
-system volume folder writable. Linux uses the
+credentials, loopback permission, native authorization UI and an exact mount
+directory. Linux uses the
 kernel CIFS mount with SMB3, signing, encryption, private file permissions and
 no userspace write cache. Credentials pass to the one-shot helper through
 stdin and then directly to the kernel. Saved leases contain only endpoint,

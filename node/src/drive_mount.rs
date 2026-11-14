@@ -565,10 +565,6 @@ async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result
     if !mount.is_absolute() || mount.parent().is_none() {
         return Err("mount point must be an absolute folder path, not the filesystem root".into());
     }
-    #[cfg(target_os = "macos")]
-    if mount.parent() != Some(Path::new("/Volumes")) {
-        return Err("macOS SMB drives must use an available volume directly under /Volumes".into());
-    }
     #[cfg(target_os = "linux")]
     if std::fs::symlink_metadata(mount).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err("mount point cannot be a symbolic link".into());
@@ -596,11 +592,6 @@ async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // NetFS creates the requested volume as the mounting user. An
-            // ordinary user cannot create directories in /Volumes itself.
-            #[cfg(target_os = "macos")]
-            return Ok(());
-            #[cfg(target_os = "linux")]
             std::fs::create_dir_all(mount).map_err(|error| {
                 format!("couldn't create mount point {}: {error}", mount.display())
             })?;
@@ -633,7 +624,9 @@ fn safe_mount_name(label: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn default_unix_mount_root() -> Result<PathBuf, String> {
-    Ok(PathBuf::from("/Volumes"))
+    dirs::home_dir()
+        .map(|home| home.join("AllMyStuff Drives"))
+        .ok_or_else(|| "couldn't find this user's home folder".into())
 }
 
 #[cfg(target_os = "linux")]

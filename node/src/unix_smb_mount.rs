@@ -50,20 +50,6 @@ fn valid_endpoint(lease: &Lease) -> bool {
         && lease.mount.parent().is_some()
 }
 
-fn canonical_mount(mount: &Path) -> Result<PathBuf, String> {
-    match std::fs::canonicalize(mount) {
-        Ok(path) => Ok(path),
-        #[cfg(target_os = "macos")]
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && mount.parent() == Some(Path::new("/Volumes")) =>
-        {
-            Ok(mount.to_path_buf())
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 fn state_file() -> Result<PathBuf, String> {
     allmystuff_protocol::myownmesh_state_dir()
         .map(|root| root.join("allmystuff-smb-mounts.json"))
@@ -204,7 +190,7 @@ impl NativeSmbMount {
         let mut random = [0u8; 16];
         getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
         let mut lease = Lease {
-            mount: canonical_mount(mount)?,
+            mount: std::fs::canonicalize(mount).map_err(|e| e.to_string())?,
             server,
             share: endpoint.share,
             port: address.port(),
@@ -358,31 +344,21 @@ fn execute(request: &Request) -> Result<Option<String>, String> {
     }
     let existing = observed(lease)?;
     if let Some(password) = &request.password {
-        if canonical_mount(&lease.mount)? != lease.mount {
+        if std::fs::canonicalize(&lease.mount).map_err(|e| e.to_string())? != lease.mount {
             return Err("the mount directory changed before setup".into());
         }
         if existing.is_some() {
             return Err("the mount point is already assigned".into());
         }
-        match std::fs::symlink_metadata(&lease.mount) {
-            Ok(metadata) => {
-                if !metadata.is_dir()
-                    || metadata.uid() != caller
-                    || std::fs::read_dir(&lease.mount)
-                        .map_err(|e| e.to_string())?
-                        .next()
-                        .is_some()
-                {
-                    return Err(
-                        "the mount point must be an empty directory owned by the caller".into(),
-                    );
-                }
-            }
-            #[cfg(target_os = "macos")]
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && lease.mount.parent() == Some(Path::new("/Volumes")) => {}
-            Err(error) => return Err(error.to_string()),
+        let metadata = std::fs::symlink_metadata(&lease.mount).map_err(|e| e.to_string())?;
+        if !metadata.is_dir()
+            || metadata.uid() != caller
+            || std::fs::read_dir(&lease.mount)
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_some()
+        {
+            return Err("the mount point must be an empty directory owned by the caller".into());
         }
         if password.len() != 64 || !password.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid SMB credential".into());
@@ -605,7 +581,12 @@ fn mount_native(lease: &Lease, password: &str) -> Result<(), String> {
         (CFString::new("AllowLoopback"), yes.clone()),
         (CFString::new("ForceNewSession"), yes.clone()),
         (CFString::new("NoUserPreferences"), yes.clone()),
-        (CFString::new("UIOption"), CFString::new("NoUI").as_CFType()),
+        // NetFS rejects custom mount locations when NoUI is explicit. Use
+        // Apple's normal authorization UI when the OS requires user consent.
+        (
+            CFString::new("UIOption"),
+            CFString::new("AllowUI").as_CFType(),
+        ),
     ]);
     let options: CFMutableDictionary<CFString, CFType> = CFMutableDictionary::from_CFType_pairs(&[
         (CFString::new("MountAtMountDir"), yes),
@@ -613,7 +594,10 @@ fn mount_native(lease: &Lease, password: &str) -> Result<(), String> {
             CFString::new("SoftMount"),
             CFBoolean::true_value().as_CFType(),
         ),
-        (CFString::new("UIOption"), CFString::new("NoUI").as_CFType()),
+        (
+            CFString::new("UIOption"),
+            CFString::new("AllowUI").as_CFType(),
+        ),
     ]);
     let mut result = std::ptr::null();
     let status = unsafe {
@@ -764,19 +748,19 @@ mod tests {
         ));
         let source = root.join("source");
         #[cfg(target_os = "macos")]
-        let mount = Path::new("/Volumes").join(format!(
-            "{} native mount",
-            root.file_name().unwrap().to_string_lossy()
-        ));
+        let mount = std::env::var_os("ALLMYSTUFF_TEST_NATIVE_SMB_MOUNT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("native mount"));
         #[cfg(target_os = "linux")]
         let mount = root.join("native mount");
         std::fs::create_dir_all(&source).unwrap();
-        #[cfg(target_os = "linux")]
-        std::fs::create_dir(&mount).unwrap();
+        if !mount.exists() {
+            std::fs::create_dir(&mount).unwrap();
+        }
         let mut cleanup = Cleanup {
             root: root.clone(),
             lease: Lease {
-                mount: canonical_mount(&mount).unwrap(),
+                mount: std::fs::canonicalize(&mount).unwrap(),
                 ..lease()
             },
         };
@@ -812,7 +796,7 @@ mod tests {
             }
         }));
         let mut spec = lease();
-        spec.mount = canonical_mount(&mount).unwrap();
+        spec.mount = std::fs::canonicalize(&mount).unwrap();
         spec.server = match address.ip() {
             std::net::IpAddr::V4(ip) => ip,
             _ => unreachable!(),

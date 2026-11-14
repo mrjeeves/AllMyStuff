@@ -29,9 +29,11 @@ the same host authorization facility. Authorize the one-shot mount from the
 user node. A hardened service's private mount namespace must fail clearly
 instead of reporting an invisible desktop mount. New mappings use no rclone or
 FUSE helper. Check missing kernel/client authorization errors too.
-On macOS, verify Auto creates a volume under `/Volumes` without precreating its
-directory as root, and preserves existing volumes. Other mount locations must
-return a clear compatibility error.
+On macOS, verify Auto creates the ordinary user mount location and allows the
+native NetFS consent dialog when required. Approve it, then check the mounted
+volume appears in Finder. Also verify cancellation preserves the recovery
+lease and existing volumes. CI uses a prepared volume under `/Volumes` to test
+the native client unattended; it does not exercise the consent dialog.
 Use a disposable subfolder for read/write/seek/rename/delete, reconnect,
 revocation, source capacity, and a >4 GiB round trip with hash comparison. Clean
 each pair's test copies before moving on. A successful sparse large-offset test

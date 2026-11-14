@@ -188,6 +188,13 @@ jobs:
             sudo modprobe cifs
             sudo env ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture
           else
+              # NetFS authorizes custom locations with UI. Prepare one empty
+              # standard volume so unattended CI needs no consent dialog;
+              # mounting and all file I/O still run as the ordinary user.
+              fixture="/Volumes/AMS SMB CI ${GITHUB_RUN_ID}"
+              sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$fixture"
+              trap 'sudo rmdir "$fixture"' EXIT
+              export ALLMYSTUFF_TEST_NATIVE_SMB_MOUNT="$fixture"
               if ! ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture; then
                 id
                 stat -f 'Console owner: %Su (%u)' /dev/console

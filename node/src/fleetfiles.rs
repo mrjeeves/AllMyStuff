@@ -665,6 +665,28 @@ impl FleetfilesReplica {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<LogicalDirectoryPage, String> {
+        self.list_directory_inner(parent, cursor, limit, true)
+    }
+
+    /// Cloud Files calls this while Windows is populating the same directory.
+    /// Probing that namespace here would recursively wait for this callback.
+    #[cfg(any(windows, test))]
+    pub(crate) fn list_directory_metadata(
+        &self,
+        parent: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<LogicalDirectoryPage, String> {
+        self.list_directory_inner(parent, cursor, limit, false)
+    }
+
+    fn list_directory_inner(
+        &self,
+        parent: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        probe_materialized: bool,
+    ) -> Result<LogicalDirectoryPage, String> {
         if !parent.is_empty() {
             validate_portable_path(parent)?;
         }
@@ -742,9 +764,6 @@ impl FleetfilesReplica {
                     )
                     .unwrap_or(false)
             });
-            let materialized = resolve_portable(&self.root, &path)
-                .map(|candidate| candidate.exists())
-                .unwrap_or(false);
             entries.push(LogicalEntry {
                 name: path.rsplit('/').next().unwrap_or(&path).to_string(),
                 path,
@@ -753,9 +772,16 @@ impl FleetfilesReplica {
                 sha256,
                 modified,
                 version: VersionStamp { counter, actor },
-                materialized,
+                materialized: false,
                 content_available,
             });
+        }
+        // A filesystem probe can synchronously invoke the Cloud Files
+        // provider, which reads this ledger. Never retain its mutex across I/O.
+        drop(statement);
+        drop(connection);
+        if probe_materialized {
+            self.probe_materializations(&mut entries);
         }
         let next_cursor = has_more
             .then(|| entries.last().map(|entry| entry.path.clone()))
@@ -843,9 +869,6 @@ impl FleetfilesReplica {
                     )
                     .unwrap_or(false)
             });
-            let materialized = resolve_portable(&self.root, &path)
-                .map(|candidate| candidate.exists())
-                .unwrap_or(false);
             entries.push(LogicalEntry {
                 name: path.rsplit('/').next().unwrap_or(&path).to_string(),
                 path,
@@ -854,10 +877,13 @@ impl FleetfilesReplica {
                 sha256,
                 modified,
                 version: VersionStamp { counter, actor },
-                materialized,
+                materialized: false,
                 content_available,
             });
         }
+        drop(statement);
+        drop(connection);
+        self.probe_materializations(&mut entries);
         let next_cursor = has_more
             .then(|| entries.last().map(|entry| entry.path.clone()))
             .flatten();
@@ -866,6 +892,14 @@ impl FleetfilesReplica {
             entries,
             next_cursor,
         })
+    }
+
+    fn probe_materializations(&self, entries: &mut [LogicalEntry]) {
+        for entry in entries {
+            entry.materialized = resolve_portable(&self.root, &entry.path)
+                .map(|candidate| candidate.exists())
+                .unwrap_or(false);
+        }
     }
 
     pub fn version_history(
@@ -2370,9 +2404,6 @@ impl FleetfilesReplica {
             )
             .optional()
             .map_err(|error| format!("locate Fleetfiles content body: {error}"))?;
-        if let Some(path) = replica.filter(|path| Path::new(path).is_file()) {
-            return Ok(Some(PathBuf::from(path)));
-        }
         let cached = connection
             .query_row(
                 "SELECT path FROM content_cache WHERE sha256=?1 AND size=?2",
@@ -2381,15 +2412,22 @@ impl FleetfilesReplica {
             )
             .optional()
             .map_err(|error| format!("locate Fleetfiles cached body: {error}"))?;
+        drop(connection);
+        if let Some(path) = replica.filter(|path| Path::new(path).is_file()) {
+            return Ok(Some(PathBuf::from(path)));
+        }
         let Some(path) = cached else {
             return Ok(None);
         };
         if !Path::new(&path).is_file() {
-            let _ =
-                connection.execute("DELETE FROM content_cache WHERE sha256=?1", params![sha256]);
+            let _ = self.connection.lock().execute(
+                "DELETE FROM content_cache WHERE sha256=?1 AND path=?2",
+                params![sha256, path],
+            );
             return Ok(None);
         }
-        connection
+        self.connection
+            .lock()
             .execute(
                 "UPDATE content_cache SET accessed_at=unixepoch() WHERE sha256=?1",
                 params![sha256],
@@ -4121,6 +4159,15 @@ mod tests {
             "a hydrated cache body must not claim durable replica status"
         );
         replica.materialize("Desktop/report.txt").unwrap().unwrap();
+        assert!(replica.list_directory("Desktop", None, 10).unwrap().entries[0].materialized);
+        assert!(
+            !replica
+                .list_directory_metadata("Desktop", None, 10)
+                .unwrap()
+                .entries[0]
+                .materialized,
+            "the provider's metadata page must not probe its own native namespace"
+        );
         assert_eq!(
             std::fs::read(root.join("Desktop/report.txt")).unwrap(),
             b"hello fleet"

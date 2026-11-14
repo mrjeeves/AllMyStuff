@@ -16311,6 +16311,16 @@ impl Mesh {
     }
 
     #[cfg(windows)]
+    pub(crate) fn cloud_fleetfiles_list(
+        &self,
+        path: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<LogicalDirectoryPage, String> {
+        self.fleetfiles.list_directory_metadata(path, cursor, limit)
+    }
+
+    #[cfg(windows)]
     pub(crate) async fn cloud_fleetfiles_read(
         &self,
         path: &str,
@@ -16402,6 +16412,11 @@ impl Mesh {
     pub(crate) fn cloud_test_source(&self, root: PathBuf) {
         self.files
             .map_root(crate::drive_mount::FLEETFILES_ROUTE, root);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn cloud_test_fleetfiles_replica(&self) -> Arc<FleetfilesReplica> {
+        self.fleetfiles.clone()
     }
 
     #[cfg(windows)]

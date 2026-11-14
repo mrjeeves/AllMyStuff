@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app, type SharePartner } from "../store.svelte";
   import { humanBytes, type FileEntry, type FileEvent } from "../types";
+  import { createFileOpener, nativeEntryPath } from "../files-entry-actions";
   import {
     filesCanvasApply,
     fleetfilesLocalDesktop,
@@ -2528,6 +2529,7 @@
   }
 
   function requestPreview(item: WorkspaceEntry): Promise<LocalFilePreview> {
+    if (!nativeEntryPath(item)) return Promise.resolve({ kind: "unsupported" });
     const existing = previewRequests.get(item.path);
     if (existing) return existing;
     const request = localFilePreview(item.path).finally(() => {
@@ -2590,6 +2592,7 @@
   }
 
   function requestNativeIcon(item: WorkspaceEntry): Promise<string | null> {
+    if (!nativeEntryPath(item)) return Promise.resolve(null);
     const existing = nativeIconRequests.get(item.id);
     if (existing) return existing;
     const request = new Promise<string | null>((resolve, reject) => {
@@ -2668,7 +2671,18 @@
     }
   }
 
+  let openingEntryIds = $state(new Set<string>());
+  const openWithFeedback = createFileOpener<WorkspaceEntry>((id, busy) => {
+    const next = new Set(openingEntryIds);
+    if (busy) next.add(id); else next.delete(id);
+    openingEntryIds = next;
+  }, (item, error) => app.toast("warn", `Couldn't open ${displayName(item)}: ${String(error)}`));
+
   async function open(item: WorkspaceEntry) {
+    await openWithFeedback(item, () => openEntry(item));
+  }
+
+  async function openEntry(item: WorkspaceEntry) {
     if (item.computerNode) {
       await navigateComputer(item.binding.deviceId, item.binding.deviceLabel);
       return;
@@ -3113,7 +3127,7 @@
     // selection honest instead of implying that an action targets a group.
     if (!selectedIds.has(item.id) || selectedIds.size > 1) void select(item);
     context = null;
-    if (!item.computerNode && item.binding.kind === "local" && platform === "windows") {
+    if (nativeEntryPath(item) && platform === "windows") {
       void localFileContextMenu(item.path).catch((error) => {
         context = { ...menuPosition, item };
         app.toast("warn", `Windows couldn't build its menu; showing the safe fallback. ${String(error)}`);
@@ -4194,6 +4208,7 @@ function newTransferId(): string {
     <button title="Forward" disabled={currentRemoteDirectory !== null || historyIndex < 0 || historyIndex >= history.length - 1} onclick={() => browseHistory(1)}>›</button>
     <button title="Up one folder" disabled={fleetHome} onclick={goUp}>↑</button>
     <button onclick={refreshWorkspace} title="Refresh">↻</button>
+    {#if openingEntryIds.size > 0}<span class="opening-status" role="status">Opening…</span>{/if}
     <input class="crumb" bind:value={address} onkeydown={navigateAddress} aria-label="Filesystem location" placeholder={computerHome ? "Device roots (not a filesystem directory)" : "Filesystem path"} spellcheck="false" />
     <div class="search-control">
       <input
@@ -4466,6 +4481,7 @@ function newTransferId(): string {
             role="button"
             class:transfer-target={transferDropTargetId === item.id}
             data-files-entry-id={item.id}
+            aria-busy={openingEntryIds.has(item.id)}
             onpointerdown={(event) => dragItem(event, item)}
             ondragstart={(event) => event.preventDefault()}
             tabindex="0"
@@ -4533,6 +4549,7 @@ function newTransferId(): string {
               class:offline={item.computerNode && item.computerOnline === false}
               class:transfer-target={transferDropTargetId === item.id}
               data-files-entry-id={item.id}
+              aria-busy={openingEntryIds.has(item.id)}
               style={`left:${position.x}px;top:${position.y}px;width:${grid.tileWidth}px;height:${grid.tileHeight}px`}
               role="button"
               tabindex="0"
@@ -4738,7 +4755,7 @@ function newTransferId(): string {
         <button onclick={() => { void showVersionHistory(context!.item); }}>Version history</button>
       {/if}
       {#if context.item.binding.kind === "local" && !context.item.computerNode}
-        <button onclick={() => { void localFileOpen(context!.item.path, true); context = null; }}>Show in {nativeBrowserName()}</button>
+        <button disabled={!nativeEntryPath(context.item)} title={!nativeEntryPath(context.item) ? "Open this file first to make it available on this computer" : ""} onclick={() => { const item = context!.item; context = null; void localFileOpen(item.path, true).catch((error) => app.toast("warn", `Couldn't show ${displayName(item)}: ${String(error)}`)); }}>Show in {nativeBrowserName()}</button>
       {:else}
         <button disabled>Available through {context.item.binding.deviceLabel}</button>
       {/if}
@@ -4804,6 +4821,7 @@ function newTransferId(): string {
   .files-workspace.places-hidden.preview-hidden { grid-template-columns: 2.5rem minmax(20rem, 1fr) 2.5rem; }
   button, input { font: inherit; }
   .filebar { grid-column: 1 / -1; display: flex; align-items: center; gap: .35rem; padding: .45rem .6rem; border-bottom: 1px solid var(--line); background: var(--surface); z-index: 4; }
+  .opening-status { color: var(--ink-soft); font-size: .76rem; white-space: nowrap; }
   .filebar > button, .switch button, .native-open, .icon-size { border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); min-height: 2rem; padding: .3rem .55rem; }
   .filebar > button:disabled { opacity: .35; }
   .filebar > button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); box-shadow: inset 0 0 0 1px var(--accent); }

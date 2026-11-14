@@ -136,7 +136,10 @@ async fn helper(request: &Request) -> Result<Option<String>, String> {
             crate::child_process::command(&exe)
         } else {
             let mut elevated = crate::child_process::command("/usr/bin/pkexec");
-            elevated.arg(&exe);
+            // Stdin carries the private SMB request, not an OS password.
+            // Require the desktop's agent instead of a textual fallback that
+            // could consume this input or wait on an invisible terminal.
+            elevated.arg("--disable-internal-agent").arg(&exe);
             elevated
         };
     }

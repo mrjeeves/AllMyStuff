@@ -31,6 +31,8 @@ an explicit compatibility error rather than an implicit fallback.
 Linux releases retain the Ubuntu 22.04 / glibc 2.35 build floor. Debian packages
 declare `pkexec | policykit-1`; RPM packages declare `polkit`. AppImage/portable
 users need the host's polkit/pkexec package for an ordinary user mount. The
+desktop's polkit authentication agent must be running; helper stdin is reserved
+for the private SMB request, so no terminal-password fallback is enabled. The
 installer attempts to install `pkexec` on apt-based systems and gives
 instructions elsewhere. The client calls the kernel mount API directly; it
 neither bundles cifs-utils nor installs a filesystem driver. A hardened system

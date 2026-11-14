@@ -25,6 +25,48 @@ an owned foreground `rclone mount` process over FUSE. The WebDAV server is never
 the file bytes still travel only on the live AllMyStuff route (direct, STUN, or
 TURN).
 
+## Distribution compatibility
+
+| Receiving platform | Native mapping | Installation requirements |
+| --- | --- | --- |
+| Windows x64 | SMB3 over AMS | Windows 11 24H2 / Server 2025 or later; installed AMS service or elevated node; signed-in user |
+| macOS ARM64 / x64 | Existing WebDAV volume | Built-in `mount_webdav`; interactive user |
+| Linux ARM64 / x64 | Existing WebDAV through FUSE | `rclone`, `fuse3`, accessible `/dev/fuse`; interactive user or user service |
+| iOS / Android | No native drive mount | Mobile remains a file browser/controller; no desktop drive letter or mount is promised |
+
+Windows, macOS, and Linux can all supply a folder to a Windows SMB receiver.
+Both endpoints need an AMS build advertising `smb-drives-v1`. This change does
+not switch the macOS/Linux receiving adapters to SMB. Fleetfiles stays separate;
+its Windows provider remains Cloud Files.
+
+The Windows app can run on versions older than the SMB receiver requirement.
+On those versions, mapping returns an explicit compatibility error. A read-only
+OS/token preflight runs before removing any legacy Cloud Files drive alias.
+There is no silent WebClient fallback or driver installation.
+
+Linux releases retain the Ubuntu 22.04 / glibc 2.35 build floor. The `.deb` and
+`.rpm` packages declare `rclone` and `fuse3` dependencies. AppImage and portable
+archives do not bundle those mount helpers: install them through the host's
+package manager. `scripts/install.sh` attempts that automatically on apt-based
+systems and gives instructions elsewhere. Missing helpers or restricted FUSE
+access produce a mount error with recovery instructions; a packaged GUI alone
+does not prove a usable mount.
+
+PR CI builds/tests the shared node and desktop backend on every native release
+runner: Ubuntu 22.04 x64/ARM64, macOS 15 ARM64/x64, and Windows x64. Ubuntu 24.04
+also checks the optional FFmpeg encoder, and latest Ubuntu checks the GUI. CI and
+release use the same Linux dependency action, including Jammy's PipeWire setup.
+The node, desktop, and mobile locks require rustix 1.1.6 or later for the SMB
+backend's Linux extended-attribute APIs. Locked CI checks prevent a newer local
+resolution from hiding an incompatible committed lockfile.
+
+Those checks validate compilation, unit behavior, and private SMB negotiation.
+They do not exercise Finder/Explorer, OS mount permissions, every Linux distro,
+or a real two-machine transfer. The manual [platform and transfer matrix](SMB-MAPPED-DRIVES-TESTING.md)
+is required before claiming runtime interoperability or large-file support for
+an untested source/receiver pair. The Android CI job checks the shell without
+the embedded engine; it is not a full mobile-engine compatibility test.
+
 ## User contract
 
 - From another machine's card or remote-control console, **Drives → Map new
@@ -186,7 +228,7 @@ computer. That invariant is enforced in both the picker and the node backend.
   endpoint. It never disconnects an unrelated SMB mapping to obtain a letter.
 - macOS uses the operating system's built-in `mount_webdav` command and gives
   the volume the label selected in AllMyStuff.
-- Linux uses `rclone mount` and FUSE as the signed-in user. Ubuntu and Debian
+- Linux uses `rclone mount` and FUSE as the signed-in user. Debian and RPM
   packages depend on `rclone` and `fuse3`; the portable installer attempts to
   install them through `apt-get`. No per-URL `/etc/fstab` entry or root mount
   privilege is needed. A restricted system service is still restricted:

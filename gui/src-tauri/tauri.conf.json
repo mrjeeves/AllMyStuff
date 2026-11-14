@@ -48,6 +48,9 @@
     "linux": {
       "deb": {
         "depends": ["rclone", "fuse3"]
+      },
+      "rpm": {
+        "depends": ["rclone", "fuse3"]
       }
     },
     "windows": {

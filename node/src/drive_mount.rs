@@ -338,7 +338,10 @@ impl DriveMounts {
         }
         let active = self.list();
         #[cfg(windows)]
-        windows_cloud_alias::migrate(_mapping)?;
+        {
+            windows_drive_mount::ensure_supported().await?;
+            windows_cloud_alias::migrate(_mapping)?;
+        }
         let mount = choose_mount(&requested_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
         #[cfg(windows)]

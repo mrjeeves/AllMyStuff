@@ -201,6 +201,10 @@ allmystuff-pixels = { path = "pixels" }
 # macOS included (it has no PR_SET_PDEATHSIG, so this is its only lever).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# smb-server 0.10 uses the *_xattr_query APIs introduced in rustix 1.1.6,
+# but declares only "1". Keep every consumer's resolver above that API floor
+# (also the fix for RUSTSEC-2026-0486), including fresh unlocked Unix builds.
+rustix = { version = "1.1.6", features = ["fs"] }
 
 # PR_SET_PDEATHSIG for the daemon lifetime tie (daemon_spawn). libloading
 # dlopens libpulse-simple at runtime for system-audio capture; zbus drives

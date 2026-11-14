@@ -30,6 +30,18 @@ impl Lease {
     }
 }
 
+const PREFLIGHT: &str = r#"
+$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+try {
+ $null=[Console]::In.ReadToEnd()
+ $command=Get-Command New-SmbGlobalMapping -ErrorAction SilentlyContinue
+ if (!$command -or !$command.Parameters.ContainsKey('TcpPort')) { throw 'SMB mapped drives require Windows 11 24H2 / Server 2025 or later.' }
+ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+ if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'SMB mapped drives require the installed AMS service or an elevated node.' }
+ exit 0
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+"#;
+
 const CONNECT: &str = r#"
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 try {
@@ -118,6 +130,14 @@ fn run(script: &str, payload: serde_json::Value) -> Result<(), String> {
         Err(format!("Windows couldn't configure the AMS SMB drive (the installed AMS service or an elevated node is required): {}",error.trim()))
     }
 }
+
+/// Check the receiving OS and token before migration can remove a legacy alias.
+pub(super) async fn ensure_supported() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| run(PREFLIGHT, json!({})))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 fn lease_file() -> Result<std::path::PathBuf, String> {
     Ok(allmystuff_protocol::myownmesh_state_dir()
         .ok_or("AllMyStuff state is unavailable")?

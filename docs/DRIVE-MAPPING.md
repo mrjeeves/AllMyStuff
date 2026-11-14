@@ -10,9 +10,16 @@ drive. Windows receives an ordinary drive letter, macOS receives a mounted
 volume, and Linux receives a filesystem mount point. Native applications use
 the result directly; it is not an AllMyStuff-only file browser.
 
-The receiving node runs a loopback-only WebDAV server that translates
-filesystem operations into the existing mesh file protocol. Windows mounts it
-with `net use`, macOS with its built-in `mount_webdav`, and Linux with
+Windows uses the built-in Cloud Files API. Each mapping has a durable local
+sync root, with a drive-letter alias in the signed-in user's namespace.
+Directory placeholders and on-demand reads translate into the existing scoped
+mesh file protocol. Byte sizes and offsets remain 64-bit; Windows WebClient's
+50 MB default and 4 GiB setting ceiling do not apply. No additional filesystem
+driver or mounting executable is used on Windows.
+
+On macOS and Linux the receiving node runs a loopback-only WebDAV server that
+translates filesystem operations into the same mesh file protocol. macOS
+mounts it with its built-in `mount_webdav`, and Linux with
 an owned foreground `rclone mount` process over FUSE. The WebDAV server is never exposed to the LAN and
 the file bytes still travel only on the live AllMyStuff route (direct, STUN, or
 TURN).
@@ -49,9 +56,9 @@ source machine                                      receiving machine
 ┌─────────────────────────────┐                    ┌──────────────────────────┐
 │ selected local folder       │                    │ Explorer / Finder / apps │
 │ route-id → canonical root   │                    │ X:\ or native mount      │
-│             │               │                    │ OS WebDAV filesystem     │
-│ scoped FileEvent host       │◄══ mesh route ═══►│ 127.0.0.1 WebDAV        │
-└─────────────────────────────┘  direct/STUN/TURN  │ RemoteDavFs adapter      │
+│             │               │                    │ Windows Cloud Files      │
+│ scoped FileEvent host       │◄══ mesh route ═══►│ or Unix loopback WebDAV │
+└─────────────────────────────┘  direct/STUN/TURN  │ scoped native adapter    │
                                                    └──────────────────────────┘
 ```
 
@@ -74,19 +81,39 @@ The native adapter adds metadata and random-access read/write operations to
 waiter instead of the GUI Files queue. Existing whole-machine Files sessions,
 room shared-file downloads, and their permissions remain separate.
 
+On Windows the native adapter is a Cloud Files provider, shared with Fleetfiles.
+An explicit mapping keeps its own sync root and authorization route; it does not
+add the shared folder to the fleet namespace. The drive letter points to that
+root, while the registered Explorer location retains cached files when the
+source or node is offline.
+
+Windows writes land locally first. A durable SQLite journal retains pending
+creates, edits, renames, and deletions across reconnects. Closed file bodies
+stream to a private source-side staging sibling before publication by rename.
+Replacements keep the previous body in a verified backup sibling until the new
+body is published; the target name can be briefly absent between those renames.
+A receipt retains the staged body's native
+identity so reconnect can recognize a commit whose acknowledgement was lost.
+Observed conflicting source changes leave the local edit pending. Cached file
+content and the pending journal are retained when a mapping disconnects.
+
 ## Lifecycle
 
 1. Source selects and canonicalizes a folder, binds it to a fresh route id,
    and offers the Storage route with `DriveRouteOffer` metadata.
 2. The receiver accepts under the normal Files authorization gate.
-3. On activation, the receiver binds an ephemeral listener to
-   `127.0.0.1:0`, builds `RemoteDavFs`, and chooses a native destination.
-   Windows selects the next free letter from Z down to D when Auto. macOS uses
+3. On activation, Windows connects the Cloud Files provider to its mapping's
+   stable local root and creates a drive-letter alias. It selects the next free
+   letter from Z down to D when Auto. Only a recorded, exact alias target can
+   be reclaimed; unrelated SMB or other drive assignments are preserved.
+   macOS and Linux bind an ephemeral listener to `127.0.0.1:0`, build
+   `RemoteDavFs`, and choose a native destination. macOS uses
    `~/AllMyStuff Drives/<name>`. A Linux system service uses
    `/mnt/allmystuff/<name>`; a user process uses
    `~/AllMyStuff Drives/<name>`. An explicit absolute mount point overrides
    those defaults.
-4. Explorer WebDAV requests become scoped FileEvents over the active route.
+4. Windows population and hydration callbacks become scoped FileEvents over
+   the active route. macOS/Linux WebDAV operations use that same protocol.
 5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and
    unmounts the native destination, but retains the relationship and reconnect
    intent. Both interfaces show it as unavailable until the peer returns.
@@ -137,10 +164,18 @@ computer. That invariant is enforced in both the picker and the node backend.
 
 ## Compatibility and tradeoffs
 
-- Windows uses its built-in WebClient redirector, so no WinFsp or Dokan driver
-  is required. Explorer's abbreviated Microsoft PROPFIND request is expanded
-  locally to include quota properties, which lets mapped drives show the
-  source filesystem's used and available space.
+- Windows requires Cloud Files support and an NTFS local cache volume. Native
+  applications read through normal file APIs, including seeks past 4 GiB.
+  Hydration has bounded, aligned range buffers and directory population uses
+  bounded source pages. Recovery enumerates only on-disk entries, avoiding
+  implicit downloads of the remote tree. The receiving volume must have space
+  for hydrated files and pending edits; drive free space reflects that cache
+  volume. Filesystem limits and actual free space still apply.
+- Native Cloud Files writes synchronize after applications close their files.
+  This is local sync-folder behavior: a successful local save can precede the
+  source acknowledgement. Explorer's in-sync state is set after publication.
+- Upgrade recovery recognizes legacy AMS WebDAV leases by their exact recorded
+  endpoint. It never disconnects an unrelated SMB mapping to obtain a letter.
 - macOS uses the operating system's built-in `mount_webdav` command and gives
   the volume the label selected in AllMyStuff.
 - Linux uses `rclone mount` and FUSE as the signed-in user. Ubuntu and Debian
@@ -159,10 +194,9 @@ computer. That invariant is enforced in both the picker and the node backend.
   removed during cleanup. The receiver must have space for buffered writes.
   See the [rclone mount documentation](https://rclone.org/commands/rclone_mount/)
   for the underlying FUSE and write-cache behavior.
-- WebDAV favors zero-install interoperability over perfect POSIX semantics.
-  Windows applications get ordinary read/write/seek/rename/delete behavior;
-  filesystem features WebDAV cannot represent (hard links, alternate streams,
-  POSIX ownership) are outside this contract.
+- The shared file protocol does not preserve all source filesystem features.
+  Hard links, alternate streams, and POSIX ownership are outside this mapping
+  contract. macOS/Linux additionally have their WebDAV representation limits.
 - Remote-source selection uses the already-authorized mesh Files session.
   Pretending a native dialog on this PC could browse another PC was rejected;
   so was temporarily exposing an entire remote disk merely to feed a picker.

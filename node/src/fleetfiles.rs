@@ -578,6 +578,15 @@ impl FleetfilesReplica {
                 if matches!(event.kind, notify::EventKind::Access(_)) {
                     return;
                 }
+                #[cfg(windows)]
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                ) {
+                    // The native provider journals the complete rename, including
+                    // online-only descendants, before changing logical paths.
+                    return;
+                }
                 for path in event.paths {
                     if is_internal(&root, &path) {
                         continue;
@@ -1573,27 +1582,107 @@ impl FleetfilesReplica {
             return Err("invalid Fleetfiles metadata target".into());
         }
         validate_metadata(metadata)?;
-        self.connection
-            .lock()
-            .execute(
-                "INSERT INTO metadata_history_queue(
-                   target,path,counter,actor,kind,size,sha256,tombstone,queued_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,unixepoch())
-                 ON CONFLICT(target,path,counter,actor) DO UPDATE SET
-                   queued_at=excluded.queued_at",
-                params![
-                    target,
-                    metadata.path,
-                    metadata.version.counter,
-                    metadata.version.actor,
-                    metadata.kind,
-                    metadata.size,
-                    metadata.sha256,
-                    metadata.tombstone,
-                ],
+        queue_metadata_on(&self.connection.lock(), target, metadata)
+    }
+
+    /// Rename/delete logical paths without hydrating online-only bodies. The
+    /// namespace and its outbound metadata commit in the same transaction.
+    #[cfg(windows)]
+    pub(crate) fn native_namespace_change(
+        &self,
+        from: &str,
+        to: Option<&str>,
+        actor: &str,
+        targets: &[String],
+    ) -> Result<(), String> {
+        validate_portable_path(from)?;
+        if let Some(to) = to {
+            validate_portable_path(to)?;
+            if to == from || to.starts_with(&format!("{from}/")) {
+                return Err("a Fleetfiles folder cannot move inside itself".into());
+            }
+        }
+        let connection = self.connection.lock();
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut counter: u64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(counter),0) FROM path_versions",
+                [],
+                |row| row.get(0),
             )
-            .map_err(|error| format!("queue Fleetfiles metadata: {error}"))?;
-        Ok(())
+            .map_err(|e| e.to_string())?;
+        let mut cursor = String::new();
+        loop {
+            let rows = {
+                let mut query = transaction.prepare("SELECT path,kind,size,sha256 FROM path_versions WHERE tombstone=0 AND (path=?1 OR substr(path,1,length(?1)+1)=?1||'/') AND path>?2 ORDER BY path LIMIT 256").map_err(|e| e.to_string())?;
+                let rows = query
+                    .query_map(params![from, cursor], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (path, kind, size, sha256) in rows {
+                cursor = path.clone();
+                if let Some(to) = to {
+                    let renamed = format!("{to}{}", &path[from.len()..]);
+                    if read_current(&transaction, &renamed)?.is_some_and(|entry| !entry.tombstone) {
+                        return Err(
+                            "the Fleetfiles destination already exists; both copies were preserved"
+                                .into(),
+                        );
+                    }
+                    counter = counter.checked_add(1).ok_or("Fleetfiles clock overflow")?;
+                    let version = VersionStamp {
+                        counter,
+                        actor: actor.to_string(),
+                    };
+                    let metadata = FleetfilesMetadata {
+                        operation: operation_id(&version, &renamed),
+                        version,
+                        path: renamed,
+                        kind,
+                        size,
+                        sha256,
+                        tombstone: false,
+                    };
+                    put_metadata_version(&transaction, &metadata)?;
+                    for target in targets {
+                        queue_metadata_on(&transaction, target, &metadata)?;
+                    }
+                }
+                counter = counter.checked_add(1).ok_or("Fleetfiles clock overflow")?;
+                let version = VersionStamp {
+                    counter,
+                    actor: actor.to_string(),
+                };
+                let metadata = FleetfilesMetadata {
+                    operation: operation_id(&version, &path),
+                    version,
+                    path,
+                    kind: "delete".into(),
+                    size: 0,
+                    sha256: None,
+                    tombstone: true,
+                };
+                put_metadata_version(&transaction, &metadata)?;
+                for target in targets {
+                    queue_metadata_on(&transaction, target, &metadata)?;
+                }
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     pub fn pending_metadata(
@@ -1844,6 +1933,18 @@ impl FleetfilesReplica {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("inspect Fleetfiles change: {error}")),
         };
+        // Placeholder creation/hydration is provider activity, not a new
+        // user version. In particular, startup must not read online-only
+        // files merely to hash the directory tree.
+        #[cfg(windows)]
+        if metadata.as_ref().is_some_and(|metadata| {
+            use std::os::windows::fs::MetadataExt;
+            !metadata.is_dir()
+                && (metadata.file_attributes() & 0x0040_1000 != 0
+                    || crate::windows_cloud_files::is_in_sync(path))
+        }) {
+            return Ok(None);
+        }
         if metadata
             .as_ref()
             .is_some_and(|metadata| metadata.file_type().is_symlink())
@@ -2255,7 +2356,11 @@ impl FleetfilesReplica {
         replica.is_some_and(|path| Path::new(&path).is_file())
     }
 
-    fn local_body_source(&self, sha256: &str, size: u64) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn local_body_source(
+        &self,
+        sha256: &str,
+        size: u64,
+    ) -> Result<Option<PathBuf>, String> {
         validate_hash(sha256)?;
         let connection = self.connection.lock();
         let replica = connection
@@ -2469,6 +2574,38 @@ fn record_content_replica(
         )
         .map_err(|error| format!("record Fleetfiles content replica: {error}"))?;
     Ok(())
+}
+
+fn queue_metadata_on(
+    connection: &Connection,
+    target: &str,
+    metadata: &FleetfilesMetadata,
+) -> Result<(), String> {
+    connection.execute(
+        "INSERT INTO metadata_history_queue(target,path,counter,actor,kind,size,sha256,tombstone,queued_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,unixepoch()) ON CONFLICT(target,path,counter,actor) DO UPDATE SET queued_at=excluded.queued_at",
+        params![target,metadata.path,metadata.version.counter,metadata.version.actor,metadata.kind,metadata.size,metadata.sha256,metadata.tombstone],
+    ).map(|_|()).map_err(|error|format!("queue Fleetfiles metadata: {error}"))
+}
+
+#[cfg(windows)]
+fn put_metadata_version(
+    connection: &Connection,
+    metadata: &FleetfilesMetadata,
+) -> Result<(), String> {
+    validate_metadata(metadata)?;
+    append_version_history(
+        connection,
+        &metadata.path,
+        &metadata.version,
+        &metadata.kind,
+        metadata.size,
+        metadata.sha256.as_deref(),
+        metadata.tombstone,
+    )?;
+    connection.execute(
+        "INSERT INTO path_versions(path,counter,actor,kind,size,sha256,tombstone,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,unixepoch()) ON CONFLICT(path) DO UPDATE SET counter=excluded.counter,actor=excluded.actor,kind=excluded.kind,size=excluded.size,sha256=excluded.sha256,tombstone=excluded.tombstone,updated_at=excluded.updated_at",
+        params![metadata.path,metadata.version.counter,metadata.version.actor,metadata.kind,metadata.size,metadata.sha256,metadata.tombstone],
+    ).map(|_|()).map_err(|error|format!("commit Fleetfiles namespace: {error}"))
 }
 
 fn put_version(
@@ -3409,6 +3546,121 @@ mod tests {
 
         drop(replica);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_namespace_moves_online_only_descendants_and_queues_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "ams-native-namespace-{}-{}",
+            std::process::id(),
+            CONTENT_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let replica = FleetfilesReplica::memory(root.clone());
+        let mut metadata = FleetfilesMetadata {
+            operation: "initial".into(),
+            version: VersionStamp {
+                counter: 1,
+                actor: "source".into(),
+            },
+            path: "Desktop/Project".into(),
+            kind: "directory".into(),
+            size: 0,
+            sha256: None,
+            tombstone: false,
+        };
+        replica.apply_metadata(&metadata).unwrap();
+        for index in 0..300 {
+            metadata.path = format!("Desktop/Project/entry-{index:04}.bin");
+            metadata.version.counter += 1;
+            metadata.kind = "file".into();
+            metadata.size = 5 * 1024 * 1024 * 1024 + index;
+            metadata.sha256 = Some("a".repeat(64));
+            replica.apply_metadata(&metadata).unwrap();
+        }
+        let targets = vec!["peer".to_string()];
+        replica
+            .native_namespace_change(
+                "Desktop/Project",
+                Some("Desktop/Renamed"),
+                "local",
+                &targets,
+            )
+            .unwrap();
+        assert_eq!(
+            replica
+                .list_directory("Desktop/Renamed", None, 512)
+                .unwrap()
+                .entries
+                .len(),
+            300
+        );
+        assert!(replica
+            .current_file_version("Desktop/Project/entry-0000.bin")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            replica
+                .current_file_version("Desktop/Renamed/entry-0000.bin")
+                .unwrap()
+                .unwrap()
+                .1,
+            5 * 1024 * 1024 * 1024
+        );
+        assert!(
+            !root.join("Desktop/Renamed/entry-0000.bin").exists(),
+            "a metadata rename must not hydrate any body"
+        );
+        let queued = || {
+            replica
+                .connection
+                .lock()
+                .query_row("SELECT COUNT(*) FROM metadata_history_queue", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(queued(), 602);
+        metadata.path = "Desktop/Blocked/entry-0000.bin".into();
+        metadata.version.counter = 1000;
+        replica.apply_metadata(&metadata).unwrap();
+        assert!(replica
+            .native_namespace_change(
+                "Desktop/Renamed",
+                Some("Desktop/Blocked"),
+                "local",
+                &targets
+            )
+            .is_err());
+        assert_eq!(
+            queued(),
+            602,
+            "a failed rename must roll back its outbound queue"
+        );
+        assert_eq!(
+            replica
+                .list_directory("Desktop/Renamed", None, 512)
+                .unwrap()
+                .entries
+                .len(),
+            300
+        );
+        replica
+            .native_namespace_change("Desktop/Renamed", None, "local", &targets)
+            .unwrap();
+        assert!(replica
+            .current_file_version("Desktop/Renamed/entry-0000.bin")
+            .unwrap()
+            .is_none());
+        assert_eq!(queued(), 903);
+        replica
+            .native_namespace_change("Desktop/Renamed", None, "local", &targets)
+            .unwrap();
+        assert_eq!(
+            queued(),
+            903,
+            "recovered namespace operations must be idempotent"
+        );
     }
 
     #[test]

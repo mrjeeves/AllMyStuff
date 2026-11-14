@@ -1,11 +1,12 @@
 //! Native drive mounts backed by a live mesh Storage route.
 //!
-//! The operating system talks WebDAV to a loopback-only listener. This
-//! adapter turns DAV filesystem operations into the same scoped FileEvent
-//! RPCs that cross the encrypted mesh route; no WebDAV listener is exposed
-//! to the LAN and no local source path is disclosed to the receiver.
+//! Windows uses native Cloud Files callbacks; Unix uses a loopback-only
+//! WebDAV listener. Both adapters turn filesystem operations into scoped
+//! FileEvent RPCs across the encrypted mesh route. No WebDAV listener is
+//! exposed to the LAN and no local source path is disclosed to the receiver.
 
 use std::collections::HashMap;
+#[cfg(not(windows))]
 use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
@@ -23,23 +24,47 @@ use dav_server::fs::{
     OpenOptions, ReadDirMeta,
 };
 use futures_util::{future, FutureExt, StreamExt};
+#[cfg(not(windows))]
 use hyper::{server::conn::http1, service::service_fn};
+#[cfg(not(windows))]
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
 use tokio::net::TcpListener;
 
 #[cfg(target_os = "macos")]
 use dav_server::localfs::LocalFs;
+#[cfg(not(windows))]
 use dav_server::{fakels::FakeLs, DavHandler};
 
 pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_cloud_alias(
+    root: &std::path::Path,
+    mount: Option<&str>,
+) -> Result<String, String> {
+    if let Some(mount) = mount {
+        windows_drive_mount::alias(mount, root, true)?;
+        return Ok(mount.to_string());
+    }
+    let mask = windows_logical_drive_mask()?
+        | crate::win_privilege::interactive_user_logical_drive_mask()?;
+    let mount = select_windows_mount(None, |mount| !drive_letter_reserved(mount, mask))?;
+    windows_drive_mount::alias(&mount, root, false)?;
+    Ok(mount)
+}
 
 use crate::mesh::Mesh;
 
 #[cfg(target_os = "linux")]
 #[path = "linux_drive_mount.rs"]
 mod linux_drive_mount;
+
+#[cfg(windows)]
+#[path = "windows_drive_mount.rs"]
+mod windows_drive_mount;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
@@ -54,6 +79,10 @@ struct ActiveMount {
     server: tokio::task::JoinHandle<()>,
     #[cfg(target_os = "linux")]
     helper: Option<linux_drive_mount::MountedHelper>,
+    #[cfg(windows)]
+    cloud_drive: Option<windows_drive_mount::NativeCloudDrive>,
+    #[cfg(windows)]
+    cloud_provider: Option<crate::windows_cloud_files::CloudConnection>,
 }
 
 #[cfg(target_os = "linux")]
@@ -162,6 +191,19 @@ impl DriveMounts {
 
     pub async fn cleanup_stale(&self) {
         cleanup_stale_native_mounts().await;
+        #[cfg(windows)]
+        if let Err(error) = windows_drive_mount::cleanup() {
+            tracing::warn!(%error,"couldn't recover native Cloud Files aliases");
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn refresh_fleetfiles(&self) {
+        if let Some(active) = self.active.lock().get(FLEETFILES_ROUTE) {
+            if let Some(provider) = &active.cloud_provider {
+                provider.refresh();
+            }
+        }
     }
     /// Hold native-drive startup recovery ahead of any peer-driven mount.
     /// The owned guard can move into a background task while node control
@@ -187,13 +229,16 @@ impl DriveMounts {
             .map_err(|error| format!("couldn't create the Fleetfiles namespace: {error}"))?;
 
         #[cfg(windows)]
-        let (info, server) = {
-            let mount =
-                tokio::task::spawn_blocking(move || crate::windows_fleetfiles::register(root))
-                    .await
-                    .map_err(|error| {
-                        format!("Fleetfiles registration stopped unexpectedly: {error}")
-                    })??;
+        let (info, server, cloud_provider) = {
+            let mount = root.to_string_lossy().to_string();
+            let provider = crate::windows_cloud_files::CloudConnection::connect(
+                _mesh,
+                root,
+                None,
+                "Fleetfiles".into(),
+                "Fleetfiles".into(),
+            )
+            .await?;
             (
                 NativeDriveInfo {
                     route: FLEETFILES_ROUTE.into(),
@@ -202,6 +247,7 @@ impl DriveMounts {
                     port: 0,
                 },
                 tokio::spawn(std::future::pending()),
+                provider,
             )
         };
         #[cfg(target_os = "macos")]
@@ -224,6 +270,10 @@ impl DriveMounts {
                 server,
                 #[cfg(target_os = "linux")]
                 helper: None,
+                #[cfg(windows)]
+                cloud_drive: None,
+                #[cfg(windows)]
+                cloud_provider: Some(cloud_provider),
             },
         );
         #[cfg(windows)]
@@ -253,6 +303,9 @@ impl DriveMounts {
         }
         #[cfg(windows)]
         {
+            if windows_drive_mount::remove_known(mount)? {
+                return Ok(());
+            }
             remove_known_native_mount(mount).await
         }
         #[cfg(not(windows))]
@@ -284,31 +337,61 @@ impl DriveMounts {
                 .iter()
                 .any(|entry| entry.mount.eq_ignore_ascii_case(&requested))
             {
+                windows_drive_mount::remove_known(&requested)?;
                 reclaim_stale_owned_mount(&requested).await?;
             }
         }
         let mount = choose_mount(&requested_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(|error| format!("couldn't start the local drive bridge: {error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| error.to_string())?
-            .port();
-        let server = DavHandler::builder()
-            .filesystem(Box::new(RemoteDavFs::new(mesh, route.clone())))
-            .locksystem(FakeLs::new())
-            .build_handler();
-        let server_task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let handler = server.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    if let Err(error) = http1::Builder::new()
+        #[cfg(windows)]
+        {
+            let cloud_drive = windows_drive_mount::NativeCloudDrive::start(
+                mesh,
+                route.clone(),
+                mount.clone(),
+                label.clone(),
+                _mapping,
+            )
+            .await?;
+            let info = NativeDriveInfo {
+                route: route.clone(),
+                label,
+                mount,
+                port: 0,
+            };
+            self.active.lock().insert(
+                route,
+                ActiveMount {
+                    info: info.clone(),
+                    server: tokio::spawn(std::future::pending()),
+                    cloud_drive: Some(cloud_drive),
+                    cloud_provider: None,
+                },
+            );
+            Ok(info)
+        }
+        #[cfg(not(windows))]
+        {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| format!("couldn't start the local drive bridge: {error}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| error.to_string())?
+                .port();
+            let server = DavHandler::builder()
+                .filesystem(Box::new(RemoteDavFs::new(mesh, route.clone())))
+                .locksystem(FakeLs::new())
+                .build_handler();
+            let server_task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let handler = server.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        if let Err(error) = http1::Builder::new()
                         .serve_connection(
                             io,
                             service_fn(move |request| {
@@ -320,80 +403,75 @@ impl DriveMounts {
                     {
                         tracing::debug!("native drive WebDAV connection ended: {error}");
                     }
-                });
+                    });
+                }
+            });
+            #[cfg(target_os = "linux")]
+            let mut startup = AbortMountStartup(Some(server_task.abort_handle()));
+            #[cfg(windows)]
+            let url = format!("http://localhost:{port}/");
+            #[cfg(not(windows))]
+            let url = format!("http://127.0.0.1:{port}/");
+            let info = NativeDriveInfo {
+                route: route.clone(),
+                label: label.clone(),
+                mount: mount.clone(),
+                port,
+            };
+            // Unix mounts can survive their node process. Record ownership before
+            // invoking the OS helper so even a partial mount followed by an error
+            // remains safe to clean on the next start.
+            if let Err(error) = remember_native_mount(&info) {
+                server_task.abort();
+                return Err(format!("couldn't record the native drive mount: {error}"));
             }
-        });
-        #[cfg(target_os = "linux")]
-        let mut startup = AbortMountStartup(Some(server_task.abort_handle()));
-        #[cfg(windows)]
-        let url = format!("http://localhost:{port}/");
-        #[cfg(not(windows))]
-        let url = format!("http://127.0.0.1:{port}/");
-        let info = NativeDriveInfo {
-            route: route.clone(),
-            label: label.clone(),
-            mount: mount.clone(),
-            port,
-        };
-        // Unix mounts can survive their node process. Record ownership before
-        // invoking the OS helper so even a partial mount followed by an error
-        // remains safe to clean on the next start. Windows records ownership
-        // in `label_native` below instead.
-        if let Err(error) = remember_native_mount(&info) {
-            server_task.abort();
-            return Err(format!("couldn't record the native drive mount: {error}"));
-        }
-        // Seed Explorer's network-drive label BEFORE `net use` publishes the
-        // mount. On a reconnect Explorer enumerates the new loopback UNC as
-        // soon as the mapping appears and caches its generated
-        // "DavWWWRoot (\\localhost@port)" name; writing `_LabelFromReg`
-        // afterwards leaves the registry correct but the visible name stale.
-        // Creating the MountPoints2 value first makes the very first
-        // enumeration read the user's chosen label.
-        if let Err(error) = label_native(&mount, &label, &route, port).await {
-            tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
-        }
-        #[cfg(target_os = "linux")]
-        let native = linux_drive_mount::start(Path::new(&mount), &url, _mapping).await;
-        #[cfg(not(target_os = "linux"))]
-        let native = mount_native(&mount, &url, &label).await;
-        if let Err(error) = native {
-            server_task.abort();
-            // A native helper can report failure after creating a partial
-            // mount. Remove it only when the OS still reports our exact
-            // loopback endpoint; another process may have won the mount race.
-            if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
-                tracing::warn!("couldn't clean failed native mount {mount}: {cleanup_error}");
+            if let Err(error) = label_native(&mount, &label, &route, port).await {
+                tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
             }
-            return Err(error);
+            #[cfg(target_os = "linux")]
+            let native = linux_drive_mount::start(Path::new(&mount), &url, _mapping).await;
+            #[cfg(not(target_os = "linux"))]
+            let native = mount_native(&mount, &url, &label).await;
+            if let Err(error) = native {
+                server_task.abort();
+                // A native helper can report failure after creating a partial
+                // mount. Remove it only when the OS still reports our exact
+                // loopback endpoint; another process may have won the mount race.
+                if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
+                    tracing::warn!("couldn't clean failed native mount {mount}: {cleanup_error}");
+                }
+                return Err(error);
+            }
+            #[cfg(target_os = "linux")]
+            let helper = native.unwrap();
+            #[cfg(target_os = "linux")]
+            startup.0.take();
+            self.active.lock().insert(
+                route.clone(),
+                ActiveMount {
+                    info: info.clone(),
+                    server: server_task,
+                    #[cfg(target_os = "linux")]
+                    helper: Some(helper),
+                },
+            );
+            if let Err(error) = label_native(&mount, &label, &route, port).await {
+                tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
+            }
+            Ok(info)
         }
-        #[cfg(target_os = "linux")]
-        let helper = native.unwrap();
-        #[cfg(target_os = "linux")]
-        startup.0.take();
-        self.active.lock().insert(
-            route.clone(),
-            ActiveMount {
-                info: info.clone(),
-                server: server_task,
-                #[cfg(target_os = "linux")]
-                helper: Some(helper),
-            },
-        );
-        // Explorer can create or refresh its MountPoints2 entry while
-        // `net use` publishes the mapping. Re-apply the friendly label after
-        // that race as well as before it so new mappings and reconnects both
-        // retain the name selected in AllMyStuff.
-        if let Err(error) = label_native(&mount, &label, &route, port).await {
-            tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
-        }
-        Ok(info)
     }
 
     pub fn stop(&self, route: &str) {
         let Some(active) = self.active.lock().remove(route) else {
             return;
         };
+        #[cfg(windows)]
+        if active.cloud_drive.is_some() || active.cloud_provider.is_some() {
+            active.server.abort();
+            drop(active);
+            return;
+        }
         #[cfg(windows)]
         if route == FLEETFILES_ROUTE {
             // Fleetfiles is a durable local sync root, not a per-process
@@ -1144,7 +1222,7 @@ fn forget_native_mount(mount: &str) -> Result<(), String> {
     save_native_mount_leases(&leases)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn remember_native_mount(_info: &NativeDriveInfo) -> Result<(), String> {
     Ok(())
 }
@@ -1173,7 +1251,7 @@ async fn remove_known_native_mount(_mount: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_webdav_remote(url: &str) -> Result<String, String> {
     let port = url
         .strip_prefix("http://localhost:")
@@ -1181,12 +1259,6 @@ fn windows_webdav_remote(url: &str) -> Result<String, String> {
         .and_then(|port| port.parse::<u16>().ok())
         .ok_or_else(|| format!("invalid local AllMyStuff WebDAV address: {url}"))?;
     Ok(format!(r"\\localhost@{port}\DavWWWRoot"))
-}
-
-#[cfg(windows)]
-async fn mount_native(mount: &str, url: &str, _label: &str) -> Result<(), String> {
-    let remote = windows_webdav_remote(url)?;
-    crate::win_privilege::connect_interactive_user_network_mapping(mount, &remote)
 }
 
 #[cfg(target_os = "macos")]
@@ -1236,92 +1308,6 @@ async fn unmount_native(mount: &str) -> Result<(), String> {
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 async fn unmount_native(_mount: &str) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(windows)]
-async fn label_native(mount: &str, label: &str, route: &str, port: u16) -> Result<(), String> {
-    let letter = mount.trim_end_matches(':');
-    let root = drive_registry_root()?;
-    let marker = format!(r"{root}\Software\AllMyStuff\MappedDrives\{letter}");
-    let drive_icon_key = format!(
-        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel"
-    );
-    // Explorer does not use DriveIcons for a WebDAV network drive. It keys
-    // that mount by its UNC transport path and reads `_LabelFromReg` from
-    // MountPoints2. Keep DriveIcons too (it covers older shells), but this is
-    // the value that changes "DavWWWRoot (\\localhost@12345)" into the name
-    // the user chose in AllMyStuff.
-    let mount_point_key = format!(
-        r"{root}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##localhost@{port}#DavWWWRoot"
-    );
-    let marked = crate::child_process::command("reg.exe")
-        .args(["add", &marker, "/ve", "/t", "REG_SZ", "/d", route, "/f"])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't record the AllMyStuff drive lease: {error}"))?;
-    if !marked.status.success() {
-        return Err(String::from_utf8_lossy(&marked.stderr).trim().to_string());
-    }
-    let port_string = port.to_string();
-    let port_marked = crate::child_process::command("reg.exe")
-        .args([
-            "add",
-            &marker,
-            "/v",
-            "Port",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            &port_string,
-            "/f",
-        ])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't record the AllMyStuff drive port: {error}"))?;
-    if !port_marked.status.success() {
-        return Err(String::from_utf8_lossy(&port_marked.stderr)
-            .trim()
-            .to_string());
-    }
-    let output = crate::child_process::command("reg.exe")
-        .args([
-            "add",
-            &drive_icon_key,
-            "/ve",
-            "/t",
-            "REG_SZ",
-            "/d",
-            label,
-            "/f",
-        ])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't launch the Explorer label update: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let mount_label = crate::child_process::command("reg.exe")
-        .args([
-            "add",
-            &mount_point_key,
-            "/v",
-            "_LabelFromReg",
-            "/t",
-            "REG_SZ",
-            "/d",
-            label,
-            "/f",
-        ])
-        .output()
-        .await
-        .map_err(|error| format!("couldn't set the Explorer network-drive label: {error}"))?;
-    if !mount_label.status.success() {
-        return Err(String::from_utf8_lossy(&mount_label.stderr)
-            .trim()
-            .to_string());
-    }
-    refresh_explorer_drive_labels().await;
     Ok(())
 }
 

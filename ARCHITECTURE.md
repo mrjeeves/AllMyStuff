@@ -751,9 +751,11 @@ root are refused. The active route is the explicit lease, so the receiver may
 browse and edit that one volume without gaining the whole-machine `:files`
 permission. AllMyStuff exposes this in Settings → Drives, while CECSupport uses
 the same route and frame contract in its Drive mapping card. The receiver turns
-the route into a loopback WebDAV filesystem, then mounts it with Windows
-WebClient, macOS `mount_webdav`, or Linux `mount.davfs`. The mount is native to
-the operating system. No KVM participates.
+the route into a native Windows Cloud Files sync root with a drive-letter
+alias, or a loopback WebDAV filesystem mounted with macOS `mount_webdav` or
+Linux `rclone mount` over FUSE. Windows shares its hydration and durable
+write-back provider with Fleetfiles, uses 64-bit sizes and offsets, and needs
+no additional driver or mounting executable. No KVM participates.
 
 **A shared folder** is that same lease made *durable*, and is what a share
 hands over instead of the whole-machine `:files` console (which stays

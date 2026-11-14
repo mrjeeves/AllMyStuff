@@ -43,6 +43,17 @@ identity, quorum, conflict, mount, and failure-injection gates.
 
 ## Data planes
 
+Windows connects the Fleetfiles Explorer root to the native Cloud Files API.
+Logical directory pages populate placeholders without downloading their bodies.
+Opening a file retrieves its verified immutable body through the existing
+foreground cache, then supplies aligned native byte ranges. Provider hydration
+and clean placeholder creation do not create new logical versions; local edits
+continue through the existing capture and version ledger. Explicit shared-drive
+roots use this same Windows provider with their scoped file route and a separate
+durable write journal, rather than joining the Fleetfiles namespace.
+Native Fleetfiles renames and deletions update the logical subtree and outbound
+metadata together, including descendants whose bodies are online-only.
+
     Files UI / native working root
                  |
                  | bounded logical pages and watched local mutations

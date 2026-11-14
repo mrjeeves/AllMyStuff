@@ -168,6 +168,14 @@ machine that has granted Files access.
 in Windows, a mounted volume on macOS, or a filesystem mount point on Linux.
 Native applications use it like other storage on that computer.
 
+On Windows, mapped folders use the built-in Cloud Files service. Files appear
+as placeholders and download when opened, including files larger than 4 GB.
+Edits are saved locally and synchronize back to the source; pending edits remain
+on this computer if the connection is interrupted. The local NTFS cache needs
+space for the files you open or change. No additional filesystem driver is
+required. If a requested drive letter belongs to another mapping, AMS preserves
+it and chooses a free letter.
+
 To map something from another device:
 
 1. Choose **Drives** on the receiving device.

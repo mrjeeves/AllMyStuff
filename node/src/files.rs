@@ -403,7 +403,6 @@ impl FilesPlane {
             FileEvent::Entries { .. }
                 | FileEvent::VolumeList { .. }
                 | FileEvent::QuotaInfo { .. }
-                | FileEvent::Watching { .. }
                 | FileEvent::Exists { .. }
                 | FileEvent::Metadata { .. }
                 | FileEvent::Ok { .. }

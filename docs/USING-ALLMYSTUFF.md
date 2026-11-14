@@ -192,9 +192,10 @@ Windows Server 2025 or later and the installed AMS service (or an elevated node)
 Both endpoints must run an AMS version with SMB drive support. Fleetfiles
 continues to use Cloud Files for its separate on-demand synchronized namespace.
 
-Auto selects the next free drive letter from Z downward. If Z: already belongs
-to an SMB share, AMS preserves it and uses Y: when that letter is free. An
-occupied requested letter is also preserved. Previous Cloud Files mapped-drive
+Auto selects the next available drive letter, searching from Z: through A:.
+AMS reserves no letters. Existing assignments, including disconnected and
+remembered network drives, are occupied even when their server is unreachable.
+An occupied requested letter is also preserved. Previous Cloud Files mapped-drive
 caches are retained; unsent edits block migration until they are recovered.
 
 To map something from another device:

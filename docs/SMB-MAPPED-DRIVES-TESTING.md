@@ -12,6 +12,11 @@ rule, WinFsp, or rclone installation is needed.
    is occupied and Y: is free; otherwise expect the next free letter. An
    explicitly requested occupied letter must also be preserved. Check both
    endpoints display the selected letter. Explorer should show a network drive.
+   Repeat with an existing disconnected mapping still assigned to its letter
+   (do not unmap it); AMS must skip it even though its server is unreachable.
+   No letter is generically reserved, and stale AMS bookkeeping must not hold
+   an otherwise free letter. Lower-letter exhaustion is covered automatically;
+   do not remove real mappings or volumes to manufacture that case manually.
 3. Compare its capacity with the actual source volume. It should report the
    source filesystem, rather than the receiver's C: capacity.
 4. In a new disposable test subfolder, copy a file larger than 4 GiB in each

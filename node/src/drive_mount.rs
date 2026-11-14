@@ -49,9 +49,9 @@ pub(crate) fn test_cloud_alias(
         windows_cloud_alias::alias(mount, root, true)?;
         return Ok(mount.to_string());
     }
-    let mask = windows_logical_drive_mask()?
-        | crate::win_privilege::interactive_user_logical_drive_mask()?;
-    let mount = select_windows_mount(None, |mount| !drive_letter_reserved(mount, mask))?;
+    let mask = crate::win_privilege::assigned_drive_mask()?
+        | crate::win_privilege::interactive_user_assigned_drive_mask()?;
+    let mount = select_windows_mount(None, |mount| !drive_letter_assigned(mount, mask))?;
     windows_cloud_alias::alias(&mount, root, false)?;
     Ok(mount)
 }
@@ -339,20 +339,6 @@ impl DriveMounts {
         let active = self.list();
         #[cfg(windows)]
         windows_cloud_alias::migrate(_mapping)?;
-        #[cfg(windows)]
-        if let Some(requested) = normalize_requested_mount(&requested_mount)? {
-            // A reconnect is allowed to reclaim only a letter carrying our
-            // private lease marker. This is the half-open state produced when
-            // Windows remembers a dead WebDAV mapping after the old route and
-            // listener are gone. Never touch a user's unrelated mapping.
-            if !active
-                .iter()
-                .any(|entry| entry.mount.eq_ignore_ascii_case(&requested))
-            {
-                windows_drive_mount::remove_known(&requested)?;
-                reclaim_stale_owned_mount(&requested).await?;
-            }
-        }
         let mount = choose_mount(&requested_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
         #[cfg(windows)]
@@ -540,24 +526,24 @@ impl DriveMounts {
 async fn choose_mount(
     requested: &str,
     _label: &str,
-    active: &[NativeDriveInfo],
+    _active: &[NativeDriveInfo],
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
-        let logical_drives = windows_logical_drive_mask()?
-            | crate::win_privilege::interactive_user_logical_drive_mask()?;
+        let logical_drives = crate::win_privilege::assigned_drive_mask()?
+            | crate::win_privilege::interactive_user_assigned_drive_mask()?;
         select_windows_mount(normalize_requested_mount(requested)?, |mount| {
-            mount_available(mount, active, &remembered, logical_drives)
+            mount_available(mount, &remembered, logical_drives)
         })
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        choose_unix_mount(requested, _label, active).await
+        choose_unix_mount(requested, _label, _active).await
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
-        let _ = (requested, _label, active);
+        let _ = (requested, _label, _active);
         Err("native drive mounting is not available on this operating system".into())
     }
 }
@@ -698,7 +684,7 @@ fn select_windows_mount(
         // replacement instead of fighting that owner on every reconnect.
         tracing::warn!("{mount} is already in use; choosing another drive letter");
     }
-    for letter in ('D'..='Z').rev() {
+    for letter in ('A'..='Z').rev() {
         let mount = format!("{letter}:");
         if requested.as_deref() == Some(mount.as_str()) {
             continue;
@@ -729,20 +715,23 @@ fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> 
 #[cfg(windows)]
 fn mount_available(
     mount: &str,
-    active: &[NativeDriveInfo],
     remembered: &std::collections::HashSet<String>,
     logical_drives: u32,
 ) -> bool {
-    if drive_letter_reserved(mount, logical_drives)
+    if drive_letter_assigned(mount, logical_drives)
         || remembered.contains(&mount.to_ascii_uppercase())
-        || active
-            .iter()
-            .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
-        || std::path::Path::new(&format!("{mount}\\")).exists()
     {
         return false;
     }
     true
+}
+
+#[cfg(windows)]
+async fn windows_letter_available(mount: &str) -> Result<bool, String> {
+    let remembered = remembered_network_mounts().await?;
+    let assigned = crate::win_privilege::assigned_drive_mask()?
+        | crate::win_privilege::interactive_user_assigned_drive_mask()?;
+    Ok(mount_available(mount, &remembered, assigned))
 }
 
 #[cfg(windows)]
@@ -845,7 +834,7 @@ async fn remembered_network_registry_mounts() -> Result<std::collections::HashSe
     }
 }
 #[cfg(windows)]
-fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
+fn drive_letter_assigned(mount: &str, logical_drives: u32) -> bool {
     drive_letter_bit(mount).is_some_and(|bit| logical_drives & bit != 0)
 }
 
@@ -1937,10 +1926,10 @@ mod registry_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::{
-        drive_letter_reserved, mount_available, normalize_requested_mount,
+        drive_letter_assigned, mount_available, normalize_requested_mount,
         parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
         windows_dos_device_targets_match_port, windows_mapping_output_matches_port,
-        windows_webdav_remote, NativeDriveInfo,
+        windows_webdav_remote,
     };
     use std::collections::HashSet;
 
@@ -1982,9 +1971,9 @@ mod windows_tests {
     #[test]
     fn assigned_drive_mask_wins_even_when_the_path_is_inaccessible() {
         let z = 1_u32 << u32::from(b'Z' - b'A');
-        assert!(drive_letter_reserved("Z:", z));
-        assert!(drive_letter_reserved("z:", z));
-        assert!(!drive_letter_reserved("Y:", z));
+        assert!(drive_letter_assigned("Z:", z));
+        assert!(drive_letter_assigned("z:", z));
+        assert!(!drive_letter_assigned("Y:", z));
     }
 
     #[test]
@@ -2002,20 +1991,30 @@ HKEY_CURRENT_USER\Network\TooLong
     }
 
     #[test]
-    fn every_windows_assignment_surface_reserves_its_letter() {
+    fn assigned_and_disconnected_remembered_drives_are_unavailable() {
         let logical = 1_u32 << u32::from(b'X' - b'A');
         let remembered = HashSet::from(["Y:".to_string()]);
-        let active = vec![NativeDriveInfo {
-            route: "route".into(),
-            label: "label".into(),
-            mount: "W:".into(),
-            port: 1,
-        }];
+        assert!(!mount_available("X:", &remembered, logical));
+        assert!(!mount_available("Y:", &remembered, logical));
+        assert!(mount_available("W:", &remembered, logical));
+        let next = select_windows_mount(Some("Y:".into()), |mount| {
+            mount_available(mount, &HashSet::from(["Z:".into(), "Y:".into()]), logical)
+        })
+        .unwrap();
+        assert_eq!(next, "W:");
+    }
 
-        assert!(!mount_available("X:", &active, &remembered, logical));
-        assert!(!mount_available("Y:", &active, &remembered, logical));
-        assert!(!mount_available("W:", &active, &remembered, logical));
-        assert!(mount_available("V:", &active, &remembered, logical));
+    #[test]
+    fn auto_has_no_generically_reserved_letters() {
+        for free in b'A'..=b'Z' {
+            let available = format!("{}:", char::from(free));
+            assert_eq!(
+                select_windows_mount(None, |mount| mount == available).unwrap(),
+                available
+            );
+        }
+        assert_eq!(select_windows_mount(None, |_| true).unwrap(), "Z:");
+        assert!(select_windows_mount(None, |_| false).is_err());
     }
 
     #[test]

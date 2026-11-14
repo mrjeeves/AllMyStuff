@@ -16,6 +16,18 @@ struct Lease {
     remote: String,
     port: u16,
     owner: String,
+    #[serde(default)]
+    generation: String,
+}
+
+impl Lease {
+    fn matches(&self, other: &Self) -> bool {
+        self.mount.eq_ignore_ascii_case(&other.mount)
+            && self.remote.eq_ignore_ascii_case(&other.remote)
+            && self.port == other.port
+            && self.owner == other.owner
+            && self.generation == other.generation
+    }
 }
 
 const CONNECT: &str = r#"
@@ -23,7 +35,9 @@ $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 try {
  $p=[Console]::In.ReadToEnd() | ConvertFrom-Json
  if (!(Get-Command New-SmbGlobalMapping).Parameters.ContainsKey('TcpPort')) { throw 'SMB mapped drives require Windows 11 24H2 / Server 2025 or later.' }
- if (Get-SmbGlobalMapping -LocalPath $p.mount -ErrorAction SilentlyContinue) { throw 'The drive letter is already assigned; its mapping was preserved.' }
+ $assigned=@(Get-SmbGlobalMapping -ErrorAction Stop)+@(Get-SmbMapping -ErrorAction Stop)
+ $remembered="Registry::HKEY_USERS\$($p.owner)\Network\$($p.mount.TrimEnd(':'))"
+ if (($assigned | Where-Object LocalPath -eq $p.mount) -or (Test-Path -LiteralPath $remembered -ErrorAction Stop)) { throw 'The drive letter is already assigned, including a disconnected mapping; it was preserved.' }
  $secret=ConvertTo-SecureString $p.password -AsPlainText -Force
  $credential=[pscredential]::new($p.username,$secret)
  $owner=([Security.Principal.SecurityIdentifier]::new($p.owner)).Translate([Security.Principal.NTAccount]).Value
@@ -125,25 +139,32 @@ fn save(leases: &[Lease]) -> Result<(), String> {
 }
 
 pub(super) fn remove_known(mount: &str) -> Result<bool, String> {
-    let _guard = LEASE_LOCK.lock();
-    let mut saved = leases()?;
-    let mut found = false;
-    for lease in saved
-        .iter()
+    let mut removed = false;
+    for lease in leases()?
+        .into_iter()
         .filter(|lease| lease.mount.eq_ignore_ascii_case(mount))
     {
-        if !owned_remote(&lease.remote) {
-            return Err("the saved SMB endpoint is not an AMS loopback share".into());
-        }
-        run(
-            DISCONNECT,
-            serde_json::to_value(lease).map_err(|error| error.to_string())?,
-        )?;
-        found = true;
+        removed |= remove_exact(&lease)?;
     }
-    saved.retain(|lease| !lease.mount.eq_ignore_ascii_case(mount));
+    Ok(removed)
+}
+
+fn remove_exact(expected: &Lease) -> Result<bool, String> {
+    let _guard = LEASE_LOCK.lock();
+    let mut saved = leases()?;
+    if !saved.iter().any(|lease| lease.matches(expected)) {
+        return Ok(false);
+    }
+    if !owned_remote(&expected.remote) {
+        return Err("the saved SMB endpoint is not an AMS loopback share".into());
+    }
+    run(
+        DISCONNECT,
+        serde_json::to_value(expected).map_err(|error| error.to_string())?,
+    )?;
+    saved.retain(|lease| !lease.matches(expected));
     save(&saved)?;
-    Ok(found)
+    Ok(true)
 }
 fn owned_remote(remote: &str) -> bool {
     let Some((host, share)) = remote
@@ -158,6 +179,13 @@ fn owned_remote(remote: &str) -> bool {
         && share.len() == 19
         && share[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+fn dos_target_matches_remote(target: &str, remote: &str) -> bool {
+    let target = target.trim_end_matches('\\').to_ascii_lowercase();
+    let suffix = format!(r"\{}", remote.trim_matches('\\')).to_ascii_lowercase();
+    (target.starts_with(r"\device\lanmanredirector\") || target.starts_with(r"\device\mup\"))
+        && target.ends_with(&suffix)
+}
 pub(super) fn cleanup() -> Result<(), String> {
     for lease in leases()? {
         remove_known(&lease.mount)?;
@@ -166,7 +194,7 @@ pub(super) fn cleanup() -> Result<(), String> {
 }
 
 pub(super) struct NativeSmbDrive {
-    mount: String,
+    lease: Lease,
 }
 impl NativeSmbDrive {
     pub(super) async fn start(
@@ -178,7 +206,7 @@ impl NativeSmbDrive {
         if !address.ip().is_loopback() {
             return Err("the SMB tunnel must listen on loopback".into());
         }
-        if !crate::win_privilege::interactive_user_dos_device_targets(mount)?.is_empty() {
+        if !super::windows_letter_available(mount).await? {
             return Err(format!(
                 "{mount} is already assigned; its drive was preserved"
             ));
@@ -187,11 +215,14 @@ impl NativeSmbDrive {
             "ams-smb-owner",
             crate::win_privilege::effective_user_sid,
         )?;
+        let mut identity = [0u8; 16];
+        getrandom::getrandom(&mut identity).map_err(|error| error.to_string())?;
         let lease = Lease {
             mount: mount.to_string(),
             remote: format!(r"\\{}\{}", address.ip(), endpoint.share),
             port: address.port(),
             owner,
+            generation: identity.iter().map(|byte| format!("{byte:02x}")).collect(),
         };
         if !owned_remote(&lease.remote) {
             return Err("the SMB share identity is invalid".into());
@@ -199,12 +230,9 @@ impl NativeSmbDrive {
         {
             let _guard = LEASE_LOCK.lock();
             let mut saved = leases()?;
-            if saved
-                .iter()
-                .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
-            {
-                return Err("an AMS SMB lease still owns that letter".into());
-            }
+            // The OS proved this letter is free. Stale bookkeeping does not
+            // reserve it, and selection never disconnects an existing drive.
+            saved.retain(|entry| !entry.mount.eq_ignore_ascii_case(mount));
             saved.push(lease.clone());
             save(&saved)?;
         }
@@ -215,19 +243,26 @@ impl NativeSmbDrive {
             .await
             .map_err(|error| error.to_string())?;
         if let Err(error) = result {
-            if let Err(cleanup) = remove_known(mount) {
+            if let Err(cleanup) = remove_exact(&lease) {
                 return Err(format!("{error}; cleanup: {cleanup}"));
             }
             return Err(error);
         }
         let visibility = crate::win_privilege::interactive_user_logical_drive_mask().and_then(|mask| {
             let letter=mount.as_bytes().first().copied().ok_or("missing SMB drive letter")?.to_ascii_uppercase();
-            if !(b'D'..=b'Z').contains(&letter) || mask & (1u32 << (letter-b'A')) == 0 {
+            if !letter.is_ascii_uppercase() || mask & (1u32 << (letter-b'A')) == 0 {
                 Err("Windows created an SMB mapping that is not visible in the signed-in user's drive namespace".to_string())
-            } else { Ok(()) }
+            } else {
+                let ours=match crate::win_privilege::interactive_user_network_mapping(mount)? {
+                    Some(remote)=>remote.trim_end_matches('\\').eq_ignore_ascii_case(lease.remote.trim_end_matches('\\')),
+                    None=>crate::win_privilege::interactive_user_dos_device_targets(mount)?.first()
+                        .is_some_and(|target|dos_target_matches_remote(target,&lease.remote)),
+                };
+                if ours {Ok(())} else {Err("The selected drive letter now belongs to another mapping; it was preserved".into())}
+            }
         });
         if let Err(error) = visibility {
-            remove_known(mount)?;
+            remove_exact(&lease)?;
             return Err(error);
         }
         let key = format!(
@@ -239,14 +274,12 @@ impl NativeSmbDrive {
             .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
             .output()
             .await;
-        Ok(Self {
-            mount: mount.to_string(),
-        })
+        Ok(Self { lease })
     }
 }
 impl Drop for NativeSmbDrive {
     fn drop(&mut self) {
-        if let Err(error) = remove_known(&self.mount) {
+        if let Err(error) = remove_exact(&self.lease) {
             tracing::warn!(%error,"couldn't remove AMS SMB mapping");
         }
     }
@@ -254,6 +287,51 @@ impl Drop for NativeSmbDrive {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visible_drive_identity_must_match_the_exact_smb_endpoint() {
+        let remote = r"\\127.64.1.2\ams0123456789abcdef";
+        assert!(super::dos_target_matches_remote(
+            r"\Device\LanmanRedirector\;Y:1234\127.64.1.2\ams0123456789abcdef",
+            remote
+        ));
+        assert!(super::dos_target_matches_remote(
+            r"\Device\Mup\127.64.1.2\ams0123456789abcdef",
+            remote
+        ));
+        for target in [
+            r"\Device\LanmanRedirector\;Y:1234\FRANK6\media",
+            r"\Device\Mup\127.64.1.3\ams0123456789abcdef",
+            r"\??\C:\temp\127.64.1.2\ams0123456789abcdef",
+            r"\Device\Mup\127.64.1.2\ams0123456789abcdef\child",
+        ] {
+            assert!(!super::dos_target_matches_remote(target, remote));
+        }
+    }
+    #[test]
+    fn an_old_owner_cannot_remove_a_replacement_on_the_same_letter() {
+        let old = super::Lease {
+            mount: "Y:".into(),
+            remote: r"\\127.64.1.2\ams0123456789abcdef".into(),
+            port: 23456,
+            owner: "user".into(),
+            generation: "original".into(),
+        };
+        let mut replacement = old.clone();
+        replacement.generation = "replacement".into();
+        assert!(!old.matches(&replacement));
+        replacement = old.clone();
+        replacement.remote = r"\\127.64.1.3\amsfedcba9876543210".into();
+        assert!(!old.matches(&replacement));
+        replacement = old.clone();
+        replacement.port += 1;
+        assert!(!old.matches(&replacement));
+        replacement = old.clone();
+        replacement.owner = "another-user".into();
+        assert!(!old.matches(&replacement));
+        replacement = old.clone();
+        replacement.mount = "y:".into();
+        assert!(old.matches(&replacement));
+    }
     #[test]
     fn ownership_requires_a_loopback_address_and_private_share_identity() {
         assert!(super::owned_remote(r"\\127.64.1.2\ams0123456789abcdef"));

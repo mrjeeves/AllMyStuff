@@ -111,7 +111,10 @@ Old cache directories and journals are retained for recovery, never deleted.
 2. The receiver accepts under the normal Files authorization gate.
 3. On activation, Windows negotiates the private source SMB endpoint, starts
    its mesh tunnel, and creates a native SMB network mapping. It selects the
-   next free letter from Z down to D when Auto. Exact owned endpoint leases
+   next unassigned letter from Z through A when Auto, with no generic letter
+   reservations. Disconnected and remembered mappings are assigned, even if
+   opening their root fails. Selection never disconnects a drive to free a letter.
+   Exact owned endpoint leases
    gate cleanup; unrelated SMB or other drive assignments are preserved.
    macOS and Linux bind an ephemeral listener to `127.0.0.1:0`, build
    `RemoteDavFs`, and choose a native destination. macOS uses

@@ -1082,7 +1082,42 @@ struct DownloadSink {
     completed_path: std::path::PathBuf,
     cache_entry: Option<std::path::PathBuf>,
     written: u64,
+    reported_total: Option<u64>,
     last_progress: std::time::Instant,
+}
+
+fn download_chunk_end(
+    written: u64,
+    previous_total: Option<u64>,
+    total: u64,
+    length: usize,
+    eof: bool,
+) -> std::io::Result<u64> {
+    let invalid = |reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    if previous_total.is_some_and(|previous| previous != total) {
+        return Err(invalid("the source file size changed during download"));
+    }
+    let end = written
+        .checked_add(length as u64)
+        .ok_or_else(|| invalid("the downloaded byte count overflowed"))?;
+    if end > total || (eof && end != total) {
+        return Err(invalid("the download ended with an unexpected byte count"));
+    }
+    Ok(end)
+}
+
+impl DownloadSink {
+    fn write_chunk(&mut self, bytes: &[u8], total: u64, eof: bool) -> std::io::Result<()> {
+        use std::io::Write;
+        let end = download_chunk_end(self.written, self.reported_total, total, bytes.len(), eof)?;
+        self.file.write_all(bytes)?;
+        if eof {
+            self.file.sync_all()?;
+        }
+        self.written = end;
+        self.reported_total = Some(total);
+        Ok(())
+    }
 }
 
 /// One file offered into a room's Shared Files area: the absolute path on
@@ -17728,6 +17763,7 @@ impl Mesh {
                 completed_path: path.clone(),
                 cache_entry: None,
                 written: 0,
+                reported_total: None,
                 last_progress: std::time::Instant::now(),
             },
         );
@@ -17790,6 +17826,7 @@ impl Mesh {
                 completed_path: completed.clone(),
                 cache_entry: Some(entry.clone()),
                 written: 0,
+                reported_total: None,
                 last_progress: std::time::Instant::now(),
             },
         );
@@ -17820,7 +17857,6 @@ impl Mesh {
     /// (or failing) emits `allmystuff://file-saved` so the window can say
     /// where it landed.
     fn feed_download(&self, route_id: &str, req: u64, event: &FileEvent) -> bool {
-        use std::io::Write as _;
         let FileEvent::Chunk {
             data, total, eof, ..
         } = event
@@ -17832,10 +17868,11 @@ impl Mesh {
         let Some(sink) = map.get_mut(&key) else {
             return false;
         };
-        if let Err(e) = sink.file.write_all(data) {
+        if let Err(e) = sink.write_chunk(data, *total, *eof) {
             let failed = map.remove(&key);
             drop(map);
             if let Some(failed) = failed {
+                drop(failed.file);
                 let _ = std::fs::remove_file(&failed.path);
                 if let Some(entry) = failed.cache_entry {
                     let _ = std::fs::remove_dir(&entry);
@@ -17847,13 +17884,11 @@ impl Mesh {
             );
             return true;
         }
-        sink.written += data.len() as u64;
         if *eof {
             let Some(sink) = map.remove(&key) else {
                 return true;
             };
             drop(map);
-            let _ = sink.file.sync_all();
             drop(sink.file);
             let completed = if sink.path == sink.completed_path {
                 Ok(sink.completed_path.clone())
@@ -22606,6 +22641,156 @@ fn parse_media(s: &str) -> MediaKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_integrity_tracks_sizes_above_four_gib() {
+        let total = 5_u64 * 1024 * 1024 * 1024 + 31;
+        assert_eq!(
+            super::download_chunk_end(total - 31, Some(total), total, 31, true).unwrap(),
+            total
+        );
+        assert_eq!(super::download_chunk_end(0, None, 0, 0, true).unwrap(), 0);
+        assert!(super::download_chunk_end(total - 31, Some(total), total, 30, true).is_err());
+        assert!(super::download_chunk_end(total, Some(total), total, 1, true).is_err());
+        assert!(super::download_chunk_end(2, Some(8), 9, 2, false).is_err());
+        assert!(super::download_chunk_end(u64::MAX, Some(u64::MAX), u64::MAX, 1, false).is_err());
+    }
+
+    #[test]
+    fn download_sink_rejects_a_short_body_before_writing_its_final_chunk() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("download.bin"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "ams-download-integrity-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("download.bin");
+        let mut sink = super::DownloadSink {
+            file: std::fs::File::create(&path).unwrap(),
+            path: path.clone(),
+            completed_path: path.clone(),
+            cache_entry: None,
+            written: 0,
+            reported_total: None,
+            last_progress: std::time::Instant::now(),
+        };
+        sink.write_chunk(b"abc", 6, false).unwrap();
+        assert!(sink.write_chunk(b"de", 6, true).is_err());
+        assert_eq!(sink.written, 3);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 3);
+        sink.write_chunk(b"def", 6, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    #[ignore = "manual integration test: streams a 5 GiB body to a temporary disk sink"]
+    fn files_browser_large_download_roundtrip() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for name in ["source.bin", "download.bin"] {
+                    let _ = std::fs::remove_file(self.0.join(name));
+                }
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        fn hash(path: &std::path::Path) -> Vec<u8> {
+            let mut file = std::fs::File::open(path).unwrap();
+            let mut buffer = vec![0; 1024 * 1024];
+            let mut digest = Sha256::new();
+            loop {
+                let count = file.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            digest.finalize().to_vec()
+        }
+        let total = 5_u64 * 1024 * 1024 * 1024 + 31;
+        let directory = std::env::temp_dir().join(format!(
+            "ams-browser-large-roundtrip-{}-{}",
+            std::process::id(),
+            super::fresh_boot_id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        assert!(
+            fs2::available_space(&directory).unwrap() > 3 * total,
+            "need at least 15 GiB free for this manual test"
+        );
+        let source = directory.join("source.bin");
+        let destination = directory.join("download.bin");
+        {
+            let mut file = std::fs::File::create(&source).unwrap();
+            file.set_len(total).unwrap();
+            for position in [0, 4_u64 * 1024 * 1024 * 1024 + 17, total - 19] {
+                file.seek(SeekFrom::Start(position)).unwrap();
+                file.write_all(b"AMS-browser-marker!").unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+        let mut sink = super::DownloadSink {
+            file: std::fs::File::create(&destination).unwrap(),
+            path: destination.clone(),
+            completed_path: destination.clone(),
+            cache_entry: None,
+            written: 0,
+            reported_total: None,
+            last_progress: std::time::Instant::now(),
+        };
+        let plane = crate::files::FilesPlane::new();
+        let mut chunks = plane.handle(
+            "browser-large-test",
+            allmystuff_session::FileEvent::Read {
+                req: 1,
+                path: source.to_string_lossy().into_owned(),
+            },
+        );
+        let mut completed = false;
+        while let Some(event) = chunks.blocking_recv() {
+            let json = serde_json::to_vec(&event).unwrap();
+            let decoded: allmystuff_session::FileEvent = serde_json::from_slice(&json).unwrap();
+            let allmystuff_session::FileEvent::Chunk {
+                data,
+                total: reported,
+                eof,
+                ..
+            } = decoded
+            else {
+                panic!("unexpected file-host response: {event:?}");
+            };
+            assert!(data.len() <= 40 * 1024);
+            sink.write_chunk(&data, reported, eof).unwrap();
+            if eof {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(sink.written, total);
+        drop(sink);
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), total);
+        let expected = hash(&source);
+        assert_eq!(hash(&destination), expected);
+        eprintln!(
+            "Files Browser download: {total} bytes, SHA-256 {}",
+            expected
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+
     #[test]
     fn live_route_stays_on_its_first_proven_network() {
         let mut pins = super::RouteNetworkPins::default();

@@ -164,6 +164,21 @@ Files also browses explicit remote-machine grants. Use those device/local-copy
 surfaces to inspect, preview, upload, download, rename, or remove files on a
 machine that has granted Files access.
 
+The older **Files Browser** window also transfers directly to and from a
+machine with Files access. Uploads read the selected file in small pieces,
+including files larger than 4 GB, and publish it after the host acknowledges
+the complete body and its length is checked. An existing file with the same
+name is preserved; rename it or choose a different destination first. Cancel
+an upload from its transfer row to discard the temporary body. Keep both
+machines awake and the session open until the transfer finishes. If a lost
+connection prevents temporary-file cleanup, the failed transfer shows its
+path so it can be removed after reconnecting.
+
+Downloads stream straight to the receiving machine's Downloads folder.
+They require enough free space there; previews in the window have a separate
+10 MB limit. Fleetfiles transfers also require sufficient allocated Fleetfiles
+storage on the receiving fleet device.
+
 **Drives** creates an operating-system mount. The result is a real drive letter
 in Windows, a mounted volume on macOS, or a filesystem mount point on Linux.
 Native applications use it like other storage on that computer.

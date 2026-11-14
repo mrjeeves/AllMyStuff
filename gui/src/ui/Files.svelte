@@ -17,6 +17,7 @@
   import {
     closeThisWindow,
     fileDownload,
+    fileDownloadCancel,
     fileSend,
     isMobile,
     onFileProgress,
@@ -24,6 +25,7 @@
     onThisWindowClose,
     watchFiles,
   } from "../tauri";
+  import { FileRequests, uploadBrowserFile } from "../files-transfer";
 
   // Touch has no reliable double-tap (and iOS eats it for zoom), so folders
   // open on the second *single* tap instead: first tap selects (revealing the
@@ -67,8 +69,14 @@
   let nextReq = 1;
   /** The id of the List currently in flight — stale listings are dropped. */
   let listReq = 0;
-  /** Ops (mkdir/rename/delete/upload) awaiting their ok/err. */
+  /** Ops (mkdir/rename/delete) awaiting their ok/err. */
   const pendingOps = new Map<number, { label: string; refresh: boolean }>();
+  const requests = new FileRequests((event) => {
+    if (!routeId || status !== "live") return Promise.reject(new Error("The file session is not connected"));
+    return fileSend(routeId, event);
+  }, () => nextReq++);
+  const uploads = new Map<number, AbortController>();
+  const uploadTasks = new Set<Promise<void>>();
   /** Previews assembling from chunks. */
   const previews = new Map<number, { name: string; parts: Uint8Array[]; bytes: number; total: number }>();
 
@@ -111,10 +119,9 @@
 
   // ---- small helpers ----------------------------------------------------
 
-  const sep = $derived(path.includes("\\") ? "\\" : "/");
-
-  function childPath(name: string): string {
-    return path.endsWith(sep) ? path + name : path + sep + name;
+  function childPath(name: string, parent = path): string {
+    const separator = parent.includes("\\") ? "\\" : "/";
+    return parent.endsWith(separator) ? parent + name : parent + separator + name;
   }
 
   function parentOf(p: string): string {
@@ -155,15 +162,6 @@
       return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
     }
     return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
-  }
-
-  function b64encode(bytes: Uint8Array): string {
-    let bin = "";
-    const STEP = 0x8000;
-    for (let i = 0; i < bytes.length; i += STEP) {
-      bin += String.fromCharCode(...bytes.subarray(i, i + STEP));
-    }
-    return btoa(bin);
   }
 
   function b64decode(text: string): Uint8Array {
@@ -219,6 +217,7 @@
   // ---- the response stream ------------------------------------------------
 
   function onEvent(ev: FileEvent) {
+    if (requests.accept(ev)) return;
     switch (ev.kind) {
       case "entries": {
         if (ev.req !== listReq) return; // a stale listing
@@ -351,15 +350,19 @@
 
   // ---- file management -------------------------------------------------------
 
-  function download(e: FileEntry) {
+  async function download(e: FileEntry) {
     if (!routeId || e.dir) return;
     const req = nextReq++;
     const rid = routeId;
+    const source = childPath(e.name);
     // Register the disk sink *first*, then ask — the first chunk can't
     // race the registration.
-    fileDownload(rid, req, e.name)
-      .then((dest) => {
-        transfers.push({
+    let registered = false;
+    try {
+      const dest = await fileDownload(rid, req, e.name);
+      registered = true;
+      if (closing || routeId !== rid || status !== "live") throw new Error("The file session ended");
+      transfers.push({
           req,
           kind: "down",
           name: e.name,
@@ -367,22 +370,24 @@
           total: e.size,
           state: "moving",
           note: dest,
-        });
-        send({ kind: "read", req, path: childPath(e.name) });
-      })
-      .catch((err) => app.toast("warn", `Couldn't start the download: ${err}`));
+      });
+      await fileSend(rid, { kind: "read", req, path: source });
+    } catch (error) {
+      if (registered) await fileDownloadCancel(rid, req).catch(() => {});
+      const transfer = transfers.find((item) => item.kind === "down" && item.req === req);
+      if (transfer) { transfer.state = "failed"; transfer.note = String(error); }
+      app.toast("warn", `Couldn't start the download: ${error}`);
+    }
   }
 
   let uploadInput = $state<HTMLInputElement | null>(null);
-  const UPLOAD_CHUNK = 40 * 1024;
-
   async function uploadFiles(files: FileList | null) {
     if (!files || !routeId) return;
+    const destination = path;
     for (const file of Array.from(files)) {
+      if (closing || status !== "live") break;
       const req = nextReq++;
-      const dest = childPath(file.name);
-      pendingOps.set(req, { label: "", refresh: true });
-      const t: Transfer = {
+      transfers.push({
         req,
         kind: "up",
         name: file.name,
@@ -390,37 +395,29 @@
         total: file.size,
         state: "moving",
         note: "",
-      };
-      transfers.push(t);
-      try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        if (bytes.length === 0) {
-          await fileSend(routeId, {
-            kind: "write", req, path: dest, data: "", append: false, create_new: true, eof: true,
+      });
+      const transfer = transfers[transfers.length - 1];
+      const controller = new AbortController();
+      uploads.set(req, controller);
+      const task = (async () => {
+        try {
+          await uploadBrowserFile(file, childPath(file.name, destination), requests, {
+            signal: controller.signal,
+            progress: (written) => { transfer.done = written; },
           });
-          continue;
-        }
-        // Sequential pieces: each IPC awaits the daemon hand-off, so the
-        // host applies them in order and the link is never flooded.
-        for (let off = 0; off < bytes.length; off += UPLOAD_CHUNK) {
-          const piece = bytes.subarray(off, Math.min(off + UPLOAD_CHUNK, bytes.length));
-          await fileSend(routeId, {
-            kind: "write",
-            req,
-            path: dest,
-            data: b64encode(piece),
-            append: off > 0,
-            create_new: off === 0,
-            eof: off + piece.length >= bytes.length,
-          });
-          t.done = Math.min(off + piece.length, bytes.length);
-        }
-      } catch (e) {
-        pendingOps.delete(req);
-        t.state = "failed";
-        t.note = String(e);
-        app.toast("warn", `Couldn't upload ${file.name}: ${e}`);
-      }
+          transfer.state = "done";
+          transfer.done = transfer.total;
+          transfer.note = "uploaded";
+          if (!closing && status === "live") refresh();
+        } catch (error) {
+          transfer.state = "failed";
+          transfer.note = String(error);
+          if (!controller.signal.aborted) app.toast("warn", `Couldn't upload ${file.name}: ${error}`);
+        } finally { uploads.delete(req); }
+      })();
+      uploadTasks.add(task);
+      await task;
+      uploadTasks.delete(task);
     }
     if (uploadInput) uploadInput.value = "";
   }
@@ -475,11 +472,28 @@
 
   // ---- session lifecycle -------------------------------------------------
 
-  function startSession() {
+  async function startSession() {
     if (started || !routeId) return;
     started = true;
-    void watchFiles(routeId, onEvent).then((stop) => (stopWatch = stop));
-    list(path);
+    const rid = routeId;
+    try {
+      const stop = await watchFiles(rid, onEvent);
+      if (closing || routeId !== rid) { stop(); return; }
+      stopWatch = stop;
+      list(path);
+    } catch (error) {
+      status = "ended";
+      note = `Couldn't watch the file session: ${error}`;
+      failTransfers(note);
+    }
+  }
+
+  function failTransfers(reason: string) {
+    for (const controller of uploads.values()) controller.abort(new Error(reason));
+    requests.close(reason);
+    for (const transfer of transfers) {
+      if (transfer.state === "moving") { transfer.state = "failed"; transfer.note = reason; }
+    }
   }
 
   $effect(() => {
@@ -493,10 +507,12 @@
       if (status !== "rejected") {
         status = "rejected";
         note = st.reason || "the far side refused the session";
+        failTransfers(note);
       }
     } else if (st?.state === "torn_down" && (status === "live" || status === "connecting")) {
       status = "ended";
       note = "session ended by the far side";
+      failTransfers(note);
     }
   });
 
@@ -510,6 +526,10 @@
   async function endAll() {
     if (closing) return;
     closing = true;
+    for (const controller of uploads.values()) controller.abort(new Error("Upload cancelled"));
+    // Give acknowledged staging-file cleanup a bounded opportunity before
+    // tearing down this window's temporary route.
+    await Promise.race([Promise.allSettled([...uploadTasks]), new Promise((r) => setTimeout(r, 600))]);
     // A normal Files window owns its temporary route. A mapped drive does not:
     // closing the browser leaves the mapping alive until the user taps Unmap.
     const ownedRoute = routeId && !mappedRoute ? routeId : null;
@@ -561,6 +581,7 @@
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
     return () => {
+      failTransfers("The file window closed");
       stopWatch?.();
       unlistenSaved?.();
       unlistenProgress?.();
@@ -762,6 +783,9 @@
               {#if t.state === "moving"}
                 <progress max={t.total || 1} value={t.total ? t.done : undefined}></progress>
                 <span class="t-note">{humanBytes(t.done)}{t.total ? ` / ${humanBytes(t.total)}` : ""}</span>
+                {#if t.kind === "up"}
+                  <button class="x small-x" onclick={() => uploads.get(t.req)?.abort(new Error("Upload cancelled"))} aria-label="Cancel upload">✕</button>
+                {/if}
               {:else if t.state === "done"}
                 <span class="t-note ok" title={t.note}>{t.kind === "down" ? "saved to Downloads" : "uploaded"} ✓</span>
                 <button class="act" title="Dismiss" onclick={() => dismissTransfer(t.req)}>✕</button>

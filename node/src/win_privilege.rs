@@ -182,9 +182,9 @@ mod imp {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_BAD_DEVICE, ERROR_FILE_NOT_FOUND,
-        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_PATH_NOT_FOUND,
-        FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, LocalFree, ERROR_BAD_DEVICE, ERROR_CONNECTION_UNAVAIL,
+        ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_CONNECTED,
+        ERROR_PATH_NOT_FOUND, FALSE, HANDLE, NO_ERROR, TRUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::NetworkManagement::WNet::{
         WNetAddConnection2W, WNetCancelConnection2W, WNetGetConnectionW, NETRESOURCEW,
@@ -384,6 +384,44 @@ mod imp {
                 .ok_or_else(|| "couldn't inspect the signed-in user's drive letters".into())
         })
         .map(|mask| mask.unwrap_or(0))
+    }
+
+    /// Local Windows assignment state, including unavailable network drives.
+    /// Do not open a drive root or probe whether its server is reachable.
+    pub(crate) fn assigned_drive_mask() -> Result<u32, String> {
+        let mut mask = unsafe { GetLogicalDrives() };
+        if mask == 0 {
+            return Err("couldn't inspect assigned drive letters".into());
+        }
+        for letter in b'A'..=b'Z' {
+            let mount = format!("{}:", char::from(letter));
+            if !read_dos_device_targets(&mount)?.is_empty() {
+                mask |= 1u32 << (letter - b'A');
+                continue;
+            }
+            let local = [u16::from(letter), u16::from(b':'), 0];
+            let mut remote = [0u16; 16];
+            let mut length = remote.len() as u32;
+            let status =
+                unsafe { WNetGetConnectionW(local.as_ptr(), remote.as_mut_ptr(), &mut length) };
+            match status {
+                NO_ERROR | ERROR_MORE_DATA | ERROR_CONNECTION_UNAVAIL => {
+                    mask |= 1u32 << (letter - b'A')
+                }
+                ERROR_BAD_DEVICE | ERROR_NOT_CONNECTED | ERROR_FILE_NOT_FOUND
+                | ERROR_PATH_NOT_FOUND => {}
+                error => {
+                    return Err(format!(
+                        "couldn't inspect the Windows mapping for {mount} (error {error})"
+                    ))
+                }
+            }
+        }
+        Ok(mask)
+    }
+
+    pub(crate) fn interactive_user_assigned_drive_mask() -> Result<u32, String> {
+        interactive_user_call("ams-drive-assignments", assigned_drive_mask)
     }
 
     /// Resolve a drive in the signed-in Explorer user's DOS-device namespace.
@@ -1173,7 +1211,10 @@ pub use imp::{
     interactive_user_network_mapping, ConsoleAgent, DesktopFollower,
 };
 #[cfg(windows)]
-pub(crate) use imp::{effective_user_sid, interactive_user_call};
+pub(crate) use imp::{
+    assigned_drive_mask, effective_user_sid, interactive_user_assigned_drive_mask,
+    interactive_user_call,
+};
 
 /// Whether this build targets Windows at all, hoisted here so callers don't
 /// sprinkle `cfg!`.

@@ -139,6 +139,25 @@ pub mod reboot;
 pub mod service_profiles;
 pub mod shares;
 pub mod sites;
+pub(crate) mod smb_drives;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_smb_mount;
+
+/// Dispatch the one-shot native mount operation before starting a desktop node.
+pub fn native_smb_helper_if_requested() -> Option<std::process::ExitCode> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix_smb_mount::run_helper_if_requested()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
+/// Embedded as well as shipped beside binaries so installs and self-updates
+/// retain the upstream permissions even when extracting only the executable.
+pub fn smb_license_notices() -> &'static str {
+    include_str!("../../docs/THIRD-PARTY-SMB-NOTICES.txt")
+}
 pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —

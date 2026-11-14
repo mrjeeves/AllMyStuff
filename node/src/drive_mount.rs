@@ -1,12 +1,12 @@
 //! Native drive mounts backed by a live mesh Storage route.
 //!
-//! Windows uses native Cloud Files callbacks; Unix uses a loopback-only
-//! WebDAV listener. Both adapters turn filesystem operations into scoped
-//! FileEvent RPCs across the encrypted mesh route. No WebDAV listener is
+//! Desktop mapped folders use native SMB over the mesh. Windows Fleetfiles
+//! keeps Cloud Files; macOS Fleetfiles keeps its separate local WebDAV volume.
+//! SMB bytes and FileEvent RPCs use the encrypted mesh route. No listener is
 //! exposed to the LAN and no local source path is disclosed to the receiver.
 
 use std::collections::HashMap;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
@@ -24,18 +24,18 @@ use dav_server::fs::{
     OpenOptions, ReadDirMeta,
 };
 use futures_util::{future, FutureExt, StreamExt};
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use hyper::{server::conn::http1, service::service_fn};
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use tokio::net::TcpListener;
 
 #[cfg(target_os = "macos")]
 use dav_server::localfs::LocalFs;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use dav_server::{fakels::FakeLs, DavHandler};
 
 pub const FLEETFILES_ROUTE: &str = "fleetfiles:local";
@@ -46,13 +46,13 @@ pub(crate) fn test_cloud_alias(
     mount: Option<&str>,
 ) -> Result<String, String> {
     if let Some(mount) = mount {
-        windows_drive_mount::alias(mount, root, true)?;
+        windows_cloud_alias::alias(mount, root, true)?;
         return Ok(mount.to_string());
     }
-    let mask = windows_logical_drive_mask()?
-        | crate::win_privilege::interactive_user_logical_drive_mask()?;
-    let mount = select_windows_mount(None, |mount| !drive_letter_reserved(mount, mask))?;
-    windows_drive_mount::alias(&mount, root, false)?;
+    let mask = crate::win_privilege::assigned_drive_mask()?
+        | crate::win_privilege::interactive_user_assigned_drive_mask()?;
+    let mount = select_windows_mount(None, |mount| !drive_letter_assigned(mount, mask))?;
+    windows_cloud_alias::alias(&mount, root, false)?;
     Ok(mount)
 }
 
@@ -60,8 +60,12 @@ use crate::mesh::Mesh;
 
 #[cfg(target_os = "linux")]
 #[path = "linux_drive_mount.rs"]
+#[allow(dead_code)] // Retained for exact legacy mount recovery and pending cache checks.
 mod linux_drive_mount;
 
+#[cfg(windows)]
+#[path = "windows_cloud_alias.rs"]
+mod windows_cloud_alias;
 #[cfg(windows)]
 #[path = "windows_drive_mount.rs"]
 mod windows_drive_mount;
@@ -80,21 +84,11 @@ struct ActiveMount {
     #[cfg(target_os = "linux")]
     helper: Option<linux_drive_mount::MountedHelper>,
     #[cfg(windows)]
-    cloud_drive: Option<windows_drive_mount::NativeCloudDrive>,
+    smb_drive: Option<windows_drive_mount::NativeSmbDrive>,
     #[cfg(windows)]
     cloud_provider: Option<crate::windows_cloud_files::CloudConnection>,
-}
-
-#[cfg(target_os = "linux")]
-struct AbortMountStartup(Option<tokio::task::AbortHandle>);
-
-#[cfg(target_os = "linux")]
-impl Drop for AbortMountStartup {
-    fn drop(&mut self) {
-        if let Some(server) = self.0.take() {
-            server.abort();
-        }
-    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unix_smb: Option<crate::unix_smb_mount::NativeSmbMount>,
 }
 
 #[cfg(target_os = "macos")]
@@ -191,9 +185,17 @@ impl DriveMounts {
 
     pub async fn cleanup_stale(&self) {
         cleanup_stale_native_mounts().await;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Err(error) = crate::unix_smb_mount::cleanup().await {
+            tracing::warn!(%error,"couldn't recover native SMB mounts");
+        }
         #[cfg(windows)]
         if let Err(error) = windows_drive_mount::cleanup() {
-            tracing::warn!(%error,"couldn't recover native Cloud Files aliases");
+            tracing::warn!(%error,"couldn't recover AMS SMB mappings");
+        }
+        #[cfg(windows)]
+        if let Err(error) = windows_cloud_alias::cleanup() {
+            tracing::warn!(%error,"couldn't migrate previous Cloud Files drive aliases");
         }
     }
 
@@ -271,9 +273,11 @@ impl DriveMounts {
                 #[cfg(target_os = "linux")]
                 helper: None,
                 #[cfg(windows)]
-                cloud_drive: None,
+                smb_drive: None,
                 #[cfg(windows)]
                 cloud_provider: Some(cloud_provider),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                unix_smb: None,
             },
         );
         #[cfg(windows)]
@@ -306,10 +310,17 @@ impl DriveMounts {
             if windows_drive_mount::remove_known(mount)? {
                 return Ok(());
             }
+            if windows_cloud_alias::remove_known(mount)? {
+                return Ok(());
+            }
             remove_known_native_mount(mount).await
         }
         #[cfg(not(windows))]
         {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if crate::unix_smb_mount::remove_known(Path::new(mount)).await? {
+                return Ok(());
+            }
             remove_known_native_mount(mount).await
         }
     }
@@ -327,147 +338,114 @@ impl DriveMounts {
             return Ok(existing.info.clone());
         }
         let active = self.list();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::unix_smb_mount::ensure_supported()?;
+        #[cfg(target_os = "linux")]
+        linux_drive_mount::check_migration_cache(_mapping)?;
         #[cfg(windows)]
-        if let Some(requested) = normalize_requested_mount(&requested_mount)? {
-            // A reconnect is allowed to reclaim only a letter carrying our
-            // private lease marker. This is the half-open state produced when
-            // Windows remembers a dead WebDAV mapping after the old route and
-            // listener are gone. Never touch a user's unrelated mapping.
-            if !active
-                .iter()
-                .any(|entry| entry.mount.eq_ignore_ascii_case(&requested))
-            {
-                windows_drive_mount::remove_known(&requested)?;
-                reclaim_stale_owned_mount(&requested).await?;
-            }
+        {
+            windows_drive_mount::ensure_supported().await?;
+            windows_cloud_alias::migrate(_mapping)?;
         }
         let mount = choose_mount(&requested_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
         #[cfg(windows)]
         {
-            let cloud_drive = windows_drive_mount::NativeCloudDrive::start(
-                mesh,
-                route.clone(),
-                mount.clone(),
-                label.clone(),
-                _mapping,
-            )
-            .await?;
+            let (endpoint, address, server) = mesh.smb_drive_tunnel(&route, _mapping).await?;
+            let smb_drive =
+                match windows_drive_mount::NativeSmbDrive::start(&mount, &label, address, endpoint)
+                    .await
+                {
+                    Ok(drive) => drive,
+                    Err(error) => {
+                        server.abort();
+                        mesh.stop_smb_tunnel(&route);
+                        return Err(error);
+                    }
+                };
+            if !mesh.smb_route_active(&route) {
+                drop(smb_drive);
+                server.abort();
+                mesh.stop_smb_tunnel(&route);
+                return Err("the drive grant ended while Windows was connecting".into());
+            }
             let info = NativeDriveInfo {
                 route: route.clone(),
                 label,
                 mount,
-                port: 0,
+                port: address.port(),
             };
             self.active.lock().insert(
                 route,
                 ActiveMount {
                     info: info.clone(),
-                    server: tokio::spawn(std::future::pending()),
-                    cloud_drive: Some(cloud_drive),
+                    server,
+                    smb_drive: Some(smb_drive),
                     cloud_provider: None,
                 },
             );
             Ok(info)
         }
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|error| format!("couldn't start the local drive bridge: {error}"))?;
-            let port = listener
-                .local_addr()
-                .map_err(|error| error.to_string())?
-                .port();
-            let server = DavHandler::builder()
-                .filesystem(Box::new(RemoteDavFs::new(mesh, route.clone())))
-                .locksystem(FakeLs::new())
-                .build_handler();
-            let server_task = tokio::spawn(async move {
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    let handler = server.clone();
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(stream);
-                        if let Err(error) = http1::Builder::new()
-                        .serve_connection(
-                            io,
-                            service_fn(move |request| {
-                                let handler = handler.clone();
-                                async move { Ok::<_, Infallible>(handler.handle(request).await) }
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::debug!("native drive WebDAV connection ended: {error}");
-                    }
-                    });
+            let (endpoint, address, server) = mesh.smb_drive_tunnel(&route, _mapping).await?;
+            let native =
+                crate::unix_smb_mount::NativeSmbMount::start(Path::new(&mount), address, endpoint)
+                    .await;
+            let native = match native {
+                Ok(native) => native,
+                Err(error) => {
+                    server.abort();
+                    mesh.stop_smb_tunnel(&route);
+                    return Err(error);
                 }
-            });
-            #[cfg(target_os = "linux")]
-            let mut startup = AbortMountStartup(Some(server_task.abort_handle()));
-            #[cfg(windows)]
-            let url = format!("http://localhost:{port}/");
-            #[cfg(not(windows))]
-            let url = format!("http://127.0.0.1:{port}/");
+            };
+            if !mesh.smb_route_active(&route) {
+                let _ = native.stop().await;
+                server.abort();
+                mesh.stop_smb_tunnel(&route);
+                return Err("the drive grant ended during native mount setup".into());
+            }
             let info = NativeDriveInfo {
                 route: route.clone(),
-                label: label.clone(),
-                mount: mount.clone(),
-                port,
+                label,
+                mount,
+                port: address.port(),
             };
-            // Unix mounts can survive their node process. Record ownership before
-            // invoking the OS helper so even a partial mount followed by an error
-            // remains safe to clean on the next start.
-            if let Err(error) = remember_native_mount(&info) {
-                server_task.abort();
-                return Err(format!("couldn't record the native drive mount: {error}"));
-            }
-            if let Err(error) = label_native(&mount, &label, &route, port).await {
-                tracing::warn!("couldn't label native drive {mount} as {label}: {error}");
-            }
-            #[cfg(target_os = "linux")]
-            let native = linux_drive_mount::start(Path::new(&mount), &url, _mapping).await;
-            #[cfg(not(target_os = "linux"))]
-            let native = mount_native(&mount, &url, &label).await;
-            if let Err(error) = native {
-                server_task.abort();
-                // A native helper can report failure after creating a partial
-                // mount. Remove it only when the OS still reports our exact
-                // loopback endpoint; another process may have won the mount race.
-                if let Err(cleanup_error) = release_native_mount_if_owned(&mount, port).await {
-                    tracing::warn!("couldn't clean failed native mount {mount}: {cleanup_error}");
-                }
-                return Err(error);
-            }
-            #[cfg(target_os = "linux")]
-            let helper = native.unwrap();
-            #[cfg(target_os = "linux")]
-            startup.0.take();
             self.active.lock().insert(
-                route.clone(),
+                route,
                 ActiveMount {
                     info: info.clone(),
-                    server: server_task,
+                    server,
+                    unix_smb: Some(native),
                     #[cfg(target_os = "linux")]
-                    helper: Some(helper),
+                    helper: None,
                 },
             );
-            if let Err(error) = label_native(&mount, &label, &route, port).await {
-                tracing::warn!("couldn't refresh native drive {mount} label {label}: {error}");
-            }
             Ok(info)
         }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        Err("native drive mounting is not available on this operating system".into())
     }
 
     pub fn stop(&self, route: &str) {
         let Some(active) = self.active.lock().remove(route) else {
             return;
         };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut active = active;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(native) = active.unix_smb.take() {
+            crate::spawn(async move {
+                if let Err(error) = native.stop().await {
+                    tracing::warn!(%error, "couldn't remove the owned native SMB mount");
+                }
+                active.server.abort();
+            });
+            return;
+        }
         #[cfg(windows)]
-        if active.cloud_drive.is_some() || active.cloud_provider.is_some() {
+        if active.smb_drive.is_some() || active.cloud_provider.is_some() {
             active.server.abort();
             drop(active);
             return;
@@ -518,24 +496,24 @@ impl DriveMounts {
 async fn choose_mount(
     requested: &str,
     _label: &str,
-    active: &[NativeDriveInfo],
+    _active: &[NativeDriveInfo],
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
         let remembered = remembered_network_mounts().await?;
-        let logical_drives = windows_logical_drive_mask()?
-            | crate::win_privilege::interactive_user_logical_drive_mask()?;
+        let logical_drives = crate::win_privilege::assigned_drive_mask()?
+            | crate::win_privilege::interactive_user_assigned_drive_mask()?;
         select_windows_mount(normalize_requested_mount(requested)?, |mount| {
-            mount_available(mount, active, &remembered, logical_drives)
+            mount_available(mount, &remembered, logical_drives)
         })
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        choose_unix_mount(requested, _label, active).await
+        choose_unix_mount(requested, _label, _active).await
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
-        let _ = (requested, _label, active);
+        let _ = (requested, _label, _active);
         Err("native drive mounting is not available on this operating system".into())
     }
 }
@@ -676,7 +654,7 @@ fn select_windows_mount(
         // replacement instead of fighting that owner on every reconnect.
         tracing::warn!("{mount} is already in use; choosing another drive letter");
     }
-    for letter in ('D'..='Z').rev() {
+    for letter in ('A'..='Z').rev() {
         let mount = format!("{letter}:");
         if requested.as_deref() == Some(mount.as_str()) {
             continue;
@@ -707,20 +685,23 @@ fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> 
 #[cfg(windows)]
 fn mount_available(
     mount: &str,
-    active: &[NativeDriveInfo],
     remembered: &std::collections::HashSet<String>,
     logical_drives: u32,
 ) -> bool {
-    if drive_letter_reserved(mount, logical_drives)
+    if drive_letter_assigned(mount, logical_drives)
         || remembered.contains(&mount.to_ascii_uppercase())
-        || active
-            .iter()
-            .any(|entry| entry.mount.eq_ignore_ascii_case(mount))
-        || std::path::Path::new(&format!("{mount}\\")).exists()
     {
         return false;
     }
     true
+}
+
+#[cfg(windows)]
+async fn windows_letter_available(mount: &str) -> Result<bool, String> {
+    let remembered = remembered_network_mounts().await?;
+    let assigned = crate::win_privilege::assigned_drive_mask()?
+        | crate::win_privilege::interactive_user_assigned_drive_mask()?;
+    Ok(mount_available(mount, &remembered, assigned))
 }
 
 #[cfg(windows)]
@@ -823,7 +804,7 @@ async fn remembered_network_registry_mounts() -> Result<std::collections::HashSe
     }
 }
 #[cfg(windows)]
-fn drive_letter_reserved(mount: &str, logical_drives: u32) -> bool {
+fn drive_letter_assigned(mount: &str, logical_drives: u32) -> bool {
     drive_letter_bit(mount).is_some_and(|bit| logical_drives & bit != 0)
 }
 
@@ -1205,7 +1186,7 @@ fn save_native_mount_leases(leases: &[NativeDriveInfo]) -> Result<(), String> {
         .map_err(|error| format!("couldn't save native mount leases: {error}"))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn remember_native_mount(info: &NativeDriveInfo) -> Result<(), String> {
     let _guard = NATIVE_MOUNT_LEASE_LOCK.lock();
     let mut leases = load_native_mount_leases();
@@ -1311,7 +1292,7 @@ async fn unmount_native(_mount: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 async fn label_native(_mount: &str, _label: &str, _route: &str, _port: u16) -> Result<(), String> {
     Ok(())
 }
@@ -1915,10 +1896,10 @@ mod registry_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::{
-        drive_letter_reserved, mount_available, normalize_requested_mount,
+        drive_letter_assigned, mount_available, normalize_requested_mount,
         parse_network_registry_mounts, parse_registry_dword, select_windows_mount,
         windows_dos_device_targets_match_port, windows_mapping_output_matches_port,
-        windows_webdav_remote, NativeDriveInfo,
+        windows_webdav_remote,
     };
     use std::collections::HashSet;
 
@@ -1960,9 +1941,9 @@ mod windows_tests {
     #[test]
     fn assigned_drive_mask_wins_even_when_the_path_is_inaccessible() {
         let z = 1_u32 << u32::from(b'Z' - b'A');
-        assert!(drive_letter_reserved("Z:", z));
-        assert!(drive_letter_reserved("z:", z));
-        assert!(!drive_letter_reserved("Y:", z));
+        assert!(drive_letter_assigned("Z:", z));
+        assert!(drive_letter_assigned("z:", z));
+        assert!(!drive_letter_assigned("Y:", z));
     }
 
     #[test]
@@ -1980,20 +1961,30 @@ HKEY_CURRENT_USER\Network\TooLong
     }
 
     #[test]
-    fn every_windows_assignment_surface_reserves_its_letter() {
+    fn assigned_and_disconnected_remembered_drives_are_unavailable() {
         let logical = 1_u32 << u32::from(b'X' - b'A');
         let remembered = HashSet::from(["Y:".to_string()]);
-        let active = vec![NativeDriveInfo {
-            route: "route".into(),
-            label: "label".into(),
-            mount: "W:".into(),
-            port: 1,
-        }];
+        assert!(!mount_available("X:", &remembered, logical));
+        assert!(!mount_available("Y:", &remembered, logical));
+        assert!(mount_available("W:", &remembered, logical));
+        let next = select_windows_mount(Some("Y:".into()), |mount| {
+            mount_available(mount, &HashSet::from(["Z:".into(), "Y:".into()]), logical)
+        })
+        .unwrap();
+        assert_eq!(next, "W:");
+    }
 
-        assert!(!mount_available("X:", &active, &remembered, logical));
-        assert!(!mount_available("Y:", &active, &remembered, logical));
-        assert!(!mount_available("W:", &active, &remembered, logical));
-        assert!(mount_available("V:", &active, &remembered, logical));
+    #[test]
+    fn auto_has_no_generically_reserved_letters() {
+        for free in b'A'..=b'Z' {
+            let available = format!("{}:", char::from(free));
+            assert_eq!(
+                select_windows_mount(None, |mount| mount == available).unwrap(),
+                available
+            );
+        }
+        assert_eq!(select_windows_mount(None, |_| true).unwrap(), "Z:");
+        assert!(select_windows_mount(None, |_| false).is_err());
     }
 
     #[test]

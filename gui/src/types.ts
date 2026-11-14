@@ -717,6 +717,8 @@ export interface FileVolume {
  *  is base64 (the wire is JSON). Every event carries the viewer-minted
  *  request id (`req`) it belongs to. */
 export type FileEvent =
+  | { kind: "smb_mount"; req: number }
+  | { kind: "smb_endpoint"; req: number; endpoint: { port: number; share: string; username: string; password: string } }
   | { kind: "volumes"; req: number }
   | { kind: "list"; req: number; path: string; cursor?: string | null; limit?: number | null }
   | { kind: "watch_directory"; req: number; path: string }

@@ -79,7 +79,8 @@ jobs:
         # ffmpeg-next 6.1 requires FFmpeg 6 headers. Ubuntu 26.04 ships
         # FFmpeg 8, which removed avfft.h; migrate the bindings deliberately
         # before changing this reference platform.
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        # Exercise the release floor and both shipped Mac/Linux CPUs too.
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     # The Opus bundled by `audiopus_sys` (via the `opus` crate) declares an
     # ancient `cmake_minimum_required`, which CMake 4.x on the runners refuses
@@ -102,14 +103,13 @@ jobs:
       # transitively through webkit/gtk; the headless node has to ask for them.
       - name: Linux media deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
-            libgbm-dev libudev-dev libgtk-3-dev libwayland-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-            libavdevice-dev libswscale-dev libswresample-dev
+        timeout-minutes: 20
+        uses: ./.github/actions/linux-desktop-deps
+        with:
+          webview: "false"
+          ffmpeg: ${{ matrix.os == 'ubuntu-24.04' }}
       - name: Verify FFmpeg binding compatibility
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           version=$(pkg-config --modversion libavcodec)
           echo "libavcodec version: $version (ffmpeg-next 6.1 expects major 60)"
@@ -127,17 +127,17 @@ jobs:
       # target there, so the platform-specific capture/input code is verified;
       # `-D warnings` lint policy stays on Linux, matching that history.
       - name: clippy
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-24.04'
         working-directory: node
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       # Lint + build the hardware-encode path too (FFmpeg dev libs installed
       # above). Linux is enough to verify the `hwenc` code; the per-OS encoder
       # list is the only platform-specific part. The default build above stays
       # software-only so the macOS/Windows jobs need no FFmpeg toolchain.
       - name: clippy (hwenc)
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-24.04'
         working-directory: node
-        run: cargo clippy --all-targets --features hwenc -- -D warnings
+        run: cargo clippy --locked --all-targets --features hwenc -- -D warnings
       # The capture-less path the iOS/Android app links: `mesh.rs` is shared
       # with the mobile build, which compiles it against `stubs/video.rs` /
       # `stubs/terminal.rs` instead of the real capture backends. Nothing else
@@ -148,14 +148,69 @@ jobs:
       - name: check capture-less stub (mobile config)
         if: runner.os == 'Linux'
         working-directory: node
-        run: cargo check --no-default-features
+        run: cargo check --locked --no-default-features
       - name: test
         working-directory: node
-        run: cargo test
-      - name: test (hwenc)
-        if: runner.os == 'Linux'
+        run: cargo test --locked
+      - name: SMB dependency licenses and distribution notices
         working-directory: node
-        run: cargo test --features hwenc
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo metadata --locked --format-version 1 --filter-platform "$host" |
+            python ../scripts/check-smb-licenses.py --check-notices ../docs/THIRD-PARTY-SMB-NOTICES.txt
+      - name: native SMB client interoperability (sparse files beyond 4 GiB)
+        if: runner.os != 'Windows'
+        timeout-minutes: 5
+        working-directory: node
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_binary=$(cargo build --locked --bin allmystuff-serve --message-format=json |
+            python3 -c 'import sys,json; rows=[json.loads(line) for line in sys.stdin]; print(next(row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="allmystuff-serve" and row.get("executable")))')
+          test_binary=$(cargo test --locked --lib --no-run --message-format=json |
+            python3 -c 'import sys,json; rows=[json.loads(line) for line in sys.stdin]; print(next(row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("profile",{}).get("test") and row.get("target",{}).get("kind")==["lib"] and row.get("executable")))')
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            # Match release identity. Apple Silicon's linker signs ad hoc;
+            # Intel's unsigned cargo executables need the explicit step.
+            codesign --force --sign - "$helper_binary"
+            codesign --force --sign - "$test_binary"
+            codesign --verify --strict "$helper_binary"
+            # Fresh headless VMs may not have loaded Apple's built-in SMB
+            # filesystem yet. Load the OS component, as Linux does for cifs;
+            # the actual mount still runs as the unprivileged desktop user.
+            sudo /usr/bin/kmutil load --bundle-identifier com.apple.filesystems.smbfs
+            sudo /usr/bin/kmutil showloaded --bundle-identifier com.apple.filesystems.smbfs
+          fi
+          test_name=unix_smb_mount::tests::native_smb_client_reads_and_writes_beyond_four_gib
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo modprobe cifs
+            sudo env ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture
+          else
+              # NetFS authorizes custom locations with UI. Prepare one empty
+              # standard volume so unattended CI needs no consent dialog;
+              # mounting and all file I/O still run as the ordinary user.
+              fixture="/Volumes/AMS SMB CI ${GITHUB_RUN_ID}"
+              sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$fixture"
+              trap 'if [[ -e "$fixture" ]]; then sudo rmdir "$fixture"; fi' EXIT
+              export ALLMYSTUFF_TEST_NATIVE_SMB_MOUNT="$fixture"
+              if ! ALLMYSTUFF_TEST_NATIVE_SMB_HELPER="$helper_binary" "$test_binary" --exact "$test_name" --ignored --test-threads=1 --nocapture; then
+                id
+                stat -f 'Console owner: %Su (%u)' /dev/console
+                ls -l /dev/nsmb* 2>/dev/null || true
+                # Only this disposable fixture runs here. Redact generated
+                # credentials if an OS diagnostic happens to include one.
+                sudo /usr/bin/log show --last 1m --style compact --info --debug \
+                  --predicate '(process == "kernel" OR process == "NetAuthSysAgent" OR process == "NetAuthAgent" OR process == "allmystuff-serve") AND (eventMessage CONTAINS[c] "smb" OR eventMessage CONTAINS[c] "mount")' \
+                  | sed -E 's/[[:xdigit:]]{64}/<redacted>/g' | tail -80 || true
+                exit 1
+              fi
+          fi
+      - name: test (hwenc)
+        if: matrix.os == 'ubuntu-24.04'
+        working-directory: node
+        run: cargo test --locked --features hwenc
 
   # The Tauri backend (its own workspace): cpal audio bridge + mesh session
   # + control client. Compile-checked on all three platforms — this is what
@@ -165,7 +220,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Match every native release target; keep latest Linux as a forward
+        # compatibility check alongside the glibc 2.35 release floor.
+        os: [ubuntu-latest, ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     # Skip bundling the myownmesh daemon sidecar here — CI only needs to
     # verify the app compiles. build.rs stamps a stub so tauri-build's
@@ -185,11 +242,9 @@ jobs:
         with:
           workspaces: gui/src-tauri
       - name: Linux webview + audio deps
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libasound2-dev \
-            libpipewire-0.3-dev libxkbcommon-dev libgbm-dev
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        uses: ./.github/actions/linux-desktop-deps
       # Tauri's build script wants the frontend dist to exist.
       - uses: pnpm/action-setup@v4
         with:
@@ -206,12 +261,12 @@ jobs:
           pnpm build
       - name: cargo check backend
         working-directory: gui/src-tauri
-        run: cargo check
+        run: cargo check --locked
       # The backend has real unit tests now (the terminal's PTY host runs a
       # live openpty/ConPTY round-trip per OS) — run them where they run.
       - name: cargo test backend
         working-directory: gui/src-tauri
-        run: cargo test
+        run: cargo test --locked
 
   # The mobile (iOS/Android) Tauri shell. It reuses the same Svelte frontend
   # as the desktop and embeds the phone's viewer/controller core

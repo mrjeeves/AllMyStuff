@@ -4982,6 +4982,17 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--smb-license-notices") {
+        print!("{}", allmystuff_node::smb_license_notices());
+        return;
+    }
+    if let Some(code) = allmystuff_node::native_smb_helper_if_requested() {
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
     #[cfg(target_os = "macos")]
     if let Some(parent_pid) = process_arg_value("--macos-autostart-refresh") {
         // Always exit successfully: `launchctl submit` restarts this helper on

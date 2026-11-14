@@ -2181,9 +2181,7 @@ impl FleetfilesReplica {
             .file
             .flush()
             .map_err(|error| format!("flush Fleetfiles staging: {error}"))?;
-        transfer
-            .file
-            .sync_all()
+        crate::persist::sync_file(&transfer.file)
             .map_err(|error| format!("sync Fleetfiles staging: {error}"))?;
         if transfer.received != transfer.size {
             let _ = std::fs::remove_file(&transfer.staging);

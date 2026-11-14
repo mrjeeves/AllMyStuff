@@ -103,42 +103,7 @@ jobs:
       - name: Linux deps
         if: runner.os == 'Linux'
         timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # Ubuntu 22.04 ships PipeWire 0.3.48, whose headers are too old
-          # for the libspa 0.9 bindings xcap's screen capture pulls in —
-          # bindgen generates spa_video_info_raw without the `flags` field
-          # and libspa fails to compile (this is what sank the linux jobs
-          # of the v0.1.1 release). The pipewire-upstream PPA publishes
-          # current PipeWire built *for* 22.04, so the release keeps its
-          # glibc 2.35 floor while the capture stack compiles. ci.yml
-          # doesn't need this — it runs on ubuntu-latest (24.04), whose
-          # stock headers are new enough; that asymmetry is why CI stayed
-          # green while the release broke.
-          # GitHub's hosted x86_64 image puts an Azure mirror first in this
-          # mirror list. When that endpoint stops responding, apt can hang on
-          # one Packages file indefinitely instead of reaching the official
-          # fallback. Keep the fallback and remove only the unhealthy mirror.
-          if [[ -f /etc/apt/apt-mirrors.txt ]] && \
-             grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
-            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
-          fi
-
-          # add-apt-repository refreshes every apt source by default. Suppress
-          # that implicit, unbounded refresh and perform one explicit update
-          # with retries and transport timeouts instead.
-          sudo add-apt-repository -y --no-update ppa:pipewire-debian/pipewire-upstream
-          apt_options=(
-            -o Acquire::Retries=5
-            -o Acquire::http::Timeout=30
-            -o Acquire::https::Timeout=30
-          )
-          sudo apt-get "${apt_options[@]}" update
-          sudo env DEBIAN_FRONTEND=noninteractive \
-            apt-get "${apt_options[@]}" install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libssl-dev libasound2-dev xdg-utils \
-            libpipewire-0.3-dev libxkbcommon-dev libgbm-dev
+        uses: ./.github/actions/linux-desktop-deps
 
       # Match the repo's rust-toolchain.toml (channel = "stable") and ci.yml
       # so the selected target is added to the *same* toolchain cargo
@@ -214,7 +179,16 @@ jobs:
       # the CLI so a headless `allmystuff serve` / `allmystuff service` works
       # without the desktop app.
       - name: Build node serve binary
-        run: cargo build --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target ${{ matrix.platform.target }}
+        run: cargo build --locked --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target ${{ matrix.platform.target }}
+
+      - name: Verify and stage SMB license notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --manifest-path node/Cargo.toml --format-version 1 --filter-platform "${{ matrix.platform.target }}" |
+            python scripts/check-smb-licenses.py --check-notices docs/THIRD-PARTY-SMB-NOTICES.txt
+          mkdir -p dist-bin
+          cp docs/THIRD-PARTY-SMB-NOTICES.txt dist-bin/THIRD-PARTY-SMB-NOTICES.txt
 
       # Leave tauri-action a single, unambiguous app. `gui/mobile` is a second,
       # self-contained Tauri project (its own `[workspace]`, its own
@@ -249,6 +223,22 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.platform.target }} ${{ matrix.platform.bundle_args }}
 
+      # Tauri signs its app/bundled copies. The original standalone binaries
+      # are uploaded separately and used by the installer/self-updater too.
+      - name: Sign portable macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in \
+            target/${{ matrix.platform.target }}/release/allmystuff \
+            target/${{ matrix.platform.target }}/release/amst \
+            node/target/${{ matrix.platform.target }}/release/allmystuff-serve \
+            gui/src-tauri/target/${{ matrix.platform.target }}/release/allmystuff-gui; do
+            codesign --force --sign - "$binary"
+            codesign --verify --strict "$binary"
+          done
+
       # Hosted Windows runners already have VC++ installed, so simply launching
       # a binary there cannot catch the missing-DLL failure on a fresh PC.
       - name: Verify Windows binaries do not require the VC++ Redistributable
@@ -279,11 +269,11 @@ jobs:
           NAME="allmystuff-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
           else
             cp "$BIN" "dist-bin/allmystuff"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
@@ -303,11 +293,11 @@ jobs:
           NAME="amst-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/amst.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" amst.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" amst.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
           else
             cp "$BIN" "dist-bin/amst"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin amst
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin amst THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
@@ -330,12 +320,12 @@ jobs:
           NAME="allmystuff-gui-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff-gui.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-gui.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-gui.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
             rm -f dist-bin/allmystuff-gui.exe
           else
             cp "$BIN" "dist-bin/allmystuff-gui"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-gui
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-gui THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
             rm -f dist-bin/allmystuff-gui
           fi
@@ -356,12 +346,12 @@ jobs:
           NAME="allmystuff-serve-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/allmystuff-serve.exe"
-            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-serve.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-serve.exe THIRD-PARTY-SMB-NOTICES.txt)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
             rm -f dist-bin/allmystuff-serve.exe
           else
             cp "$BIN" "dist-bin/allmystuff-serve"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-serve
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-serve THIRD-PARTY-SMB-NOTICES.txt
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
             rm -f dist-bin/allmystuff-serve
           fi

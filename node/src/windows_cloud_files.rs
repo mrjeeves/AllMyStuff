@@ -307,6 +307,28 @@ enum Mutation {
     Delete(String),
 }
 
+pub(crate) fn has_pending_drive_edits(root: &Path) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    let identity = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+    let database = allmystuff_protocol::myownmesh_state_dir()
+        .ok_or("AllMyStuff state is unavailable")?
+        .join("cloud-provider")
+        .join(format!("{identity}.sqlite3"));
+    if !database.exists() {
+        return Ok(false);
+    }
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending) OR EXISTS(SELECT 1 FROM uploads)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
 struct Journal(Mutex<Connection>);
 impl Journal {
     fn open(path: &Path) -> Result<Self, String> {

@@ -1,28 +1,75 @@
 # Native drive mapping over the mesh
 
-This is the implementation and security specification. For ordinary mapping
-steps, start with [Files and drives](USING-ALLMYSTUFF.md#files-and-drives).
+This is the implementation specification. For ordinary mapping steps, start
+with [Files and drives](USING-ALLMYSTUFF.md#files-and-drives).
 
 ## Decision
 
-AllMyStuff maps an explicitly selected folder as a real operating-system
-drive. Windows receives an ordinary drive letter, macOS receives a mounted
-volume, and Linux receives a filesystem mount point. Native applications use
-the result directly; it is not an AllMyStuff-only file browser.
+Mapped/shared folders use SMB3 over the authenticated AMS Storage route on
+Windows, macOS and Linux. The source runs the same MIT-licensed `smb-server`
+backend, confined to the granted folder. The receiver uses its native OS SMB
+client through a private loopback tunnel. No listener is exposed to the LAN.
+There is no WebDAV/WebClient size ceiling or mapped-folder sync cache in this
+path, and no WinFsp or rclone dependency. Fleetfiles remains separate: Windows
+keeps Cloud Files and macOS keeps its existing local Fleetfiles presentation.
 
-Windows uses the built-in Cloud Files API. Each mapping has a durable local
-sync root, with a drive-letter alias in the signed-in user's namespace.
-Directory placeholders and on-demand reads translate into the existing scoped
-mesh file protocol. Byte sizes and offsets remain 64-bit; Windows WebClient's
-50 MB default and 4 GiB setting ceiling do not apply. No additional filesystem
-driver or mounting executable is used on Windows.
+## Distribution compatibility
 
-On macOS and Linux the receiving node runs a loopback-only WebDAV server that
-translates filesystem operations into the same mesh file protocol. macOS
-mounts it with its built-in `mount_webdav`, and Linux with
-an owned foreground `rclone mount` process over FUSE. The WebDAV server is never exposed to the LAN and
-the file bytes still travel only on the live AllMyStuff route (direct, STUN, or
-TURN).
+| Receiving platform | Native client | Requirements |
+| --- | --- | --- |
+| Windows x64 | Built-in SMB redirector | Windows 11 24H2 / Server 2025 or later; AMS service or elevated node; signed-in user |
+| macOS ARM64 / x64 | Built-in NetFS/SMB filesystem | Desktop user session; native mount authorization |
+| Linux ARM64 / x64 | Kernel CIFS/SMB3 filesystem | Kernel CIFS support; desktop user session; polkit/pkexec mount authorization or root |
+| iOS / Android | No native drive mount | Mobile remains a file browser/controller; no desktop mount is promised |
+
+Every desktop source/receiver OS pair uses the same SMB transport. Both
+endpoints need an AMS build advertising `smb-drives-v1`. Alternate SMB ports
+impose the Windows receiver minimum above; OS/token preflight runs before
+migration can remove a Cloud Files drive alias. Older Windows versions receive
+an explicit compatibility error rather than an implicit fallback.
+
+Linux releases retain the Ubuntu 22.04 / glibc 2.35 build floor. Debian packages
+declare `pkexec | policykit-1`; RPM packages declare `polkit`. AppImage/portable
+users need the host's polkit/pkexec package for an ordinary user mount. The
+desktop's polkit authentication agent must be running; helper stdin is reserved
+for the private SMB request, so no terminal-password fallback is enabled. The
+installer attempts to install `pkexec` on apt-based systems and gives
+instructions elsewhere. The client calls the kernel mount API directly; it
+neither bundles cifs-utils nor installs a filesystem driver. A hardened system
+service's private mount namespace cannot expose desktop mounts, so that case
+fails with instructions to use the desktop user node. Service hardening stays
+intact. Polkit authorizes a one-shot operation in the existing node executable;
+AMS does not install a setuid helper or privileged mount daemon.
+
+PR CI builds/tests the node and desktop backend on every native release runner:
+Ubuntu 22.04 x64/ARM64, macOS 15 ARM64/x64, and Windows x64. Ubuntu 24.04 also
+checks the optional FFmpeg encoder; latest Ubuntu checks the GUI. CI and release
+share the Linux dependency action. Node/desktop/mobile locks require rustix
+1.1.6 or later for the SMB Linux extended-attribute APIs. Locked checks prevent
+a newer local resolution from hiding an incompatible committed lockfile.
+
+Unix native-client tests mount a private share, read/write sparse data beyond
+4 GiB, exercise mutation, and remove the mount and fixtures. They run with
+mount privileges on Linux and through NetFS as an ordinary macOS user. Mac CI
+prepares an empty, user-owned mount directory under `/Volumes` to avoid an
+unattended consent dialog; the application allows NetFS's normal authorization
+UI for custom locations. They do not replace real
+two-machine/package tests in the [platform matrix](SMB-MAPPED-DRIVES-TESTING.md).
+Windows Explorer mapping, every Linux distro, and mobile's embedded engine still
+need runtime acceptance; Android CI checks only the shell without that engine.
+
+## Licensing
+
+AMS integration code remains MIT. `smb-server` is pinned to MIT-licensed 0.10.0;
+its desktop dependency closure uses permissive licenses. MIT is selected where
+available; BSD, Unicode and Zlib notices retain their own terms. This does not
+relicense dependencies or OS filesystem implementations. No Samba server code
+or commercial filesystem SDK is embedded. `scripts/check-smb-licenses.py`
+checks each target's dependency closure in CI and release. The combined
+[upstream notices](THIRD-PARTY-SMB-NOTICES.txt) ship in GUI bundles and portable
+archives. A license/dependency change fails that guard until reviewed.
+The node and desktop shell also embed the notices; `allmystuff-serve
+--smb-license-notices` prints them even after a binary-only self-update.
 
 ## User contract
 
@@ -51,84 +98,62 @@ TURN).
 
 ## Architecture
 
-```text
-source machine                                      receiving machine
-┌─────────────────────────────┐                    ┌──────────────────────────┐
-│ selected local folder       │                    │ Explorer / Finder / apps │
-│ route-id → canonical root   │                    │ X:\ or native mount      │
-│             │               │                    │ Windows Cloud Files      │
-│ scoped FileEvent host       │◄══ mesh route ═══►│ or Unix loopback WebDAV │
-└─────────────────────────────┘  direct/STUN/TURN  │ scoped native adapter    │
-                                                   └──────────────────────────┘
-```
-
-One mapping has a stable mapping ID and a `Storage` route:
+One mapping has a stable mapping ID and Storage route:
 
 ```text
-<source>:drive-map:<mapping-id> → <receiver>:storage-in
+<source>:drive-map:<mapping-id> -> <receiver>:storage-in
+
+granted folder -> private SMB3 server <== authenticated AMS tunnel ==> native OS SMB client
 ```
 
-Both endpoints persist the mapping ID and its display relationship. The
-receiver additionally persists the reconnect information required to restore
-its OS mount. After the mount succeeds, it reports the actual selected drive
-letter or mount point to the source, so both interfaces display the same name
-and destination. Before offering, the source canonicalizes the chosen path and
-binds it locally to the mapping's route. Multiple folders between the same pair
-therefore remain independent.
+The source canonicalizes the root and binds it locally to that route. Scoped
+Files RPC negotiates the per-route SMB endpoint with random credentials. The
+capability-confined filesystem rejects traversal and symlink escapes. Signing
+and SMB3 encryption are required; SMB leases are disabled so external source
+edits remain visible. Credentials stay out of snapshots, debug output, saved
+leases and process arguments. General Sites grants do not expose this endpoint:
+only the route's authenticated peer can tunnel to its recorded SMB port.
 
-The native adapter adds metadata and random-access read/write operations to
-`FileEvent`. Replies for OS filesystem calls use a dedicated per-request
-waiter instead of the GUI Files queue. Existing whole-machine Files sessions,
-room shared-file downloads, and their permissions remain separate.
-
-On Windows the native adapter is a Cloud Files provider, shared with Fleetfiles.
-An explicit mapping keeps its own sync root and authorization route; it does not
-add the shared folder to the fleet namespace. The drive letter points to that
-root, while the registered Explorer location retains cached files when the
-source or node is offline.
-
-Windows writes land locally first. A durable SQLite journal retains pending
-creates, edits, renames, and deletions across reconnects. Closed file bodies
-stream to a private source-side staging sibling before publication by rename.
-Replacements keep the previous body in a verified backup sibling until the new
-body is published; the target name can be briefly absent between those renames.
-A receipt retains the staged body's native
-identity so reconnect can recognize a commit whose acknowledgement was lost.
-Observed conflicting source changes leave the local edit pending. Cached file
-content and the pending journal are retained when a mapping disconnects.
+Windows uses nonpersistent `New-SmbGlobalMapping`, restricted to the signed-in
+account and LocalSystem. macOS uses `NetFSMountURLSync` with separate in-memory
+credentials, loopback permission, native authorization UI and an exact mount
+directory. Linux uses the
+kernel CIFS mount with SMB3, signing, encryption, private file permissions and
+no userspace write cache. Credentials pass to the one-shot helper through
+stdin and then directly to the kernel. Saved leases contain only endpoint,
+owner and mount identity. Linux kernel mount IDs and macOS filesystem IDs
+protect replacement mounts; generation checks protect stale lease owners.
 
 ## Lifecycle
 
-1. Source selects and canonicalizes a folder, binds it to a fresh route id,
-   and offers the Storage route with `DriveRouteOffer` metadata.
-2. The receiver accepts under the normal Files authorization gate.
-3. On activation, Windows connects the Cloud Files provider to its mapping's
-   stable local root and creates a drive-letter alias. It selects the next free
-   letter from Z down to D when Auto. Only a recorded, exact alias target can
-   be reclaimed; unrelated SMB or other drive assignments are preserved.
-   macOS and Linux bind an ephemeral listener to `127.0.0.1:0`, build
-   `RemoteDavFs`, and choose a native destination. macOS uses
-   `~/AllMyStuff Drives/<name>`. A Linux system service uses
-   `/mnt/allmystuff/<name>`; a user process uses
-   `~/AllMyStuff Drives/<name>`. An explicit absolute mount point overrides
-   those defaults.
-4. Windows population and hydration callbacks become scoped FileEvents over
-   the active route. macOS/Linux WebDAV operations use that same protocol.
-5. Ordinary route loss aborts the listener, cancels in-flight RPCs, and
-   unmounts the native destination, but retains the relationship and reconnect
-   intent. Both interfaces show it as unavailable until the peer returns.
-6. Explicit removal deletes the relationship and reconnect intent on both
-   endpoints. A crash-safe pending removal is retried until the peer confirms
-   it, preventing a sleeping Windows machine from recreating an orphan drive.
-7. If native mounting fails, the receiver tears the route down instead of
-   showing a live connection line for a drive the operating system cannot use.
-8. AllMyStuff records only the native mounts it created. After a crash or hard
-   stop, startup cleanup unmounts those exact owned entries before restoring
-   the durable mapping relationships. It never sweeps unrelated mounts.
+1. The source selects/canonicalizes a folder, binds it to a new route ID and
+   offers Storage metadata. The receiver applies normal Files authorization.
+2. The receiver checks native support and migration recovery before choosing
+   its destination. Windows Auto searches Z through A with no generic letter
+   reservations. Assigned, disconnected and remembered drives are occupied;
+   selection never unmaps a drive to free a letter. Unix rejects an existing
+   mount or nonempty destination and chooses an available directory.
+3. The receiver negotiates the private SMB endpoint and starts its loopback
+   tunnel. It records recovery ownership before invoking the OS mount client,
+   then confirms the OS-reported mount. Both interfaces display the actual
+   letter/path chosen by the receiver.
+4. SMB bytes travel in bounded SiteFrames over the active Storage route. A
+   failed native mount tears down its tunnel rather than reporting a usable
+   drive. No native listener opens on the LAN.
+5. Route loss/removal closes the SMB server and its tunnel. Cleanup removes
+   only an owned endpoint/instance. A replacement drive or Unix mount is
+   preserved. Recovery leases survive incomplete cleanup for the next startup.
+6. Relationships retain reconnect intent; explicit removal records durable
+   removal on both endpoints and retries when a sleeping peer returns.
+7. Windows Cloud Files mapped-drive journals with unsent edits block migration;
+   old cache directories remain. Linux blocks migration if its prior rclone
+   cache contains files requiring recovery. Legacy exact-mount cleanup remains
+   available; migration never deletes old cached data.
+8. The separate Fleetfiles sync namespace/provider remains unchanged.
 
 ## KVM install and firmware media
 
-KVM media is deliberately not the desktop WebDAV mapping described above.
+KVM media is deliberately not the desktop SMB mapping described above.
 BIOS/UEFI cannot see a drive mounted by an operating-system agent. Instead:
 
 1. The source opens an ISO/IMG, or reads a selected removable USB disk as a raw
@@ -156,74 +181,23 @@ computer. That invariant is enforced in both the picker and the node backend.
 - All viewer paths are virtual paths below the bound root. Parent traversal,
   prefixes, and symlink escapes are rejected. The virtual root cannot be
   renamed or deleted.
-- WebDAV binds only to loopback. There is no new remotely reachable HTTP
-  service and no separate credential to leak.
+- SMB binds only to loopback. Per-route credentials require signing/encryption
+  and stay out of process arguments, snapshots and saved leases.
 - Native operating-system drive mapping never depends on a KVM and never
   creates a Files share *to* a KVM. KVM virtual media is a separate,
   purpose-built path that terminates at the KVM's USB gadget.
 
-## Compatibility and tradeoffs
+## Compatibility and verification
 
-- Windows requires Cloud Files support and an NTFS local cache volume. Native
-  applications read through normal file APIs, including seeks past 4 GiB.
-  Hydration has bounded, aligned range buffers and directory population uses
-  bounded source pages. Recovery enumerates only on-disk entries, avoiding
-  implicit downloads of the remote tree. The receiving volume must have space
-  for hydrated files and pending edits; drive free space reflects that cache
-  volume. Filesystem limits and actual free space still apply.
-- Native Cloud Files writes synchronize after applications close their files.
-  This is local sync-folder behavior: a successful local save can precede the
-  source acknowledgement. Explorer's in-sync state is set after publication.
-- Upgrade recovery recognizes legacy AMS WebDAV leases by their exact recorded
-  endpoint. It never disconnects an unrelated SMB mapping to obtain a letter.
-- macOS uses the operating system's built-in `mount_webdav` command and gives
-  the volume the label selected in AllMyStuff.
-- Linux uses `rclone mount` and FUSE as the signed-in user. Ubuntu and Debian
-  packages depend on `rclone` and `fuse3`; the portable installer attempts to
-  install them through `apt-get`. No per-URL `/etc/fstab` entry or root mount
-  privilege is needed. A restricted system service is still restricted:
-  desktop mounts belong in the interactive user node or a user service.
-- The node owns the Linux mount process and bounds startup and teardown.
-  Cleanup verifies the exact mount identity before unmounting, including after
-  a crash, rather than treating a reused mount path or a port prefix as ours.
-  Linux unmounts use `fusermount3` or `fusermount`.
-- Linux's write cache permits applications to seek while writing. Its private
-  configuration and cache are keyed to the logical mapping so a changed route
-  or loopback port does not change the cache identity. Closed writes are
-  uploaded promptly; interrupted, unsent cache data is retained rather than
-  removed during cleanup. The receiver must have space for buffered writes.
-  See the [rclone mount documentation](https://rclone.org/commands/rclone_mount/)
-  for the underlying FUSE and write-cache behavior.
-- The shared file protocol does not preserve all source filesystem features.
-  Hard links, alternate streams, and POSIX ownership are outside this mapping
-  contract. macOS/Linux additionally have their WebDAV representation limits.
-- Remote-source selection uses the already-authorized mesh Files session.
-  Pretending a native dialog on this PC could browse another PC was rejected;
-  so was temporarily exposing an entire remote disk merely to feed a picker.
-- The receiver chooses Auto at activation because only it knows which drive
-  letters are actually free. It reports that result to the source for display;
-  the receiver's OS remains authoritative.
+Mapped drives need the source online. Interrupted operations fail rather than
+becoming offline sync edits. Source permissions, capacity and filesystem limits
+still apply. Native SMB mounting follows OS authorization policy; no per-route
+`/etc/fstab` entry or relaxed service sandbox is installed. POSIX ownership,
+hard links and every source's metadata are not promised by a passing transfer.
 
-## Verification
-
-- Unit-test scoped paths, symlink/parent escape rejection, metadata, ranged
-  reads, and ranged writes.
-- Test offer metadata round-tripping and multiple unique folder routes.
-- On Windows, map a folder both directions, verify the letter appears in
-  Explorer, verify used and free space match the source filesystem, exercise
-  read/write/seek/rename/delete with native programs, and confirm each one-way
-  relationship appears on both machines.
-- On macOS, verify the selected label under `~/AllMyStuff Drives`, reconnect
-  after source sleep, and exercise the same native file operations.
-- On an Ubuntu file server, install and run the system service, verify the
-  mount under `/mnt/allmystuff`, reboot both sides independently, and confirm
-  the owned-mount cleanup restores the relationship without leaving a ghost
-  mount.
-- Take either endpoint offline, remove the relationship from the other, bring
-  it back, and confirm the pending removal clears the native drive and cannot
-  be resurrected by reconnect.
-- Repeat over forced TURN and while disconnecting mid-read.
-- Verify fleet, Files-share, and CECSupport-consent admission separately.
-- Verify ISO boot, raw USB installer boot, and firmware/BIOS media on both
-  NanoKVM and NanoKVM-Pro; confirm the attached computer never appears as an
-  eligible source and that Eject removes the presence relationship.
+Unit tests cover route admission, confined paths, protocol negotiation, drive
+allocation and mount ownership. Unix native-client tests exercise sparse data
+past 4 GiB and cleanup. Runtime acceptance must still cover every source/receiver
+pair, native application operations, reconnect/revocation, forced TURN and
+interruption. Use the [manual checklist](SMB-MAPPED-DRIVES-TESTING.md). Verify
+KVM ISO/raw USB/firmware media separately on NanoKVM and NanoKVM-Pro.

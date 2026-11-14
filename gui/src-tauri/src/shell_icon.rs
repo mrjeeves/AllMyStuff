@@ -312,6 +312,8 @@ fn render_icon_layers(icon: HICON, overlay: Option<HICON>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The shell shares native image-list initialization across these calls.
+    static SHELL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn shell_paths_drop_only_windows_verbatim_syntax() {
@@ -346,14 +348,23 @@ mod tests {
 
     #[test]
     fn filesystem_folder_icon_is_a_png() {
-        let encoded =
-            filesystem_icon(&std::env::temp_dir()).expect("Windows Shell returned no folder icon");
+        let _guard = SHELL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let folder = std::env::temp_dir().join(format!("ams-shell-icon-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("ordinary folder fixture");
+        let encoded = filesystem_icon(&folder.canonicalize().unwrap());
+        std::fs::remove_dir(&folder).expect("remove empty icon fixture");
+        let encoded = encoded.expect("Windows Shell returned no folder icon");
         let decoded = STANDARD.decode(encoded).expect("base64 PNG");
         assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
     }
 
     #[test]
     fn recycle_bin_stock_icon_is_a_png() {
+        let _guard = SHELL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let encoded = recycle_bin_icon().expect("Windows Shell returned no Recycle Bin icon");
         let decoded = STANDARD.decode(encoded).expect("base64 PNG");
         assert_eq!(decoded.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()),);

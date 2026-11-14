@@ -16,6 +16,26 @@
 use std::io::Write;
 use std::path::Path;
 
+/// Keep the strongest supported flush. Darwin's F_FULLFSYNC is unavailable
+/// on network filesystems; an ordinary fsync still requests the SMB flush.
+/// Other errors (including a failed fallback) remain real transfer failures.
+pub(crate) fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    let result = file.sync_all();
+    #[cfg(target_os = "macos")]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::ENOTSUP))
+    {
+        use std::os::fd::AsRawFd;
+        return if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+    result
+}
+
 /// Atomically replace `path` with `bytes`. The temp file lives in the
 /// same directory (rename can't cross filesystems) and is created
 /// `0600` on Unix — the ownership record carries the plaintext fleet
@@ -42,7 +62,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         // The rename must not be able to land before the data does.
-        f.sync_all()?;
+        sync_file(&f)?;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);

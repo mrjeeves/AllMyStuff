@@ -124,26 +124,26 @@ install_serve_binary() {
 
 ensure_drive_mount_helper() {
   [ "$OS" = "linux" ] || return 0
-  if command -v rclone >/dev/null 2>&1 && { command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; }; then
+  if command -v pkexec >/dev/null 2>&1; then
     return 0
   fi
   if [ "$DRY_RUN" = "true" ]; then
-    log "(dry-run) would install rclone and fuse3 for native Linux drive mapping"
+    log "(dry-run) would install pkexec for native Linux SMB mount authorization"
     return 0
   fi
   if ! command -v apt-get >/dev/null 2>&1; then
-    warn "Native Linux drive mapping needs rclone and FUSE. Install them with your package manager."
+    warn "Native Linux SMB mapping needs the kernel CIFS client and polkit/pkexec mount authorization. Install polkit with your package manager."
     return 0
   fi
-  log "Installing rclone and fuse3 for native Linux drive mapping…"
+  log "Installing pkexec for native Linux SMB mount authorization…"
   if [ "$(id -u)" -eq 0 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rclone fuse3 ||
-      warn "Couldn't install rclone and fuse3; native drive mapping needs both packages."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkexec ||
+      warn "Couldn't install pkexec; native SMB mapping needs polkit mount authorization."
   elif sudo -n true 2>/dev/null; then
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rclone fuse3 ||
-      warn "Couldn't install rclone and fuse3; native drive mapping needs both packages."
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkexec ||
+      warn "Couldn't install pkexec; native SMB mapping needs polkit mount authorization."
   else
-    warn "Native Linux drive mapping needs rclone and fuse3. Run: sudo apt-get install rclone fuse3"
+    warn "Native Linux SMB mapping needs mount authorization. Run: sudo apt-get install pkexec"
   fi
 }
 

@@ -812,7 +812,7 @@ mod tests {
             file.write_all(b"start").unwrap();
             file.seek(SeekFrom::Start(offset)).unwrap();
             file.write_all(b"above-four-gib").unwrap();
-            file.sync_all().unwrap();
+            crate::persist::sync_file(&file).unwrap();
             drop(file);
             let source_path = source_copy.join("large-offset.bin");
             assert_eq!(std::fs::metadata(&source_path).unwrap().len(), offset + 14);
@@ -834,7 +834,7 @@ mod tests {
             drop(mapped);
             let mut small = std::fs::File::create(mount_copy.join("created.txt")).unwrap();
             small.write_all(b"native-create").unwrap();
-            small.sync_all().unwrap();
+            crate::persist::sync_file(&small).unwrap();
             drop(small);
             assert_eq!(
                 std::fs::read(source_copy.join("created.txt")).unwrap(),

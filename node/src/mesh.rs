@@ -1113,7 +1113,7 @@ impl DownloadSink {
         let end = download_chunk_end(self.written, self.reported_total, total, bytes.len(), eof)?;
         self.file.write_all(bytes)?;
         if eof {
-            self.file.sync_all()?;
+            crate::persist::sync_file(&self.file)?;
         }
         self.written = end;
         self.reported_total = Some(total);

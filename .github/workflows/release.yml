@@ -223,6 +223,22 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.platform.target }} ${{ matrix.platform.bundle_args }}
 
+      # Tauri signs its app/bundled copies. The original standalone binaries
+      # are uploaded separately and used by the installer/self-updater too.
+      - name: Sign portable macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in \
+            target/${{ matrix.platform.target }}/release/allmystuff \
+            target/${{ matrix.platform.target }}/release/amst \
+            node/target/${{ matrix.platform.target }}/release/allmystuff-serve \
+            gui/src-tauri/target/${{ matrix.platform.target }}/release/allmystuff-gui; do
+            codesign --force --sign - "$binary"
+            codesign --verify --strict "$binary"
+          done
+
       # Hosted Windows runners already have VC++ installed, so simply launching
       # a binary there cannot catch the missing-DLL failure on a fresh PC.
       - name: Verify Windows binaries do not require the VC++ Redistributable

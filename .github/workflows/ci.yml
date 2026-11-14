@@ -171,6 +171,14 @@ jobs:
             python3 -c 'import sys,json; rows=[json.loads(line) for line in sys.stdin]; print(next(row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="allmystuff-serve" and row.get("executable")))')
           test_binary=$(cargo test --locked --lib --no-run --message-format=json |
             python3 -c 'import sys,json; rows=[json.loads(line) for line in sys.stdin]; print(next(row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("profile",{}).get("test") and row.get("target",{}).get("kind")==["lib"] and row.get("executable")))')
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            # Match release identity. Apple Silicon's linker signs ad hoc;
+            # Intel's unsigned cargo executables need the explicit step.
+            codesign --force --sign - "$helper_binary"
+            codesign --force --sign - "$test_binary"
+            codesign --verify --strict "$helper_binary"
+            sudo /usr/bin/kmutil showloaded --bundle-identifier com.apple.filesystems.smbfs
+          fi
           test_name=unix_smb_mount::tests::native_smb_client_reads_and_writes_beyond_four_gib
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo modprobe cifs

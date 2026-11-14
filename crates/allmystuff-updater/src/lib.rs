@@ -1147,7 +1147,9 @@ fn runs_as_bundled_foreign_runtime() -> bool {
 }
 
 /// True when `path` lies inside `root`, compared component-wise and (because
-/// this guards Windows paths) case-insensitively.
+/// this guards Windows paths) case-insensitively. Only the Windows service-copy
+/// check calls it outside tests.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn path_is_within(path: &Path, root: &Path) -> bool {
     let mut path = path.components();
     for root_part in root.components() {

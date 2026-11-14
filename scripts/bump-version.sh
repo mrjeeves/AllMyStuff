@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Bump every workspace crate's version + the workspace root in a
-# single atomic edit. Argument is the new version, e.g.
+# single operation. Argument is the new version, e.g.
 # `./scripts/bump-version.sh 0.2.0`.
 #
 # Edits:
 #   - Cargo.toml                    [workspace.package].version
 #   - crates/*/Cargo.toml           no-op (they inherit via version.workspace = true)
 #   - gui/src-tauri/Cargo.toml      [package].version  (separate workspace)
-#   - gui/src-tauri/Cargo.lock      allmystuff-gui [[package]] version
+#   - gui/src-tauri/Cargo.lock      every affected local package version
 #   - gui/package.json              "version"
 #   - node/Cargo.toml               [package].version  (separate workspace)
-#   - node/Cargo.lock               allmystuff-node [[package]] version
+#   - node/Cargo.lock               every affected local package version
+#   - gui/mobile/*                  mobile manifests + local package lock entries
 #
 # The GUI lives in its own Cargo workspace (so `cargo build --workspace`
 # at the root stays fast — no Tauri compile), so its version doesn't
@@ -40,15 +41,12 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKSPACE_TOML="$ROOT/Cargo.toml"
 GUI_TAURI_TOML="$ROOT/gui/src-tauri/Cargo.toml"
-GUI_TAURI_LOCK="$ROOT/gui/src-tauri/Cargo.lock"
 GUI_PACKAGE_JSON="$ROOT/gui/package.json"
 NODE_TOML="$ROOT/node/Cargo.toml"
-NODE_LOCK="$ROOT/node/Cargo.lock"
 # The mobile app is a third, self-contained Tauri workspace (gui/mobile). It
 # doesn't inherit the root version either, and if it lags, tauri-action can
 # mis-resolve the desktop release to it — so keep it in lockstep here too.
 MOBILE_TOML="$ROOT/gui/mobile/Cargo.toml"
-MOBILE_LOCK="$ROOT/gui/mobile/Cargo.lock"
 MOBILE_TAURI="$ROOT/gui/mobile/tauri.conf.json"
 MOBILE_PACKAGE_JSON="$ROOT/gui/mobile/package.json"
 
@@ -107,10 +105,6 @@ with open(path, "w", encoding="utf-8") as f:
 print(f"bumped {path} -> {version} ({n_deps} internal dep pin(s) updated)")
 PY
 
-# Refresh Cargo.lock so it tracks the new version.
-cd "$ROOT"
-cargo update --workspace --quiet || true
-
 # --- GUI sub-workspace --------------------------------------------------
 
 if [ -f "$GUI_TAURI_TOML" ]; then
@@ -136,31 +130,6 @@ if n != 1:
 with open(path, "w", encoding="utf-8") as f:
     f.write(new_content)
 print(f"bumped {path} -> {version}")
-PY
-fi
-
-if [ -f "$GUI_TAURI_LOCK" ]; then
-    # gui/src-tauri/Cargo.lock — bump the [[package]] entry whose name is
-    # "allmystuff-gui". The lock file groups each package's fields together
-    # so the `version` field we want is always the next one after the name.
-    python3 - "$GUI_TAURI_LOCK" "$VERSION" <<'PY'
-import re
-import sys
-
-path, version = sys.argv[1], sys.argv[2]
-with open(path, "r", encoding="utf-8") as f:
-    content = f.read()
-
-pattern = re.compile(
-    r'(name\s*=\s*"allmystuff-gui"\s*\nversion\s*=\s*")[^"]*(")',
-)
-new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
-if n != 1:
-    print(f"warning: could not find allmystuff-gui in {path} (skipping)", file=sys.stderr)
-else:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    print(f"bumped {path} -> {version}")
 PY
 fi
 
@@ -194,30 +163,6 @@ print(f"bumped {path} -> {version}")
 PY
 fi
 
-if [ -f "$NODE_LOCK" ]; then
-    # node/Cargo.lock — bump the [[package]] entry whose name is
-    # "allmystuff-node".
-    python3 - "$NODE_LOCK" "$VERSION" <<'PY'
-import re
-import sys
-
-path, version = sys.argv[1], sys.argv[2]
-with open(path, "r", encoding="utf-8") as f:
-    content = f.read()
-
-pattern = re.compile(
-    r'(name\s*=\s*"allmystuff-node"\s*\nversion\s*=\s*")[^"]*(")',
-)
-new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
-if n != 1:
-    print(f"warning: could not find allmystuff-node in {path} (skipping)", file=sys.stderr)
-else:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    print(f"bumped {path} -> {version}")
-PY
-fi
-
 # --- mobile sub-workspace (gui/mobile) ----------------------------------
 
 if [ -f "$MOBILE_TOML" ]; then
@@ -242,29 +187,6 @@ if n != 1:
 with open(path, "w", encoding="utf-8") as f:
     f.write(new_content)
 print(f"bumped {path} -> {version}")
-PY
-fi
-
-if [ -f "$MOBILE_LOCK" ]; then
-    # gui/mobile/Cargo.lock — the [[package]] entry named "allmystuff-mobile".
-    python3 - "$MOBILE_LOCK" "$VERSION" <<'PY'
-import re
-import sys
-
-path, version = sys.argv[1], sys.argv[2]
-with open(path, "r", encoding="utf-8") as f:
-    content = f.read()
-
-pattern = re.compile(
-    r'(name\s*=\s*"allmystuff-mobile"\s*\nversion\s*=\s*")[^"]*(")',
-)
-new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
-if n != 1:
-    print(f"warning: could not find allmystuff-mobile in {path} (skipping)", file=sys.stderr)
-else:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    print(f"bumped {path} -> {version}")
 PY
 fi
 
@@ -316,5 +238,17 @@ if [ -f "$GUI_PACKAGE_JSON" ]; then
         console.log(`bumped ${f} -> ${process.argv[2]}`);
     ' "$GUI_PACKAGE_JSON" "$VERSION"
 fi
+
+# Resolve only workspace/path packages after *all* manifests have been bumped.
+# Each independent lock also records shared local dependencies (and GUI/mobile
+# record the node), so editing just its top-level package leaves --locked builds
+# broken. Cargo keeps unrelated dependency selections, including independently
+# versioned local crates. Any resolution failure must stop `just release` before
+# it commits or pushes a tag.
+for manifest in "$WORKSPACE_TOML" "$NODE_TOML" "$GUI_TAURI_TOML" "$MOBILE_TOML"; do
+    if [ -f "$manifest" ]; then
+        cargo update --workspace --manifest-path "$manifest" --quiet
+    fi
+done
 
 echo "ok"

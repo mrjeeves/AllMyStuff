@@ -34,6 +34,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Release version-bump regression tests (system Bash)
+        if: runner.os != 'Windows'
+        run: python3 scripts/bump-version.tests.py
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         if: matrix.os == 'ubuntu-latest'

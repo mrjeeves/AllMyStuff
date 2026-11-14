@@ -594,16 +594,20 @@ fn mount_native(lease: &Lease, password: &str) -> Result<(), String> {
     let user = CFString::new("ams");
     let secret = CFString::new(password);
     let yes = CFBoolean::true_value().as_CFType();
+    // NetFS permits NoUI only for standard /Volumes mount points. Elsewhere
+    // the OS requires its normal consent UI; suppressing it returns EPERM.
+    // At an already-authorized standard volume, avoid an unnecessary server
+    // confirmation dialog (including unattended native-client tests).
+    let ui = if lease.mount.parent() == Some(Path::new("/Volumes")) {
+        "NoUI"
+    } else {
+        "AllowUI"
+    };
     let open: CFMutableDictionary<CFString, CFType> = CFMutableDictionary::from_CFType_pairs(&[
         (CFString::new("AllowLoopback"), yes.clone()),
         (CFString::new("ForceNewSession"), yes.clone()),
         (CFString::new("NoUserPreferences"), yes.clone()),
-        // NetFS rejects custom mount locations when NoUI is explicit. Use
-        // Apple's normal authorization UI when the OS requires user consent.
-        (
-            CFString::new("UIOption"),
-            CFString::new("AllowUI").as_CFType(),
-        ),
+        (CFString::new("UIOption"), CFString::new(ui).as_CFType()),
     ]);
     let options: CFMutableDictionary<CFString, CFType> = CFMutableDictionary::from_CFType_pairs(&[
         (CFString::new("MountAtMountDir"), yes),
@@ -611,10 +615,7 @@ fn mount_native(lease: &Lease, password: &str) -> Result<(), String> {
             CFString::new("SoftMount"),
             CFBoolean::true_value().as_CFType(),
         ),
-        (
-            CFString::new("UIOption"),
-            CFString::new("AllowUI").as_CFType(),
-        ),
+        (CFString::new("UIOption"), CFString::new(ui).as_CFType()),
     ]);
     let mut result = std::ptr::null();
     let status = unsafe {

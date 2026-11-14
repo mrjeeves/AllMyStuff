@@ -63,6 +63,8 @@ or commercial filesystem SDK is embedded. `scripts/check-smb-licenses.py`
 checks each target's dependency closure in CI and release. The combined
 [upstream notices](THIRD-PARTY-SMB-NOTICES.txt) ship in GUI bundles and portable
 archives. A license/dependency change fails that guard until reviewed.
+The node and desktop shell also embed the notices; `allmystuff-serve
+--smb-license-notices` prints them even after a binary-only self-update.
 
 ## User contract
 

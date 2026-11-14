@@ -725,10 +725,42 @@ mod tests {
         std::fs::create_dir(&mount).unwrap();
         let hosts = crate::smb_drives::SmbHosts::default();
         let endpoint = hosts.start("native-client-test", &source).await.unwrap();
+        // Use the application's private client identity and TCP bridge rather
+        // than sharing macOS's localhost credential/session namespace.
+        struct Tunnel(tokio::task::JoinHandle<()>);
+        impl Drop for Tunnel {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let listener = crate::smb_drives::client_listener(&root.to_string_lossy())
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_port = endpoint.port;
+        let tunnel = Tunnel(tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = listener.accept() => {
+                        let Ok((mut client, _)) = incoming else { break; };
+                        connections.spawn(async move {
+                            if let Ok(mut source) = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, server_port)).await {
+                                let _ = tokio::io::copy_bidirectional(&mut client, &mut source).await;
+                            }
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        }));
         let mut spec = lease();
         spec.mount = std::fs::canonicalize(&mount).unwrap();
-        spec.server = Ipv4Addr::LOCALHOST;
-        spec.port = endpoint.port;
+        spec.server = match address.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        };
+        spec.port = address.port();
         spec.share = endpoint.share;
         spec.uid = unsafe { libc::geteuid() };
         spec.gid = unsafe { libc::getegid() };
@@ -737,6 +769,14 @@ mod tests {
             root: root.clone(),
             lease: spec.clone(),
         };
+        let offset = 4 * 1024 * 1024 * 1024 + 73;
+        // Prepare the hole at the source. A native client may zero-fill a
+        // remote extension if it does not negotiate sparse-file support,
+        // turning an offset test into an unintended 4 GiB bulk transfer.
+        let sparse = std::fs::File::create(source.join("large-offset.bin")).unwrap();
+        sparse.set_len(offset + 14).unwrap();
+        assert!(sparse.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+        drop(sparse);
         println!("mounting the isolated native SMB fixture");
         spec.identity = native_operation(Request {
             lease: spec.clone(),
@@ -746,11 +786,13 @@ mod tests {
         .unwrap();
         let mounted = spec;
         println!("checking native file operations above 4 GiB");
-        let offset = 4 * 1024 * 1024 * 1024 + 73;
         let source_copy = source.clone();
         let mount_copy = mount.clone();
         tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::create(mount_copy.join("large-offset.bin")).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(mount_copy.join("large-offset.bin"))
+                .unwrap();
             file.write_all(b"start").unwrap();
             file.seek(SeekFrom::Start(offset)).unwrap();
             file.write_all(b"above-four-gib").unwrap();
@@ -774,6 +816,15 @@ mod tests {
             mapped.read_exact(&mut back).unwrap();
             assert_eq!(&back, b"read-back");
             drop(mapped);
+            let mut small = std::fs::File::create(mount_copy.join("created.txt")).unwrap();
+            small.write_all(b"native-create").unwrap();
+            small.sync_all().unwrap();
+            drop(small);
+            assert_eq!(
+                std::fs::read(source_copy.join("created.txt")).unwrap(),
+                b"native-create"
+            );
+            std::fs::remove_file(mount_copy.join("created.txt")).unwrap();
             std::fs::rename(
                 mount_copy.join("large-offset.bin"),
                 mount_copy.join("renamed.bin"),
@@ -794,6 +845,7 @@ mod tests {
         .unwrap();
         assert!(observed(&cleanup.lease).unwrap().is_none());
         hosts.stop("native-client-test");
+        drop(tunnel);
         drop(cleanup);
         assert!(
             !root.exists(),

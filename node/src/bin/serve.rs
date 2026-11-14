@@ -165,6 +165,10 @@ fn run_cli_verb() -> Option<ExitCode> {
             Some(ExitCode::SUCCESS)
         }
         Some("update") => Some(run_update_now()),
+        Some("--smb-license-notices") => {
+            print!("{}", allmystuff_node::smb_license_notices());
+            Some(ExitCode::SUCCESS)
+        }
         _ => None,
     }
 }

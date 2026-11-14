@@ -152,6 +152,12 @@ pub fn native_smb_helper_if_requested() -> Option<std::process::ExitCode> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     None
 }
+
+/// Embedded as well as shipped beside binaries so installs and self-updates
+/// retain the upstream permissions even when extracting only the executable.
+pub fn smb_license_notices() -> &'static str {
+    include_str!("../../docs/THIRD-PARTY-SMB-NOTICES.txt")
+}
 pub mod storage_plan;
 /// The field-test telemetry line: process/system CPU + per-engine GPU
 /// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —

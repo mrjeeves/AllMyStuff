@@ -174,6 +174,7 @@ async fn helper(request: &Request) -> Result<Option<String>, String> {
 
 pub(crate) struct NativeSmbMount {
     lease: Lease,
+    cleanup_on_drop: bool,
 }
 
 impl NativeSmbMount {
@@ -215,20 +216,29 @@ impl NativeSmbMount {
             Ok(Some(identity)) => {
                 lease.identity = Some(identity);
                 remember(&lease)?;
-                Ok(Self { lease })
+                Ok(Self {
+                    lease,
+                    cleanup_on_drop: true,
+                })
             }
             Ok(None) => Err("the OS did not report a native SMB mount".into()),
             Err(error) => Err(error),
         }
     }
 
-    pub(crate) async fn stop(self) -> Result<(), String> {
+    pub(crate) async fn stop(mut self) -> Result<(), String> {
+        // An explicit stop already owns recovery/error reporting. In
+        // particular, do not prompt for OS authorization again after Cancel.
+        self.cleanup_on_drop = false;
         remove_exact(&self.lease).await
     }
 }
 
 impl Drop for NativeSmbMount {
     fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
         let lease = self.lease.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -562,7 +572,8 @@ fn mount_native(lease: &Lease, password: &str) -> Result<(), String> {
         return Err("invalid SMB mount URL".into());
     }
     let url: CFURL = unsafe { TCFType::wrap_under_create_rule(raw_url) };
-    let mount = CFURL::from_path(&lease.mount, true).ok_or("invalid SMB mount path")?;
+    // The exact mount directory must not acquire a trailing URL separator.
+    let mount = CFURL::from_path(&lease.mount, false).ok_or("invalid SMB mount path")?;
     let user = CFString::new("ams");
     let secret = CFString::new(password);
     let yes = CFBoolean::true_value().as_CFType();
@@ -723,6 +734,13 @@ mod tests {
         let mount = root.join("mount");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir(&mount).unwrap();
+        let mut cleanup = Cleanup {
+            root: root.clone(),
+            lease: Lease {
+                mount: std::fs::canonicalize(&mount).unwrap(),
+                ..lease()
+            },
+        };
         let hosts = crate::smb_drives::SmbHosts::default();
         let endpoint = hosts.start("native-client-test", &source).await.unwrap();
         // Use the application's private client identity and TCP bridge rather
@@ -765,10 +783,7 @@ mod tests {
         spec.uid = unsafe { libc::geteuid() };
         spec.gid = unsafe { libc::getegid() };
         spec.identity = None;
-        let cleanup = Cleanup {
-            root: root.clone(),
-            lease: spec.clone(),
-        };
+        cleanup.lease = spec.clone();
         let offset = 4 * 1024 * 1024 * 1024 + 73;
         // Prepare the hole at the source. A native client may zero-fill a
         // remote extension if it does not negotiate sparse-file support,
@@ -785,6 +800,7 @@ mod tests {
         .await
         .unwrap();
         let mounted = spec;
+        cleanup.lease = mounted.clone();
         println!("checking native file operations above 4 GiB");
         let source_copy = source.clone();
         let mount_copy = mount.clone();

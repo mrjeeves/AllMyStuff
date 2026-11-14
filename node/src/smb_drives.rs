@@ -99,7 +99,7 @@ impl SmbHosts {
 
 /// Separate loopback identities avoid Windows' per-server credential collision
 /// between simultaneous mappings. No network adapter or host-file entry needed.
-#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+#[cfg(any(windows, target_os = "linux", test))]
 pub(crate) fn client_address(mapping: &str) -> std::net::Ipv4Addr {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(mapping.as_bytes());
@@ -107,8 +107,15 @@ pub(crate) fn client_address(mapping: &str) -> std::net::Ipv4Addr {
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-pub(crate) async fn client_listener(mapping: &str) -> Result<tokio::net::TcpListener, String> {
-    tokio::net::TcpListener::bind((client_address(mapping), 0))
+pub(crate) async fn client_listener(_mapping: &str) -> Result<tokio::net::TcpListener, String> {
+    // Darwin only permits binding configured interface addresses, unlike
+    // Windows/Linux's whole 127/8 range. NetFS forces a new session per mount;
+    // its distinct TCP port/share isolate sessions on the configured loopback.
+    #[cfg(target_os = "macos")]
+    let address = std::net::Ipv4Addr::LOCALHOST;
+    #[cfg(not(target_os = "macos"))]
+    let address = client_address(_mapping);
+    tokio::net::TcpListener::bind((address, 0))
         .await
         .map_err(|error| format!("bind private SMB tunnel: {error}"))
 }

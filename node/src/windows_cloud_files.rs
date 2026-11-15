@@ -274,7 +274,14 @@ impl Request {
             },
             CompletionStatus: status,
             PlaceholderTotalCount: total,
-            PlaceholderArray: entries.as_mut_ptr(),
+            // An empty Rust slice has a non-null dangling pointer. Cloud Files
+            // rejects that pointer even with a zero PlaceholderCount, leaving
+            // Explorer unable to enumerate empty or already populated folders.
+            PlaceholderArray: if entries.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                entries.as_mut_ptr()
+            },
             PlaceholderCount: entries.len() as u32,
             ..Default::default()
         };
@@ -1716,6 +1723,9 @@ mod tests {
             actor: "test-source".into(),
         };
         replica.apply_directory(version.clone(), "Desktop").unwrap();
+        replica
+            .apply_directory(version.clone(), "Desktop/empty")
+            .unwrap();
         let desktop = PathBuf::from(replica.materialize("Desktop").unwrap().unwrap());
         let root = desktop.parent().unwrap().to_path_buf();
         let journal = allmystuff_protocol::myownmesh_state_dir()
@@ -1813,8 +1823,13 @@ mod tests {
             .expect("Fleetfiles listing re-entered its own provider")
             .unwrap()
             .unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].name, "report.txt");
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.entries.iter().any(|entry| entry.name == "report.txt"));
+        // Both an empty folder and a folder whose children are already on
+        // disk complete their callback with zero newly created placeholders.
+        assert_external_directory(&root, &["Desktop"]).await;
+        assert_external_directory(&desktop.join("empty"), &[]).await;
+        assert_external_directory(&root, &["Desktop"]).await;
         assert_external_text(
             &desktop.join("report.txt"),
             std::str::from_utf8(text).unwrap(),
@@ -1826,6 +1841,34 @@ mod tests {
         assert!(
             !root.exists(),
             "native Fleetfiles test data was not removed"
+        );
+    }
+
+    async fn assert_external_directory(path: &Path, expected: &[&str]) {
+        let path = path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference='Stop';[IO.Directory]::EnumerateFileSystemEntries('{path}') | ForEach-Object {{ [IO.Path]::GetFileName($_) }} | Where-Object {{ -not $_.StartsWith('.allmystuff-') }} | Sort-Object"
+        );
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            crate::child_process::command("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("native directory population did not complete")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .replace("\r\n", "\n")
+                .trim(),
+            expected.join("\n")
         );
     }
 

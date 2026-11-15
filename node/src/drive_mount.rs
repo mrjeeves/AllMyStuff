@@ -70,6 +70,95 @@ mod windows_cloud_alias;
 #[path = "windows_drive_mount.rs"]
 mod windows_drive_mount;
 
+#[cfg(all(test, windows))]
+mod smb_integration_tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires elevated Windows SMB client; maps a temporary AMS-only drive"]
+    async fn native_windows_smb_client_reads_and_writes_private_share() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("marker.txt"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "ams-native-smb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("marker.txt"), b"before").unwrap();
+        let hosts = crate::smb_drives::SmbHosts::default();
+        let mut drives = Vec::new();
+        let mut proxies: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for (index, route) in [
+            "native-client-test",
+            "native-client-test-2",
+            "native-client-test",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 2 {
+                drop(drives.remove(0));
+                proxies[0].abort();
+                hosts.stop(route);
+            }
+            let endpoint = hosts.start(route, &root).await.unwrap();
+            let listener = crate::smb_drives::client_listener(route).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let port = endpoint.port;
+            let proxy = tokio::spawn(async move {
+                while let Ok((mut client, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut host =
+                            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                                .await
+                                .unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut host).await;
+                    });
+                }
+            });
+            let mask = crate::win_privilege::assigned_drive_mask().unwrap()
+                | crate::win_privilege::interactive_user_assigned_drive_mask().unwrap();
+            let mount = super::select_windows_mount(None, |mount| {
+                !super::drive_letter_assigned(mount, mask)
+            })
+            .unwrap();
+            let drive = super::windows_drive_mount::NativeSmbDrive::start(
+                &mount,
+                "AMS temporary SMB test",
+                address,
+                endpoint,
+            )
+            .await
+            .unwrap();
+            drives.push(drive);
+            proxies.push(proxy);
+            let remote_file = std::path::PathBuf::from(format!("{mount}\\marker.txt"));
+            std::fs::write(root.join("marker.txt"), b"before").unwrap();
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(std::fs::read(&remote_file).unwrap(), b"before");
+                std::fs::write(&remote_file, b"after").unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(root.join("marker.txt")).unwrap(), b"after");
+        }
+        drop(drives);
+        for proxy in proxies {
+            proxy.abort();
+        }
+        hosts.stop("native-client-test");
+        hosts.stop("native-client-test-2");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
     pub route: String,

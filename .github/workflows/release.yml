@@ -330,6 +330,18 @@ jobs:
             rm -f dist-bin/allmystuff-gui
           fi
 
+      - name: Package complete macOS GUI bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          BUNDLE="gui/src-tauri/target/${{ matrix.platform.target }}/release/bundle/macos/AllMyStuff.app"
+          test -f "$BUNDLE/Contents/MacOS/allmystuff-gui"
+          codesign --verify --deep --strict "$BUNDLE"
+          NAME="allmystuff-gui-bundle-${{ matrix.platform.name }}.tar.gz"
+          tar -czf "dist-bin/$NAME" -C "$(dirname "$BUNDLE")" AllMyStuff.app
+          (cd dist-bin && shasum -a 256 "$NAME" > "$NAME.sha256")
+
       # Package the portable node binary so a headless box can fetch
       # `allmystuff-serve-<platform>.<ext>` (the installer drops it next to
       # the CLI, and `allmystuff serve` / `service` find it there).

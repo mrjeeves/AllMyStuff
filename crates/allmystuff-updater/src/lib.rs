@@ -54,6 +54,8 @@
 //! Package-manager installs (Homebrew, dpkg/apt, MSI) are detected and
 //! left to the OS updater.
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_bundle;
 pub mod policy;
 
 use std::fs::{File, OpenOptions};
@@ -174,6 +176,44 @@ fn updates_dir() -> Result<PathBuf> {
     let d = home()?.join("updates");
     std::fs::create_dir_all(&d)?;
     Ok(d)
+}
+
+/// Durable handoff from the service to the desktop that owns its install.
+/// A one-shot event can be lost while either process is restarting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopUpdateRequest {
+    pub version: String,
+    pub from: String,
+}
+
+pub fn request_desktop_update(version: String, from: String) -> Result<()> {
+    let _lock = lock_pending_state()?;
+    std::fs::write(
+        updates_dir()?.join("desktop-request.json"),
+        serde_json::to_vec(&DesktopUpdateRequest { version, from })?,
+    )?;
+    Ok(())
+}
+
+pub fn desktop_update_request() -> Result<Option<DesktopUpdateRequest>> {
+    let _lock = lock_pending_state()?;
+    match std::fs::read(updates_dir()?.join("desktop-request.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn complete_desktop_update(request: &DesktopUpdateRequest) -> Result<()> {
+    let _lock = lock_pending_state()?;
+    let path = updates_dir()?.join("desktop-request.json");
+    let current = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DesktopUpdateRequest>(&bytes).ok());
+    if current.as_ref() == Some(request) {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -645,6 +685,43 @@ fn apply_one(art: &StagedArtifact) -> Result<bool> {
     let Some(target) = artifact_target_path(art.kind) else {
         return Ok(false);
     };
+    #[cfg(target_os = "macos")]
+    if art.kind == ArtifactKind::Gui && macos_bundle::bundle_for_executable(&target).is_some() {
+        if !art
+            .archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("allmystuff-gui-bundle-"))
+        {
+            return Err(Error::msg(
+                "the desktop bundle requires a complete verified bundle archive",
+            ));
+        }
+        macos_bundle::replace_bundle(&art.archive, &target, |bundle| {
+            let signature = std::process::Command::new("/usr/bin/codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(bundle)
+                .output()?;
+            if !signature.status.success() {
+                return Err(Error::msg(
+                    "release desktop bundle failed code-signature verification",
+                ));
+            }
+            let identity = std::process::Command::new("/usr/bin/plutil")
+                .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+                .arg(bundle.join("Contents/Info.plist"))
+                .output()?;
+            if !identity.status.success()
+                || String::from_utf8_lossy(&identity.stdout).trim() != "works.allmystuff.gui"
+            {
+                return Err(Error::msg(
+                    "release desktop bundle has the wrong application identity",
+                ));
+            }
+            Ok(())
+        })?;
+        return Ok(true);
+    }
     let staged_dir = art
         .archive
         .parent()
@@ -657,16 +734,16 @@ fn apply_one(art: &StagedArtifact) -> Result<bool> {
 /// Where an artifact is installed, mirroring the CLI launcher's discovery
 /// (env override → running exe / sibling → `PATH`). Returns `None` when the
 /// host doesn't have that half (a headless box with no GUI, say), or when it
-/// lives in an OS bundle we shouldn't touch.
+/// lives in an OS bundle that cannot accept an individual binary swap.
 ///
 /// The bundle guard is load-bearing: inside a macOS `.app` an in-place Mach-O
 /// swap breaks the bundle's code signature and identity, so the relaunch comes
 /// back refused or running the stale cached image — the "ran the update, came
 /// back on the same version" symptom. A bundled app is updated by its own
 /// installer (a DMG / pkg), never by swapping a binary under it, so the updater
-/// leaves bundle paths alone and reports nothing to apply — the same stance
-/// MyOwnMesh's `find_installed_gui_binary` takes. Loose siblings and `PATH`
-/// copies (portable / `curl | sh` installs) still swap as before.
+/// leaves bundle members alone. The desktop GUI has a separate complete-
+/// bundle target and verified archive; loose siblings and `PATH` copies
+/// (portable / `curl | sh` installs) still swap as before.
 fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
     resolve_installed_path(kind).filter(|p| !path_in_os_bundle(p))
 }
@@ -687,10 +764,28 @@ fn desktop_suite_target(kind: ArtifactKind) -> Option<PathBuf> {
 }
 
 fn artifact_target_path(kind: ArtifactKind) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if kind == ArtifactKind::Gui {
+        // Keep the original install path after replacing the running bundle.
+        static BUNDLE_EXECUTABLE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        if let Some(executable) = BUNDLE_EXECUTABLE.get_or_init(|| {
+            resolve_installed_path(ArtifactKind::Gui)
+                .filter(|path| macos_bundle::bundle_for_executable(path).is_some())
+        }) {
+            return Some(executable.clone());
+        }
+    }
     installed_path(kind).or_else(|| desktop_suite_target(kind))
 }
 
 fn artifact_required_here(kind: ArtifactKind) -> bool {
+    #[cfg(target_os = "macos")]
+    if kind == ArtifactKind::Gui
+        && artifact_target_path(kind)
+            .is_some_and(|path| macos_bundle::bundle_for_executable(&path).is_some())
+    {
+        return true;
+    }
     kind.is_required() || desktop_suite_target(kind).is_some()
 }
 
@@ -870,7 +965,7 @@ fn artifact_version_marker(kind: ArtifactKind) -> Option<PathBuf> {
 fn installed_artifact_version(kind: ArtifactKind) -> Option<String> {
     let text = std::fs::read_to_string(artifact_version_marker(kind)?).ok()?;
     let marker: ArtifactVersionMarker = serde_json::from_str(&text).ok()?;
-    let installed = installed_path(kind)?;
+    let installed = artifact_target_path(kind)?;
     let actual = sha256_file(&installed).ok()?;
     if actual == marker.sha256 {
         return Some(marker.version);
@@ -883,7 +978,7 @@ fn installed_artifact_version(kind: ArtifactKind) -> Option<String> {
 /// `--version` verbs. A GUI sibling is not spawned because older GUI builds did
 /// not have a version-only verb and would open a second app instead.
 fn reported_artifact_version(kind: ArtifactKind) -> Option<String> {
-    let installed = installed_path(kind)?;
+    let installed = artifact_target_path(kind)?;
     let current = std::env::current_exe().ok();
     let same_as_running = current
         .as_ref()
@@ -956,7 +1051,7 @@ pub fn installed_artifact_statuses() -> Vec<InstalledArtifactStatus> {
         .into_iter()
         .map(|kind| InstalledArtifactStatus {
             component: kind.as_str().to_string(),
-            installed: installed_path(kind).is_some(),
+            installed: artifact_target_path(kind).is_some(),
             version: effective_artifact_version(kind),
         })
         .collect()
@@ -966,7 +1061,7 @@ fn record_artifact_version(kind: ArtifactKind, version: &str) {
     let Some(path) = artifact_version_marker(kind) else {
         return;
     };
-    let Some(installed) = installed_path(kind) else {
+    let Some(installed) = artifact_target_path(kind) else {
         return;
     };
     let Ok(sha256) = sha256_file(&installed) else {
@@ -1776,7 +1871,17 @@ async fn stage_release(
     // actual error was lost to a best-effort warning no CLI subscriber prints.
     let mut errors: Vec<String> = Vec::new();
     for &kind in want {
-        let asset_name = platform_asset(kind.asset_stem());
+        let stem = kind.asset_stem();
+        #[cfg(target_os = "macos")]
+        let stem = if kind == ArtifactKind::Gui
+            && artifact_target_path(kind)
+                .is_some_and(|path| macos_bundle::bundle_for_executable(&path).is_some())
+        {
+            "allmystuff-gui-bundle"
+        } else {
+            stem
+        };
+        let asset_name = platform_asset(stem);
         let asset = assets
             .iter()
             .find(|a| a["name"].as_str() == Some(&asset_name));
@@ -2102,6 +2207,29 @@ mod tests {
     /// `ALLMYSTUFF_HOME` is process-global; serialize the tests that mutate
     /// it so cargo's parallel runner can't cross their temp dirs.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn desktop_update_handoff_survives_restarts_and_does_not_acknowledge_a_newer_request() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ALLMYSTUFF_HOME");
+        std::env::set_var("ALLMYSTUFF_HOME", root.path());
+        assert_eq!(desktop_update_request().unwrap(), None);
+        request_desktop_update("0.2.127".into(), "owner".into()).unwrap();
+        let first = desktop_update_request().unwrap().unwrap();
+        assert_eq!(first.version, "0.2.127");
+        request_desktop_update("0.2.128".into(), "owner".into()).unwrap();
+        complete_desktop_update(&first).unwrap();
+        let next = desktop_update_request().unwrap().unwrap();
+        assert_eq!(next.version, "0.2.128");
+        complete_desktop_update(&next).unwrap();
+        assert_eq!(desktop_update_request().unwrap(), None);
+        if let Some(previous) = previous {
+            std::env::set_var("ALLMYSTUFF_HOME", previous);
+        } else {
+            std::env::remove_var("ALLMYSTUFF_HOME");
+        }
+    }
 
     #[test]
     fn attended_checks_ignore_only_the_automatic_update_preference() {

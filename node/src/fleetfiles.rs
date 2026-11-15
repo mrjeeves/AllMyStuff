@@ -1209,6 +1209,24 @@ impl FleetfilesReplica {
             .is_some()
     }
 
+    /// Recover a known version from an existing copy without creating a new
+    /// version or changing its namespace. A matching size alone is not proof.
+    pub fn recover_body(&self, path: &str, source: &Path) -> Result<(), String> {
+        let (_, size, sha256) = self
+            .current_file_version(path)?
+            .ok_or("there is no current file version to recover")?;
+        let (actual_size, actual_hash) = hash_file(source)?;
+        if actual_size != size || actual_hash != sha256 {
+            return Err(
+                "the recovery source does not match the Fleetfiles version checksum".into(),
+            );
+        }
+        if !self.persist_verified_content(source, size, &sha256)? {
+            self.persist_cached_content(source, size, &sha256)?;
+        }
+        Ok(())
+    }
+
     /// Materialize the current logical winner from a local immutable body.
     /// Returning `None` means the namespace is known but another replica must
     /// supply the body; it never means the file does not exist logically.
@@ -2429,14 +2447,14 @@ impl FleetfilesReplica {
             return Ok(Some(PathBuf::from(path)));
         }
         let Some(path) = cached else {
-            return Ok(None);
+            return self.recover_materialized_body(sha256, size);
         };
         if !Path::new(&path).is_file() {
             let _ = self.connection.lock().execute(
                 "DELETE FROM content_cache WHERE sha256=?1 AND path=?2",
                 params![sha256, path],
             );
-            return Ok(None);
+            return self.recover_materialized_body(sha256, size);
         }
         self.connection
             .lock()
@@ -2448,8 +2466,71 @@ impl FleetfilesReplica {
         Ok(Some(PathBuf::from(path)))
     }
 
+    fn recover_materialized_body(
+        &self,
+        sha256: &str,
+        size: u64,
+    ) -> Result<Option<PathBuf>, String> {
+        // Windows' namespace contains placeholders: opening one here would
+        // recursively ask this same provider to hydrate its missing body.
+        #[cfg(windows)]
+        {
+            let _ = (sha256, size);
+            Ok(None)
+        }
+        #[cfg(not(windows))]
+        {
+            self.recover_physical_body(sha256, size)
+        }
+    }
+
+    #[cfg(any(not(windows), test))]
+    fn recover_physical_body(&self, sha256: &str, size: u64) -> Result<Option<PathBuf>, String> {
+        let paths = {
+            let connection = self.connection.lock();
+            let mut query = connection.prepare("SELECT path FROM path_versions WHERE tombstone=0 AND kind='file' AND sha256=?1 AND size=?2")
+                .map_err(|error| error.to_string())?;
+            let paths = query
+                .query_map(params![sha256, size], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            paths
+        };
+        let Ok(root) = self.root.canonicalize() else {
+            return Ok(None);
+        };
+        for path in paths {
+            validate_portable_path(&path)?;
+            let candidate = self.root.join(&path);
+            if !std::fs::symlink_metadata(&candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.len() == size)
+            {
+                continue;
+            }
+            let Ok(candidate) = candidate.canonicalize() else {
+                continue;
+            };
+            if !candidate.starts_with(&root) {
+                continue;
+            }
+            if hash_file(&candidate)? != (size, sha256.to_string()) {
+                continue;
+            }
+            self.persist_cached_content(&candidate, size, sha256)?;
+            return Ok(Some(
+                self.root
+                    .join(".allmystuff-staging/cache-v1")
+                    .join(&sha256[..2])
+                    .join(sha256),
+            ));
+        }
+        Ok(None)
+    }
+
     fn persist_cached_content(&self, source: &Path, size: u64, sha256: &str) -> Result<(), String> {
         validate_hash(sha256)?;
+        let _store_guard = self.content_store_lock.lock();
         let target = self
             .root
             .join(".allmystuff-staging")
@@ -2953,6 +3034,62 @@ mod bytes_b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_file_without_a_cache_receipt_can_supply_its_verified_version() {
+        let root = std::env::temp_dir().join(format!(
+            "allmystuff-fleetfiles-recovery-{}-{}",
+            std::process::id(),
+            CONTENT_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("Desktop")).unwrap();
+        let replica = FleetfilesReplica::memory(root.clone());
+        let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let metadata = FleetfilesMetadata {
+            operation: "existing-copy".into(),
+            version: VersionStamp {
+                counter: 1,
+                actor: "mac".into(),
+            },
+            path: "Desktop/existing.txt".into(),
+            kind: "file".into(),
+            size: 3,
+            sha256: Some(sha.into()),
+            tombstone: false,
+        };
+        replica.apply_metadata(&metadata).unwrap();
+        let native = root.join("Desktop/existing.txt");
+        std::fs::write(&native, b"abc").unwrap();
+        let before = replica.current_file_version(&metadata.path).unwrap();
+        let body = replica.recover_physical_body(sha, 3).unwrap().unwrap();
+        assert_eq!(std::fs::read(&body).unwrap(), b"abc");
+        assert_ne!(body, native, "send an immutable cached copy");
+        std::fs::write(&native, b"xyz").unwrap();
+        assert_eq!(std::fs::read(&body).unwrap(), b"abc");
+        assert!(replica
+            .body_mutation("read".into(), &metadata.path, &metadata.version, 3, sha)
+            .is_ok());
+        assert!(replica
+            .recover_body(&metadata.path, &native)
+            .unwrap_err()
+            .contains("checksum"));
+        assert_eq!(
+            replica.current_file_version(&metadata.path).unwrap(),
+            before
+        );
+        std::fs::remove_file(&body).unwrap();
+        replica
+            .connection
+            .lock()
+            .execute("DELETE FROM content_cache", [])
+            .unwrap();
+        assert!(
+            replica.recover_physical_body(sha, 3).unwrap().is_none(),
+            "same-size changed bytes cannot represent the old version"
+        );
+        drop(replica);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn file_stream_resolves_storage_at_begin_and_commit_but_not_per_chunk() {

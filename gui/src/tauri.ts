@@ -1067,6 +1067,10 @@ export function disconnectRoute(routeId: string): Promise<null> {
   return tryInvoke("disconnect_route", { routeId });
 }
 
+export function retainRoute(routeId: string): Promise<null> {
+  return tryInvoke("retain_route", { routeId });
+}
+
 export async function mapNativeDrive(
   target: string,
   root: string,
@@ -1964,6 +1968,12 @@ export async function onDeviceRestart(
   return listen<{ from: string }>("allmystuff://device-restart", (e) =>
     cb(e.payload),
   );
+}
+
+export async function onUpgradeStatus(cb: (e: { from: string; phase: string; error?: string | null }) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string; phase: string; error?: string | null }>("allmystuff://upgrade-status", (e) => cb(e.payload));
 }
 
 export interface DriveMountEvent {

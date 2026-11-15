@@ -904,6 +904,12 @@ pub enum AppControl {
     /// the confirmation, exactly as a claim confirms by re-advertising its
     /// new owner.
     Upgrade,
+    /// Update progress/errors from the authenticated fleet peer that ran it.
+    UpgradeStatus {
+        phase: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// "Restart your AllMyStuff app." Sent to a fleet machine to relaunch its
     /// node onto the same build — the recovery step heavier than a reconnect
     /// but lighter than an upgrade (it stages/applies nothing). The receiver

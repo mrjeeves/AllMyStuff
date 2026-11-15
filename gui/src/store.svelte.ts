@@ -64,6 +64,7 @@ import {
   disabledNetworks,
   exportNetworkFile,
   disconnectRoute,
+  retainRoute,
   emitRoomLocal,
   emitVideoLocal,
   fileDownload,
@@ -190,6 +191,7 @@ import {
   componentStatus,
   componentRepair,
   upgradeNode,
+  onUpgradeStatus,
   windowBehaviorGet,
   windowBehaviorSet,
   cecStatus,
@@ -1847,6 +1849,11 @@ class AppStore {
     // no-TURN verdict used to be invisible, a peer that was just… quiet.
     await onMeshEvent((e) => this.handleMeshDiag(e));
     await onSession((snap) => this.applySessionSnapshot(snap));
+    await onUpgradeStatus((status) => {
+      const label = this.machineByAnyId(status.from)?.label ?? status.from;
+      if (status.error) this.toast("warn", `Update failed on ${label}: ${status.error}`);
+      else if (status.phase === "restarting") this.toast("info", `${label} applied the update and is restarting AMS…`);
+    });
     // CEC Support: keep the tab's state live. A technician trying to connect
     // (customer side) queues a request + toasts; a dialed customer's node
     // updating (technician side) refreshes the graph + the "Active connections"
@@ -4273,6 +4280,8 @@ class AppStore {
       if (!existedBefore) {
         this.addRoute(from, to);
         this.fireBackendConnect(from, to, this.capability(from)!.media, codec);
+      } else if (this.backendConnected) {
+        void retainRoute(id);
       }
       return { id, created: !existedBefore };
     }
@@ -4305,6 +4314,8 @@ class AppStore {
     if (!existedBefore) {
       this.addRoute(from, to);
       this.fireBackendConnect(from, to, src.media);
+    } else if (this.backendConnected) {
+      void retainRoute(id);
     }
     return { id, created: !existedBefore };
   }

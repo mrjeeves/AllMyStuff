@@ -10682,40 +10682,67 @@ impl Mesh {
                 });
             }
             AppControl::Upgrade => {
+                if self.self_update_inflight.swap(true, Ordering::SeqCst) {
+                    return;
+                }
                 tracing::info!(
                     "upgrade requested by {} — running self-update",
                     short_id(from.as_str())
                 );
                 // Download + apply off the inbound-frame task (it does network
-                // I/O), then restart onto the new build. The peer gets no
-                // reply: our next presence advert (the new version) is the
-                // confirmation, and the button it pressed disappears when the
-                // upgrade lands — exactly how a claim confirms by re-advert.
-                let sink = self.sink.clone();
+                // I/O), persist the desktop handoff, then restart the stack.
+                // Report failures to the requester instead of silently
+                // restarting a GUI whose update never staged.
+                let mesh = self.clone();
+                let requester = from.to_string();
                 crate::spawn(async move {
-                    let node_updated = match allmystuff_updater::update_now().await {
+                    let version = match allmystuff_updater::update_now().await {
                         Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
                             tracing::info!(
                                 "self-update applied {to} ({}) — restarting",
                                 components.join("+")
                             );
-                            true
+                            Ok(to)
                         }
-                        Ok(other) => {
-                            tracing::info!("node upgrade request: nothing to do ({other:?})");
-                            false
+                        Ok(allmystuff_updater::UpdateNowOutcome::UpToDate { latest, .. }) => {
+                            Ok(latest)
+                        }
+                        Ok(allmystuff_updater::UpdateNowOutcome::PackageManager) => {
+                            Err("This AMS installation requires its package manager or installer to update.".to_string())
                         }
                         Err(e) => {
                             tracing::warn!("node upgrade request failed: {e}");
-                            false
+                            Err(e.to_string())
                         }
                     };
-                    sink.upgrade_host();
-                    if node_updated {
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                        sink.restart();
+                    let ready = version.and_then(|version| {
+                        allmystuff_updater::request_desktop_update(version, requester.clone())
+                            .map_err(|error| error.to_string())
+                    });
+                    let error = ready.err();
+                    let _ = mesh
+                        .send_control(
+                            &requester,
+                            &ControlMessage::App(AppControl::UpgradeStatus {
+                                phase: if error.is_some() { "failed" } else { "staged" }.into(),
+                                error: error.clone(),
+                            }),
+                        )
+                        .await;
+                    if error.is_some() {
+                        mesh.self_update_inflight.store(false, Ordering::SeqCst);
+                        return;
                     }
+                    mesh.sink.upgrade_host();
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    mesh.sink.restart();
                 });
+            }
+            AppControl::UpgradeStatus { phase, error } => {
+                self.sink.emit(
+                    "allmystuff://upgrade-status",
+                    json!({ "from": from, "phase": phase, "error": error }),
+                );
             }
             AppControl::Restart => {
                 tracing::info!(
@@ -11631,6 +11658,19 @@ impl Mesh {
         tracing::info!("asking {} to upgrade + restart", short_id(&node));
         let msg = ControlMessage::App(AppControl::Upgrade);
         self.send_control(&node, &msg).await
+    }
+
+    pub async fn report_upgrade_status(
+        &self,
+        node: String,
+        phase: String,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        self.send_control(
+            &node,
+            &ControlMessage::App(AppControl::UpgradeStatus { phase, error }),
+        )
+        .await
     }
 
     /// Ask a fleet machine to **restart** its AllMyStuff app (relaunch onto the
@@ -16355,7 +16395,7 @@ impl Mesh {
             .into_iter()
             .filter(|peer| {
                 !peer.is_empty()
-                    && self.network_for_peer(peer).is_some()
+                    && self.fleetfiles_network_for_peer(peer).is_ok()
                     && self.peer_supports_feature(peer, FEATURE_FLEETFILES_LEDGER)
             })
             .collect::<Vec<_>>();
@@ -16420,6 +16460,22 @@ impl Mesh {
                 .await?;
         }
         Ok(json!({ "path": self.fleetfiles.materialize(&path)? }))
+    }
+
+    pub async fn fleetfiles_recover_body(
+        &self,
+        path: String,
+        source: String,
+    ) -> Result<Value, String> {
+        let replica = self.fleetfiles.clone();
+        tokio::task::spawn_blocking(move || {
+            replica.recover_body(&path, std::path::Path::new(&source))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        #[cfg(windows)]
+        self.drive_mounts.refresh_fleetfiles();
+        Ok(json!({ "recovered": true }))
     }
 
     #[cfg(windows)]
@@ -20254,7 +20310,10 @@ impl Mesh {
     /// durable backlog is empty or reachability/policy pauses it.
     fn schedule_fleetfiles_drain(self: &Arc<Self>, peer: &str) {
         let target = pubkey_part(peer).to_string();
-        if target.is_empty() || !self.fleetfiles_draining.lock().insert(target.clone()) {
+        if target.is_empty()
+            || self.fleetfiles_network_for_peer(&target).is_err()
+            || !self.fleetfiles_draining.lock().insert(target.clone())
+        {
             return;
         }
         let mesh = self.clone();
@@ -20682,14 +20741,27 @@ impl Mesh {
         }
     }
 
+    /// Fleetfiles is a fleet-scoped protocol. Discovery and ordinary route
+    /// traffic may remember a different mesh when two devices share several;
+    /// that mesh cannot carry transactions the receiver authenticates against
+    /// the fleet roster.
+    fn fleetfiles_network_for_peer(&self, peer: &str) -> Result<String, String> {
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("Fleetfiles requires an authenticated fleet")?;
+        if !self.sender_may_control(peer) {
+            return Err("Fleetfiles target is not an authenticated fleet member".into());
+        }
+        Ok(network)
+    }
+
     async fn send_fleetfiles_message(
         &self,
         peer: &str,
         message: FleetfilesMessage,
     ) -> Result<(), String> {
-        let network = self
-            .network_for_peer(peer)
-            .ok_or("Fleetfiles replica target is not reachable")?;
+        let network = self.fleetfiles_network_for_peer(peer)?;
         let payload = serde_json::to_value(message).map_err(|error| error.to_string())?;
         let response = self
             .client
@@ -24353,6 +24425,28 @@ mod tests {
         fn restart(&self) -> ! {
             unreachable!("test sink never restarts")
         }
+    }
+
+    #[test]
+    fn fleetfiles_uses_the_authenticated_fleet_even_when_discovery_moves_meshes() {
+        let client = Arc::new(ControlClient::new().unwrap());
+        let mut mesh = Mesh::new(client, Arc::new(NoopSink));
+        Arc::get_mut(&mut mesh).unwrap().ownership = Arc::new(Ownership::memory());
+        let peer = "fleet-peer";
+        assert!(mesh.fleetfiles_network_for_peer(peer).is_err());
+        mesh.ownership
+            .adopt_fleet_key("test-fleet-key", "Test fleet");
+        let fleet = mesh.ownership.fleet_network_id().unwrap();
+        mesh.fleet_authorized.lock().insert(peer.into());
+        for unrelated in ["public-discovery", "shared-support", "another-mesh"] {
+            mesh.note_peer_network(peer, unrelated);
+            assert_eq!(mesh.network_for_peer(peer).as_deref(), Some(unrelated));
+            assert_eq!(mesh.fleetfiles_network_for_peer(peer).unwrap(), fleet);
+        }
+        mesh.note_peer_network("outsider", &fleet);
+        assert!(mesh.fleetfiles_network_for_peer("outsider").is_err());
+        mesh.fleet_authorized.lock().remove(peer);
+        assert!(mesh.fleetfiles_network_for_peer(peer).is_err());
     }
 
     #[test]

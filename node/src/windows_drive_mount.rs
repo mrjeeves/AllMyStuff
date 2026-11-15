@@ -262,13 +262,20 @@ fn network_label_key(lease: &Lease) -> String {
 fn notify_network_drive(mount: &str, event: u32) {
     use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSHNOWAIT, SHCNF_PATHW};
     let path: Vec<u16> = format!("{mount}\\").encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        SHChangeNotify(
-            event as i32,
-            SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
-            path.as_ptr().cast(),
-            std::ptr::null(),
-        );
+    // The Always On node runs as SYSTEM. Shell notifications must use the
+    // desktop user's identity, just like the mapping's namespace and label.
+    if let Err(error) = crate::win_privilege::interactive_user_call("ams-drive-notify", move || {
+        unsafe {
+            SHChangeNotify(
+                event as i32,
+                SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                path.as_ptr().cast(),
+                std::ptr::null(),
+            );
+        }
+        Ok(())
+    }) {
+        tracing::warn!(%error, "couldn't notify Explorer about the SMB drive");
     }
 }
 

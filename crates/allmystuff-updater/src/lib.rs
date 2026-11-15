@@ -1834,7 +1834,11 @@ fn release_tag(release: &serde_json::Value) -> Result<String> {
 
 async fn fetch_release(au: &AutoUpdateConfig) -> Result<serde_json::Value> {
     let url = resolve_release_url(au);
-    let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let resp = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -1862,7 +1866,11 @@ async fn stage_release(
     let dir = updates_dir()?.join(version);
     std::fs::create_dir_all(&dir)?;
 
-    let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()?;
     let mut staged = Vec::new();
     let mut manifest = Vec::new();
     // Real per-half failure reasons, so a release where nothing could be staged
@@ -2018,6 +2026,7 @@ async fn find_sha256(
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
     Ok(client
         .get(url)
+        .timeout(Duration::from_secs(30))
         .send()
         .await?
         .error_for_status()?

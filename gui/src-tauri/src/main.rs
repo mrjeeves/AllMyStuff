@@ -106,6 +106,7 @@ struct LocalDirectoryWatch {
 
 struct AppState {
     window_routes: Mutex<window_routes::WindowRoutes>,
+    upgrade_notify: Arc<tokio::sync::Notify>,
     node: Arc<NodeClient>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
@@ -4107,7 +4108,7 @@ async fn upgrade_desktop(app: &tauri::AppHandle) {
         }
         Err(error) => Err(error.to_string()),
     };
-    if let Some(request) = &request {
+    if let Some(request) = request.as_ref().filter(|request| !request.from.is_empty()) {
         let _ = app.state::<AppState>().node.request("report_upgrade_status", json!({
             "node": request.from, "phase": if result.is_ok() { "restarting" } else { "failed" },
             "error": result.as_ref().err(),
@@ -4129,6 +4130,27 @@ async fn upgrade_desktop(app: &tauri::AppHandle) {
     }
     if let Err(error) = relaunch_updated_app(app.clone(), true) {
         tracing::warn!(%error, "couldn't relaunch updated desktop");
+    }
+}
+
+/// Update intent survives dropped event subscriptions and backend restarts.
+/// Keep download work off the node event pump so it can reconnect normally.
+async fn run_desktop_update_worker(app: tauri::AppHandle) {
+    let notify = app.state::<AppState>().upgrade_notify.clone();
+    loop {
+        tokio::select! {
+            _ = notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+        }
+        if matches!(allmystuff_updater::desktop_update_request(), Ok(Some(_))) {
+            upgrade_desktop(&app).await;
+            // A failure retains the request; contain retries on an unstable
+            // connection while allowing a new explicit request to wake us.
+            tokio::select! {
+                _ = notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+            }
+        }
     }
 }
 
@@ -5026,18 +5048,22 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
         // every later delivery closes that owner-handoff gap without polling a
         // hardware scan every three seconds.
         let _ = app.emit("allmystuff://backend-ready", json!({}));
-        // Recover a service handoff even if the Upgrade event was emitted
-        // before this GUI subscribed, or while the backend was restarting.
-        if matches!(allmystuff_updater::desktop_update_request(), Ok(Some(_))) {
-            upgrade_desktop(&app).await;
-        }
         while let Some(ev) = rx.recv().await {
             match ev {
                 NodeEvent::Emit { event, payload } => {
                     let _ = app.emit(&event, payload);
                 }
                 NodeEvent::Upgrade => {
-                    upgrade_desktop(&app).await;
+                    // Compatibility with older nodes that only emit an event.
+                    if matches!(allmystuff_updater::desktop_update_request(), Ok(None)) {
+                        if let Err(error) = allmystuff_updater::request_desktop_update(
+                            env!("CARGO_PKG_VERSION").into(),
+                            String::new(),
+                        ) {
+                            tracing::warn!(%error, "couldn't persist the legacy desktop update request");
+                        }
+                    }
+                    app.state::<AppState>().upgrade_notify.notify_one();
                 }
                 NodeEvent::Restart => app.restart(), // never returns
             }
@@ -5409,6 +5435,7 @@ fn main() {
             };
             app.manage(AppState {
                 window_routes: Mutex::new(window_routes::WindowRoutes::default()),
+                upgrade_notify: Arc::new(tokio::sync::Notify::new()),
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
                 local_files: Arc::new(Mutex::new(LocalFileBrowser::default())),
@@ -5418,6 +5445,7 @@ fn main() {
                     local_file_operations::LocalFileOperations::default(),
                 )),
             });
+            tauri::async_runtime::spawn(run_desktop_update_worker(handle.clone()));
             // Repair only services the user already installed. A missing
             // service is an intentional opt-out, never a migration signal.
             // Existing installations can arrive here through the self-updater,

@@ -6,6 +6,7 @@ import type { DeviceSupportStatus, KvmSupportStatus } from "./types";
 // is about *intent* and *feedback*.
 
 import { durableGrantCapability, screenShareKey } from "./screen-shares";
+import { mappedDriveLabel } from "./drive-label";
 import {
   canSink,
   canSource,
@@ -4735,7 +4736,7 @@ class AppStore {
           drive: { label: mapping.label, mount: mapping.mount },
         },
         direction,
-        drive: mapping.label || "Mapped drive",
+        drive: mappedDriveLabel(mapping.label, this.machineByAnyId(source)?.label ?? shortId(source)),
         machine: this.machineByAnyId(other)?.label ?? shortId(other),
         host: source,
         target,
@@ -4758,7 +4759,10 @@ class AppStore {
       const fromNode = from?.node ?? this.capNodeOf(route.from);
       const toNode = to?.node ?? this.capNodeOf(route.to);
       const mounted = this.driveMounts[route.id];
-      const driveLabel = mounted?.label ?? route.drive?.label ?? from?.label ?? "Mapped drive";
+      const driveLabel = mappedDriveLabel(
+        mounted?.label ?? route.drive?.label ?? from?.label ?? "Mapped drive",
+        this.machineByAnyId(fromNode)?.label ?? shortId(fromNode),
+      );
       const mount = mounted?.mount ?? route.drive?.mount ?? "";
       if (this.isMe(toNode)) {
         out.push({

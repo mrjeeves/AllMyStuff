@@ -73,6 +73,7 @@ pub mod daemon_spawn;
 /// Local-only development diagnostics shared by the GUI setting and node
 /// startup. This never travels over the mesh or signaling layer.
 pub mod diagnostics;
+mod drive_label;
 pub mod drive_mount;
 pub mod files;
 pub mod fleetfiles;

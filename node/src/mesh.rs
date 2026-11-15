@@ -14041,15 +14041,15 @@ impl Mesh {
                         .unwrap_or_else(|| route_id.clone());
                     let source_node = from_node.clone();
                     let target_node = to_node.clone();
+                    // Decorate only after the original offer/request has been
+                    // authorized, preserving compatibility with older peers.
+                    let label = crate::drive_label::mapped_drive_label(
+                        &drive.label,
+                        &self.peer_label(&NodeId::from(from_node.as_str())),
+                    );
                     crate::spawn(async move {
                         match mounts
-                            .mount(
-                                mesh.clone(),
-                                route_id.clone(),
-                                drive.label,
-                                drive.mount,
-                                &mapping,
-                            )
+                            .mount(mesh.clone(), route_id.clone(), label, drive.mount, &mapping)
                             .await
                         {
                             Ok(info) => {

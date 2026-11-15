@@ -356,10 +356,12 @@ impl NativeSmbDrive {
             super::drive_registry_root()?,
             mount.trim_end_matches(':')
         );
+        let label = crate::drive_label::windows_drive_label(label);
         let _ = crate::child_process::command("reg.exe")
-            .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
+            .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", &label, "/f"])
             .output()
             .await;
+        super::refresh_explorer_drive_labels().await;
         Ok(Self { lease })
     }
 }

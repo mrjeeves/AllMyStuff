@@ -630,7 +630,7 @@ async fn choose_unix_mount(
             root.display()
         )
     })?;
-    let stem = safe_mount_name(label);
+    let stem = crate::drive_label::unix_mount_name(label);
     for suffix in 1..=1_000 {
         let name = if suffix == 1 {
             stem.clone()
@@ -688,27 +688,6 @@ async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result
         Err(error) => return Err(format!("couldn't inspect {}: {error}", mount.display())),
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn safe_mount_name(label: &str) -> String {
-    let cleaned = label
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let cleaned = cleaned.trim_matches([' ', '.']).trim();
-    if cleaned.is_empty() {
-        "Remote Drive".into()
-    } else {
-        cleaned.to_string()
-    }
 }
 
 #[cfg(target_os = "macos")]

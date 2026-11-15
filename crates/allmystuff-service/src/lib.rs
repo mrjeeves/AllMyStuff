@@ -1918,16 +1918,13 @@ fn install_dirs() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".local").join("bin"));
         #[cfg(windows)]
-        dirs.push(
-            home.join("AppData")
-                .join("Local")
-                .join("Programs")
-                .join("AllMyStuff"),
-        );
+        dirs.extend(windows_default_install_dirs(
+            &home.join("AppData").join("Local"),
+        ));
     }
     #[cfg(windows)]
     if let Some(la) = std::env::var_os("LOCALAPPDATA") {
-        dirs.push(PathBuf::from(la).join("Programs").join("AllMyStuff"));
+        dirs.extend(windows_default_install_dirs(Path::new(&la)));
     }
     #[cfg(unix)]
     {
@@ -1936,6 +1933,14 @@ fn install_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from("/usr/bin"));
     }
     dirs
+}
+
+#[cfg(any(windows, test))]
+fn windows_default_install_dirs(local: &Path) -> [PathBuf; 2] {
+    [
+        local.join("AllMyStuff"),
+        local.join("Programs").join("AllMyStuff"),
+    ]
 }
 
 fn workspace_serve_path(profile: &str, exe: &str) -> Option<PathBuf> {
@@ -2043,6 +2048,18 @@ fn workspace_gui_path(profile: &str, exe: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_install_discovery_includes_both_default_locations() {
+        let local = Path::new("Local");
+        assert_eq!(
+            windows_default_install_dirs(local),
+            [
+                local.join("AllMyStuff"),
+                local.join("Programs").join("AllMyStuff"),
+            ]
+        );
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

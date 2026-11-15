@@ -31,7 +31,9 @@ param(
     [switch]$NoGui,
     [switch]$NoMesh,
     [switch]$NoAmst,
-    [string]$Prefix = "$env:LOCALAPPDATA\Programs\AllMyStuff",
+    # Match the native currentUser installer's initial directory. An explicit
+    # -Prefix can still select a separate installation anywhere else.
+    [string]$Prefix = "$env:LOCALAPPDATA\AllMyStuff",
     [string]$Repo = $(if ($env:ALLMYSTUFF_REPO) { $env:ALLMYSTUFF_REPO } else { "mrjeeves/AllMyStuff" }),
     [string]$MeshRepo = $(if ($env:MYOWNMESH_REPO) { $env:MYOWNMESH_REPO } else { "mrjeeves/MyOwnMesh" })
 )

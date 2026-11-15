@@ -25,6 +25,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/windows-runtime.tests.ps1
+      - name: Windows installation path regression tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-install.tests.ps1
       # `just release` runs this with the OS-provided shell. macOS still ships
       # Bash 3.2, so execute the real pin/lock guard there in CI rather than
       # discovering Bash-4-only builtins while cutting a release.

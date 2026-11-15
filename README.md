@@ -52,6 +52,10 @@ tools, and brings the pinned MyOwnMesh runtime with it. Prebuilt `.dmg`, `.msi`,
 `.deb`, and `.AppImage` bundles, plus portable archives, are available on the
 [releases page](https://github.com/mrjeeves/AllMyStuff/releases).
 
+On Windows, both the PowerShell script and native `.exe` installer initially
+default to `%LOCALAPPDATA%\AllMyStuff`. Pass `-Prefix` to the script or choose
+another folder in the native installer for a separate installation.
+
 ## Your first fleet
 
 Install AllMyStuff on each computer you want to own as a group. On the local

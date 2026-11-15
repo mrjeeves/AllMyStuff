@@ -224,14 +224,62 @@ fn remove_exact(expected: &Lease) -> Result<bool, String> {
         DISCONNECT,
         serde_json::to_value(expected).map_err(|error| error.to_string())?,
     )?;
+    // Global SMB mappings need explicit Shell events to retire the old
+    // endpoint's display-name cache before this letter can be reused.
+    notify_network_drive(
+        &expected.mount,
+        windows_sys::Win32::UI::Shell::SHCNE_DRIVEREMOVED,
+    );
     if let Some(address) = &expected.loopback_alias {
         if expected.remote.starts_with(&format!(r"\\{address}\")) {
             run(REMOVE_LOOPBACK, json!({"address": address}))?;
         }
     }
+    // The name belongs to this exact UNC endpoint, never to a drive letter
+    // that another application may already have reused.
+    let _ = crate::child_process::blocking_command("reg.exe")
+        .args([
+            "delete",
+            &network_label_key(expected),
+            "/v",
+            "_LabelFromReg",
+            "/f",
+        ])
+        .output();
     saved.retain(|lease| !lease.matches(expected));
     save(&saved)?;
     Ok(true)
+}
+
+fn network_label_key(lease: &Lease) -> String {
+    format!(
+        r"HKEY_USERS\{}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\{}",
+        lease.owner,
+        lease.remote.replace('\\', "#")
+    )
+}
+
+fn notify_network_drive(mount: &str, event: u32) {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSHNOWAIT, SHCNF_PATHW};
+    let path: Vec<u16> = format!("{mount}\\").encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        SHChangeNotify(
+            event as i32,
+            SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+            path.as_ptr().cast(),
+            std::ptr::null(),
+        );
+    }
+}
+
+async fn refresh_network_drive_label(mount: &str) {
+    let mount = mount.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        use windows_sys::Win32::UI::Shell::{SHCNE_DRIVEADD, SHCNE_UPDATEITEM};
+        notify_network_drive(&mount, SHCNE_DRIVEADD);
+        notify_network_drive(&mount, SHCNE_UPDATEITEM);
+    })
+    .await;
 }
 fn owned_remote(remote: &str) -> bool {
     let Some((host, share)) = remote
@@ -351,17 +399,31 @@ impl NativeSmbDrive {
             remove_exact(&lease)?;
             return Err(error);
         }
-        let key = format!(
-            r"{}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{}\DefaultLabel",
-            super::drive_registry_root()?,
-            mount.trim_end_matches(':')
-        );
+        // Network drives use the per-share label, not DriveIcons' local-drive
+        // override. Recreate it whenever reconnect allocates a new endpoint.
+        let key = network_label_key(&lease);
         let label = crate::drive_label::windows_drive_label(label);
-        let _ = crate::child_process::command("reg.exe")
-            .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", &label, "/f"])
+        match crate::child_process::command("reg.exe")
+            .args([
+                "add",
+                &key,
+                "/v",
+                "_LabelFromReg",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &label,
+                "/f",
+            ])
             .output()
-            .await;
-        super::refresh_explorer_drive_labels().await;
+            .await
+        {
+            Ok(output) if output.status.success() => refresh_network_drive_label(mount).await,
+            Ok(output) => {
+                tracing::warn!(error = %String::from_utf8_lossy(&output.stderr), "couldn't name the Windows SMB drive")
+            }
+            Err(error) => tracing::warn!(%error, "couldn't name the Windows SMB drive"),
+        }
         Ok(Self { lease })
     }
 }

@@ -130,14 +130,51 @@ mod smb_integration_tests {
                 !super::drive_letter_assigned(mount, mask)
             })
             .unwrap();
+            let label = format!("Fixture {index} (on Native SMB test)");
             let drive = super::windows_drive_mount::NativeSmbDrive::start(
-                &mount,
-                "AMS temporary SMB test",
-                address,
-                endpoint,
+                &mount, &label, address, endpoint,
             )
             .await
             .unwrap();
+            let shell_mount = format!("{mount}\\");
+            let expected_label = label.clone();
+            let display_name = tokio::task::spawn_blocking(move || {
+                use windows::Win32::System::Com::{
+                    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+                };
+                use windows::Win32::UI::Shell::{
+                    IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY,
+                };
+                let path: Vec<u16> = shell_mount.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+                    // Shell change notifications are delivered asynchronously.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let display = loop {
+                        let item: IShellItem =
+                            SHCreateItemFromParsingName(windows::core::PCWSTR(path.as_ptr()), None)
+                                .unwrap();
+                        let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).unwrap();
+                        let display = name.to_string().unwrap();
+                        CoTaskMemFree(Some(name.0.cast()));
+                        drop(item);
+                        if display.starts_with(&expected_label)
+                            || std::time::Instant::now() >= deadline
+                        {
+                            break display;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    };
+                    CoUninitialize();
+                    display
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                display_name.starts_with(&label),
+                "Windows Shell returned {display_name:?}, expected {label:?}"
+            );
             drives.push(drive);
             proxies.push(proxy);
             let remote_file = std::path::PathBuf::from(format!("{mount}\\marker.txt"));

@@ -235,17 +235,9 @@ fn remove_exact(expected: &Lease) -> Result<bool, String> {
             run(REMOVE_LOOPBACK, json!({"address": address}))?;
         }
     }
-    // The name belongs to this exact UNC endpoint, never to a drive letter
-    // that another application may already have reused.
-    let _ = crate::child_process::blocking_command("reg.exe")
-        .args([
-            "delete",
-            &network_label_key(expected),
-            "/v",
-            "_LabelFromReg",
-            "/f",
-        ])
-        .output();
+    // Keep Windows' per-UNC friendly-name cache. Explorer can retain a removed
+    // endpoint's PIDL when this letter is reused; deleting its label exposes
+    // the generated share identity. This display metadata is not a connection.
     saved.retain(|lease| !lease.matches(expected));
     save(&saved)?;
     Ok(true)
@@ -259,16 +251,44 @@ fn network_label_key(lease: &Lease) -> String {
     )
 }
 
+async fn set_network_drive_label(lease: &Lease, label: &str) {
+    let key = network_label_key(lease);
+    let label = crate::drive_label::windows_drive_label(label);
+    match crate::child_process::command("reg.exe")
+        .args([
+            "add",
+            &key,
+            "/v",
+            "_LabelFromReg",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &label,
+            "/f",
+        ])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            tracing::warn!(error = %String::from_utf8_lossy(&output.stderr), "couldn't name the Windows SMB drive")
+        }
+        Err(error) => tracing::warn!(%error, "couldn't name the Windows SMB drive"),
+    }
+}
+
 fn notify_network_drive(mount: &str, event: u32) {
-    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSHNOWAIT, SHCNF_PATHW};
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSH, SHCNF_PATHW};
     let path: Vec<u16> = format!("{mount}\\").encode_utf16().chain(Some(0)).collect();
     // The Always On node runs as SYSTEM. Shell notifications must use the
     // desktop user's identity, just like the mapping's namespace and label.
+    // Finish delivery before reverting impersonation and ending this thread;
+    // otherwise Explorer can retain an unremovable disconnected-drive entry.
     if let Err(error) = crate::win_privilege::interactive_user_call("ams-drive-notify", move || {
         unsafe {
             SHChangeNotify(
                 event as i32,
-                SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                SHCNF_PATHW | SHCNF_FLUSH,
                 path.as_ptr().cast(),
                 std::ptr::null(),
             );
@@ -377,6 +397,9 @@ impl NativeSmbDrive {
         if let Some(mut alias) = alias_guard.take() {
             alias.0.clear();
         }
+        // Windows announces the drive during CONNECT. Publish its name first
+        // so Explorer cannot cache the generated share name on that arrival.
+        set_network_drive_label(&lease, label).await;
         let mut payload = serde_json::to_value(&lease).map_err(|error| error.to_string())?;
         payload["username"] = json!(endpoint.username);
         payload["password"] = json!(endpoint.password);
@@ -406,31 +429,7 @@ impl NativeSmbDrive {
             remove_exact(&lease)?;
             return Err(error);
         }
-        // Network drives use the per-share label, not DriveIcons' local-drive
-        // override. Recreate it whenever reconnect allocates a new endpoint.
-        let key = network_label_key(&lease);
-        let label = crate::drive_label::windows_drive_label(label);
-        match crate::child_process::command("reg.exe")
-            .args([
-                "add",
-                &key,
-                "/v",
-                "_LabelFromReg",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &label,
-                "/f",
-            ])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => refresh_network_drive_label(mount).await,
-            Ok(output) => {
-                tracing::warn!(error = %String::from_utf8_lossy(&output.stderr), "couldn't name the Windows SMB drive")
-            }
-            Err(error) => tracing::warn!(%error, "couldn't name the Windows SMB drive"),
-        }
+        refresh_network_drive_label(mount).await;
         Ok(Self { lease })
     }
 }

@@ -60,6 +60,7 @@ mod secondary_window;
 #[cfg(windows)]
 mod shell_icon;
 mod window_behavior;
+mod window_routes;
 
 use backend_recovery::{
     BackendRecovery, Decision as RecoveryDecision, Observation as RecoveryObservation,
@@ -104,6 +105,8 @@ struct LocalDirectoryWatch {
 }
 
 struct AppState {
+    window_routes: Mutex<window_routes::WindowRoutes>,
+    upgrade_notify: Arc<tokio::sync::Notify>,
     node: Arc<NodeClient>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
@@ -143,6 +146,7 @@ fn scan_full() -> Result<Value, String> {
 /// `None` (and every non-terminal route) mints a fresh one.
 #[tauri::command]
 async fn connect_route(
+    window: tauri::Window,
     state: State<'_, AppState>,
     from: String,
     to: String,
@@ -151,6 +155,8 @@ async fn connect_route(
     session: Option<String>,
     room: Option<String>,
 ) -> Result<String, String> {
+    let route = format!("route:{from}→{to}");
+    let generation = state.window_routes.lock().acquire(window.label(), &route);
     let v = state
         .node
         .request(
@@ -158,18 +164,54 @@ async fn connect_route(
             json!({ "from": from, "to": to, "media": media, "video": video, "session": session, "room": room }),
         )
         .await
-        .map_err(|e| e.to_string())?;
-    serde_json::from_value(v).map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if v.is_err()
+        || !state
+            .window_routes
+            .lock()
+            .is_current(window.label(), generation)
+    {
+        if state
+            .window_routes
+            .lock()
+            .release_generation(window.label(), generation, &route)
+        {
+            let _ = state
+                .node
+                .request("disconnect_route", json!({ "route_id": route }))
+                .await;
+        }
+    }
+    serde_json::from_value(v?).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn disconnect_route(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+async fn disconnect_route(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    route_id: String,
+) -> Result<(), String> {
+    if !state
+        .window_routes
+        .lock()
+        .release(window.label(), &route_id)
+    {
+        return Ok(());
+    }
     state
         .node
         .request("disconnect_route", json!({ "route_id": route_id }))
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn retain_route(window: tauri::Window, state: State<'_, AppState>, route_id: String) {
+    state
+        .window_routes
+        .lock()
+        .acquire(window.label(), &route_id);
 }
 
 #[tauri::command]
@@ -4010,8 +4052,12 @@ async fn update_apply() -> Result<Value, String> {
 #[tauri::command]
 async fn update_relaunch(app: tauri::AppHandle) -> Result<(), String> {
     let applied = allmystuff_updater::apply_now().map_err(|e| e.to_string())?;
+    relaunch_updated_app(app, applied.is_some())
+}
+
+fn relaunch_updated_app(app: tauri::AppHandle, changed: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    if applied.is_some() {
+    if changed {
         // launchd caches a lightweight code requirement for a LaunchAgent's
         // executable. Portable updates replace our ad-hoc-signed Mach-O and
         // therefore change its cdhash; schedule a registration refresh before
@@ -4031,8 +4077,81 @@ async fn update_relaunch(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = applied;
+    let _ = changed;
     app.restart()
+}
+
+async fn upgrade_desktop(app: &tauri::AppHandle) {
+    let request = match allmystuff_updater::desktop_update_request() {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(%error, "couldn't read desktop update handoff");
+            return;
+        }
+    };
+    let outcome = allmystuff_updater::update_now().await;
+    let result = match outcome {
+        Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, .. })
+        | Ok(allmystuff_updater::UpdateNowOutcome::UpToDate { latest: to, .. }) => {
+            if request.as_ref().is_some_and(|request| {
+                allmystuff_updater::policy::compare_semver(&to, &request.version).is_lt()
+            }) {
+                Err(format!(
+                    "The desktop update feed returned {to}, below the requested version."
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(allmystuff_updater::UpdateNowOutcome::PackageManager) => {
+            Err("The desktop app requires its package manager or installer to update.".to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    if let Some(request) = request.as_ref().filter(|request| !request.from.is_empty()) {
+        let _ = app.state::<AppState>().node.request("report_upgrade_status", json!({
+            "node": request.from, "phase": if result.is_ok() { "restarting" } else { "failed" },
+            "error": result.as_ref().err(),
+        })).await;
+    }
+    if let Err(error) = result {
+        tracing::warn!(%error, "fleet desktop update failed; keeping the handoff for retry");
+        let _ = app.emit(
+            "allmystuff://upgrade-status",
+            json!({ "from": "this device", "phase": "failed", "error": error }),
+        );
+        return;
+    }
+    if let Some(request) = &request {
+        if let Err(error) = allmystuff_updater::complete_desktop_update(request) {
+            tracing::warn!(%error, "couldn't acknowledge desktop update");
+            return;
+        }
+    }
+    if let Err(error) = relaunch_updated_app(app.clone(), true) {
+        tracing::warn!(%error, "couldn't relaunch updated desktop");
+    }
+}
+
+/// Update intent survives dropped event subscriptions and backend restarts.
+/// Keep download work off the node event pump so it can reconnect normally.
+async fn run_desktop_update_worker(app: tauri::AppHandle) {
+    let notify = app.state::<AppState>().upgrade_notify.clone();
+    loop {
+        tokio::select! {
+            _ = notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+        }
+        if matches!(allmystuff_updater::desktop_update_request(), Ok(Some(_))) {
+            upgrade_desktop(&app).await;
+            // A failure retains the request; contain retries on an unstable
+            // connection while allowing a new explicit request to wake us.
+            tokio::select! {
+                _ = notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -4570,7 +4689,8 @@ fn schedule_macos_autostart_refresh(app: &tauri::AppHandle) -> Result<bool, Stri
     // Rewrite the plugin-owned plist while this process is still alive. The
     // helper only has to atomically swap launchd's in-memory registration.
     mgr.enable().map_err(|e| e.to_string())?;
-    let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
+    let exe = tauri::process::current_binary(&app.env())
+        .map_err(|e| format!("locating AllMyStuff: {e}"))?;
     let pid = std::process::id().to_string();
     let label = format!("com.allmystuff.autostart-refresh-{pid}");
     let submitted = std::process::Command::new("launchctl")
@@ -4934,13 +5054,16 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
                     let _ = app.emit(&event, payload);
                 }
                 NodeEvent::Upgrade => {
-                    match allmystuff_updater::update_now().await {
-                        Ok(outcome) => {
-                            tracing::info!("fleet GUI upgrade completed: {outcome:?}")
+                    // Compatibility with older nodes that only emit an event.
+                    if matches!(allmystuff_updater::desktop_update_request(), Ok(None)) {
+                        if let Err(error) = allmystuff_updater::request_desktop_update(
+                            env!("CARGO_PKG_VERSION").into(),
+                            String::new(),
+                        ) {
+                            tracing::warn!(%error, "couldn't persist the legacy desktop update request");
                         }
-                        Err(e) => tracing::warn!("fleet GUI upgrade failed: {e}"),
                     }
-                    app.restart();
+                    app.state::<AppState>().upgrade_notify.notify_one();
                 }
                 NodeEvent::Restart => app.restart(), // never returns
             }
@@ -4955,6 +5078,23 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
 /// persisted "Always On" preference by hiding to the tray instead of closing
 /// or minimizing to the taskbar.
 fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if matches!(event, tauri::WindowEvent::Destroyed) {
+        let Some(state) = window.try_state::<AppState>() else {
+            return;
+        };
+        let routes = state.window_routes.lock().close(window.label());
+        for route in routes {
+            let node = state.node.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = node
+                    .request("disconnect_route", json!({ "route_id": route }))
+                    .await
+                {
+                    tracing::warn!(%error, "couldn't end a closed window's route");
+                }
+            });
+        }
+    }
     if window.label() != "main" {
         return;
     }
@@ -5100,6 +5240,7 @@ fn main() {
             kvm_media_stage,
             kvm_media_unmount,
             disconnect_route,
+            retain_route,
             client_log,
             claim_node,
             upgrade_node,
@@ -5293,6 +5434,8 @@ fn main() {
                 }
             };
             app.manage(AppState {
+                window_routes: Mutex::new(window_routes::WindowRoutes::default()),
+                upgrade_notify: Arc::new(tokio::sync::Notify::new()),
                 node: node.clone(),
                 node_child: Mutex::new(OwnedNode::default()),
                 local_files: Arc::new(Mutex::new(LocalFileBrowser::default())),
@@ -5302,6 +5445,7 @@ fn main() {
                     local_file_operations::LocalFileOperations::default(),
                 )),
             });
+            tauri::async_runtime::spawn(run_desktop_update_worker(handle.clone()));
             // Repair only services the user already installed. A missing
             // service is an intentional opt-out, never a migration signal.
             // Existing installations can arrive here through the self-updater,

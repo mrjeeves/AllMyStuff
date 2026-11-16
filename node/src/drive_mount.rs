@@ -70,6 +70,132 @@ mod windows_cloud_alias;
 #[path = "windows_drive_mount.rs"]
 mod windows_drive_mount;
 
+#[cfg(all(test, windows))]
+mod smb_integration_tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires elevated Windows SMB client; maps a temporary AMS-only drive"]
+    async fn native_windows_smb_client_reads_and_writes_private_share() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("marker.txt"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "ams-native-smb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("marker.txt"), b"before").unwrap();
+        let hosts = crate::smb_drives::SmbHosts::default();
+        let mut drives = Vec::new();
+        let mut proxies: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for (index, route) in [
+            "native-client-test",
+            "native-client-test-2",
+            "native-client-test",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 2 {
+                drop(drives.remove(0));
+                proxies[0].abort();
+                hosts.stop(route);
+            }
+            let endpoint = hosts.start(route, &root).await.unwrap();
+            let listener = crate::smb_drives::client_listener(route).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let port = endpoint.port;
+            let proxy = tokio::spawn(async move {
+                while let Ok((mut client, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut host =
+                            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                                .await
+                                .unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut host).await;
+                    });
+                }
+            });
+            let mask = crate::win_privilege::assigned_drive_mask().unwrap()
+                | crate::win_privilege::interactive_user_assigned_drive_mask().unwrap();
+            let mount = super::select_windows_mount(None, |mount| {
+                !super::drive_letter_assigned(mount, mask)
+            })
+            .unwrap();
+            let label = format!("Fixture {index} (on Native SMB test)");
+            let drive = super::windows_drive_mount::NativeSmbDrive::start(
+                &mount, &label, address, endpoint,
+            )
+            .await
+            .unwrap();
+            let shell_mount = format!("{mount}\\");
+            let expected_label = label.clone();
+            let display_name = tokio::task::spawn_blocking(move || {
+                use windows::Win32::System::Com::{
+                    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+                };
+                use windows::Win32::UI::Shell::{
+                    IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY,
+                };
+                let path: Vec<u16> = shell_mount.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+                    // Shell change notifications are delivered asynchronously.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let display = loop {
+                        let item: IShellItem =
+                            SHCreateItemFromParsingName(windows::core::PCWSTR(path.as_ptr()), None)
+                                .unwrap();
+                        let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).unwrap();
+                        let display = name.to_string().unwrap();
+                        CoTaskMemFree(Some(name.0.cast()));
+                        drop(item);
+                        if display.starts_with(&expected_label)
+                            || std::time::Instant::now() >= deadline
+                        {
+                            break display;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    };
+                    CoUninitialize();
+                    display
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                display_name.starts_with(&label),
+                "Windows Shell returned {display_name:?}, expected {label:?}"
+            );
+            drives.push(drive);
+            proxies.push(proxy);
+            let remote_file = std::path::PathBuf::from(format!("{mount}\\marker.txt"));
+            std::fs::write(root.join("marker.txt"), b"before").unwrap();
+            tokio::task::spawn_blocking(move || {
+                assert_eq!(std::fs::read(&remote_file).unwrap(), b"before");
+                std::fs::write(&remote_file, b"after").unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(root.join("marker.txt")).unwrap(), b"after");
+        }
+        drop(drives);
+        for proxy in proxies {
+            proxy.abort();
+        }
+        hosts.stop("native-client-test");
+        hosts.stop("native-client-test-2");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDriveInfo {
     pub route: String,
@@ -541,7 +667,7 @@ async fn choose_unix_mount(
             root.display()
         )
     })?;
-    let stem = safe_mount_name(label);
+    let stem = crate::drive_label::unix_mount_name(label);
     for suffix in 1..=1_000 {
         let name = if suffix == 1 {
             stem.clone()
@@ -599,27 +725,6 @@ async fn validate_unix_mount(mount: &Path, active: &[NativeDriveInfo]) -> Result
         Err(error) => return Err(format!("couldn't inspect {}: {error}", mount.display())),
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn safe_mount_name(label: &str) -> String {
-    let cleaned = label
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let cleaned = cleaned.trim_matches([' ', '.']).trim();
-    if cleaned.is_empty() {
-        "Remote Drive".into()
-    } else {
-        cleaned.to_string()
-    }
 }
 
 #[cfg(target_os = "macos")]

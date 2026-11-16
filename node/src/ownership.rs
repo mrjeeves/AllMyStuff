@@ -103,6 +103,14 @@ pub struct Ownership {
 }
 
 impl Ownership {
+    #[cfg(test)]
+    pub(crate) fn memory() -> Self {
+        Self {
+            path: None,
+            inner: Mutex::new(Inner::default()),
+        }
+    }
+
     /// Load the record from disk (or start blank). The start-time
     /// `ALLMYSTUFF_CLAIMABLE` flag seeds claim mode for this run, but only
     /// while the device is still unowned.

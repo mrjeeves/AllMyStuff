@@ -1080,6 +1080,7 @@ mod winsvc {
                 return Ok(());
             }
         };
+        let initial_payload = payload_stamp(&exe);
         let mut agent: Option<allmystuff_node::win_privilege::ConsoleAgent> = None;
         let mut agent_started: Option<Instant> = None;
         let mut short_failures = 0u32;
@@ -1091,6 +1092,19 @@ mod winsvc {
             }
             let session_moved = agent.as_ref().is_some_and(|child| child.session_moved());
             let exited = agent.as_ref().is_some_and(|child| !child.alive());
+            if exited
+                && initial_payload.is_some()
+                && payload_stamp(&exe).is_some_and(|stamp| Some(stamp) != initial_payload)
+            {
+                // The agent updated our shared service payload and exited.
+                // Relaunching only the child leaves this SCM supervisor on
+                // the previous image indefinitely. Recovery restarts both.
+                tracing::info!(
+                    "service payload changed; restarting the SCM supervisor and session agent"
+                );
+                drop(agent.take());
+                super::service_relaunch();
+            }
             let replace = session_moved || exited;
             if replace {
                 if let Some(child) = agent.take() {
@@ -1159,6 +1173,11 @@ mod winsvc {
         Duration::from_secs(1u64 << short_failures.min(6))
     }
 
+    fn payload_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.len(), metadata.modified().ok()?))
+    }
+
     /// A `MakeWriter` over `%ProgramData%\AllMyStuff\logs\service.log` (append),
     /// so a service with no console still leaves a log. `None` if the file
     /// can't be opened, in which case logging falls back to stderr.
@@ -1188,6 +1207,21 @@ mod winsvc {
             assert_eq!(restart_delay(2), Duration::from_secs(4));
             assert_eq!(restart_delay(6), Duration::from_secs(64));
             assert_eq!(restart_delay(100), Duration::from_secs(64));
+        }
+
+        #[test]
+        fn service_supervisor_detects_an_atomic_payload_replacement() {
+            let path = std::env::temp_dir()
+                .join(format!("ams-service-payload-test-{}", std::process::id()));
+            let replacement = path.with_extension("new");
+            assert!(!path.exists() && !replacement.exists());
+            std::fs::write(&path, b"old").unwrap();
+            let initial = payload_stamp(&path).unwrap();
+            std::fs::write(&replacement, b"updated payload").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+            assert_ne!(payload_stamp(&path).unwrap(), initial);
+            std::fs::remove_file(path).unwrap();
         }
     }
 }

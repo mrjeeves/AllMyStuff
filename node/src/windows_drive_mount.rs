@@ -18,6 +18,8 @@ struct Lease {
     owner: String,
     #[serde(default)]
     generation: String,
+    #[serde(default)]
+    loopback_alias: Option<String>,
 }
 
 impl Lease {
@@ -27,6 +29,7 @@ impl Lease {
             && self.port == other.port
             && self.owner == other.owner
             && self.generation == other.generation
+            && self.loopback_alias == other.loopback_alias
     }
 }
 
@@ -51,13 +54,46 @@ try {
  $remembered="Registry::HKEY_USERS\$($p.owner)\Network\$($p.mount.TrimEnd(':'))"
  if (($assigned | Where-Object LocalPath -eq $p.mount) -or (Test-Path -LiteralPath $remembered -ErrorAction Stop)) { throw 'The drive letter is already assigned, including a disconnected mapping; it was preserved.' }
  $secret=ConvertTo-SecureString $p.password -AsPlainText -Force
- $credential=[pscredential]::new($p.username,$secret)
+ $credential=[pscredential]::new("AMS\$($p.username)",$secret)
  $owner=([Security.Principal.SecurityIdentifier]::new($p.owner)).Translate([Security.Principal.NTAccount]).Value
  $system=([Security.Principal.SecurityIdentifier]::new('S-1-5-18')).Translate([Security.Principal.NTAccount]).Value
  New-SmbGlobalMapping -LocalPath $p.mount -RemotePath $p.remote -TcpPort $p.port -Credential $credential -TransportType TCP -RequireIntegrity $true -RequirePrivacy $true -Persistent $false -FullAccess @($owner,$system) -ErrorAction Stop | Out-Null
  exit 0
 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
 "#;
+const ADD_LOOPBACK: &str = r#"
+$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+try {
+ $p=[Console]::In.ReadToEnd() | ConvertFrom-Json
+ $ip=[Net.IPAddress]::Parse($p.address)
+ if (!$ip.ToString().StartsWith('127.') -or $ip.ToString() -eq '127.0.0.1') { throw 'Invalid AMS loopback identity' }
+ if (Get-NetIPAddress -IPAddress $ip.ToString() -ErrorAction SilentlyContinue) { throw 'The private loopback identity is already assigned; it was preserved.' }
+ $loopback=Get-NetIPAddress -IPAddress '127.0.0.1' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+ New-NetIPAddress -InterfaceIndex $loopback.InterfaceIndex -IPAddress $ip.ToString() -PrefixLength 32 -SkipAsSource $true -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+ exit 0
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+"#;
+const REMOVE_LOOPBACK: &str = r#"
+$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+try {
+ $p=[Console]::In.ReadToEnd() | ConvertFrom-Json
+ $ip=[Net.IPAddress]::Parse($p.address)
+ if (!$ip.ToString().StartsWith('127.') -or $ip.ToString() -eq '127.0.0.1') { throw 'Invalid AMS loopback identity' }
+ $loopback=Get-NetIPAddress -IPAddress '127.0.0.1' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+ $alias=Get-NetIPAddress -InterfaceIndex $loopback.InterfaceIndex -IPAddress $ip.ToString() -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+ if ($alias -and $alias.PrefixLength -eq 32 -and $alias.SkipAsSource) { $alias | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop }
+ exit 0
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+"#;
+
+struct LoopbackAlias(String);
+impl Drop for LoopbackAlias {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            let _ = run(REMOVE_LOOPBACK, json!({"address": self.0}));
+        }
+    }
+}
 const DISCONNECT: &str = r#"
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 try {
@@ -82,6 +118,9 @@ fn run(script: &str, payload: serde_json::Value) -> Result<(), String> {
     );
     // Credentials travel through stdin, never the command line or a file.
     let mut child = crate::child_process::blocking_command("powershell.exe")
+        // Windows PowerShell must load its own built-in modules even when the
+        // desktop was launched from PowerShell 7 with a different module path.
+        .env_remove("PSModulePath")
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -127,7 +166,10 @@ fn run(script: &str, payload: serde_json::Value) -> Result<(), String> {
                 || error.to_string(),
                 |secret| error.replace(secret, "[redacted]"),
             );
-        Err(format!("Windows couldn't configure the AMS SMB drive (the installed AMS service or an elevated node is required): {}",error.trim()))
+        Err(format!(
+            "Windows couldn't configure the AMS SMB drive: {}",
+            error.trim()
+        ))
     }
 }
 
@@ -182,9 +224,69 @@ fn remove_exact(expected: &Lease) -> Result<bool, String> {
         DISCONNECT,
         serde_json::to_value(expected).map_err(|error| error.to_string())?,
     )?;
+    // Global SMB mappings need explicit Shell events to retire the old
+    // endpoint's display-name cache before this letter can be reused.
+    notify_network_drive(
+        &expected.mount,
+        windows_sys::Win32::UI::Shell::SHCNE_DRIVEREMOVED,
+    );
+    if let Some(address) = &expected.loopback_alias {
+        if expected.remote.starts_with(&format!(r"\\{address}\")) {
+            run(REMOVE_LOOPBACK, json!({"address": address}))?;
+        }
+    }
+    // The name belongs to this exact UNC endpoint, never to a drive letter
+    // that another application may already have reused.
+    let _ = crate::child_process::blocking_command("reg.exe")
+        .args([
+            "delete",
+            &network_label_key(expected),
+            "/v",
+            "_LabelFromReg",
+            "/f",
+        ])
+        .output();
     saved.retain(|lease| !lease.matches(expected));
     save(&saved)?;
     Ok(true)
+}
+
+fn network_label_key(lease: &Lease) -> String {
+    format!(
+        r"HKEY_USERS\{}\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\{}",
+        lease.owner,
+        lease.remote.replace('\\', "#")
+    )
+}
+
+fn notify_network_drive(mount: &str, event: u32) {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSHNOWAIT, SHCNF_PATHW};
+    let path: Vec<u16> = format!("{mount}\\").encode_utf16().chain(Some(0)).collect();
+    // The Always On node runs as SYSTEM. Shell notifications must use the
+    // desktop user's identity, just like the mapping's namespace and label.
+    if let Err(error) = crate::win_privilege::interactive_user_call("ams-drive-notify", move || {
+        unsafe {
+            SHChangeNotify(
+                event as i32,
+                SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                path.as_ptr().cast(),
+                std::ptr::null(),
+            );
+        }
+        Ok(())
+    }) {
+        tracing::warn!(%error, "couldn't notify Explorer about the SMB drive");
+    }
+}
+
+async fn refresh_network_drive_label(mount: &str) {
+    let mount = mount.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        use windows_sys::Win32::UI::Shell::{SHCNE_DRIVEADD, SHCNE_UPDATEITEM};
+        notify_network_drive(&mount, SHCNE_DRIVEADD);
+        notify_network_drive(&mount, SHCNE_UPDATEITEM);
+    })
+    .await;
 }
 fn owned_remote(remote: &str) -> bool {
     let Some((host, share)) = remote
@@ -243,10 +345,25 @@ impl NativeSmbDrive {
             port: address.port(),
             owner,
             generation: identity.iter().map(|byte| format!("{byte:02x}")).collect(),
+            loopback_alias: (address.ip() != std::net::Ipv4Addr::LOCALHOST)
+                .then(|| address.ip().to_string()),
         };
         if !owned_remote(&lease.remote) {
             return Err("the SMB share identity is invalid".into());
         }
+        // The Windows redirector cannot connect to an unconfigured 127/8
+        // address, and refuses different TCP ports for the same server. Give
+        // each mapping an active-only /32 on the existing loopback interface.
+        // Never adopt or remove an address another application already owns.
+        let mut alias_guard = if let Some(address) = lease.loopback_alias.clone() {
+            let registered = address.clone();
+            tokio::task::spawn_blocking(move || run(ADD_LOOPBACK, json!({"address": registered})))
+                .await
+                .map_err(|error| error.to_string())??;
+            Some(LoopbackAlias(address))
+        } else {
+            None
+        };
         {
             let _guard = LEASE_LOCK.lock();
             let mut saved = leases()?;
@@ -255,6 +372,10 @@ impl NativeSmbDrive {
             saved.retain(|entry| !entry.mount.eq_ignore_ascii_case(mount));
             saved.push(lease.clone());
             save(&saved)?;
+        }
+        // Durable lease cleanup owns the alias from here, including failures.
+        if let Some(mut alias) = alias_guard.take() {
+            alias.0.clear();
         }
         let mut payload = serde_json::to_value(&lease).map_err(|error| error.to_string())?;
         payload["username"] = json!(endpoint.username);
@@ -285,15 +406,31 @@ impl NativeSmbDrive {
             remove_exact(&lease)?;
             return Err(error);
         }
-        let key = format!(
-            r"{}\Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{}\DefaultLabel",
-            super::drive_registry_root()?,
-            mount.trim_end_matches(':')
-        );
-        let _ = crate::child_process::command("reg.exe")
-            .args(["add", &key, "/ve", "/t", "REG_SZ", "/d", label, "/f"])
+        // Network drives use the per-share label, not DriveIcons' local-drive
+        // override. Recreate it whenever reconnect allocates a new endpoint.
+        let key = network_label_key(&lease);
+        let label = crate::drive_label::windows_drive_label(label);
+        match crate::child_process::command("reg.exe")
+            .args([
+                "add",
+                &key,
+                "/v",
+                "_LabelFromReg",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &label,
+                "/f",
+            ])
             .output()
-            .await;
+            .await
+        {
+            Ok(output) if output.status.success() => refresh_network_drive_label(mount).await,
+            Ok(output) => {
+                tracing::warn!(error = %String::from_utf8_lossy(&output.stderr), "couldn't name the Windows SMB drive")
+            }
+            Err(error) => tracing::warn!(%error, "couldn't name the Windows SMB drive"),
+        }
         Ok(Self { lease })
     }
 }
@@ -330,6 +467,7 @@ mod tests {
     #[test]
     fn an_old_owner_cannot_remove_a_replacement_on_the_same_letter() {
         let old = super::Lease {
+            loopback_alias: None,
             mount: "Y:".into(),
             remote: r"\\127.64.1.2\ams0123456789abcdef".into(),
             port: 23456,

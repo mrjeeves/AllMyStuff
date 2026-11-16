@@ -1,5 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
+  import { mappedDriveLabel } from "../drive-label";
   import RemoteFolderPicker from "./RemoteFolderPicker.svelte";
   import KvmMediaPanel from "./KvmMediaPanel.svelte";
 
@@ -114,7 +115,7 @@
             </svg>
           </span>
           <div class="drive-copy">
-            <strong>{mapping.drive}</strong>
+            <strong title={mapping.drive}>{mapping.drive}</strong>
             <span>
               {#if mapping.direction === "out"}
                 Mapped to {mapping.machine}{mapping.mount ? ` as ${mapping.mount}` : ""}{mapping.status === "unavailable" ? " · Unavailable" : ""}
@@ -140,7 +141,7 @@
       <span class="path">Shared by {app.machineByAnyId(pendingShared.source)?.label || "the other machine"} · source path private</span>
       <div class="readonly-field">
         <span>Name</span>
-        <strong class="shared-name">{pendingShared.folder.label}</strong>
+        <strong class="shared-name">{mappedDriveLabel(pendingShared.folder.label, app.machineByAnyId(pendingShared.source)?.label || "Device")}</strong>
       </div>
       <label>
         Mount on
@@ -231,6 +232,7 @@
         Name
         <input bind:value={pending.label} required aria-label="Mapped drive name" />
       </label>
+      <span class="path">{mappedDriveLabel(pending.label, app.machineByAnyId(pending.source || app.localId)?.label || "Device")}</span>
       <label>
         Drive letter
         <input bind:value={pending.mount} placeholder="Auto: next available" aria-label="Drive letter or mount point" />

@@ -1110,6 +1110,12 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_upgrade(node).await)
         }
+        "report_upgrade_status" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let phase: String = try_arg!(arg(a, "phase"));
+            let error = a.get("error").and_then(Value::as_str).map(str::to_string);
+            json_result(mesh.report_upgrade_status(node, phase, error).await)
+        }
         "restart_node" => {
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_restart(node).await)
@@ -1419,6 +1425,11 @@ pub async fn dispatch(
         "fleetfiles_materialize" => {
             let path: String = try_arg!(arg(a, "path"));
             json_result(mesh.fleetfiles_materialize(path).await)
+        }
+        "fleetfiles_recover_body" => {
+            let path: String = try_arg!(arg(a, "path"));
+            let source: String = try_arg!(arg(a, "source"));
+            json_result(mesh.fleetfiles_recover_body(path, source).await)
         }
         "fleetfiles_restore_version" => {
             let path: String = try_arg!(arg(a, "path"));

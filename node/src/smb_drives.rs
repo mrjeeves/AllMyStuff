@@ -58,6 +58,7 @@ impl SmbHosts {
             LocalFsBackend::new(root).map_err(|error| format!("open SMB share root: {error}"))?;
         let server = SmbServer::builder()
             .listen("127.0.0.1:0".parse().unwrap())
+            .netbios_name(format!("AMS{}", &share[3..15]))
             .user(&username, &password)
             .require_signing(true)
             .encrypt_data(true)
@@ -108,13 +109,22 @@ pub(crate) fn client_address(mapping: &str) -> std::net::Ipv4Addr {
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub(crate) async fn client_listener(_mapping: &str) -> Result<tokio::net::TcpListener, String> {
-    // Darwin only permits binding configured interface addresses, unlike
-    // Windows/Linux's whole 127/8 range. NetFS forces a new session per mount;
-    // its distinct TCP port/share isolate sessions on the configured loopback.
+    // Darwin requires its configured loopback address. On Windows the mount
+    // owner registers the selected /32 on the existing loopback interface
+    // before asking the native SMB client to connect.
     #[cfg(target_os = "macos")]
     let address = std::net::Ipv4Addr::LOCALHOST;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let address = client_address(_mapping);
+    #[cfg(windows)]
+    let address = {
+        // Windows retains the server's TCP-port/credential association even
+        // after its last mapping is removed. A reconnect gets a new tunnel
+        // port and password, so it also needs a fresh private server identity.
+        let mut incarnation = [0u8; 16];
+        getrandom::getrandom(&mut incarnation).map_err(|error| error.to_string())?;
+        client_address(&format!("{_mapping}:{incarnation:?}"))
+    };
     tokio::net::TcpListener::bind((address, 0))
         .await
         .map_err(|error| format!("bind private SMB tunnel: {error}"))

@@ -7,6 +7,13 @@ use std::{
 
 type LaunchLock = tokio::sync::Mutex<()>;
 
+/// WKWebView queues scripts while a new page is loading, but Wry drops their
+/// evaluation callbacks in that path. A dropped sender means the renderer is
+/// not ready yet; the launcher's existing deadline still bounds every retry.
+pub async fn renderer_ready_reply(reply: tokio::sync::oneshot::Receiver<bool>) -> bool {
+    reply.await.unwrap_or(false)
+}
+
 /// Coalesce concurrent opens for the same window without holding up launches
 /// for other machines. Weak entries disappear when no launch is using them.
 pub fn launch_lock(label: &str) -> Arc<LaunchLock> {
@@ -43,6 +50,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropped_loading_callback_retries_until_the_renderer_is_mounted() {
+        let mut calls = 0;
+        wait_until_ready(
+            || {
+                calls += 1;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // Wry drops the initial callback while WKWebView is loading.
+                // The next evaluation works before Svelte has mounted, then
+                // the mounted app finally answers true.
+                if calls > 1 {
+                    tx.send(calls == 3).unwrap();
+                }
+                async move { Ok(renderer_ready_reply(rx).await) }
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
 
     #[tokio::test]
     async fn duplicate_clicks_wait_but_other_machines_can_open() {

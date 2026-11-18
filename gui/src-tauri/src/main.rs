@@ -1040,7 +1040,7 @@ async fn webview_ready(window: &tauri::WebviewWindow) -> Result<bool, String> {
             }
         })
         .map_err(|e| e.to_string())?;
-    rx.await.map_err(|e| e.to_string())
+    Ok(secondary_window::renderer_ready_reply(rx).await)
 }
 
 async fn destroy_secondary_window(

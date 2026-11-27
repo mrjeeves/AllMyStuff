@@ -348,10 +348,8 @@
 
   // ---- source aspect (mouse letterbox correction) --------------------
   //
-  // A machine whose native resolution isn't 16:9 gets letterboxed into the
-  // capture; the mouse must map over the desktop inside the bars. "Auto" reads
-  // the bars off the picture (detectActiveRegion); an explicit aspect computes
-  // the exact symmetric bars with no sampling — the confident manual path.
+  // A KVM's HDMI signal can include bars around the desktop. "Auto" reads
+  // them from the picture; an explicit aspect computes the symmetric bars.
   const ASPECTS: Array<{ label: string; value: string; ratio: number | null }> = [
     { label: "Auto", value: "auto", ratio: null },
     { label: "16:9", value: "16:9", ratio: 16 / 9 },
@@ -844,9 +842,8 @@
     // hasFrame gate below then drops events until the first fresh frame repaints.
     frameW = 0;
     frameH = 0;
-    // A new source may have a different (or no) letterbox — start from the full
-    // frame, unlock, and let the one-shot detector re-measure and re-lock.
-    activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+    // Start a fresh HDMI letterbox measurement for the new stream.
+    kvmRegion = FULL_FRAME_REGION;
     detectLocked = false;
     detectPrev = null;
     hostStatus = null;
@@ -1277,13 +1274,7 @@
     const fx = (e.clientX - ox) / cw;
     const fy = (e.clientY - oy) / ch;
     if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
-    // Remap over the ACTIVE region — inside any baked-in letterbox bars. A
-    // source whose native aspect ≠ the 16:9 capture (e.g. a 16:10 laptop output
-    // as 1080p) bakes black bars into the frame, and the remote's absolute
-    // pointer maps over its DESKTOP, not the whole frame — so mapping over the
-    // full frame lands the cursor off by the bar width. activeRegion is the
-    // detected desktop box (0..1), or the full frame when there are no clear,
-    // symmetric bars. Bar-hits clamp to the desktop edge.
+    // With HDMI capture, hits on baked-in bars clamp to the desktop edge.
     const ar = activeRegion;
     const x = Math.min(1, Math.max(0, (fx - ar.x0) / (ar.x1 - ar.x0)));
     const y = Math.min(1, Math.max(0, (fy - ar.y0) / (ar.y1 - ar.y0)));
@@ -1292,9 +1283,11 @@
 
   // ---- letterbox / active-area detection -----------------------------
   //
-  // The active region of the streamed frame in 0..1 fractions (the desktop
-  // inside any baked-in black bars); the full frame until detection runs.
-  let activeRegion = $state({ x0: 0, y0: 0, x1: 1, y1: 1 });
+  const FULL_FRAME_REGION = { x0: 0, y0: 0, x1: 1, y1: 1 };
+  let kvmRegion = $state(FULL_FRAME_REGION);
+  // Native captures scale the whole monitor into the video frame. Dark parts
+  // of that desktop are valid mouse targets, even if they look like HDMI bars.
+  const activeRegion = $derived(kvmSource ? kvmRegion : FULL_FRAME_REGION);
   // The bars are baked pixels with no sidechannel (HDMI reports only the signal
   // size, the SPS only the coded size), so they must be measured off the frame —
   // but they're STATIC for a source mode, so this is a one-shot: it measures on
@@ -1323,7 +1316,7 @@
   // instant" regression. Sampling the frame we were handed sidesteps the
   // canvas entirely. `src` is the VideoFrame / ImageBitmap that was painted.
   function maybeDetect(src: CanvasImageSource) {
-    if (detectLocked || aspectChoice !== "auto" || !stagePointerActive) return;
+    if (!kvmSource || detectLocked || aspectChoice !== "auto" || !stagePointerActive) return;
     const now = performance.now();
     if (now - lastDetectAt < 1000) return;
     lastDetectAt = now;
@@ -1333,11 +1326,9 @@
   // Measure the frame's active region: mirror the decoded FRAME into the small
   // CPU-side scratch surface (created once, willReadFrequently from birth) and
   // scan that one downscaled readback for symmetric black letterbox/pillarbox
-  // bars. The live presentation canvas is never read or drawn-from, so it stays
-  // GPU-accelerated for the whole session. Conservative: only crops when clear
-  // bars sit on BOTH opposite edges and are near-symmetric (a real letterbox),
-  // so ordinary dark content is never mistaken for a bar; otherwise it maps
-  // over the whole frame.
+  // bars. The live presentation canvas is never read or drawn from, so it stays
+  // GPU-accelerated. On HDMI the heuristic looks for near-symmetric dark bands
+  // on opposite edges. The manual aspect setting overrides its estimate.
   function detectActiveRegion(src: CanvasImageSource) {
     if (detectLocked) return;
     if (!detectScratch) {
@@ -1422,7 +1413,7 @@
       y0: okY ? y0 / h : 0,
       y1: okY ? y1 / h : 1,
     };
-    activeRegion = next;
+    kvmRegion = next;
     // Lock once two consecutive content-bearing frames agree — then stop
     // sampling entirely until the next re-wire resets it.
     const near = (a: number, b: number) => Math.abs(a - b) < 0.005;
@@ -1454,23 +1445,20 @@
     return { x0: 0, y0: 0, x1: 1, y1: 1 };
   }
 
-  // Apply the Aspect pick: "Auto" hands the active region back to the one-shot
-  // pixel detector; an explicit aspect computes the exact bars and disables
-  // detection. Re-runs when the pick or the frame geometry changes.
+  // Apply the KVM's Aspect pick when it or the frame geometry changes.
   $effect(() => {
     const choice = aspectChoice;
     const fw = frameW;
     const fh = frameH;
     const ratio = ASPECTS.find((a) => a.value === choice)?.ratio ?? null;
-    if (ratio == null) {
-      // Auto — unlock and let detectActiveRegion re-measure.
+    if (!kvmSource || ratio == null) {
       detectLocked = false;
       detectPrev = null;
-      activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+      kvmRegion = FULL_FRAME_REGION;
       return;
     }
     detectLocked = true; // stop the detector; the aspect is authoritative
-    activeRegion = fw && fh ? activeRegionForAspect(ratio, fw, fh) : { x0: 0, y0: 0, x1: 1, y1: 1 };
+    kvmRegion = fw && fh ? activeRegionForAspect(ratio, fw, fh) : FULL_FRAME_REGION;
   });
 
   // The KVM rule: with control live, the window your keyboard should reach is
@@ -2789,11 +2777,11 @@
                       {/each}
                     </div>
                   {/if}
-                  {#if stagePointerActive}
+                  {#if stagePointerActive && kvmSource}
                     <button
                       class="vrow"
                       class:tuned={aspectChoice !== "auto"}
-                      title="Source aspect: corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      title="Correct the mouse for bars in the KVM's HDMI signal. Auto estimates the bars from the picture."
                       onclick={() => (openSub = openSub === "aspect" ? null : "aspect")}
                     >
                       <span>Aspect</span>

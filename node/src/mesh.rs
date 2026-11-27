@@ -769,6 +769,7 @@ struct DrivePullRequest {
     root: String,
     label: String,
     mount: String,
+    exact_mount: bool,
     /// Set when this pull asked for a **shared folder** rather than a path.
     /// A folder pull carries no root — reconnect re-sends this opaque id.
     folder: Option<String>,
@@ -790,6 +791,10 @@ struct DriveReconnect {
     root: String,
     label: String,
     mount: String,
+    /// Auto remembers the last mount but can move to a different letter.
+    /// Saved mappings from before this distinction keep that behavior.
+    #[serde(default)]
+    exact_mount: bool,
     /// Opaque shared-folder id. Older persisted mappings omit this and keep
     /// reconnecting by their owner/fleet root path.
     #[serde(default)]
@@ -811,6 +816,9 @@ struct DriveRelationship {
     mount: String,
     #[serde(default)]
     route: String,
+    /// The receiver confirmed the operating system mounted this incarnation.
+    #[serde(default)]
+    mounted: bool,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -2299,6 +2307,7 @@ impl Mesh {
                     label: reconnect.label.clone(),
                     mount: reconnect.mount.clone(),
                     route: String::new(),
+                    mounted: false,
                 });
         }
         let _ = persist_drive_reconnects(&drive_reconnect_path, &drive_reconnects);
@@ -5046,6 +5055,7 @@ impl Mesh {
                                         pull.label
                                     },
                                     mount: pull.mount,
+                                    exact_mount: pull.exact_mount,
                                     folder: pull.folder,
                                 })
                                 .or_else(|| {
@@ -5056,6 +5066,7 @@ impl Mesh {
                                         root: offer.root.clone()?,
                                         label: offer.label.clone(),
                                         mount: offer.mount.clone(),
+                                        exact_mount: !offer.mount.trim().is_empty(),
                                         folder: None,
                                     })
                                 });
@@ -5074,6 +5085,7 @@ impl Mesh {
                                     label: offer.label.clone(),
                                     mount: offer.mount.clone(),
                                     route: route.id.clone(),
+                                    mounted: false,
                                 });
                             }
                         }
@@ -6704,6 +6716,7 @@ impl Mesh {
             label: label.clone(),
             mount: mount.clone(),
             route: route.id.clone(),
+            mounted: false,
         });
         let drive = DriveRouteOffer {
             label,
@@ -7032,7 +7045,8 @@ impl Mesh {
         mount: String,
     ) -> Result<(), String> {
         let mapping = new_drive_mapping_id()?;
-        self.drive_map_from_requested(source, root, label, mount, mapping)
+        let exact_mount = !mount.trim().is_empty();
+        self.drive_map_from_requested(source, root, label, mount, mapping, exact_mount)
             .await
     }
 
@@ -7043,6 +7057,7 @@ impl Mesh {
         label: String,
         mount: String,
         mapping: String,
+        exact_mount: bool,
     ) -> Result<(), String> {
         let source = pubkey_part(&node_of(&source)).to_string();
         if source.is_empty()
@@ -7071,6 +7086,7 @@ impl Mesh {
                 root: root.clone(),
                 label: label.clone(),
                 mount: mount.clone(),
+                exact_mount,
                 folder: None,
                 made: Instant::now(),
             },
@@ -7120,7 +7136,8 @@ impl Mesh {
         mount: String,
     ) -> Result<(), String> {
         let mapping = new_drive_mapping_id()?;
-        self.folder_open_requested(source, folder, mount, mapping)
+        let exact_mount = !mount.trim().is_empty();
+        self.folder_open_requested(source, folder, mount, mapping, exact_mount)
             .await
     }
 
@@ -7130,6 +7147,7 @@ impl Mesh {
         folder: String,
         mount: String,
         mapping: String,
+        exact_mount: bool,
     ) -> Result<(), String> {
         let source = pubkey_part(&node_of(&source)).to_string();
         if source.is_empty()
@@ -7161,6 +7179,7 @@ impl Mesh {
                 root: String::new(),
                 label: String::new(),
                 mount: mount.clone(),
+                exact_mount,
                 folder: Some(folder.clone()),
                 made: Instant::now(),
             },
@@ -7414,6 +7433,7 @@ impl Mesh {
             label: label.clone(),
             mount: mount.clone(),
             route: route.id.clone(),
+            mounted: false,
         });
         let drive = DriveRouteOffer {
             label,
@@ -7561,7 +7581,13 @@ impl Mesh {
                     "label": mapping.label,
                     "mount": mapping.mount,
                     "route": mapping.route,
-                    "status": if mounted.is_some() { "mounted" } else if active { "connected" } else { "unavailable" },
+                    "status": if mounted.is_some() || (active && mapping.mounted) {
+                        "mounted"
+                    } else if active {
+                        "connected"
+                    } else {
+                        "unavailable"
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -7725,6 +7751,7 @@ impl Mesh {
                             folder,
                             intent.mount.clone(),
                             intent.mapping.clone(),
+                            intent.exact_mount,
                         )
                         .await
                     } else {
@@ -7734,6 +7761,7 @@ impl Mesh {
                             intent.label.clone(),
                             intent.mount.clone(),
                             intent.mapping.clone(),
+                            intent.exact_mount,
                         )
                         .await
                     };
@@ -8088,6 +8116,14 @@ impl Mesh {
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        self.disconnect_route(route_id, None).await
+    }
+
+    async fn disconnect_route(
+        self: &Arc<Self>,
+        route_id: String,
+        rejection: Option<String>,
+    ) -> Result<(), String> {
         // An explicit disconnect means "forget this mapping", not merely
         // "this connection incarnation ended". Automatic peer-restart reaps
         // bypass this command and intentionally retain the reconnect intent.
@@ -8180,9 +8216,15 @@ impl Mesh {
         // here, or they'd leak (the port stays bound, the accept loop runs).
         self.sites.stop_route(&route_id);
         self.drop_downloads(&route_id);
-        if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
+        if let (Some(msg), Some(peer)) = (msg, self.route_peer(&route_id)) {
+            let msg = rejection.map_or(msg, |reason| {
+                ControlMessage::Route(RouteControl::Reject {
+                    route_id: route_id.clone(),
+                    reason,
+                })
+            });
             // Best-effort: the route is gone locally either way.
-            let _ = self.send_control(&peer, msg).await;
+            let _ = self.send_control(&peer, &msg).await;
         }
         self.route_networks.lock().release(&route_id);
         self.emit_snapshot();
@@ -10578,6 +10620,12 @@ impl Mesh {
                 let Some(existing) = self.drive_relationships.lock().get(&mapping).cloned() else {
                     return;
                 };
+                if existing.route != route
+                    || !same_node(&existing.target, from.as_str())
+                    || !self.smb_route_active(&route)
+                {
+                    return;
+                }
                 self.record_drive_relationship(DriveRelationship {
                     mapping,
                     source: existing.source,
@@ -10585,6 +10633,7 @@ impl Mesh {
                     label,
                     mount,
                     route,
+                    mounted: true,
                 });
             }
             AppControl::ShareFolder {
@@ -14039,6 +14088,17 @@ impl Mesh {
                         .clone()
                         .filter(|mapping| !mapping.is_empty())
                         .unwrap_or_else(|| route_id.clone());
+                    // Pulls and reconnects use the receiver's saved choice.
+                    // On a first push the destination comes from the offer.
+                    let (requested_mount, exact_mount) = self
+                        .drive_reconnects
+                        .lock()
+                        .get(&route_id)
+                        .map(|intent| (intent.mount.clone(), intent.exact_mount))
+                        .unwrap_or_else(|| {
+                            let exact = !drive.mount.trim().is_empty();
+                            (drive.mount, exact)
+                        });
                     let source_node = from_node.clone();
                     let target_node = to_node.clone();
                     // Decorate only after the original offer/request has been
@@ -14049,16 +14109,22 @@ impl Mesh {
                     );
                     crate::spawn(async move {
                         match mounts
-                            .mount(mesh.clone(), route_id.clone(), label, drive.mount, &mapping)
+                            .mount(
+                                mesh.clone(),
+                                route_id.clone(),
+                                label,
+                                requested_mount,
+                                exact_mount,
+                                &mapping,
+                            )
                             .await
                         {
                             Ok(info) => {
                                 if let Some(intent) =
                                     mesh.drive_reconnects.lock().get_mut(&route_id)
                                 {
-                                    // Empty means "pick one" only on the first
-                                    // mount. A reconnect must reclaim the same
-                                    // letter/mount point the user already sees.
+                                    // Remember the successful destination.
+                                    // Windows Auto prefers it on reconnect.
                                     intent.mount = info.mount.clone();
                                 }
                                 mesh.persist_drive_reconnects();
@@ -14069,6 +14135,7 @@ impl Mesh {
                                     label: info.label.clone(),
                                     mount: info.mount.clone(),
                                     route: route_id.clone(),
+                                    mounted: true,
                                 });
                                 let _ = mesh
                                     .send_control(
@@ -14115,7 +14182,10 @@ impl Mesh {
                                     }),
                                 );
                                 mesh.finish_drive_pull(request.as_deref(), Err(error.clone()));
-                                let _ = mesh.disconnect(route_id).await;
+                                // A source that pushed this mapping needs the
+                                // receiving OS's result. Pulls report locally.
+                                let rejection = request.is_none().then_some(error);
+                                let _ = mesh.disconnect_route(route_id, rejection).await;
                             }
                         }
                     });
@@ -25702,6 +25772,7 @@ mod tests {
             root: "/Volumes/Install Media".into(),
             label: "Windows installer".into(),
             mount: "X:".into(),
+            exact_mount: true,
             folder: None,
         };
         let mappings = std::collections::HashMap::from([
@@ -25733,6 +25804,7 @@ mod tests {
             root: String::new(),
             label: "Family photos".into(),
             mount: "Y:".into(),
+            exact_mount: false,
             folder: Some("opaque-folder-id".into()),
         };
         let mappings = std::collections::HashMap::from([("route:folder".into(), intent.clone())]);
@@ -25759,6 +25831,7 @@ mod tests {
             legacy.mapping.is_empty(),
             "older records gain an id at store load"
         );
+        assert!(!legacy.exact_mount, "legacy preferences can still relocate");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -25779,6 +25852,7 @@ mod tests {
             label: "Laptop Documents".into(),
             mount: "Z:".into(),
             route: "route:live".into(),
+            mounted: true,
         };
         let relationships =
             std::collections::HashMap::from([("mapping-1".into(), relationship.clone())]);

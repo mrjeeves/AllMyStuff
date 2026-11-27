@@ -1,10 +1,13 @@
 <script lang="ts">
   import { app } from "../store.svelte";
   import { mappedDriveLabel } from "../drive-label";
+  import { driveSourceLabel } from "../files-canvas";
   import RemoteFolderPicker from "./RemoteFolderPicker.svelte";
   import KvmMediaPanel from "./KvmMediaPanel.svelte";
 
   let { target, supportSession = false }: { target: string; supportSession?: boolean } = $props();
+  const panelId = $props.id();
+  const driveLetterList = `${panelId}-drive-letters`;
   let pending = $state<{ root: string; label: string; mount: string; source?: string } | null>(null);
   let pendingShared = $state<{ source: string; folder: { id: string; label: string; path: string }; mount: string; target: string } | null>(null);
   let choosingSource = $state(false);
@@ -16,7 +19,14 @@
   const targetNode = $derived(app.machineByAnyId(target));
   const targetLabel = $derived(targetNode?.label || "that computer");
   const sharedFolders = $derived(app.sharedFoldersFrom(targetNode));
-  const sharedDestinations = $derived(app.driveTargets.filter((node) => app.isFleetMember(node.id)));
+  const sharedDestinations = $derived(app.driveTargets.filter((node) =>
+    app.isFleetMember(node.id) && !app.isSameMachine(node.id, pendingShared?.source ?? target),
+  ));
+  const destination = $derived(pendingShared?.target ?? (pending?.source ? app.localId : target));
+  const destinationOs = $derived(app.machineByAnyId(destination)?.summary?.os ?? "");
+  const windowsDestination = $derived(/\bWindows\b/i.test(destinationOs) ||
+    (app.isMe(destination) && !destinationOs && /^Win/i.test(navigator.platform)));
+  const driveLetters = Array.from("ZYXWVUTSRQPONMLKJIHGFEDCBA", (letter) => `${letter}:`);
   const mappings = $derived(
     app.driveMappings.filter(
       (mapping) =>
@@ -36,27 +46,30 @@
     choosingDirection = false;
     const root = await app.pickDriveSource();
     if (!root) return;
-    const pieces = root.split(/[\\/]/).filter(Boolean);
     pending = {
       root,
-      label: pieces.at(-1)?.replace(/:$/, "") || "Remote drive",
+      label: driveSourceLabel(root),
       mount: "",
     };
     requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
   }
 
   function chooseShared(source: string, folder: { id: string; label: string; path: string }) {
-    const destination = app.isFleetMember(target) ? target : app.localId;
-    pendingShared = { source, folder, mount: "", target: destination };
+    pendingShared = { source, folder, mount: "", target: app.localId };
     remoteSource = null;
-    requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
+    requestAnimationFrame(() => formEl?.querySelector("select")?.focus());
+  }
+
+  function mountRequest(value: string): string {
+    if (!windowsDestination || !value) return value;
+    return `${value.toUpperCase().replace(/:$/, "")}:`;
   }
 
   async function saveShared() {
     if (!pendingShared || saving) return;
     saving = true;
     const draft = pendingShared;
-    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, draft.mount, draft.target);
+    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, mountRequest(draft.mount), draft.target);
     if (done) {
       pendingShared = null;
       choosingSource = false;
@@ -70,9 +83,10 @@
     if (!pending || saving) return;
     saving = true;
     const draft = pending;
+    const mount = mountRequest(draft.mount);
     const done = draft.source
-      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, draft.mount, supportSession)
-      : await app.mapFolderToNode(target, draft.root, draft.label, draft.mount, supportSession);
+      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, mount, supportSession)
+      : await app.mapFolderToNode(target, draft.root, draft.label, mount, supportSession);
     if (done) {
       pending = null;
       choosingSource = false;
@@ -82,24 +96,35 @@
     saving = false;
   }
 
-  function leaveForm(event: FocusEvent) {
-    const next = event.relatedTarget as Node | null;
-    if (next && formEl?.contains(next)) return;
-    queueMicrotask(() => void (pendingShared ? saveShared() : save()));
-  }
-
-
-  $effect(() => {
-    if (!pending && !pendingShared) return;
-    function saveOnOutside(event: PointerEvent) {
-      const element = event.target as Element | null;
-      if (element?.closest?.(".drive-menu")) return;
-      void (pendingShared ? saveShared() : save());
-    }
-    window.addEventListener("pointerdown", saveOnOutside, true);
-    return () => window.removeEventListener("pointerdown", saveOnOutside, true);
-  });
 </script>
+
+{#snippet mountField(draft: { mount: string })}
+  {#if windowsDestination}
+    <label>
+      Drive letter
+      <input
+        bind:value={draft.mount}
+        list={driveLetterList}
+        placeholder="Auto if blank"
+        pattern="[A-Za-z]:?"
+        title="Enter one letter, such as D or D:, or leave blank for Auto"
+        autocomplete="off"
+        spellcheck={false}
+        disabled={saving}
+      />
+    </label>
+    <datalist id={driveLetterList}>
+      {#each driveLetters as letter (letter)}
+        <option value={letter}></option>
+      {/each}
+    </datalist>
+  {:else}
+    <label>
+      Mount location
+      <input bind:value={draft.mount} placeholder={destinationOs ? "Auto or an absolute path" : "Auto, drive letter, or absolute path"} disabled={saving} />
+    </label>
+  {/if}
+{/snippet}
 
 {#if app.isKvm(app.machineByAnyId(target))}
   <KvmMediaPanel kvm={target} />
@@ -108,6 +133,7 @@
   {#if mappings.length}
     <div class="drive-list">
       {#each mappings as mapping (mapping.id)}
+        {@const failure = app.routeStates[mapping.route.id]?.reason}
         <div class="drive-row">
           <span class="drive-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -118,7 +144,13 @@
             <strong title={mapping.drive}>{mapping.drive}</strong>
             <span>
               {#if mapping.direction === "out"}
-                Mapped to {mapping.machine}{mapping.mount ? ` as ${mapping.mount}` : ""}{mapping.status === "unavailable" ? " · Unavailable" : ""}
+                {#if mapping.status === "mounted"}
+                  Mapped to {mapping.machine} as {mapping.mount}
+                {:else if mapping.status === "unavailable"}
+                  To {mapping.machine}{mapping.mount ? ` · ${mapping.mount}` : ""} · Unavailable
+                {:else}
+                  Mapping to {mapping.machine}…
+                {/if}
               {:else if mapping.status === "mounted"}
                 From {mapping.machine} · Mounted as {mapping.mount}
               {:else if mapping.status === "unavailable"}
@@ -127,6 +159,9 @@
                 From {mapping.machine} · Connecting…
               {/if}
             </span>
+            {#if mapping.status === "unavailable" && failure}
+              <small class="mount-error">{failure}</small>
+            {/if}
           </div>
           <button class="remove" title="Remove mapped drive from both machines" onclick={() => app.unmapDrive(mapping.id)}>×</button>
         </div>
@@ -137,7 +172,7 @@
   {/if}
 
   {#if pendingShared}
-    <form bind:this={formEl} class="map-form" onsubmit={(event) => { event.preventDefault(); void saveShared(); }} onfocusout={leaveForm}>
+    <form bind:this={formEl} class="map-form" onsubmit={(event) => { event.preventDefault(); void saveShared(); }}>
       <span class="path">Shared by {app.machineByAnyId(pendingShared.source)?.label || "the other machine"} · source path private</span>
       <div class="readonly-field">
         <span>Name</span>
@@ -145,25 +180,22 @@
       </div>
       <label>
         Mount on
-        <select bind:value={pendingShared.target} aria-label="Fleet machine to receive this drive">
+        <select bind:value={pendingShared.target} onchange={() => { if (pendingShared) pendingShared.mount = ""; }} disabled={saving} aria-label="Fleet machine to receive this drive">
           <option value={app.localId}>{app.machineByAnyId(app.localId)?.label || "This device"} (this device)</option>
           {#each sharedDestinations as destination (destination.id)}
             <option value={destination.id}>{destination.label}</option>
           {/each}
         </select>
       </label>
-      <label>
-        Drive letter
-        <input bind:value={pendingShared.mount} placeholder="Auto: next available" aria-label="Drive letter or mount point" />
-      </label>
+      {@render mountField(pendingShared)}
       <div class="form-actions">
-        <button type="button" class="quiet" onclick={() => (pendingShared = null)}>Cancel</button>
+        <button type="button" class="quiet" disabled={saving} onclick={() => (pendingShared = null)}>Cancel</button>
         <button type="submit" class="save" disabled={saving}>{saving ? "Mounting…" : "Mount drive"}</button>
       </div>
     </form>
   {:else if remoteSource && !pending}
     {@const remoteMounts = app.sharedFoldersFrom(remoteSource)}
-    {#if remoteMounts.length > 0 && !app.isFleetMember(remoteSource)}
+    {#if remoteMounts.length > 0 && !app.filesAllowed(app.machineByAnyId(remoteSource) ?? undefined) && !supportSession}
       <div class="source-list">
         <div class="source-head">Shared drives from {app.machineByAnyId(remoteSource)?.label || "this machine"}</div>
         {#each remoteMounts as folder (folder.id)}
@@ -182,6 +214,7 @@
         onpick={(root, label) => {
           pending = { root, label, mount: "", source: remoteSource ?? undefined };
           remoteSource = null;
+          requestAnimationFrame(() => formEl?.querySelector<HTMLInputElement>("input")?.focus());
         }}
       />
     {/if}
@@ -226,19 +259,16 @@
       <button class="source-cancel" onclick={() => (choosingSource = false)}>Cancel</button>
     </div>
   {:else if pending}
-    <form bind:this={formEl} class="map-form" onsubmit={(event) => { event.preventDefault(); void save(); }} onfocusout={leaveForm}>
+    <form bind:this={formEl} class="map-form" onsubmit={(event) => { event.preventDefault(); void save(); }}>
       <span class="path" title={pending.root}>{pending.root}</span>
       <label>
         Name
-        <input bind:value={pending.label} required aria-label="Mapped drive name" />
+        <input bind:value={pending.label} required disabled={saving} aria-label="Mapped drive name" />
       </label>
       <span class="path">{mappedDriveLabel(pending.label, app.machineByAnyId(pending.source || app.localId)?.label || "Device")}</span>
-      <label>
-        Drive letter
-        <input bind:value={pending.mount} placeholder="Auto: next available" aria-label="Drive letter or mount point" />
-      </label>
+      {@render mountField(pending)}
       <div class="form-actions">
-        <button type="button" class="quiet" onclick={() => (pending = null)}>Cancel</button>
+        <button type="button" class="quiet" disabled={saving} onclick={() => (pending = null)}>Cancel</button>
         <button type="submit" class="save" disabled={saving}>{saving ? "Mapping…" : "Map drive"}</button>
       </div>
     </form>
@@ -259,6 +289,7 @@
   .drive-copy { min-width: 0; display: grid; gap: 2px; flex: 1; }
   .drive-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
   .drive-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mount-error { color: #ff9caf; overflow-wrap: anywhere; }
   .drive-copy span, .empty, .path { color: var(--muted, #9297aa); font-size: 11px; }
   .remove { width: 27px; height: 27px; border: 0; border-radius: 8px; color: #ff9caf; background: rgba(255,83,119,.1); font-size: 18px; cursor: pointer; }
   .empty { padding: 9px 7px 12px; }

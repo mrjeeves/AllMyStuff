@@ -78,17 +78,22 @@ The node and desktop shell also embed the notices; `allmystuff-serve
   or one folder.
 - From **This Device → Drives**, the user first chooses an online fleet,
   shared, or support machine with Files access, browses that machine's real
-  file session, and chooses the remote folder to mount here. A local native
-  picker cannot browse a remote filesystem, so this distinction is explicit.
+  file session, and chooses a remote volume or folder to mount here. The same
+  volume picker is available from **Use a folder from…** on the source card.
+  A folder-only grant exposes its shared folder by ID.
 - A KVM's Drives button is its virtual-media surface. The user chooses an ISO,
   IMG, or whole removable USB disk from an eligible source machine; the KVM
   presents it to its attached computer as BIOS/UEFI-visible USB storage.
 - The attached computer is the destination and is therefore excluded from the
   source list. This prevents a circular source that disappears when that
   computer reboots into an installer or firmware utility.
-- The drive-letter field defaults to **Auto, next available**. A user may
-  enter a particular `X:` instead. Enter, click-away, or Map Drive completes
-  the form.
+- The Windows receiver defaults to **Auto**, which picks a free drive letter.
+  Leave the field blank for Auto, choose a suggestion, or type a letter such as
+  `D`, `d`, or `D:`. A specific letter is an exact choice, including on reconnect.
+  An occupied letter returns an error. Auto tries the last successful letter on
+  reconnect and can pick another if needed. Older saved mappings keep that fallback.
+  macOS and Linux accept a mount path or use Auto. Submit with **Map drive**
+  or **Mount drive**.
 - A mapping is still one-way, but both affected machines show the same source,
   destination, label, mount point, and availability in every Drives surface.
   Creating the reverse direction is a second explicit mapping, not a default.
@@ -136,7 +141,8 @@ protect replacement mounts; generation checks protect stale lease owners.
 3. The receiver negotiates the private SMB endpoint and starts its loopback
    tunnel. It records recovery ownership before invoking the OS mount client,
    then confirms the OS-reported mount. Both interfaces display the actual
-   letter/path chosen by the receiver.
+   letter/path after confirmation. A receiver error on a pushed mapping is
+   shown on the sender's mapping row.
 4. SMB bytes travel in bounded SiteFrames over the active Storage route. A
    failed native mount tears down its tunnel rather than reporting a usable
    drive. No native listener opens on the LAN.

@@ -51,7 +51,7 @@ pub(crate) fn test_cloud_alias(
     }
     let mask = crate::win_privilege::assigned_drive_mask()?
         | crate::win_privilege::interactive_user_assigned_drive_mask()?;
-    let mount = select_windows_mount(None, |mount| !drive_letter_assigned(mount, mask))?;
+    let mount = select_windows_mount(None, false, |mount| !drive_letter_assigned(mount, mask))?;
     windows_cloud_alias::alias(&mount, root, false)?;
     Ok(mount)
 }
@@ -126,7 +126,7 @@ mod smb_integration_tests {
             });
             let mask = crate::win_privilege::assigned_drive_mask().unwrap()
                 | crate::win_privilege::interactive_user_assigned_drive_mask().unwrap();
-            let mount = super::select_windows_mount(None, |mount| {
+            let mount = super::select_windows_mount(None, false, |mount| {
                 !super::drive_letter_assigned(mount, mask)
             })
             .unwrap();
@@ -230,7 +230,7 @@ async fn mount_macos_fleetfiles_location(
         .join("AllMyStuff")
         .join("Mounts")
         .join(&label);
-    let mount = choose_mount(&mountpoint.to_string_lossy(), &label, active).await?;
+    let mount = choose_unix_mount(&mountpoint.to_string_lossy(), &label, active).await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;
@@ -457,6 +457,7 @@ impl DriveMounts {
         route: String,
         label: String,
         requested_mount: String,
+        exact_mount: bool,
         _mapping: &str,
     ) -> Result<NativeDriveInfo, String> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -473,7 +474,7 @@ impl DriveMounts {
             windows_drive_mount::ensure_supported().await?;
             windows_cloud_alias::migrate(_mapping)?;
         }
-        let mount = choose_mount(&requested_mount, &label, &active).await?;
+        let mount = choose_mount(&requested_mount, exact_mount, &label, &active).await?;
         wait_for_route(&mesh, &route).await?;
         #[cfg(windows)]
         {
@@ -621,6 +622,7 @@ impl DriveMounts {
 
 async fn choose_mount(
     requested: &str,
+    _exact_mount: bool,
     _label: &str,
     _active: &[NativeDriveInfo],
 ) -> Result<String, String> {
@@ -629,9 +631,11 @@ async fn choose_mount(
         let remembered = remembered_network_mounts().await?;
         let logical_drives = crate::win_privilege::assigned_drive_mask()?
             | crate::win_privilege::interactive_user_assigned_drive_mask()?;
-        select_windows_mount(normalize_requested_mount(requested)?, |mount| {
-            mount_available(mount, &remembered, logical_drives)
-        })
+        select_windows_mount(
+            normalize_requested_mount(requested)?,
+            _exact_mount,
+            |mount| mount_available(mount, &remembered, logical_drives),
+        )
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -748,15 +752,20 @@ fn default_unix_mount_root() -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn select_windows_mount(
     requested: Option<String>,
+    exact_mount: bool,
     mut available: impl FnMut(&str) -> bool,
 ) -> Result<String, String> {
     if let Some(mount) = requested.as_deref() {
         if available(mount) {
             return Ok(mount.to_string());
         }
-        // A persisted reconnect preference is not ownership. If another
-        // volume now owns the letter, relocate once and persist the successful
-        // replacement instead of fighting that owner on every reconnect.
+        if exact_mount {
+            return Err(format!(
+                "{mount} is already assigned on the receiving computer. Remove that mapping if you want to reuse its letter, or choose another letter or Auto."
+            ));
+        }
+        // Auto prefers its last successful letter and may safely relocate.
+        // Older saved mappings also use this policy.
         tracing::warn!("{mount} is already in use; choosing another drive letter");
     }
     for letter in ('A'..='Z').rev() {
@@ -772,15 +781,15 @@ fn select_windows_mount(
 }
 #[cfg(windows)]
 fn normalize_requested_mount(requested: &str) -> Result<Option<String>, String> {
-    let requested = requested.trim().trim_end_matches(['\\', '/']);
+    let requested = requested.trim();
     if requested.is_empty() {
         return Ok(None);
     }
     let mut chars = requested.chars();
-    let Some(letter) = chars.next().map(|letter| letter.to_ascii_uppercase()) else {
-        return Err("choose a drive letter".into());
-    };
-    if !letter.is_ascii_alphabetic() || !matches!(chars.next(), Some(':')) || chars.next().is_some()
+    let letter = chars.next().unwrap().to_ascii_uppercase();
+    let suffix = chars.as_str();
+    if !letter.is_ascii_alphabetic()
+        || (!suffix.is_empty() && suffix.trim_end_matches(['\\', '/']) != ":")
     {
         return Err("drive letter must look like X:".into());
     }
@@ -2039,6 +2048,15 @@ mod windows_tests {
             Some("X:".into())
         );
         assert_eq!(normalize_requested_mount("").unwrap(), None);
+        assert_eq!(normalize_requested_mount(" x ").unwrap(), Some("X:".into()));
+        for requested in ["D", "d", "D:", "d:"] {
+            assert_eq!(
+                normalize_requested_mount(requested).unwrap(),
+                Some("D:".into())
+            );
+        }
+        assert!(normalize_requested_mount("/").is_err());
+        assert!(normalize_requested_mount("X/folder").is_err());
         assert!(normalize_requested_mount("XX:").is_err());
         assert!(normalize_requested_mount("1:").is_err());
     }
@@ -2072,7 +2090,7 @@ HKEY_CURRENT_USER\Network\TooLong
         assert!(!mount_available("X:", &remembered, logical));
         assert!(!mount_available("Y:", &remembered, logical));
         assert!(mount_available("W:", &remembered, logical));
-        let next = select_windows_mount(Some("Y:".into()), |mount| {
+        let next = select_windows_mount(Some("Y:".into()), false, |mount| {
             mount_available(mount, &HashSet::from(["Z:".into(), "Y:".into()]), logical)
         })
         .unwrap();
@@ -2084,21 +2102,30 @@ HKEY_CURRENT_USER\Network\TooLong
         for free in b'A'..=b'Z' {
             let available = format!("{}:", char::from(free));
             assert_eq!(
-                select_windows_mount(None, |mount| mount == available).unwrap(),
+                select_windows_mount(None, false, |mount| mount == available).unwrap(),
                 available
             );
         }
-        assert_eq!(select_windows_mount(None, |_| true).unwrap(), "Z:");
-        assert!(select_windows_mount(None, |_| false).is_err());
+        assert_eq!(select_windows_mount(None, false, |_| true).unwrap(), "Z:");
+        assert!(select_windows_mount(None, false, |_| false).is_err());
     }
 
     #[test]
-    fn occupied_requested_letter_relocates_once_to_a_safe_letter() {
-        let exact = select_windows_mount(Some("Z:".into()), |mount| mount == "Z:").unwrap();
+    fn only_automatic_and_legacy_choices_can_relocate() {
+        let exact = select_windows_mount(Some("Z:".into()), true, |mount| mount == "Z:").unwrap();
         assert_eq!(exact, "Z:");
 
         let mut checked = Vec::new();
-        let relocated = select_windows_mount(Some("Z:".into()), |mount| {
+        let occupied = select_windows_mount(Some("Z:".into()), true, |mount| {
+            checked.push(mount.to_string());
+            mount == "Y:"
+        })
+        .unwrap_err();
+        assert!(occupied.contains("Z: is already assigned"));
+        assert_eq!(checked, ["Z:"]);
+
+        checked.clear();
+        let relocated = select_windows_mount(Some("Z:".into()), false, |mount| {
             checked.push(mount.to_string());
             mount == "Y:"
         })

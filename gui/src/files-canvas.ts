@@ -97,6 +97,17 @@ export function nativeLocationTrail(path: string, platform = ""): NativeLocation
   return parts.map((label, index) => ({ label, path: parts.slice(0, index + 1).join("\\") }));
 }
 
+export function nativeFolderChild(path: string, name: string): string {
+  const windows = /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
+  const separator = windows && path.includes("\\") ? "\\" : "/";
+  return path.endsWith(separator) ? path + name : path + separator + name;
+}
+
+export function driveSourceLabel(path: string): string {
+  const name = nativeLocationTrail(path).at(-1)?.label;
+  if (!name || name === "/") return "Remote drive";
+  return !path.startsWith("/") && /^[A-Za-z]:$/.test(name) ? name.slice(0, 1) : name;
+}
 
 export interface CanvasStamp {
   counter: number;

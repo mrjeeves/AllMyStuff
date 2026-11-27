@@ -4869,7 +4869,7 @@ class AppStore {
         return false;
       }
       const target = this.machineByAnyId(targetNodeId)?.label || "the other computer";
-      this.toast("ok", `${label || "Drive"} is being mapped onto ${target}`);
+      this.toast("ok", `Mapping request sent to ${target}`);
       return true;
     } catch (error) {
       this.toast("warn", String(error));

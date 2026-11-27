@@ -58,6 +58,7 @@ pub use windows::{windows_disk_for_drive_letter, WindowsDiskInfo};
 
 pub mod report;
 
+pub use sys::storage as storage_volumes;
 pub use types::*;
 
 use sysinfo::System;
@@ -81,7 +82,7 @@ pub fn scan() -> Inventory {
         cpu: sys::cpu(&system),
         memory: sys::memory(&system),
         gpus,
-        storage: sys::storage(),
+        storage: storage_volumes(),
         networks: sys::networks(),
         displays: platform_displays(),
         microphones,

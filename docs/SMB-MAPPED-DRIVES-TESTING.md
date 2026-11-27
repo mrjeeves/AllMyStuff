@@ -56,11 +56,13 @@ rule, WinFsp, or rclone installation is needed.
 1. Record the existing Z: mapping and its contents. Keep Z: mapped to its
    existing SMB share throughout the test. Record any other occupied letters.
 2. In AMS, map an authorized source folder with **Auto**. Expect Y: when Z:
-   is occupied and Y: is free; otherwise expect the next free letter. An
-   explicitly requested occupied letter must also be preserved. Check both
-   endpoints display the selected letter. Explorer should show a network drive.
+   is occupied and Y: is free. Otherwise expect the next free letter. Choose
+   an explicitly occupied letter and expect an error with the existing drive
+   intact. Choose a known free letter and verify the exact letter in Explorer
+   and both AMS windows after the receiver confirms the mount. Repeat from the
+   source and the receiver, including a Windows source's secondary volume.
    Repeat with an existing disconnected mapping still assigned to its letter
-   (do not unmap it); AMS must skip it even though its server is unreachable.
+   (do not unmap it). Auto must skip it even when its server is unreachable.
    No letter is generically reserved, and stale AMS bookkeeping must not hold
    an otherwise free letter. Lower-letter exhaustion is covered automatically;
    do not remove real mappings or volumes to manufacture that case manually.
@@ -90,3 +92,22 @@ Automated checks cover SMB negotiation, required signing, encryption
 capability, private endpoint lifecycle, credential redaction, native endpoint
 ownership, and the existing occupied-letter selection behavior. The full
 Windows mapping and two-machine transfer checks above are manual.
+
+## Performance verification
+
+The receiver uses its OS SMB client. AMS still wraps the stream in 40 KiB
+chunks over the reliable mesh media channel. Base64 adds roughly one-third
+to the byte count before JSON, mesh, and SMB framing. The tunnel closes a
+connection if its socket writer cannot drain the bounded inbound queue.
+SMB leases are disabled to keep external source edits visible. The Linux
+CIFS mount also disables client file and attribute caching, which can increase
+round trips for small files and directory-heavy work.
+
+Run the same disposable workloads on a direct LAN path and a forced TURN path.
+Record throughput in each direction for a hashed file larger than 4 GiB.
+Record median and 95th-percentile directory listing and open times across
+repeated runs on a nested small-file tree. Record endpoint CPU use, transfer
+errors, and whether a simultaneous remote console stays responsive. Use the
+same source storage and test data for comparisons. A loopback mount and a
+sparse seek past 4 GiB establish interoperability and addressing.
+Two-machine runs establish throughput and responsiveness.

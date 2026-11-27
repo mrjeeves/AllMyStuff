@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { driveSourceLabel, nativeFolderChild } from "./files-canvas.ts";
 import test from "node:test";
 
 import { coalesceLatestBy, containingFrame, descendantsOf, desktopColumnPosition, FILE_TILE_SIZES, fileReferenceId, fileTileSizeLabel, fleetfilesLogicalPath, framesInPaintOrder, hydrateCanvasRecords, isLegacyAutoRowPlacement, isWorkspaceFileReplyKind, mergeCanvasRecords, nativeFileDisplayName, nativeFileGridMetrics, nativeLocationTrail, nativeWindowsLinkExtension, nearestFileTileSize, normalizeFrameNesting, planFleetfilesPlacementMigration, rectsIntersect, resolveDesktopTileCollisions, routeActivationOutcome, sharedFilesystemObject, translateCanvasPoint } from "./files-canvas.ts";
@@ -158,6 +159,18 @@ test("native location trails preserve host path syntax and every clickable ances
     { label: "Documents", path: "/Users/Chris/Documents" },
   ]);
   assert.deepEqual(nativeLocationTrail("/tmp/a\\b", "windows").at(-1), { label: "a\\b", path: "/tmp/a\\b" });
+});
+
+test("mapping can browse a secondary Windows volume and a literal POSIX backslash", () => {
+  const root = "D:\\";
+  assert.equal(nativeLocationTrail(root).length, 1);
+  const child = nativeFolderChild(root, "Project files");
+  assert.equal(child, "D:\\Project files");
+  assert.equal(nativeLocationTrail(child).at(-2).path, root);
+  assert.equal(driveSourceLabel(root), "D");
+  assert.equal(nativeFolderChild("/Volumes/archive\\2026", "source"), "/Volumes/archive\\2026/source");
+  assert.equal(driveSourceLabel("/Volumes/archive\\2026"), "archive\\2026");
+  assert.equal(driveSourceLabel("/home/c:"), "c:");
 });
 
 test("Windows shell-link presentation hides only final native suffixes", () => {

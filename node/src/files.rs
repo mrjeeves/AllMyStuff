@@ -458,32 +458,28 @@ fn run_op(
                 reason: "quota is only available on a scoped drive route".into(),
             },
         }),
-        FileEvent::Volumes { req } => {
-            let inv = allmystuff_inventory::scan();
-            Some(FileEvent::VolumeList {
-                req,
-                volumes: inv
-                    .storage
-                    .into_iter()
-                    .filter_map(|volume| {
-                        volume.mount_point.and_then(|path| {
-                            if excluded_volume_mounts
-                                .iter()
-                                .any(|excluded| same_native_mount_path(&path, excluded))
-                            {
-                                return None;
-                            }
-                            Some(allmystuff_session::FileVolume {
-                                name: volume.name,
-                                path,
-                                size: volume.total_bytes,
-                                removable: volume.removable,
-                            })
+        FileEvent::Volumes { req } => Some(FileEvent::VolumeList {
+            req,
+            volumes: allmystuff_inventory::storage_volumes()
+                .into_iter()
+                .filter_map(|volume| {
+                    volume.mount_point.and_then(|path| {
+                        if excluded_volume_mounts
+                            .iter()
+                            .any(|excluded| same_native_mount_path(&path, excluded))
+                        {
+                            return None;
+                        }
+                        Some(allmystuff_session::FileVolume {
+                            name: volume.name,
+                            path,
+                            size: volume.total_bytes,
+                            removable: volume.removable,
                         })
                     })
-                    .collect(),
-            })
-        }
+                })
+                .collect(),
+        }),
         FileEvent::List {
             req,
             path,

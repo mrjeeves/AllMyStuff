@@ -59,8 +59,9 @@ rule, WinFsp, or rclone installation is needed.
    is occupied and Y: is free. Otherwise expect the next free letter. Choose
    an explicitly occupied letter and expect an error with the existing drive
    intact. Choose a known free letter and verify the exact letter in Explorer
-   and both AMS windows after the receiver confirms the mount. Repeat from the
-   source and the receiver, including a Windows source's secondary volume.
+   and both AMS windows after the receiver confirms the mount. Try typing the
+   free letter in both uppercase and lowercase, without a colon. Repeat from
+   the source and the receiver, including a Windows source's secondary volume.
    Repeat with an existing disconnected mapping still assigned to its letter
    (do not unmap it). Auto must skip it even when its server is unreachable.
    No letter is generically reserved, and stale AMS bookkeeping must not hold

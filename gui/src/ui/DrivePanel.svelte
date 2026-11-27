@@ -6,6 +6,8 @@
   import KvmMediaPanel from "./KvmMediaPanel.svelte";
 
   let { target, supportSession = false }: { target: string; supportSession?: boolean } = $props();
+  const panelId = $props.id();
+  const driveLetterList = `${panelId}-drive-letters`;
   let pending = $state<{ root: string; label: string; mount: string; source?: string } | null>(null);
   let pendingShared = $state<{ source: string; folder: { id: string; label: string; path: string }; mount: string; target: string } | null>(null);
   let choosingSource = $state(false);
@@ -58,11 +60,16 @@
     requestAnimationFrame(() => formEl?.querySelector("select")?.focus());
   }
 
+  function mountRequest(value: string): string {
+    if (!windowsDestination || !value) return value;
+    return `${value.toUpperCase().replace(/:$/, "")}:`;
+  }
+
   async function saveShared() {
     if (!pendingShared || saving) return;
     saving = true;
     const draft = pendingShared;
-    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, draft.mount, draft.target);
+    const done = await app.mountSharedFolderFrom(draft.source, draft.folder, mountRequest(draft.mount), draft.target);
     if (done) {
       pendingShared = null;
       choosingSource = false;
@@ -76,9 +83,10 @@
     if (!pending || saving) return;
     saving = true;
     const draft = pending;
+    const mount = mountRequest(draft.mount);
     const done = draft.source
-      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, draft.mount, supportSession)
-      : await app.mapFolderToNode(target, draft.root, draft.label, draft.mount, supportSession);
+      ? await app.mapFolderFromNode(draft.source, draft.root, draft.label, mount, supportSession)
+      : await app.mapFolderToNode(target, draft.root, draft.label, mount, supportSession);
     if (done) {
       pending = null;
       choosingSource = false;
@@ -94,13 +102,22 @@
   {#if windowsDestination}
     <label>
       Drive letter
-      <select bind:value={draft.mount} disabled={saving}>
-        <option value="">Auto · next free letter</option>
-        {#each driveLetters as letter (letter)}
-          <option value={letter}>{letter}</option>
-        {/each}
-      </select>
+      <input
+        bind:value={draft.mount}
+        list={driveLetterList}
+        placeholder="Auto if blank"
+        pattern="[A-Za-z]:?"
+        title="Enter one letter, such as D or D:, or leave blank for Auto"
+        autocomplete="off"
+        spellcheck={false}
+        disabled={saving}
+      />
     </label>
+    <datalist id={driveLetterList}>
+      {#each driveLetters as letter (letter)}
+        <option value={letter}></option>
+      {/each}
+    </datalist>
   {:else}
     <label>
       Mount location

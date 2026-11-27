@@ -2049,6 +2049,12 @@ mod windows_tests {
         );
         assert_eq!(normalize_requested_mount("").unwrap(), None);
         assert_eq!(normalize_requested_mount(" x ").unwrap(), Some("X:".into()));
+        for requested in ["D", "d", "D:", "d:"] {
+            assert_eq!(
+                normalize_requested_mount(requested).unwrap(),
+                Some("D:".into())
+            );
+        }
         assert!(normalize_requested_mount("/").is_err());
         assert!(normalize_requested_mount("X/folder").is_err());
         assert!(normalize_requested_mount("XX:").is_err());

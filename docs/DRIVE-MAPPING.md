@@ -88,9 +88,10 @@ The node and desktop shell also embed the notices; `allmystuff-serve
   source list. This prevents a circular source that disappears when that
   computer reboots into an installer or firmware utility.
 - The Windows receiver defaults to **Auto**, which picks a free drive letter.
-  A specific letter is an exact choice, including on reconnect. An occupied
-  letter returns an error. Auto tries the last successful letter on reconnect
-  and can pick another if needed. Older saved mappings keep that fallback.
+  Leave the field blank for Auto, choose a suggestion, or type a letter such as
+  `D`, `d`, or `D:`. A specific letter is an exact choice, including on reconnect.
+  An occupied letter returns an error. Auto tries the last successful letter on
+  reconnect and can pick another if needed. Older saved mappings keep that fallback.
   macOS and Linux accept a mount path or use Auto. Submit with **Map drive**
   or **Mount drive**.
 - A mapping is still one-way, but both affected machines show the same source,

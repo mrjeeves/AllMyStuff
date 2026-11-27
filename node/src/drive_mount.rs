@@ -230,7 +230,7 @@ async fn mount_macos_fleetfiles_location(
         .join("AllMyStuff")
         .join("Mounts")
         .join(&label);
-    let mount = choose_mount(&mountpoint.to_string_lossy(), &label, active).await?;
+    let mount = choose_unix_mount(&mountpoint.to_string_lossy(), &label, active).await?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("couldn't start the local Fleetfiles bridge: {error}"))?;

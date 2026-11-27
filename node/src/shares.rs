@@ -151,6 +151,19 @@ impl Shares {
             .map(|s| s.person.clone())
     }
 
+    /// A device can be bound to both a fleet share and a direct share. Check
+    /// each bound record for a locally authored grant that covers the request.
+    pub fn any_out_grant_for_node(&self, node: &str, permits: impl FnMut(&Grant) -> bool) -> bool {
+        let canon = pubkey_part(node);
+        self.inner
+            .lock()
+            .shares
+            .iter()
+            .filter(|share| share.nodes.iter().any(|n| pubkey_part(n.as_str()) == canon))
+            .flat_map(|share| &share.out_grants)
+            .any(permits)
+    }
+
     /// The union of grants (inbound + outbound) in this person's share —
     /// every grant that could authorize a route involving their devices.
     pub fn grants_for(&self, person: &PersonId) -> Vec<Grant> {
@@ -578,6 +591,46 @@ mod tests {
         assert_eq!(sh.person_for_node("alexkey").unwrap().id, alex().id);
         assert_eq!(sh.person_for_node("alexkey-AB12C").unwrap().id, alex().id);
         assert!(sh.person_for_node("stranger").is_none());
+    }
+
+    #[test]
+    fn folder_grants_on_a_direct_share_survive_an_earlier_fleet_binding() {
+        let shares = memory();
+        let fleet = alex();
+        let device = Person {
+            id: "person:alexdesk".into(),
+            name: "Alex's desktop".into(),
+        };
+        let desktop = NodeId::from("alexdesk-A1234");
+        let folder_grant = |person: &Person, capability: &str| {
+            Grant::scoped(
+                &person.id,
+                MediaKind::Storage,
+                GrantRole::Provide,
+                Some(capability.into()),
+                "Shared folder",
+            )
+        };
+        let fleet_grant = folder_grant(&fleet, "source:folder:drive");
+        let direct_grant = folder_grant(&device, "source:folder:footage");
+        let inbound_grant = folder_grant(&device, "alexdesk:folder:incoming");
+        shares.grant(&fleet, &"alexowner".into(), fleet_grant.clone());
+        assert!(shares.vouch_siblings("alexowner", std::slice::from_ref(&desktop)));
+        shares.grant(&device, &desktop, direct_grant.clone());
+        shares.record_inbound(&device, &desktop, vec![inbound_grant.clone()]);
+
+        // The first record represents the fleet, so a single-person lookup
+        // would miss the directly granted folder for this same desktop.
+        assert_eq!(shares.person_for_node("alexdesk").unwrap().id, fleet.id);
+        assert!(shares.any_out_grant_for_node("alexdesk", |grant| grant == &fleet_grant));
+        assert!(shares.any_out_grant_for_node("alexdesk", |grant| grant == &direct_grant));
+        assert!(!shares.any_out_grant_for_node("alexdesk", |grant| grant == &inbound_grant));
+        assert!(!shares.any_out_grant_for_node("alexowner", |grant| grant == &direct_grant));
+        assert!(!shares.any_out_grant_for_node("stranger", |_| true));
+
+        assert!(shares.revoke(&device.id, &direct_grant.id));
+        assert!(!shares.any_out_grant_for_node("alexdesk", |grant| grant == &direct_grant));
+        assert!(shares.any_out_grant_for_node("alexdesk", |grant| grant == &fleet_grant));
     }
 
     #[test]

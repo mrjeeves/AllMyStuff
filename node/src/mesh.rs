@@ -18703,10 +18703,7 @@ impl Mesh {
         if self.sender_may_control(sender) {
             return true;
         }
-        let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
-            return false;
-        };
-        self.shares.out_grants_for(&person.id).iter().any(|g| {
+        self.shares.any_out_grant_for_node(sender, |g| {
             g.media == MediaKind::Storage
                 && g.role.allows_source()
                 && g.capability

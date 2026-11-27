@@ -67,7 +67,7 @@ use crate::operations::{OperationPhase, OperationRecord, OperationsStore};
 use crate::ownership::Ownership;
 use crate::service_profiles::{ServiceProfiles, TransferOutcome};
 use crate::shares::Shares;
-use crate::sites::{ClientMapping, SitesProxy};
+use crate::sites::{bind_exact_local_port, ClientMapping, SiteIntent, SitesProxy};
 use crate::storage_plan::{
     DeviceServiceIntent, DeviceServiceRole, PolicyRecord, StorageAllocation, StoragePlanMessage,
     StoragePlanStore, StoragePolicy, PLAN_CHUNK,
@@ -248,6 +248,7 @@ pub struct Mesh {
     /// live reverse-proxy connections (client mappings sinking here, host
     /// tunnels sourcing here). See [`SitesProxy`].
     sites: SitesProxy,
+    site_mapping_ops: tokio::sync::Mutex<()>,
     /// Sequence for outbound site frames (one stream per app run, like the
     /// other media-plane sequences).
     site_seq: AtomicU64,
@@ -2365,6 +2366,7 @@ impl Mesh {
             kvm_media_requests: Mutex::new(HashMap::new()),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
+            site_mapping_ops: tokio::sync::Mutex::new(()),
             site_seq: AtomicU64::new(0),
             site_remap_inflight: Mutex::new(std::collections::HashSet::new()),
             site_nack_at: Mutex::new(HashMap::new()),
@@ -3551,6 +3553,7 @@ impl Mesh {
         // cadence and re-advertises when the picture changed. Once for the
         // engine's life — it survives daemon-link drops untouched.
         self.spawn_inventory_watch();
+        self.spawn_site_restore();
 
         // Offers need a deadline: a route offered to a machine whose
         // AllMyStuff app died (daemon still up, so it looks present) used to
@@ -4098,10 +4101,11 @@ impl Mesh {
                     (
                         allmystuff_bridge::node_summary(&inv),
                         Self::advertised_capabilities(&inv, &node),
+                        inv,
                     )
                 })
                 .await;
-                let Ok((summary, capabilities)) = scanned else {
+                let Ok((summary, capabilities, inv)) = scanned else {
                     continue;
                 };
                 let changed = {
@@ -4110,11 +4114,17 @@ impl Mesh {
                         continue;
                     };
                     let fresh = profile_fingerprint(&summary, &capabilities);
-                    if profile_fingerprint(&p.summary, &p.capabilities) == fresh {
+                    let sites = allmystuff_bridge::sites::sites_from_inventory(
+                        &inv,
+                        &mesh.sites.exposed_map(),
+                    );
+                    if profile_fingerprint(&p.summary, &p.capabilities) == fresh && p.sites == sites
+                    {
                         false
                     } else {
                         p.summary = summary;
                         p.capabilities = capabilities;
+                        p.sites = sites;
                         true
                     }
                 };
@@ -4831,6 +4841,12 @@ impl Mesh {
                             .map(|s| s.apply_presence(profile))
                             .unwrap_or(false)
                     };
+                    if new_boot || !known {
+                        let prefix = format!("{}:", pubkey_part(node_id.as_str()));
+                        self.site_remap_refused
+                            .lock()
+                            .retain(|key, _| !key.starts_with(&prefix));
+                    }
                     // A mapped drive is user intent, not an ICE-session lease.
                     // If the source laptop woke into a fresh incarnation, the
                     // route reap above made its old drive route terminal; this
@@ -5443,6 +5459,7 @@ impl Mesh {
                                 }) => self
                                     .sites
                                     .mapping_details(route_id)
+                                    .filter(|(node, _, _)| same_node(node, &from))
                                     .map(|d| (route_id.clone(), d)),
                                 _ => None,
                             };
@@ -5463,13 +5480,7 @@ impl Mesh {
                                 // StopMedia, so its mapping/listener would
                                 // otherwise linger and block the re-map — then
                                 // heal on the same local port off the hot path.
-                                self.sites.stop_route(&old_route);
-                                {
-                                    let mut st = self.state.lock();
-                                    if let Some(s) = st.session.as_mut() {
-                                        let _ = s.teardown(&old_route);
-                                    }
-                                }
+                                self.clear_site_route(&old_route);
                                 let mesh = self.clone();
                                 crate::spawn(async move {
                                     mesh.remap_site_route(node, host_port, local_port).await;
@@ -6906,7 +6917,7 @@ impl Mesh {
                     .into(),
             );
         }
-        let port = self.site_map(kvm.clone(), 80, true).await?;
+        let port = self.site_map(kvm.clone(), 80, true, false).await?;
         crate::kvm_media::stage(port, &me, &path, &label).await?;
         // Mount metadata is now part of KVM presence. Ask for a fresh advert
         // so every graph learns the source→KVM relationship immediately.
@@ -6988,7 +6999,7 @@ impl Mesh {
         if kvm.is_empty() {
             return Err("choose a KVM".into());
         }
-        let port = self.site_map(kvm.clone(), 80, true).await?;
+        let port = self.site_map(kvm.clone(), 80, true, false).await?;
         crate::kvm_media::unmount(port).await?;
         let _ = self
             .send_control(&kvm, &ControlMessage::ProfileRequest)
@@ -8273,6 +8284,10 @@ impl Mesh {
             "peers": peers,
             "routes": routes,
             "shares": shares,
+            "site_state": {
+                "exposed": self.sites.exposed_map(),
+                "mappings": self.site_mapping_values(Some(session)),
+            },
         })
     }
 
@@ -17068,21 +17083,67 @@ impl Mesh {
     pub async fn site_set_exposed(
         self: &Arc<Self>,
         exposed: std::collections::BTreeMap<String, String>,
-    ) -> std::collections::BTreeMap<String, String> {
-        let map = self.sites.set_exposed(exposed);
+    ) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let map = self.sites.set_exposed(exposed)?;
+        let withdrawn = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .routes()
+                        .filter(|live| {
+                            live.is_active()
+                                && is_site_route(&live.route)
+                                && same_node(
+                                    &node_of(live.route.from.as_str()),
+                                    session.me().as_str(),
+                                )
+                                && site_route_port(&live.route)
+                                    .is_some_and(|port| !map.contains_key(&format!("tcp:{port}")))
+                        })
+                        .map(|live| live.route.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        for route in withdrawn {
+            let _ = self.disconnect(route).await;
+        }
         // Rebuild + re-advertise this node's profile (its `sites` follow the
         // exposed set). Re-broadcast so peers' Sites tabs update promptly.
         self.restamp_profile().await;
-        map
+        Ok(map)
     }
 
-    /// Every site this device currently has mapped: `(node, host_port,
-    /// local_port)`.
-    pub fn site_mappings(&self) -> Vec<(String, u16, u16)> {
-        self.sites
-            .list_mappings()
+    pub fn site_mappings(&self) -> Vec<Value> {
+        self.site_mapping_values(self.state.lock().session.as_ref())
+    }
+
+    fn site_mapping_values(&self, session: Option<&Session>) -> Vec<Value> {
+        let mut intents = self.sites.intents();
+        intents.sort_by_key(|mapping| mapping.local_port);
+        intents
             .into_iter()
-            .map(|(_, node, host_port, local_port)| (node, host_port, local_port))
+            .filter_map(|mapping| {
+                let route = self.sites.route_for(&mapping.node, mapping.host_port);
+                if !mapping.remembered && route.is_none() {
+                    return None;
+                }
+                let active = route.as_deref().is_some_and(|route| {
+                    self.sites.mapping_task_finished(route) == Some(false)
+                        && session
+                            .and_then(|s| s.route(route))
+                            .is_some_and(|r| r.is_active())
+                });
+                Some(json!({
+                    "node": mapping.node,
+                    "port": mapping.host_port,
+                    "localPort": mapping.local_port,
+                    "active": active,
+                    "remembered": mapping.remembered,
+                }))
+            })
             .collect()
     }
 
@@ -17173,8 +17234,9 @@ impl Mesh {
                     );
                     return;
                 }
-                self.sites.set_exposed(exposed);
-                self.restamp_profile().await;
+                if let Err(error) = self.site_set_exposed(exposed).await {
+                    tracing::warn!(%error, "couldn't save remote Sites exposure");
+                }
             }
             // A site-management kind a newer build introduced — ignore it.
             SiteControl::Unknown => {}
@@ -17191,8 +17253,13 @@ impl Mesh {
         node: String,
         port: u16,
         user_initiated: bool,
+        remember: bool,
     ) -> Result<u16, String> {
+        let _ops = self.site_mapping_ops.lock().await;
         let me = self.local_node_id().ok_or("mesh not ready")?;
+        if pubkey_part(&node).is_empty() || port == 0 {
+            return Err("invalid Site address".into());
+        }
         if pubkey_part(&node) == pubkey_part(&me) {
             return Err("that's this device".into());
         }
@@ -17214,40 +17281,92 @@ impl Mesh {
         // accept task is alive. A route offer that expires/rejects causes that
         // task to exit and drop the listener; retaining its mapping produced a
         // permanent zombie where every later click reopened dead localhost.
-        if let Some((route_id, _, _, local_port)) = self
-            .sites
-            .list_mappings()
-            .into_iter()
-            .find(|(_, n, hp, _)| pubkey_part(n) == pubkey_part(&node) && *hp == port)
-        {
+        let prior = self.sites.intent(&node, port);
+        if let Some(route_id) = self.sites.route_for(&node, port) {
             let accept_finished = self.sites.mapping_task_finished(&route_id).unwrap_or(true);
             if !accept_finished {
-                return Ok(local_port);
-            }
-            tracing::warn!(
-                "site mapping {}:{} on :{} had no listener — rebuilding",
-                short_id(&node),
-                port,
-                local_port
-            );
-            self.sites.stop_route(&route_id);
-            {
-                let mut st = self.state.lock();
-                if let Some(s) = st.session.as_mut() {
-                    let _ = s.teardown(&route_id);
+                if let Some((_, _, local_port)) = self.sites.mapping_details(&route_id) {
+                    self.sites.remember(SiteIntent {
+                        node,
+                        host_port: port,
+                        local_port,
+                        remembered: remember,
+                    })?;
+                    self.emit_snapshot();
+                    return Ok(local_port);
                 }
             }
-            let listener = self.bind_exact_local_port(local_port).await?;
-            self.establish_site_route(node, port, listener, local_port)
-                .await?;
-            return Ok(local_port);
+            self.clear_site_route(&route_id);
         }
-        // Bind a local listener, preferring the same port number, then a free
-        // one — the OS is the final arbiter, so retry on a lost race.
-        let (listener, local_port) = self.bind_site_listener(port).await?;
-        self.establish_site_route(node, port, listener, local_port)
+        let (listener, local_port) = if let Some(prior) = prior {
+            (
+                bind_exact_local_port(prior.local_port).await?,
+                prior.local_port,
+            )
+        } else {
+            self.bind_site_listener(port).await?
+        };
+        let route = self
+            .establish_site_route(node.clone(), port, listener, local_port)
             .await?;
+        if let Err(error) = self.sites.remember(SiteIntent {
+            node,
+            host_port: port,
+            local_port,
+            remembered: remember,
+        }) {
+            let _ = self.disconnect(route).await;
+            return Err(error);
+        }
+        self.emit_snapshot();
         Ok(local_port)
+    }
+
+    fn clear_site_route(&self, route: &str) {
+        self.sites.stop_route(route);
+        {
+            let mut st = self.state.lock();
+            if let Some(session) = st.session.as_mut() {
+                let _ = session.teardown(route);
+            }
+        }
+        self.route_networks.lock().release(route);
+    }
+
+    fn spawn_site_restore(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let Some(mesh) = weak.upgrade() else { return };
+                for mapping in mesh.sites.intents().into_iter().filter(|m| m.remembered) {
+                    if mesh
+                        .sites
+                        .route_for(&mapping.node, mapping.host_port)
+                        .is_some_and(|route| {
+                            mesh.sites.mapping_task_finished(&route) == Some(false)
+                        })
+                    {
+                        continue;
+                    }
+                    let peer = mesh.state.lock().session.as_ref().and_then(|s| {
+                        s.peers()
+                            .find(|peer| {
+                                same_node(peer.node.as_str(), &mapping.node)
+                                    && peer.sites.iter().any(|site| site.port == mapping.host_port)
+                            })
+                            .map(|peer| peer.node.to_string())
+                    });
+                    if let Some(peer) = peer {
+                        let mesh = mesh.clone();
+                        crate::spawn(async move {
+                            mesh.remap_site_route(peer, mapping.host_port, mapping.local_port)
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
     }
 
     /// Offer a site route for `node`:`host_port` over an already-bound local
@@ -17272,7 +17391,8 @@ impl Mesh {
         // every exposed port; a cross-fleet share is admitted only when its
         // standing grant names this same `tcp:<port>` capability.
         let from = format!("{node}:site:tcp:{host_port}");
-        let to = format!("{me}:site-view:{}-{seq}", host_port);
+        let boot = self.boot_id.load(Ordering::Relaxed);
+        let to = format!("{me}:site-view:{host_port}-{boot:x}-{seq}");
         let route_id = format!("route:{from}→{to}");
         // Offer the route through the session (drives offer→accept→active).
         let msg = {
@@ -17345,22 +17465,35 @@ impl Mesh {
         let mut healed = false;
         for attempt in 0..SITE_REMAP_ATTEMPTS {
             tokio::time::sleep(SITE_REMAP_BACKOFF.saturating_mul(attempt + 1)).await;
-            // A manual remap (or a prior attempt) already restored it.
-            if self.sites.route_for(&node, host_port).is_some() {
-                healed = true;
-                break;
+            let ops = self.site_mapping_ops.lock().await;
+            if !self
+                .sites
+                .intent(&node, host_port)
+                .is_some_and(|intent| intent.local_port == local_port)
+            {
+                self.site_remap_inflight.lock().remove(&key);
+                return;
             }
-            let listener = match self.bind_exact_local_port(local_port).await {
+            // A manual remap (or a prior attempt) already restored it.
+            if let Some(route) = self.sites.route_for(&node, host_port) {
+                if self.sites.mapping_task_finished(&route) == Some(false) {
+                    healed = true;
+                    break;
+                }
+                self.clear_site_route(&route);
+            }
+            let listener = match bind_exact_local_port(local_port).await {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::debug!("site re-map bind :{local_port} failed: {e}");
                     continue;
                 }
             };
-            match self
+            let offered = self
                 .establish_site_route(node.clone(), host_port, listener, local_port)
-                .await
-            {
+                .await;
+            drop(ops);
+            match offered {
                 Ok(route_id) => {
                     if self.await_route_active(&route_id).await {
                         tracing::info!(
@@ -17374,11 +17507,7 @@ impl Mesh {
                     }
                     // Host didn't accept in time — clear this attempt fully so
                     // the next one re-binds cleanly, then retry.
-                    self.sites.stop_route(&route_id);
-                    let mut st = self.state.lock();
-                    if let Some(s) = st.session.as_mut() {
-                        let _ = s.teardown(&route_id);
-                    }
+                    self.clear_site_route(&route_id);
                 }
                 Err(e) => tracing::debug!("site re-map offer failed: {e}"),
             }
@@ -17415,26 +17544,7 @@ impl Mesh {
             );
         }
         self.site_remap_inflight.lock().remove(&key);
-    }
-
-    /// Bind a loopback listener on *exactly* `port`, retrying briefly — a
-    /// just-aborted accept loop may not have released the port yet. The re-map
-    /// path needs the identical local port an open tab is already on, so unlike
-    /// [`Self::bind_site_listener`] it never falls back to another number.
-    async fn bind_exact_local_port(&self, port: u16) -> Result<tokio::net::TcpListener, String> {
-        use std::net::{Ipv4Addr, SocketAddr};
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let mut last = String::new();
-        for _ in 0..20 {
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => return Ok(l),
-                Err(e) => {
-                    last = e.to_string();
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-        Err(format!("local port :{port} still busy after 2s: {last}"))
+        self.emit_snapshot();
     }
 
     /// NACK a site frame that arrived on a route we don't hold live — the
@@ -17500,9 +17610,22 @@ impl Mesh {
 
     /// Unmap a site: tear the route down (closing the listener + every
     /// connection via `StopMedia`) and tell the host.
-    pub async fn site_unmap(self: &Arc<Self>, node: String, port: u16) -> Result<(), String> {
+    pub async fn site_unmap(
+        self: &Arc<Self>,
+        node: String,
+        port: u16,
+        forget: bool,
+    ) -> Result<(), String> {
+        let _ops = self.site_mapping_ops.lock().await;
+        if forget {
+            self.sites.forget(&node, port)?;
+        }
+        self.site_remap_refused
+            .lock()
+            .remove(&format!("{}:{port}", pubkey_part(&node)));
         let Some(route_id) = self.sites.route_for(&node, port) else {
-            return Ok(()); // nothing mapped — idempotent
+            self.emit_snapshot();
+            return Ok(());
         };
         self.disconnect(route_id).await
     }
@@ -17519,14 +17642,16 @@ impl Mesh {
         let preferred = allmystuff_bridge::sites::allocate_local_port(host_port, &taken);
         // Bind loopback only — a mapped site is for *this* machine's clients,
         // never re-exposed onto this machine's LAN.
-        for candidate in [preferred, 0] {
+        for candidate in [preferred, 0, 0] {
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, candidate));
             if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
                 let port = listener
                     .local_addr()
                     .map(|a| a.port())
                     .map_err(|e| e.to_string())?;
-                return Ok((listener, port));
+                if !taken.contains(&port) {
+                    return Ok((listener, port));
+                }
             }
         }
         Err(format!(
@@ -17564,13 +17689,7 @@ impl Mesh {
                     let healer = mesh.clone();
                     let failed_route = route_id.clone();
                     crate::spawn(async move {
-                        healer.sites.stop_route(&failed_route);
-                        {
-                            let mut st = healer.state.lock();
-                            if let Some(s) = st.session.as_mut() {
-                                let _ = s.teardown(&failed_route);
-                            }
-                        }
+                        healer.clear_site_route(&failed_route);
                         healer.remap_site_route(node, failed_port, local_port).await;
                     });
                 }

@@ -4,12 +4,18 @@
   // Copy (address) / Unmap. Bottom (collapsed by default): "Your ports" —
   // the services this machine is listening on, each exposable to the fleet
   // under a name (prefilled from the page <title> when there is one).
+  import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import { displayName, siteIcon, type ListeningService, type SiteAdvert } from "../types";
 
   // Whether the "Your ports" section is expanded — collapsed at first so the
   // fleet's sites lead.
   let portsOpen = $state(false);
+  onMount(() => { void app.loadSites(); });
+  const unlistedMappings = $derived(app.siteMappings.filter((mapping) =>
+    mapping.remembered && !app.sitesByMachine.some((group) =>
+      app.isSameMachine(group.node.id, mapping.node) && group.sites.some((site) => site.id === mapping.site)),
+  ));
 
   // Inline copy feedback: the row whose address was just copied flashes its
   // Copy button to "✓ Copied" for a beat, instead of firing a toast.
@@ -56,8 +62,9 @@
                 <span class="s-main">
                   <span class="s-name">{site.label}<span class="s-port">:{site.port}</span></span>
                   {#if mapping}
-                    <span class="s-sub mapped" title="Reachable locally at this address">
+                    <span class="s-sub" class:mapped={mapping.active !== false}>
                       {app.siteUrl(mapping)}
+                      {#if mapping.active === false} · Waiting to reconnect{/if}
                     </span>
                   {:else if site.loopback}
                     <span class="s-sub"><span class="tag">local-only</span></span>
@@ -68,6 +75,7 @@
                     <button
                       class="btn small primary"
                       title="Open in your browser"
+                      disabled={mapping.active === false}
                       onclick={() => app.openSite(mapping)}>Open</button
                     >
                     <button
@@ -98,6 +106,27 @@
       {/each}
     {/if}
   </section>
+
+  {#if unlistedMappings.length}
+    <section class="block">
+      <h5 class="block-head">Saved mappings</h5>
+      <ul class="list">
+        {#each unlistedMappings as mapping (mapping.localPort)}
+          {@const host = app.machineByAnyId(mapping.node)}
+          <li class="row">
+            <span class="s-icon" aria-hidden="true">{siteIcon(mapping.scheme)}</span>
+            <span class="s-main">
+              <span class="s-name">{mapping.label}{host ? ` · ${displayName(host)}` : ""}</span>
+              <span class="s-sub">{app.siteUrl(mapping)}{mapping.active === false ? " · Waiting to reconnect" : ""}</span>
+            </span>
+            <div class="row-actions">
+              <button class="btn small ghost" onclick={() => app.unmapSite(mapping.node, mapping.site)}>Unmap</button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
 
   <!-- This machine's own exposed sites — always listed, even when their
        server has gone offline, so an exposed port is never just a count

@@ -1505,9 +1505,7 @@ pub async fn dispatch(
         }
         "site_set_exposed" => {
             let exposed: std::collections::BTreeMap<String, String> = try_arg!(arg(a, "exposed"));
-            json_result::<std::collections::BTreeMap<String, String>>(Ok(mesh
-                .site_set_exposed(exposed)
-                .await))
+            json_result(mesh.site_set_exposed(exposed).await)
         }
         "site_map" => {
             let node: String = try_arg!(arg(a, "node"));
@@ -1517,7 +1515,8 @@ pub async fn dispatch(
             // that knows it isn't one says so, and forgoes clearing the
             // auto-heal refusal backoff.
             let user_initiated: bool = try_arg!(opt(a, "userInitiated")).unwrap_or(true);
-            match mesh.site_map(node, port, user_initiated).await {
+            let remember: bool = try_arg!(opt(a, "remember")).unwrap_or(user_initiated);
+            match mesh.site_map(node, port, user_initiated, remember).await {
                 Ok(local_port) => DispatchOut::Json(json!({ "localPort": local_port })),
                 Err(e) => DispatchOut::Err(e),
             }
@@ -1525,18 +1524,10 @@ pub async fn dispatch(
         "site_unmap" => {
             let node: String = try_arg!(arg(a, "node"));
             let port: u16 = try_arg!(arg(a, "port"));
-            json_result(mesh.site_unmap(node, port).await)
+            let forget: bool = try_arg!(opt(a, "forget")).unwrap_or(true);
+            json_result(mesh.site_unmap(node, port, forget).await)
         }
-        "site_mappings" => {
-            let mappings: Vec<Value> = mesh
-                .site_mappings()
-                .into_iter()
-                .map(|(node, port, local_port)| {
-                    json!({ "node": node, "port": port, "localPort": local_port })
-                })
-                .collect();
-            DispatchOut::Json(Value::Array(mappings))
-        }
+        "site_mappings" => DispatchOut::Json(Value::Array(mesh.site_mappings())),
         "site_remote_list" => {
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.site_remote_list(node).await)

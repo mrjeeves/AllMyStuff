@@ -55,6 +55,7 @@ export interface SessionSnapshot {
   ready: boolean;
   me?: string;
   network?: string | null;
+  site_state?: { exposed: Record<string, string>; mappings: SiteMappingInfo[] };
   peers?: Array<{
     node: string;
     label: string;
@@ -2894,10 +2895,9 @@ export async function siteExposed(): Promise<Record<string, string>> {
 export async function siteSetExposed(
   exposed: Record<string, string>,
 ): Promise<Record<string, string>> {
-  const r = await tryInvoke<Record<string, string>>("site_set_exposed", {
-    exposed,
-  });
-  return r && typeof r === "object" ? r : exposed;
+  if (!isTauri()) return exposed;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<Record<string, string>>("site_set_exposed", { exposed });
 }
 
 /** A live local mapping of a remote site: the host port and the local port
@@ -2906,6 +2906,8 @@ export interface SiteMappingInfo {
   node: string;
   port: number;
   localPort: number;
+  active?: boolean;
+  remembered?: boolean;
 }
 
 /** Map a peer's site to a local port — sets up the reverse-proxy route and
@@ -2919,13 +2921,16 @@ export function siteMap(
   node: string,
   port: number,
   userInitiated = true,
+  remember = userInitiated,
 ): Promise<{ localPort: number } | null> {
-  return tryInvoke<{ localPort: number }>("site_map", { node, port, userInitiated });
+  return tryInvoke<{ localPort: number }>("site_map", { node, port, userInitiated, remember });
 }
 
 /** Tear a site mapping down (unbinds the local listener, drops the route). */
-export function siteUnmap(node: string, port: number): Promise<null> {
-  return tryInvoke("site_unmap", { node, port });
+export async function siteUnmap(node: string, port: number, forget = true): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("site_unmap", { node, port, forget });
 }
 
 /** Every site this machine currently has mapped. Empty in web mode. */

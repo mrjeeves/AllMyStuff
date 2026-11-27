@@ -352,6 +352,8 @@ export interface SiteMapping {
   port: number;
   /** The local port this machine bound for the tunnel. */
   localPort: number;
+  active?: boolean;
+  remembered?: boolean;
   scheme: string;
   label: string;
 }

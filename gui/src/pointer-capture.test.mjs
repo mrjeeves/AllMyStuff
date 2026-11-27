@@ -65,7 +65,7 @@ test("Console: dark desktop edges do not stretch mouse coordinates away from cen
     ASPECTS: [{ value: "4:3", ratio: 4 / 3 }],
   });
   vm.runInContext(transpile(functionCode(source, [
-    "maybeDetect", "detectActiveRegion", "normPoint", "activeRegionForAspect",
+    "maybeDetect", "detectActiveRegion", "normPoint", "contentBox", "activeRegionForAspect",
   ])), context);
   const activeRegion = source.statements.filter(ts.isVariableStatement)
     .flatMap((statement) => [...statement.declarationList.declarations])
@@ -102,6 +102,32 @@ test("Console: dark desktop edges do not stretch mouse coordinates away from cen
   assert.equal(mappedX(), 0.75, "an HDMI region cannot carry over onto a native desktop");
   applyAspect();
   assert.equal(mappedX(), 0.75, "a saved HDMI aspect cannot crop a native desktop");
+});
+
+test("Console: fitting a smaller frame keeps pointer coordinates and zoom bounds on the picture", () => {
+  const source = productionSource("./ui/Console.svelte");
+  const stage = { clientWidth: 800, clientHeight: 600 };
+  const context = vm.createContext({
+    hasFrame: true, frameW: 320, frameH: 180, stageEl: stage, kbInset: 0,
+    activeRegion: { x0: 0, y0: 0, x1: 1, y1: 1 },
+    canvasEl: {
+      getBoundingClientRect: () => ({ left: 10, top: 20, width: stage.clientWidth, height: stage.clientHeight }),
+    },
+  });
+  vm.runInContext(transpile(functionCode(source, ["contentBox", "normPoint", "clampView"])), context);
+
+  const fit = context.contentBox(context.canvasEl.getBoundingClientRect());
+  assert.deepEqual({ ...fit }, { left: 10, top: 95, width: 800, height: 450 });
+  assert.deepEqual({ ...context.normPoint({ clientX: 810, clientY: 545 }) }, { x: 1, y: 1 });
+  assert.equal(context.normPoint({ clientX: 410, clientY: 94 }), null);
+  assert.deepEqual({ ...context.clampView({ scale: 1.25, x: 200, y: 200 }) }, { scale: 1.25, x: 100, y: 0 });
+  assert.deepEqual({ ...context.clampView({ scale: 2, x: -500, y: 200 }) }, { scale: 2, x: -400, y: 150 });
+
+  stage.clientWidth = 360;
+  assert.deepEqual({ ...context.contentBox(context.canvasEl.getBoundingClientRect()) }, {
+    left: 10, top: 218.75, width: 360, height: 202.5,
+  });
+  assert.deepEqual({ ...context.normPoint({ clientX: 190, clientY: 320 }) }, { x: 0.5, y: 0.5 });
 });
 
 class Events {

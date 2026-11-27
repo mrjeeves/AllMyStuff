@@ -619,10 +619,13 @@
     // At 1× with no keyboard there is nothing to pan; otherwise fall through so
     // the keyboard's upward shift is allowed even un-zoomed.
     if (!c || !s || (scale === 1 && kbInset <= 0)) return { scale, x: 0, y: 0 };
-    // offsetWidth/Height are the LAYOUT box — unaffected by the current
-    // transform, which is exactly what the clamp must scale from.
-    const mx = Math.max(0, (c.offsetWidth * scale - s.clientWidth) / 2);
-    const my = Math.max(0, (c.offsetHeight * scale - s.clientHeight) / 2);
+    // Clamp against the fitted picture before applying the zoom. The stage
+    // includes the letterbox space, which cannot be used for panning.
+    const width = s.clientWidth;
+    const height = s.clientHeight;
+    const fit = contentBox({ left: 0, top: 0, width, height });
+    const mx = Math.max(0, (fit.width * scale - width) / 2);
+    const my = Math.max(0, (fit.height * scale - height) / 2);
     // The soft keyboard covers the bottom `kbInset` px; showing background
     // there is invisible, so the picture may shift UP that much further to lift
     // a text field above the keys. Only the upward (negative-y) room grows.
@@ -670,6 +673,11 @@
   }
   function resetView() {
     view = { scale: 1, x: 0, y: 0 };
+  }
+  function resizeConsole() {
+    clampBarPos();
+    if (view.scale > 1 || kbInset > 0) setView(view);
+    else updateCrosshair();
   }
 
   // Decode errors ask the sender for a clean entry (rate-limited again
@@ -1263,16 +1271,11 @@
     if (!img || !hasFrame || !frameW || !frameH) return null;
     // The rect reflects the pinch-zoom transform too — zoomed in, the same
     // math maps over the enlarged (partly off-pane) picture unchanged.
-    const r = img.getBoundingClientRect();
+    const r = contentBox(img.getBoundingClientRect());
     if (r.width === 0 || r.height === 0) return null;
-    const scale = Math.min(r.width / frameW, r.height / frameH);
-    const cw = frameW * scale;
-    const ch = frameH * scale;
-    const ox = r.left + (r.width - cw) / 2;
-    const oy = r.top + (r.height - ch) / 2;
     // Fraction over the streamed FRAME.
-    const fx = (e.clientX - ox) / cw;
-    const fy = (e.clientY - oy) / ch;
+    const fx = (e.clientX - r.left) / r.width;
+    const fy = (e.clientY - r.top) / r.height;
     if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
     // With HDMI capture, hits on baked-in bars clamp to the desktop edge.
     const ar = activeRegion;
@@ -1518,7 +1521,7 @@
     const ar = activeRegion;
     // Where the cursor sits on screen right now (through the active region
     // and the current zoom), and where the stage centre is. Mapped over
-    // the CONTENT box — in theater the element carries letterbox bars.
+    // the content box inside the fitted canvas.
     const cb = contentBox(r);
     const px = cb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * cb.width;
     const py = cb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * cb.height;
@@ -1530,13 +1533,8 @@
     const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
-  // The picture's content box within the canvas ELEMENT — object-fit:
-  // contain's inset, the same min-scale math normPoint runs. Outside
-  // theater the element IS the content box (auto-sized), so the inset is
-  // zero and this degrades to the rect itself; in theater the element
-  // fills the stage and the picture letterboxes inside it, and every
-  // virt→client mapping must go through here or it drifts by a bar width.
-  function contentBox(r: DOMRect): { left: number; top: number; width: number; height: number } {
+  // The centered picture inside the canvas, matching object-fit: contain.
+  function contentBox(r: Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">) {
     if (!frameW || !frameH || r.width === 0 || r.height === 0) {
       return { left: r.left, top: r.top, width: r.width, height: r.height };
     }
@@ -1593,10 +1591,9 @@
     moveBy: (dx, dy) => {
       const c = canvasEl;
       if (!c || !hasFrame) return;
-      // The transformed rect IS the rendered frame (element == content
-      // box), so dividing finger px by it — and by the active region's
-      // share — locks cursor speed to finger speed at any zoom.
-      const r = c.getBoundingClientRect();
+      // Divide by the transformed picture and its active region so finger
+      // movement matches cursor movement at any zoom.
+      const r = contentBox(c.getBoundingClientRect());
       if (!r.width || !r.height) return;
       const ar = activeRegion;
       virt.x = Math.min(1, Math.max(0, virt.x + dx / (r.width * (ar.x1 - ar.x0))));
@@ -2140,7 +2137,7 @@
   onkeydown={onWindowKey}
   onmousemove={onLockedMouseMove}
   onpointerdown={onWindowPointerDown}
-  onresize={clampBarPos}
+  onresize={resizeConsole}
   onblur={() => void releaseNativePointerLock()}
 />
 
@@ -2806,10 +2803,10 @@
               <div class="zoom-row" role="group" aria-label="Zoom">
                 <span class="zlabel">Zoom</span>
                 <button class="zbtn" aria-label="Zoom out" onclick={() => zoomStep(-1)}>−</button>
-                <span class="znow">{zoomPercent(view.scale)}</span>
+                <span class="znow">{view.scale === 1 ? "Fit" : zoomPercent(view.scale)}</span>
                 <button class="zbtn" aria-label="Zoom in" onclick={() => zoomStep(1)}>+</button>
                 {#if view.scale > 1.001}
-                  <button class="zreset" onclick={resetView}>Reset</button>
+                  <button class="zreset" onclick={resetView}>Fit</button>
                 {/if}
               </div>
               {#if hasFrame}
@@ -2953,40 +2950,15 @@
   .console.theater > .stage {
     background: #000;
   }
-  .console.theater .live {
-    border-radius: 0;
-    box-shadow: none;
-    /* Theater FILLS the monitor: the element takes the whole stage and
-       the picture letterboxes inside it (bars where the aspect differs)
-       instead of sitting at native size in a black field. Every
-       virt→client mapping goes through contentBox() so the inset never
-       skews the pointer, crosshair, or follow-cursor math; normPoint
-       always computed it. Windowed keeps the element==content-box
-       pattern below. */
+  .live {
+    /* Fill the stage's element box. Contain scales the picture up or down
+       while preserving its aspect ratio and keeping the whole frame visible. */
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: contain;
-  }
-  .live {
-    /* Windowed: size the element to the video's OWN box (its intrinsic
-       backing store scaled down to fit the stage), centered by the stage's
-       place-items — the responsive-replaced-element pattern. Theater
-       overrides to width/height:100% + object-fit (fills the monitor,
-       bars inside the element); every virt→client mapping goes through
-       contentBox() so the inset is handled in BOTH shapes — normPoint
-       always computed it, and the crosshair/follow paths do now too. The
-       pinch-zoom transform scales the same box; getBoundingClientRect
-       keeps reporting the truth. */
-    display: block;
-    width: auto;
-    height: auto;
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
     user-select: none;
     -webkit-user-drag: none;
-    border-radius: 4px;
-    box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
     transform-origin: center center;
   }
   /* Mounted (so the first frame has somewhere to land) but invisible

@@ -69,6 +69,7 @@ import {
   emitRoomLocal,
   emitVideoLocal,
   fileDownload,
+  fileDownloadCancel,
   fileSend,
   fleetKick,
   fleetLeave,
@@ -152,6 +153,11 @@ import {
   type NodeSitesEvent,
   type SiteMappingInfo,
   roomWindowTarget,
+  type RoomLocalEvent,
+  chatWindowTarget,
+  filesWorkspaceWindowTarget,
+  isCecWindow,
+  videoWindowTarget,
   terminalWindowTarget,
   terminalSessions,
   onTerminalSessions,
@@ -1070,13 +1076,9 @@ class AppStore {
    *  (the uploader's own list). Cleared when we leave; not persisted —
    *  shares are stream-only, like everything else in a room. */
   roomMyShares = $state<Record<string, SharedFileMeta[]>>({});
-  /** The **host** side of the Shared Files list: for a room we host, every
-   *  member's current offerings (room id → uploader node id → files). We
-   *  aggregate these and restate the whole as the room's `shares` list. */
+  /** File offers for rooms we host, keyed by room and uploader. */
   private roomHostShares: Record<string, Record<string, SharedFileMeta[]>> = {};
-  /** The Shared Files list as a **non-host** member received it from the
-   *  room's host (room id → entries). The host is the catalog; we just
-   *  render and download from this. */
+  /** The authoritative Shared Files list, including in the host's room window. */
   roomSharesFromHost = $state<Record<string, SharedEntry[]>>({});
   /** In-flight / finished shared-file downloads, keyed by fetch token: what
    *  the panel shows as a progress bar and "Saved to …". */
@@ -1116,7 +1118,9 @@ class AppStore {
    *  store hears every mesh event, so host-side *decisions* that answer
    *  one (admitting a knock) run only here — once, not once per window. */
   private readonly isMainWindow =
-    !consoleWindowTarget() && !terminalWindowTarget() && !filesWindowTarget() && !roomWindowTarget();
+    !consoleWindowTarget() && !terminalWindowTarget() && !filesWindowTarget() &&
+    !filesWorkspaceWindowTarget() && !roomWindowTarget() && !videoWindowTarget() &&
+    !isCecWindow() && !chatWindowTarget();
 
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
@@ -7356,12 +7360,14 @@ class AppStore {
       this.joinedRoomIds = [...this.joinedRoomIds, roomId];
       this.roomSend = { ...this.roomSend, [roomId]: { ...ROOM_SEND_OFF } };
       this.roomRoutes[roomId] = emptyRoomRoutes();
+      // Let the main window hand the catalog to the room window before the
+      // mesh announcement can trigger more catalog updates.
+      await emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId }).catch(() => {});
       await this.startRoomScope(room);
       this.roomJoinedAt = { ...this.roomJoinedAt, [roomId]: Date.now() };
       this.presenceAdd(roomId, canonicalNodeId(this.localId));
       this.callLog(`join ${roomId}: announcing presence to ${room.members.length - 1} member(s)`);
       this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
-      void emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId });
       // Re-announce any files we were already offering here (a rejoin), so
       // the host folds them back into the room's Shared Files list.
       if ((this.roomMyShares[roomId]?.length ?? 0) > 0) this.publishMyShares(roomId);
@@ -7452,7 +7458,7 @@ class AppStore {
 
   /** One event off the same-device room bus (another window of this app
    *  talking; our own echoes are dropped by token). */
-  private handleRoomLocal(e: { token: string; kind: string; room?: string; from?: string }) {
+  private handleRoomLocal(e: RoomLocalEvent) {
     if (e.token === this.windowToken) return;
     switch (e.kind) {
       case "knock-done": {
@@ -7463,11 +7469,52 @@ class AppStore {
         if (e.room && !this.roomsJoinedElsewhere.includes(e.room)) {
           this.roomsJoinedElsewhere = [...this.roomsJoinedElsewhere, e.room];
         }
+        const room = this.rooms.find((r) => r.id === e.room);
+        if (this.isMainWindow && room && this.isRoomHost(room)) {
+          void emitRoomLocal({
+            token: this.windowToken, kind: "share-catalog", room: e.room,
+            files: this.hostSharedEntries(room), handoff: true,
+          });
+        }
         break;
       }
       case "leave": {
         if (e.room) {
           this.roomsJoinedElsewhere = this.roomsJoinedElsewhere.filter((id) => id !== e.room);
+        }
+        if (this.isMainWindow && this.roomHostShares[e.room]) {
+          this.setHostShare(e.room, this.localId, []);
+          this.rebroadcastHostShares(e.room);
+        }
+        break;
+      }
+      case "share-list": {
+        const room = this.rooms.find((r) => r.id === e.room);
+        if (room && this.tracksRoomShareCatalog(room)) {
+          this.setHostShare(e.room, this.localId, e.files);
+        }
+        break;
+      }
+      case "share-catalog": {
+        if (e.handoff) {
+          // The new call window may have missed offers received before it
+          // opened. Restore just those uploaders it hasn't heard from yet.
+          if (!this.isJoined(e.room)) break;
+          const known = this.roomHostShares[e.room] ?? {};
+          const restored = new Map<string, SharedFileMeta[]>();
+          for (const { from, ...file } of e.files) {
+            if (Object.hasOwn(known, from)) continue;
+            const files = restored.get(from) ?? [];
+            files.push(file);
+            restored.set(from, files);
+          }
+          for (const [from, files] of restored) {
+            this.presenceAdd(e.room, from);
+            this.setHostShare(e.room, from, files);
+          }
+          this.rebroadcastHostShares(e.room);
+        } else {
+          this.setRoomShareCatalog(e.room, e.files);
         }
         break;
       }
@@ -7482,9 +7529,23 @@ class AppStore {
         // delete, a fresh invite). Reload it; a joined room that vanished
         // (the host here closed it from the main window) unjoins quietly —
         // its room window notices and closes itself.
+        const previous = this.rooms;
         this.loadRooms();
         for (const id of [...this.joinedRoomIds]) {
           if (!this.rooms.some((r) => r.id === id)) this.unjoinRoom(id);
+        }
+        for (const room of this.rooms) {
+          const before = previous.find((r) => r.id === room.id)?.members;
+          if (!before) continue;
+          const removed = before.filter((member) => !room.members.some((current) => sameMachine(member, current)));
+          for (const member of removed) {
+            this.presenceDrop(room.id, member);
+            if (this.tracksRoomShareCatalog(room)) this.setHostShare(room.id, member, []);
+          }
+          if (removed.length || before.length !== room.members.length) {
+            this.refreshSharePeers(room.id);
+            this.rebroadcastHostShares(room.id);
+          }
         }
         break;
       }
@@ -7661,15 +7722,10 @@ class AppStore {
     (): { from: string; me: boolean; who: string; machine: string | null; file: SharedFileMeta }[] => {
       const room = this.openRoom;
       if (!room) return [];
-      // The host renders from its own aggregate (filtered to who's still
-      // present/online — a file is offered only while its uploader is);
-      // everyone else renders the list the host sent them. Our *own*
-      // offerings are merged in directly too, so they show the instant we
-      // share (before the host's list echoes back, and in demo mode).
+      // Merge our offerings so the uploader sees them before the catalog
+      // echoes back, and in demo mode.
       const me = canonicalNodeId(this.localId);
-      const authoritative: SharedEntry[] = this.isRoomHost(room)
-        ? this.hostSharedEntries(room.id)
-        : this.roomSharesFromHost[room.id] ?? [];
+      const authoritative = this.roomSharesFromHost[room.id] ?? [];
       const seen = new Set<string>();
       const entries: SharedEntry[] = [];
       for (const f of this.roomMyShares[room.id] ?? []) {
@@ -7697,14 +7753,14 @@ class AppStore {
   /** The host's aggregated Shared Files list for `roomId`, flattened to
    *  entries and pruned to uploaders that are still present *and* online —
    *  the "available as long as the uploader is online" rule. */
-  private hostSharedEntries(roomId: string): SharedEntry[] {
-    const byUploader = this.roomHostShares[roomId] ?? {};
-    const present = this.roomPresence[roomId] ?? [];
+  private hostSharedEntries(room: VirtualRoom): SharedEntry[] {
+    const byUploader = this.roomHostShares[room.id] ?? {};
+    const present = this.roomPresence[room.id] ?? [];
     const out: SharedEntry[] = [];
     for (const [from, files] of Object.entries(byUploader)) {
       const here = this.isMe(from) || present.some((m) => sameMachine(m, from));
       const online = this.isMe(from) || !!this.machineByAnyId(from)?.online;
-      if (!here || !online) continue;
+      if (!here || !online || !room.members.some((member) => sameMachine(member, from))) continue;
       for (const f of files) out.push({ from, ...f });
     }
     return out;
@@ -7726,8 +7782,12 @@ class AppStore {
       return;
     }
     const paths = await pickFilesToShare();
-    if (paths.length === 0) return;
+    if (paths.length === 0 || !this.isJoined(room.id)) return;
     const metas = await roomShareFiles(room.members, paths);
+    if (!this.isJoined(room.id)) {
+      if (metas.length) void roomUnshare(metas.map((f) => f.token));
+      return;
+    }
     if (metas.length === 0) {
       this.toast("warn", "Couldn't read those files to share them");
       return;
@@ -7761,8 +7821,9 @@ class AppStore {
     if (!room) return;
     const mine = this.roomMyShares[roomId] ?? [];
     if (this.isRoomHost(room)) {
-      this.setHostShare(roomId, canonicalNodeId(this.localId), mine);
+      this.setHostShare(roomId, this.localId, mine);
       this.rebroadcastHostShares(roomId);
+      if (this.backendConnected) void emitRoomLocal({ token: this.windowToken, kind: "share-list", room: roomId, files: mine });
     } else {
       const host = this.roomHost(room);
       if (host && this.backendConnected) {
@@ -7774,17 +7835,32 @@ class AppStore {
   /** Host side: record one uploader's offer list in the aggregate. */
   private setHostShare(roomId: string, uploader: string, files: SharedFileMeta[]) {
     const room = (this.roomHostShares[roomId] ??= {});
-    if (files.length === 0) delete room[canonicalNodeId(uploader)];
-    else room[canonicalNodeId(uploader)] = files;
+    // An empty offer list also records a withdrawal so a handoff cannot
+    // restore an older offer from that uploader.
+    room[canonicalNodeId(uploader)] = files;
+  }
+
+  private setRoomShareCatalog(roomId: string, files: SharedEntry[]) {
+    this.roomSharesFromHost = { ...this.roomSharesFromHost, [roomId]: files };
+  }
+
+  private tracksRoomShareCatalog(room: VirtualRoom): boolean {
+    return this.isRoomHost(room) && (this.isMainWindow || roomWindowTarget() === room.id);
   }
 
   /** Host side: restate the room's whole Shared Files list to its members
    *  (replacement semantics — exactly like the roster). Pruned to present,
    *  online uploaders, so a file drops off the moment its uploader leaves. */
   private rebroadcastHostShares(roomId: string) {
+    if (!this.backendConnected) return;
     const room = this.rooms.find((r) => r.id === roomId);
-    if (!room || !this.isRoomHost(room) || !this.backendConnected) return;
-    const files = this.hostSharedEntries(roomId);
+    if (!room || !this.tracksRoomShareCatalog(room)) return;
+    // A joined call window owns publication. The main window takes over when
+    // the call window leaves, and neither blocks the other from closing.
+    if (!this.isJoined(roomId) && (!this.isMainWindow || this.roomsJoinedElsewhere.includes(roomId))) return;
+    const files = this.hostSharedEntries(room);
+    this.setRoomShareCatalog(roomId, files);
+    void emitRoomLocal({ token: this.windowToken, kind: "share-catalog", room: roomId, files });
     this.broadcastRoom(room, { room: roomId, name: room.name, kind: "shares", files });
   }
 
@@ -7800,6 +7876,10 @@ class AppStore {
     }
     const existing = this.sharedDownloads[file.token];
     if (existing && existing.state === "fetching") return; // already going
+    const pending: SharedDownload = {
+      token: file.token, name: file.name, done: 0, total: file.size, state: "fetching", note: "",
+    };
+    this.sharedDownloads = { ...this.sharedDownloads, [file.token]: pending };
     let routeId: string | null = null;
     const req = this.sharedReqSeq++;
     try {
@@ -7808,12 +7888,23 @@ class AppStore {
       this.sharedReqToken[`${routeId}:${req}`] = file.token;
       this.sharedDownloads = {
         ...this.sharedDownloads,
-        [file.token]: { token: file.token, name: file.name, done: 0, total: file.size, state: "fetching", note: dest },
+        [file.token]: { ...pending, note: dest },
       };
       await fileSend(routeId, { kind: "fetch", req, token: file.token });
     } catch (e) {
-      if (routeId) void disconnectRoute(routeId);
-      this.toast("warn", `Couldn't start the download: ${errMsg(e)}`);
+      const failedRoute = routeId;
+      if (failedRoute) {
+        delete this.sharedReqToken[`${failedRoute}:${req}`];
+        void fileDownloadCancel(failedRoute, req)
+          .catch(() => {})
+          .finally(() => disconnectRoute(failedRoute));
+      }
+      const error = errMsg(e);
+      this.sharedDownloads = {
+        ...this.sharedDownloads,
+        [file.token]: { ...pending, state: "error", note: error },
+      };
+      this.toast("warn", `Couldn't start the download: ${error}`);
     }
   }
 
@@ -7826,26 +7917,30 @@ class AppStore {
     const fromEp = `${host}:shared`;
     const n = ++this.sharedViewSeq;
     const toEp = `${this.localId}:shared-view:${Date.now().toString(36)}-${n}`;
-    const routeId = `route:${fromEp}→${toEp}`;
-    const offered = await connectRoute(fromEp, toEp, "generic");
-    if (!offered) throw new Error("the shared-file route could not be offered");
+    const routeId = await connectRoute(fromEp, toEp, "generic");
+    if (!routeId) throw new Error("the shared-file route could not be offered");
 
     // Fetch frames sent before Accept are correctly rejected by the host as
     // not belonging to a live route. Wait for the handshake instead of racing
     // the first (and only) Fetch into that gate.
-    const deadline = Date.now() + 8_000;
-    while (this.routeStates[routeId]?.state !== "active" && Date.now() < deadline) {
-      await this.refreshSession();
-      const state = this.routeStates[routeId];
-      if (state?.state === "rejected" || state?.state === "torn_down") {
-        throw new Error(state.reason || "the shared-file route was refused");
+    try {
+      const deadline = Date.now() + 8_000;
+      while (this.routeStates[routeId]?.state !== "active" && Date.now() < deadline) {
+        await this.refreshSession();
+        const state = this.routeStates[routeId];
+        if (state?.state === "rejected" || state?.state === "torn_down") {
+          throw new Error(state.reason || "the shared-file route was refused");
+        }
+        if (state?.state !== "active") await new Promise<void>((resolve) => setTimeout(resolve, 100));
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      if (this.routeStates[routeId]?.state !== "active") {
+        throw new Error("the shared-file route did not become active");
+      }
+      return routeId;
+    } catch (error) {
+      void disconnectRoute(routeId);
+      throw error;
     }
-    if (this.routeStates[routeId]?.state !== "active") {
-      throw new Error("the shared-file route did not become active");
-    }
-    return routeId;
   }
 
   /** A shared download reported progress — find its row by route+req. */
@@ -7992,7 +8087,8 @@ class AppStore {
         if (existing && this.isJoined(existing.id)) void this.refreshRoomScope(existing.id);
         // The list lives with the host: when an uploader leaves, their
         // files come off it (the bytes were only theirs to serve).
-        if (existing && this.isRoomHost(existing)) {
+        if (existing && this.tracksRoomShareCatalog(existing) &&
+            existing.members.some((member) => sameMachine(member, sender))) {
           this.setHostShare(existing.id, sender, []);
           this.rebroadcastHostShares(existing.id);
         }
@@ -8014,7 +8110,8 @@ class AppStore {
       case "share_list": {
         // A member tells us (the host) what it's offering. Only the host
         // aggregates; from anyone to a non-host it's noise.
-        if (!existing || !this.isRoomHost(existing)) return;
+        if (!existing || !this.tracksRoomShareCatalog(existing)) return;
+        if (!existing.members.some((member) => sameMachine(member, sender))) return;
         this.setHostShare(existing.id, sender, msg.files);
         this.rebroadcastHostShares(existing.id);
         break;
@@ -8025,7 +8122,7 @@ class AppStore {
         if (!existing) return;
         const host = this.roomHost(existing);
         if (host && !sameMachine(host, sender)) return;
-        this.roomSharesFromHost = { ...this.roomSharesFromHost, [existing.id]: msg.files };
+        this.setRoomShareCatalog(existing.id, msg.files);
         break;
       }
       case "chat": {

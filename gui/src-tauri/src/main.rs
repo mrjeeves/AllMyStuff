@@ -2863,20 +2863,42 @@ async fn site_set_exposed(
 /// Map a peer's site to a local port — set up the reverse-proxy route and
 /// bind a local listener. Returns `{ localPort }`.
 #[tauri::command]
-async fn site_map(state: State<'_, AppState>, node: String, port: u16) -> Result<Value, String> {
+async fn site_map(
+    state: State<'_, AppState>,
+    node: String,
+    port: u16,
+    user_initiated: Option<bool>,
+    remember: Option<bool>,
+) -> Result<Value, String> {
+    let user_initiated = user_initiated.unwrap_or(true);
     state
         .node
-        .request("site_map", json!({ "node": node, "port": port }))
+        .request(
+            "site_map",
+            json!({
+                "node": node, "port": port,
+                "userInitiated": user_initiated,
+                "remember": remember.unwrap_or(user_initiated),
+            }),
+        )
         .await
         .map_err(|e| e.to_string())
 }
 
 /// Tear a site mapping down (unbind the local listener, drop the route).
 #[tauri::command]
-async fn site_unmap(state: State<'_, AppState>, node: String, port: u16) -> Result<(), String> {
+async fn site_unmap(
+    state: State<'_, AppState>,
+    node: String,
+    port: u16,
+    forget: Option<bool>,
+) -> Result<(), String> {
     state
         .node
-        .request("site_unmap", json!({ "node": node, "port": port }))
+        .request(
+            "site_unmap",
+            json!({ "node": node, "port": port, "forget": forget.unwrap_or(true) }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())

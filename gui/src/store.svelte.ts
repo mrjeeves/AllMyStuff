@@ -150,6 +150,7 @@ import {
   siteRemoteSetExposed,
   onNodeSites,
   type NodeSitesEvent,
+  type SiteMappingInfo,
   roomWindowTarget,
   terminalWindowTarget,
   terminalSessions,
@@ -1102,6 +1103,7 @@ class AppStore {
   /** Sites this device has mapped to a local port — the live reverse-proxy
    *  bindings, keyed for lookup by `"<node>::<site>"`. */
   siteMappings = $state<SiteMapping[]>([]);
+  private siteStateRevision = 0;
   /** A fleet machine's full site list + exposed map, fetched on demand when
    *  you open its drawer to manage exposure remotely. Keyed by canonical
    *  node id; filled by the `allmystuff://node-sites` reply. */
@@ -2757,14 +2759,19 @@ class AppStore {
       this.consoleClipboard = false;
     }
 
-    // Reconcile site mappings against what each host now advertises: a host
+    if (snap.site_state) {
+      this.siteStateRevision++;
+      this.applySiteState(snap.site_state.exposed, snap.site_state.mappings);
+    }
+
+    // Reconcile temporary site mappings against what each host now advertises: a host
     // that's online but no longer lists a site we'd mapped has stopped
     // exposing it — tear our local mapping down so the dead port is freed
     // (and the row disappears). Only when the host is online, so a brief
     // drop-off doesn't unmap.
     for (const m of [...this.siteMappings]) {
       const host = this.machineByAnyId(m.node);
-      if (host?.online && !(host.sites ?? []).some((s) => s.id === m.site)) {
+      if (!m.remembered && host?.online && !(host.sites ?? []).some((s) => s.id === m.site)) {
         void this.unmapSite(m.node, m.site);
       }
     }
@@ -5366,14 +5373,21 @@ class AppStore {
       this.seedDemoSites();
       return;
     }
-    const [listening, exposed, mappings] = await Promise.all([
-      siteScan(),
-      siteExposed(),
-      siteMappings(),
-    ]);
-    this.myListening = listening;
+    const revision = this.siteStateRevision;
+    const scan = siteScan().then((listening) => {
+      this.myListening = listening;
+      this.syncLocalSites();
+    });
+    const settings = revision === 0 ? Promise.all([siteExposed(), siteMappings()]).then(([exposed, mappings]) => {
+      if (this.siteStateRevision !== revision) return;
+      this.applySiteState(exposed, mappings);
+    }) : Promise.resolve();
+    await Promise.all([scan, settings]);
+  }
+
+  private applySiteState(exposed: Record<string, string>, mappings: SiteMappingInfo[]) {
     this.exposedSites = exposed;
-    this.siteMappings = mappings.map((m) => this.mappingFromInfo(m));
+    this.siteMappings = mappings.map((mapping) => this.mappingFromInfo(mapping));
     this.syncLocalSites();
   }
 
@@ -5411,14 +5425,16 @@ class AppStore {
     return svc.title.trim() || svc.name;
   }
 
-  private mappingFromInfo(info: { node: string; port: number; localPort: number }): SiteMapping {
+  private mappingFromInfo(info: SiteMappingInfo): SiteMapping {
     // Resolve the advert so the mapping carries a label + scheme for the UI.
-    const advert = this.node(info.node)?.sites?.find((s) => s.port === info.port);
+    const advert = this.machineByAnyId(info.node)?.sites?.find((s) => s.port === info.port);
     return {
       node: info.node,
       site: advert?.id ?? `tcp:${info.port}`,
       port: info.port,
       localPort: info.localPort,
+      active: info.active,
+      remembered: info.remembered,
       scheme: advert?.scheme ?? "",
       label: advert?.label ?? `Port ${info.port}`,
     };
@@ -5450,11 +5466,12 @@ class AppStore {
   }
 
   private async pushExposed(next: Record<string, string>) {
-    this.exposedSites = next;
-    if (this.backendConnected) {
+    try {
       this.exposedSites = await siteSetExposed(next);
+      this.syncLocalSites();
+    } catch (error) {
+      this.toast("warn", `Couldn't save Sites exposure: ${errMsg(error)}`);
     }
-    this.syncLocalSites();
   }
 
   /** Map a peer's site to a local port — sets up the reverse-proxy and binds
@@ -5465,7 +5482,7 @@ class AppStore {
    *  `userInitiated` false marks a background map (the power lamp's one-time
    *  console map): the node keeps its auto-heal refusal backoff instead of
    *  treating the call as a person insisting that access has changed. */
-  async mapSite(nodeId: string, site: SiteAdvert, quiet = false, userInitiated = true) {
+  async mapSite(nodeId: string, site: SiteAdvert, quiet = false, userInitiated = true, remember = userInitiated) {
     const node = this.node(nodeId);
     if (!node) return;
     // A KVM's own web UI rides this same proxy path — gated by its session
@@ -5498,16 +5515,19 @@ class AppStore {
       // No toast — the row now shows its localhost:<port> address inline.
       return;
     }
-    const r = await siteMap(nodeId, site.port, userInitiated);
+    const revision = this.siteStateRevision;
+    const r = await siteMap(nodeId, site.port, userInitiated, remember);
     if (!r) {
       if (!quiet) this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
       return;
     }
+    if (this.siteStateRevision !== revision && this.siteMappingFor(nodeId, site.id)) return;
     const mapping: SiteMapping = {
       node: nodeId,
       site: site.id,
       port: site.port,
       localPort: r.localPort,
+      remembered: existing?.remembered || remember,
       scheme: site.scheme ?? "",
       label: site.label,
     };
@@ -5532,8 +5552,12 @@ class AppStore {
   async unmapSite(nodeId: string, siteId: string) {
     const m = this.siteMappingFor(nodeId, siteId);
     if (!m) return;
-    this.siteMappings = this.siteMappings.filter((x) => x !== m);
-    if (this.backendConnected) await siteUnmap(m.node, m.port);
+    try {
+      await siteUnmap(m.node, m.port);
+      this.siteMappings = this.siteMappings.filter((x) => x !== m);
+    } catch (error) {
+      this.toast("warn", `Couldn't unmap ${m.label}: ${errMsg(error)}`);
+    }
   }
 
   /** Open a mapped site in the system browser — a plain navigation to its
@@ -5741,7 +5765,7 @@ class AppStore {
       this.toast("info", `Opening ${node.label}'s KVM console…`);
       return;
     }
-    await this.mapSite(nodeId, site);
+    await this.mapSite(nodeId, site, false, true, false);
     const m = this.siteMappingFor(nodeId, site.id);
     if (!m) return; // mapSite already toasted the failure
     this.openSite(m);
@@ -5780,7 +5804,7 @@ class AppStore {
       if (this.kvmConsoleMapped.has(key)) return null;
     }
     this.kvmConsoleMapped.add(key);
-    await this.mapSite(nodeId, site, quiet, !background);
+    await this.mapSite(nodeId, site, quiet, !background, false);
     return this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
   }
 
@@ -5948,11 +5972,12 @@ class AppStore {
     const existing = this.siteMappingFor(nodeId, site.id);
     if (existing && existing.localPort !== failedPort) return existing.localPort;
 
-    this.siteMappings = this.siteMappings.filter(
-      (m) => !(sameMachine(m.node, nodeId) && m.site === site.id),
-    );
-    await siteUnmap(existing?.node ?? nodeId, existing?.port ?? site.port);
-    await this.mapSite(nodeId, site, quiet);
+    try {
+      await siteUnmap(existing?.node ?? nodeId, existing?.port ?? site.port, false);
+    } catch {
+      return null;
+    }
+    await this.mapSite(nodeId, site, quiet, true, false);
     const repairedPort = this.siteMappingFor(nodeId, site.id)?.localPort ?? null;
     if (this.wifiFor && sameMachine(this.wifiFor, nodeId)) this.wifiPort = repairedPort;
     return repairedPort;
@@ -6562,8 +6587,15 @@ class AppStore {
   /** A managed machine's full discovered services (this machine: the live
    *  scan; a fleet member: its last reported list). */
   deviceServices(nodeId: string): ListeningService[] {
-    if (this.isMe(nodeId)) return this.myListening;
-    return this.remoteSites[canonicalNodeId(nodeId)]?.services ?? [];
+    const services = this.isMe(nodeId) ? this.myListening : this.remoteSites[canonicalNodeId(nodeId)]?.services ?? [];
+    const byId = new Map(services.map((service) => [service.id, service]));
+    for (const [id, name] of Object.entries(this.deviceExposed(nodeId))) {
+      if (byId.has(id)) continue;
+      const port = sitePort(id);
+      if (!port) continue;
+      byId.set(id, { id, port, name: name.trim() || `Port ${port}`, kind: "", scheme: "", loopback: false, process: "", title: "" });
+    }
+    return [...byId.values()].sort((a, b) => a.port - b.port);
   }
 
   private deviceExposed(nodeId: string): Record<string, string> {

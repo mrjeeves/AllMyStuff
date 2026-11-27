@@ -632,6 +632,12 @@ mod imp {
     fn with_interactive_user<T>(
         read: impl FnOnce() -> Result<T, String>,
     ) -> Result<Option<T>, String> {
+        with_interactive_user_token(|_| read())
+    }
+
+    fn with_interactive_user_token<T>(
+        read: impl FnOnce(HANDLE) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
         let Some(process_id) = interactive_explorer_process_id()? else {
             return Ok(None);
         };
@@ -655,7 +661,7 @@ mod imp {
             unsafe { CloseHandle(token) };
             return Err("couldn't enter the signed-in user's drive namespace".into());
         }
-        let result = read();
+        let result = read(token);
         let reverted = unsafe { RevertToSelf() };
         unsafe { CloseHandle(token) };
         if reverted == 0 {
@@ -672,18 +678,64 @@ mod imp {
         thread_name: &str,
         action: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
+        interactive_user_token_call(thread_name, move |_| action())
+    }
+
+    fn interactive_user_token_call<T: Send + 'static>(
+        thread_name: &str,
+        action: impl FnOnce(HANDLE) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         let thread_name = thread_name.to_string();
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || with_interactive_user(action))
+            .spawn(move || with_interactive_user_token(action))
             .map_err(|error| format!("couldn't start the interactive-user operation: {error}"))?
             .join()
             .map_err(|_| "the interactive-user operation stopped unexpectedly".to_string())?
             .and_then(|value| {
-                value.ok_or_else(|| {
-                    "there is no signed-in Explorer session for Fleetfiles".to_string()
-                })
+                value.ok_or_else(|| "there is no signed-in Explorer session".to_string())
             })
+    }
+
+    /// Resolve Windows' Downloads known folder with the Explorer user's token
+    /// and perform the operation under that same account.
+    pub(crate) fn interactive_user_download<T: Send + 'static>(
+        action: impl FnOnce(&Path) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        use std::os::windows::ffi::OsStringExt as _;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_CREATE,
+        };
+
+        interactive_user_token_call("ams-download", move |token| {
+            if let Ok(expected_sid) = std::env::var("ALLMYSTUFF_CLIENT_SID") {
+                if effective_user_sid()? != expected_sid {
+                    return Err("the AllMyStuff service user is not signed in to Explorer".into());
+                }
+            }
+            let mut raw_path = std::ptr::null_mut();
+            let status = unsafe {
+                SHGetKnownFolderPath(
+                    &FOLDERID_Downloads,
+                    KF_FLAG_CREATE as u32,
+                    token,
+                    &mut raw_path,
+                )
+            };
+            let path = (status >= 0 && !raw_path.is_null()).then(|| {
+                let path = unsafe { widestring::U16CStr::from_ptr_str(raw_path) };
+                std::ffi::OsString::from_wide(path.as_slice())
+            });
+            unsafe { CoTaskMemFree(Some(raw_path.cast())) };
+            let path = path.ok_or_else(|| {
+                format!(
+                    "couldn't open the user's Downloads folder (0x{:08x})",
+                    status as u32
+                )
+            })?;
+            action(Path::new(&path))
+        })
     }
 
     /// Return the SID of the effective thread token. Fleetfiles calls this
@@ -1213,7 +1265,7 @@ pub use imp::{
 #[cfg(windows)]
 pub(crate) use imp::{
     assigned_drive_mask, effective_user_sid, interactive_user_assigned_drive_mask,
-    interactive_user_call,
+    interactive_user_call, interactive_user_download,
 };
 
 /// Whether this build targets Windows at all, hoisted here so callers don't

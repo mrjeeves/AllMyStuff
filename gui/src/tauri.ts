@@ -25,6 +25,7 @@ import type {
   OwnedRoster,
   PeerInfo,
   RosterPeer,
+  SharedEntry,
   SharedFileMeta,
   SiteAdvert,
   SiteService,
@@ -2631,18 +2632,13 @@ export function roomWindowTarget(): string | null {
  *  windows of one device need this local lane to stay in step. Carried on
  *  the Tauri event bus (which reaches every window, the sender included —
  *  receivers drop their own `token`). No-op in web mode: one window. */
-export interface RoomLocalEvent {
-  /** The emitting window's store token — receivers ignore their own. */
-  token: string;
-  /** What happened: `join`/`leave` mirror self-presence, `leave-ask`
-   *  requests whichever window holds the room joined to hang up, `sync`
-   *  says the persisted rooms list changed (reload it), `knock-done`
-   *  says an ask-to-join was answered (clear it everywhere). */
-  kind: "join" | "leave" | "leave-ask" | "sync" | "knock-done";
-  room?: string;
-  /** `knock-done`: whose ask was answered. */
-  from?: string;
-}
+export type RoomLocalEvent = { token: string } & (
+  | { kind: "join" | "leave" | "leave-ask"; room: string }
+  | { kind: "sync" }
+  | { kind: "knock-done"; room: string; from: string }
+  | { kind: "share-list"; room: string; files: SharedFileMeta[] }
+  | { kind: "share-catalog"; room: string; files: SharedEntry[]; handoff?: boolean }
+);
 
 export async function emitRoomLocal(event: RoomLocalEvent): Promise<void> {
   if (!isTauri()) return;

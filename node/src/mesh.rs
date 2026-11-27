@@ -18266,11 +18266,7 @@ impl Mesh {
             .map(|n| n.to_string_lossy().into_owned())
             .filter(|n| !n.is_empty() && n != "." && n != "..")
             .unwrap_or_else(|| "download".to_string());
-        let dir = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .ok_or("no Downloads folder here")?;
-        let path = unique_path(&dir, &base);
-        let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        let (path, file) = open_download_destination(base)?;
         self.downloads.lock().insert(
             (route_id, req),
             DownloadSink {
@@ -22566,6 +22562,25 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         }
     }
     unreachable!()
+}
+
+fn open_download_destination(name: String) -> Result<(PathBuf, std::fs::File), String> {
+    let open = move |dir: &std::path::Path| {
+        #[cfg(windows)]
+        let name = name.replace(['<', '>', ':', '"', '|', '?', '*'], "_");
+        let path = unique_path(dir, &name);
+        let file = std::fs::File::create_new(&path).map_err(|error| error.to_string())?;
+        Ok((path, file))
+    };
+    #[cfg(windows)]
+    if crate::win_privilege::current_posture().integrity == crate::win_privilege::Integrity::System
+    {
+        return crate::win_privilege::interactive_user_download(open);
+    }
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or("no Downloads folder here")?;
+    open(&dir)
 }
 
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing

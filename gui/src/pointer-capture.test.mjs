@@ -34,6 +34,102 @@ function effectCode(source, includes) {
   return statement.expression.arguments[0].getText(source);
 }
 
+test("Console: dark desktop edges do not stretch mouse coordinates away from center", () => {
+  const source = productionSource("./ui/Console.svelte");
+  const width = 48;
+  const height = 28;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 12; x < 36; x++) {
+      const i = (y * width + x) * 4;
+      pixels.fill(255, i, i + 4);
+    }
+  }
+  let now = 1000;
+  let samples = 0;
+  const full = { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const context = vm.createContext({
+    kvmSource: false, kvmRegion: full, FULL_FRAME_REGION: full,
+    stagePointerActive: true, aspectChoice: "auto", hasFrame: true,
+    frameW: 1600, frameH: 900,
+    canvasEl: { getBoundingClientRect: () => ({ left: 100, top: 200, width: 800, height: 600 }) },
+    detectLocked: false, detectPrev: null, detectScratch: null, lastDetectAt: 0,
+    DETECT_W: width, DETECT_H: height,
+    performance: { now: () => now },
+    document: {
+      createElement: () => ({ getContext: () => ({
+        drawImage() {},
+        getImageData() { samples++; return { data: pixels }; },
+      }) }),
+    },
+    ASPECTS: [{ value: "4:3", ratio: 4 / 3 }],
+  });
+  vm.runInContext(transpile(functionCode(source, [
+    "maybeDetect", "detectActiveRegion", "normPoint", "contentBox", "activeRegionForAspect",
+  ])), context);
+  const activeRegion = source.statements.filter(ts.isVariableStatement)
+    .flatMap((statement) => [...statement.declarationList.declarations])
+    .find((declaration) => declaration.name.getText(source) === "activeRegion");
+  assert.ok(activeRegion?.initializer && ts.isCallExpression(activeRegion.initializer));
+  const readRegion = vm.runInContext(`() => ${activeRegion.initializer.arguments[0].getText(source)}`, context);
+  Object.defineProperty(context, "activeRegion", { get: readRegion });
+  const applyAspect = vm.runInContext(transpile(`(${effectCode(source, "activeRegionForAspect")})`), context);
+
+  const point = { clientX: 700, clientY: 500 };
+  const mappedX = () => context.normPoint(point).x;
+  const sampleTwice = () => {
+    context.maybeDetect({});
+    now += 1000;
+    context.maybeDetect({});
+    now += 1000;
+  };
+
+  sampleTwice();
+  assert.equal(mappedX(), 0.75);
+  assert.equal(samples, 0);
+  assert.equal(context.normPoint({ clientX: 700, clientY: 220 }), null, "CSS letterbox still excludes pointer input");
+
+  context.kvmSource = true;
+  sampleTwice();
+  assert.equal(mappedX(), 1, "the same dark bands would have stretched desktop coordinates");
+  assert.equal(samples, 2);
+  assert.equal(context.normPoint({ clientX: 500, clientY: 500 }).x, 0.5);
+
+  context.aspectChoice = "4:3";
+  applyAspect();
+  assert.ok(Math.abs(mappedX() - 5 / 6) < 1e-12, "manual KVM aspect still applies");
+  context.kvmSource = false;
+  assert.equal(mappedX(), 0.75, "an HDMI region cannot carry over onto a native desktop");
+  applyAspect();
+  assert.equal(mappedX(), 0.75, "a saved HDMI aspect cannot crop a native desktop");
+});
+
+test("Console: fitting a smaller frame keeps pointer coordinates and zoom bounds on the picture", () => {
+  const source = productionSource("./ui/Console.svelte");
+  const stage = { clientWidth: 800, clientHeight: 600 };
+  const context = vm.createContext({
+    hasFrame: true, frameW: 320, frameH: 180, stageEl: stage, kbInset: 0,
+    activeRegion: { x0: 0, y0: 0, x1: 1, y1: 1 },
+    canvasEl: {
+      getBoundingClientRect: () => ({ left: 10, top: 20, width: stage.clientWidth, height: stage.clientHeight }),
+    },
+  });
+  vm.runInContext(transpile(functionCode(source, ["contentBox", "normPoint", "clampView"])), context);
+
+  const fit = context.contentBox(context.canvasEl.getBoundingClientRect());
+  assert.deepEqual({ ...fit }, { left: 10, top: 95, width: 800, height: 450 });
+  assert.deepEqual({ ...context.normPoint({ clientX: 810, clientY: 545 }) }, { x: 1, y: 1 });
+  assert.equal(context.normPoint({ clientX: 410, clientY: 94 }), null);
+  assert.deepEqual({ ...context.clampView({ scale: 1.25, x: 200, y: 200 }) }, { scale: 1.25, x: 100, y: 0 });
+  assert.deepEqual({ ...context.clampView({ scale: 2, x: -500, y: 200 }) }, { scale: 2, x: -400, y: 150 });
+
+  stage.clientWidth = 360;
+  assert.deepEqual({ ...context.contentBox(context.canvasEl.getBoundingClientRect()) }, {
+    left: 10, top: 218.75, width: 360, height: 202.5,
+  });
+  assert.deepEqual({ ...context.normPoint({ clientX: 190, clientY: 320 }) }, { x: 0.5, y: 0.5 });
+});
+
 class Events {
   listeners = new Map();
   addEventListener(name, handler) {
